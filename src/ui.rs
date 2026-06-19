@@ -3,8 +3,8 @@ use egui::{scroll_area::ScrollBarVisibility, Context, FontFamily, FontId, Rect, 
 use crate::animation::action_bar_overlay_rect;
 use crate::app::VadadeeBerryApp;
 use crate::document::{
-    default_loft_gap_for_node, find_effect_for_pair, ArcJoin, FillKind, GeometryProfile, LineCap,
-    LineJoin, NodeKind, OnPathMode, TextStyle, A4_HEIGHT_PX, A4_WIDTH_PX,
+    compute_whole_object_bounds, compute_tiling_whole_bounds, compute_circular_whole_bounds, default_loft_gap_for_node, find_effect_for_pair, ArcJoin, FillKind, GeometryProfile, LineCap,
+    LineJoin, NodeKind, OnPathMode, PathData, TextStyle, A4_HEIGHT_PX, A4_WIDTH_PX,
 };
 use crate::gradient_ui::{
     apply_angle_to_flow_line, gradient_flow_line_editor, gradient_strip_editor,
@@ -500,6 +500,8 @@ const ON_PATH_CONTAINER_MIN_H: f32 = 220.0;
 
 fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     app.sync_on_path_ui_from_selection();
+    app.sync_tiling_ui_from_selection();
+    app.sync_circular_ui_from_selection();
     let on_path_offer = app.selection_path_and_objects().is_some()
         && !app.selection_has_object_on_path_effect();
     let on_path_container = app.selection_has_object_on_path_effect();
@@ -622,7 +624,7 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                     .strong()
                                     .color(colors::TEXT.gamma_multiply(alpha)),
                             )
-                            .min_size(egui::vec2(128.0 * scale, 28.0 * scale));
+                            .min_size(egui::vec2(100.0 * scale, 28.0 * scale));
                             if ui.add(btn).clicked() {
                                 app.apply_object_on_path_effect();
                                 ui.ctx().request_repaint();
@@ -657,6 +659,8 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 }
                 let _ = path_id;
 
+
+
                 // Force the effect to match current UI mode (handles mode switches reliably, even if changed detect misses)
                 let needs_update = objects.iter().any(|&sid| {
                     find_effect_for_pair(&app.project.document.path_effects, sid, path_id)
@@ -677,11 +681,112 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     }
 
+    // Tiling container (live, separate from ObjectOnPath)
+    if app.selection_has_tiling_effect() {
+        ui.separator();
+        ui.label(RichText::new("Tiling (2D)").strong());
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Rows");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_rows).range(1..=20)).changed();
+            ui.label("Cols");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_cols).range(1..=20)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Gap X");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_gap_x).speed(1.0)).changed();
+            ui.label("Y");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_gap_y).speed(1.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Offset X");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_offset_x).speed(1.0)).changed();
+            ui.label("Y");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_offset_y).speed(1.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Row Rot °");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_row_rot).speed(1.0)).changed();
+            ui.label("Col Rot °");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_col_rot).speed(1.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Row Scale");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_row_scale).speed(0.01)).changed();
+            ui.label("Col Scale");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_col_scale).speed(0.01)).changed();
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Bake as group").clicked() {
+                app.bake_tiling();
+            }
+            if ui.button("Remove").clicked() {
+                app.remove_tiling_effect();
+                ui.ctx().request_repaint();
+            }
+        });
+        if changed {
+            app.update_tiling_effects_live();
+            ui.ctx().request_repaint();
+        }
+    }
+
+    // CircularClone container
+    if app.selection_has_circular_effect() {
+        ui.separator();
+        ui.label(RichText::new("CircularClone").strong());
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Copies");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_circular_copies).range(3..=32)).changed();
+            ui.label("Angle °");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_circular_angle_offset).speed(1.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Origin X");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_circular_origin_x).speed(1.0)).changed();
+            ui.label("Y");
+            changed |= ui.add(egui::DragValue::new(&mut app.ui_circular_origin_y).speed(1.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Bake as group").clicked() {
+                app.bake_circular();
+            }
+            if ui.button("Remove").clicked() {
+                app.remove_circular_effect();
+                ui.ctx().request_repaint();
+            }
+        });
+        if changed {
+            app.update_circular_effects_live();
+            ui.ctx().request_repaint();
+        }
+    }
+
     if path_ids.is_empty() && app.object_on_path_panel_context().is_none() {
-        ui.label(
-            RichText::new("Select path(s) or one path + object(s).")
-                .color(colors::TEXT_MUTED),
-        );
+        // Show Tiling and CircularClone apply when only facial objects (e.g. Circle) selected, and not yet enabled
+        let facial_objects: Vec<_> = app.selection.iter().filter(|&&id| {
+            app.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. } | NodeKind::Group { .. }))
+        }).cloned().collect();
+        let has_t_or_c = app.selection_has_tiling_effect() || app.selection_has_circular_effect();
+        if !facial_objects.is_empty() && !has_t_or_c {
+            ui.label(RichText::new("Path Magic (separate traits)").strong());
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Tiling (size gap)").clicked() {
+                    app.apply_tiling_magic();
+                }
+                if ui.button("CircularClone (6 sides)").clicked() {
+                    app.apply_circular_clone_magic();
+                }
+            });
+            ui.add_space(8.0);
+        }
+        if !has_t_or_c {
+            ui.label(
+                RichText::new("Select path(s) or one path + object(s).")
+                    .color(colors::TEXT_MUTED),
+            );
+        }
         return;
     }
 
@@ -1468,6 +1573,73 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     if app.tools.active == ToolKind::Text && app.selection.is_empty() {
         text_style_panel(app, ui, true);
         return;
+    }
+
+    // When an ObjectOnPath path is selected, show the *whole* resulting object size
+    // (union of all placed source instances), not just the spine path.
+    if matches!(&node.kind, NodeKind::Path { .. }) {
+        if let Some((objects, path_id)) = app.object_on_path_panel_context() {
+            if path_id == id && !objects.is_empty() {
+                if let Some(first_src_id) = objects.first() {
+                    if let (Some(src), Some(eff)) = (
+                        app.project.nodes.get(*first_src_id),
+                        find_effect_for_pair(&app.project.document.path_effects, *first_src_id, path_id),
+                    ) {
+                        if let NodeKind::Path { path } = &node.kind {
+                            let whole = compute_whole_object_bounds(src, eff, path, 0.5);
+                            let w = (whole.x1 - whole.x0).abs();
+                            let h = (whole.y1 - whole.y0).abs();
+                            ui.label(
+                                RichText::new("Whole Object (on-path placements)")
+                                    .small()
+                                    .color(colors::TEXT_MUTED),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label(format!("W: {w:.1}"));
+                                ui.label(format!("H: {h:.1}"));
+                            });
+                            ui.separator();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Show whole bounds for Tiling or CircularClone on this selected object
+    if let Some(e) = app.project.document.tiling_effects.values().find(|e| e.source_id == id) {
+        if let Some(src) = app.project.nodes.get(id) {
+            let whole = compute_tiling_whole_bounds(src, e);
+            let w = (whole.x1 - whole.x0).abs();
+            let h = (whole.y1 - whole.y0).abs();
+            ui.label(
+                RichText::new("Whole Tiling")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.horizontal(|ui| {
+                ui.label(format!("W: {w:.1}"));
+                ui.label(format!("H: {h:.1}"));
+            });
+            ui.separator();
+        }
+    }
+    if let Some(e) = app.project.document.circular_effects.values().find(|e| e.source_id == id) {
+        if let Some(src) = app.project.nodes.get(id) {
+            let whole = compute_circular_whole_bounds(src, e);
+            let w = (whole.x1 - whole.x0).abs();
+            let h = (whole.y1 - whole.y0).abs();
+            ui.label(
+                RichText::new("Whole CircularClone")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.horizontal(|ui| {
+                ui.label(format!("W: {w:.1}"));
+                ui.label(format!("H: {h:.1}"));
+            });
+            ui.separator();
+        }
     }
 
     match node.geometry_profile() {

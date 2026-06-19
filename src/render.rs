@@ -11,7 +11,7 @@ use crate::canvas::Viewport;
 use std::collections::HashSet;
 
 use crate::document::{
-    ArcJoin, Fill, LineCap, LineJoin, Node, NodeId, NodeKind, NodeStore, Paint, TextStyle,
+    ArcJoin, FaceRenderable, Fill, LineCap, LineJoin, Node, NodeId, NodeKind, NodeStore, Paint, PathMagic, TextStyle,
     regular_polygon_vertices,
 };
 use crate::theme::colors;
@@ -1686,11 +1686,19 @@ pub fn selection_union_screen_rect(
     selection: &[crate::document::NodeId],
     viewport: &Viewport,
     origin: Pos2,
+    tiling_effects: &indexmap::IndexMap<uuid::Uuid, crate::document::TilingEffect>,
+    circular_effects: &indexmap::IndexMap<uuid::Uuid, crate::document::CircularCloneEffect>,
 ) -> Option<Rect> {
     let mut union: Option<kurbo::Rect> = None;
     for id in selection {
         let Some(node) = nodes.get(*id) else { continue };
-        let b = node.bounds_with_store(nodes);
+        let mut b = node.bounds_with_store(nodes);
+        if let Some(e) = tiling_effects.values().find(|e| e.source_id == *id) {
+            b = b.union(crate::document::compute_tiling_whole_bounds(node, e));
+        }
+        if let Some(e) = circular_effects.values().find(|e| e.source_id == *id) {
+            b = b.union(crate::document::compute_circular_whole_bounds(node, e));
+        }
         union = Some(match union {
             None => b,
             Some(u) => u.union(b),
@@ -1810,6 +1818,122 @@ pub fn draw_nodes(
     }
 }
 
+pub fn draw_tiling_effects(
+    painter: &Painter,
+    nodes: &NodeStore,
+    effects: &indexmap::IndexMap<uuid::Uuid, crate::document::TilingEffect>,
+    viewport: &Viewport,
+    origin: Pos2,
+    fonts: &crate::fonts::FontRegistry,
+    image_textures: &std::collections::HashMap<NodeId, egui::TextureHandle>,
+    selection: &[NodeId],
+) {
+    use crate::document::{FaceRenderable, node_at_placement};
+    for effect in effects.values() {
+        let Some(source) = nodes.get(effect.source_id) else { continue; };
+        let src_face: &dyn FaceRenderable = source;
+        let b = source.bounds();
+        let w = b.x1 - b.x0;
+        let h = b.y1 - b.y0;
+        let first_left = b.x0 + effect.offset_x;
+        let first_top = b.y0 + effect.offset_y;
+        for ix in 0..effect.count_x {
+            for iy in 0..effect.count_y {
+                let left = first_left + ix as f64 * effect.gap_x;
+                let top = first_top + iy as f64 * effect.gap_y;
+                let cx = left + w / 2.0;
+                let cy = top + h / 2.0;
+                let rot = (ix as f64 * effect.row_rotation + iy as f64 * effect.col_rotation).to_radians();
+                let sc = 1.0 + (ix as f64 * effect.row_scale + iy as f64 * effect.col_scale);
+                let pl = crate::document::PathPlacement {
+                    x: cx,
+                    y: cy,
+                    angle_rad: rot,
+                    scale: sc as f32,
+                    opacity_mul: 1.0,
+                };
+                let inst = node_at_placement(src_face, &pl);
+                draw_node(painter, &inst, viewport, origin, false, fonts, image_textures);
+            }
+        }
+        if selection.contains(&effect.source_id) {
+            let b = source.bounds();
+            let first_x = b.x0 + effect.offset_x;
+            let first_y = b.y0 + effect.offset_y;
+            let col_end_x = first_x + effect.gap_x;
+            let col_end_y = first_y;
+            let row_end_x = first_x;
+            let row_end_y = first_y + effect.gap_y;
+            let p0 = viewport.doc_to_screen((first_x, first_y), origin);
+            let p_col = viewport.doc_to_screen((col_end_x, col_end_y), origin);
+            let p_row = viewport.doc_to_screen((row_end_x, row_end_y), origin);
+            let col = Color32::from_rgb(255, 165, 0);
+            painter.line_segment([p0, p_col], Stroke::new(2.0, col));
+            painter.line_segment([p0, p_row], Stroke::new(2.0, col));
+            painter.circle_filled(p0, 5.0, Color32::WHITE);
+            painter.circle_stroke(p0, 5.0, Stroke::new(1.5, col));
+            painter.circle_filled(p_col, 4.0, Color32::WHITE);
+            painter.circle_filled(p_row, 4.0, Color32::WHITE);
+        }
+    }
+}
+
+pub fn draw_circular_effects(
+    painter: &Painter,
+    nodes: &NodeStore,
+    effects: &indexmap::IndexMap<uuid::Uuid, crate::document::CircularCloneEffect>,
+    viewport: &Viewport,
+    origin: Pos2,
+    fonts: &crate::fonts::FontRegistry,
+    image_textures: &std::collections::HashMap<NodeId, egui::TextureHandle>,
+    selection: &[NodeId],
+) {
+    use crate::document::{FaceRenderable, node_at_placement};
+    for effect in effects.values() {
+        let Some(source) = nodes.get(effect.source_id) else { continue; };
+        let src_face: &dyn FaceRenderable = source;
+        let dx = effect.base_x - effect.origin_x;
+        let dy = effect.base_y - effect.origin_y;
+        let r = dx.hypot(dy).max(1.0);
+        let base_ang = dy.atan2(dx);
+        let n = effect.copies.max(3);
+        for i in 0..n {
+            let ang = base_ang + (i as f64 / n as f64) * std::f64::consts::TAU + effect.angle_offset.to_radians();
+            let x = effect.origin_x + r * ang.cos();
+            let y = effect.origin_y + r * ang.sin();
+            let pl = crate::document::PathPlacement {
+                x,
+                y,
+                angle_rad: ang,
+                scale: 1.0,
+                opacity_mul: 1.0,
+            };
+            let inst = node_at_placement(src_face, &pl);
+            draw_node(painter, &inst, viewport, origin, false, fonts, image_textures);
+        }
+        if selection.contains(&effect.source_id) {
+            let p0 = viewport.doc_to_screen((effect.base_x, effect.base_y), origin);
+            let p1 = viewport.doc_to_screen((effect.origin_x, effect.origin_y), origin);
+            // compute p2 as one step
+            let dx = effect.base_x - effect.origin_x;
+            let dy = effect.base_y - effect.origin_y;
+            let r = dx.hypot(dy).max(1.0);
+            let base_ang = dy.atan2(dx);
+            let ang1 = base_ang + (std::f64::consts::TAU / effect.copies.max(3) as f64) + effect.angle_offset.to_radians();
+            let p2x = effect.origin_x + r * ang1.cos();
+            let p2y = effect.origin_y + r * ang1.sin();
+            let p2 = viewport.doc_to_screen((p2x, p2y), origin);
+            let col = Color32::from_rgb(255, 165, 0);
+            painter.line_segment([p0, p1], Stroke::new(2.0, col));
+            painter.line_segment([p1, p2], Stroke::new(2.0, col));
+            painter.circle_filled(p0, 5.0, Color32::WHITE);
+            painter.circle_stroke(p0, 5.0, Stroke::new(1.5, col));
+            painter.circle_filled(p1, 5.0, Color32::WHITE);
+            painter.circle_stroke(p1, 5.0, Stroke::new(1.5, col));
+        }
+    }
+}
+
 pub fn draw_path_effects(
     painter: &Painter,
     nodes: &NodeStore,
@@ -1840,8 +1964,8 @@ pub fn draw_path_effects(
             // No union/contour in live render (avoids CPU and stale outlines).
             // The "edge" is the natural boundary of the merged shade.
             // Path line shown in edit.
-            for placement in effect_placements(effect, path, tol) {
-                let mut instance = node_at_placement(source, &placement);
+            for placement in effect_placements(effect, path as &dyn PathMagic, tol) {
+                let mut instance = node_at_placement(source as &dyn FaceRenderable, &placement);
                 instance.style.stroke.width = 0.0;
                 draw_node(
                     painter,
@@ -1874,8 +1998,8 @@ pub fn draw_path_effects(
         }
 
         // non-Loft modes
-        for placement in effect_placements(effect, path, tol) {
-            let instance = node_at_placement(source, &placement);
+        for placement in effect_placements(effect, path as &dyn PathMagic, tol) {
+            let instance = node_at_placement(source as &dyn FaceRenderable, &placement);
             draw_node(
                 painter,
                 &instance,

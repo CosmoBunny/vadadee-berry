@@ -131,6 +131,8 @@ pub enum ResizeHandle {
 pub enum SelectDrag {
     Move,
     Resize(ResizeHandle),
+    TilingGizmo(usize),   // 0 = origin (first), 1 = col end, 2 = row end
+    CircularGizmo(usize), // 0 = first/base pos, 1 = origin
 }
 
 /// Drag on empty canvas to select all objects intersecting the rectangle.

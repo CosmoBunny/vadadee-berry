@@ -5,7 +5,7 @@ use kurbo::{BezPath, PathEl, Shape};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{Node, NodeId, PathData};
+use super::{FaceRenderable, Node, NodeId, NodeKind, PathData, PathMagic};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OnPathMode {
@@ -32,6 +32,74 @@ pub struct ObjectOnPathEffect {
     pub loft_end_scale: f32,
     pub loft_end_opacity: f32,
     pub hide_source: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TilingEffect {
+    pub id: Uuid,
+    pub source_id: NodeId,
+    pub gap_x: f64,
+    pub gap_y: f64,
+    pub count_x: usize,
+    pub count_y: usize,
+    pub offset_x: f64,
+    pub offset_y: f64,
+    pub row_rotation: f64, // degrees
+    pub col_rotation: f64, // degrees
+    pub row_scale: f64,
+    pub col_scale: f64,
+    pub hide_source: bool,
+}
+
+impl Default for TilingEffect {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            source_id: Uuid::nil(),
+            gap_x: 48.0,
+            gap_y: 48.0,
+            count_x: 3,
+            count_y: 3,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            row_rotation: 0.0,
+            col_rotation: 0.0,
+            row_scale: 0.0,
+            col_scale: 0.0,
+            hide_source: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CircularCloneEffect {
+    pub id: Uuid,
+    pub source_id: NodeId,
+    pub origin_x: f64,
+    pub origin_y: f64,
+    pub radius: f64,
+    pub copies: usize,
+    pub angle_offset: f64, // degrees
+    pub base_x: f64,
+    pub base_y: f64,
+    pub hide_source: bool,
+}
+
+impl Default for CircularCloneEffect {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            source_id: Uuid::nil(),
+            origin_x: 0.0,
+            origin_y: 0.0,
+            radius: 48.0,
+            copies: 6,
+            angle_offset: 0.0,
+            base_x: 0.0,
+            base_y: 0.0,
+            hide_source: false,
+        }
+    }
 }
 
 impl Default for ObjectOnPathEffect {
@@ -209,78 +277,55 @@ fn sample_at(sample: &PathSample, dist: f64) -> (f64, f64, f64) {
 
 pub fn effect_placements(
     effect: &ObjectOnPathEffect,
-    path: &PathData,
+    path: &dyn PathMagic,
     tolerance: f64,
 ) -> Vec<PathPlacement> {
-    let sample = build_path_samples(path, tolerance);
-    if sample.points.len() < 2 || sample.total_length < 1e-6 {
+    let total = path.total_length(tolerance);
+    if total < 1e-6 {
         return Vec::new();
     }
+    let closed = path.is_closed();
     let mut raw: Vec<(f64, f64, f64, f32, f32)> = Vec::new();
     match effect.mode {
         OnPathMode::GapDuplicate => {
             let gap = effect.gap.max(1.0);
             let mut dist = effect.start_offset.max(0.0);
-            let limit = if effect.cyclic && sample.closed {
-                sample.total_length
-            } else {
-                sample.total_length + 1e-6
-            };
+            let limit = if effect.cyclic && closed { total } else { total + 1e-6 };
             while dist <= limit + 1e-6 {
-                let (x, y, ang) = sample_at(&sample, dist);
+                let (x, y, ang) = path.sample_at(dist, tolerance);
                 raw.push((x, y, ang, 1.0, 1.0));
                 dist += gap;
-                if !effect.cyclic && dist > sample.total_length {
-                    break;
-                }
-                if effect.cyclic && sample.closed && dist >= sample.total_length {
-                    break;
-                }
-                if raw.len() > 512 {
-                    break;
-                }
+                if !effect.cyclic && dist > total { break; }
+                if effect.cyclic && closed && dist >= total { break; }
+                if raw.len() > 512 { break; }
             }
         }
         OnPathMode::Loft => {
-            // Force dense step. Choose step so we get good coverage without millions of points
-            // on very long paths, while still dense enough for smooth union silhouette.
-            let total = sample.total_length;
-            let desired = 300f64; // dense enough for smooth merge, but not thousands to keep FPS
+            let desired = 300f64;
             let gap = (total / desired).clamp(0.05, 1.5);
             let mut dist = effect.start_offset.max(0.0);
-            let limit = if effect.cyclic && sample.closed {
-                total
-            } else {
-                total + 1e-6
-            };
+            let limit = if effect.cyclic && closed { total } else { total + 1e-6 };
             while dist <= limit + 1e-6 {
                 let t = (dist / total).clamp(0.0, 1.0) as f32;
-                let (x, y, ang) = sample_at(&sample, dist);
+                let (x, y, ang) = path.sample_at(dist, tolerance);
                 let scale = 1.0 + (effect.loft_end_scale - 1.0) * t;
                 let shade = 1.0 + (effect.loft_end_opacity - 1.0) * t;
                 raw.push((x, y, ang, scale, shade));
                 dist += gap;
-                if !effect.cyclic && dist > total {
-                    break;
-                }
-                if effect.cyclic && sample.closed && dist >= total {
-                    break;
-                }
-                if raw.len() > 4096 {
-                    break;
-                }
+                if !effect.cyclic && dist > total { break; }
+                if effect.cyclic && closed && dist >= total { break; }
+                if raw.len() > 4096 { break; }
             }
-            // Guarantee the exact end point (for correct end scale/shade + full path coverage in union).
-            let (ex, ey, eang) = sample_at(&sample, total);
+            // end point guarantee
+            let (ex, ey, eang) = path.sample_at(total, tolerance);
             let et = 1.0f32;
             let escale = 1.0 + (effect.loft_end_scale - 1.0) * et;
             let eshade = 1.0 + (effect.loft_end_opacity - 1.0) * et;
             if let Some(last) = raw.last() {
                 if (last.0 - ex).hypot(last.1 - ey) > 1e-3 {
                     raw.push((ex, ey, eang, escale, eshade));
-                } else {
-                    let n = raw.len();
-                    raw[n - 1] = (ex, ey, eang, escale, eshade);
+                } else if let Some(last_mut) = raw.last_mut() {
+                    *last_mut = (ex, ey, eang, escale, eshade);
                 }
             } else {
                 raw.push((ex, ey, eang, escale, eshade));
@@ -289,15 +334,15 @@ pub fn effect_placements(
         OnPathMode::EvenlySpaced => {
             let n = effect.count.max(2);
             for i in 0..n {
-                let t = if effect.cyclic && sample.closed {
+                let t = if effect.cyclic && closed {
                     i as f64 / n as f64
                 } else if n == 1 {
                     0.0
                 } else {
                     i as f64 / (n - 1) as f64
                 };
-                let dist = effect.start_offset + t * sample.total_length;
-                let (x, y, ang) = sample_at(&sample, dist);
+                let dist = effect.start_offset + t * total;
+                let (x, y, ang) = path.sample_at(dist, tolerance);
                 raw.push((x, y, ang, 1.0, 1.0));
             }
         }
@@ -319,6 +364,102 @@ pub fn default_loft_gap_for_node(source: &Node) -> f64 {
     let w = (b.x1 - b.x0).abs().max(1.0);
     let h = (b.y1 - b.y0).abs().max(1.0);
     (w.min(h) * 0.35).clamp(2.0, 24.0)
+}
+
+/// For ObjectOnPath selections: compute the "whole Object" bounds (union of all placed instances).
+/// This is so the inspector shows the full extent, not just the path spine.
+pub fn compute_whole_object_bounds(
+    source: &Node,
+    effect: &ObjectOnPathEffect,
+    path: &PathData,
+    tolerance: f64,
+) -> kurbo::Rect {
+    let placements = effect_placements(effect, path as &dyn PathMagic, tolerance);
+    if placements.is_empty() {
+        return source.bounds();
+    }
+    let mut acc: Option<kurbo::Rect> = None;
+    for pl in placements {
+        let inst = node_at_placement(source as &dyn FaceRenderable, &pl);
+        let b = inst.bounds();
+        acc = Some(match acc {
+            Some(r) => r.union(b),
+            None => b,
+        });
+    }
+    acc.unwrap_or_else(|| source.bounds())
+}
+
+pub fn compute_tiling_whole_bounds(source: &Node, effect: &TilingEffect) -> kurbo::Rect {
+    let b = source.bounds();
+    let w = b.x1 - b.x0;
+    let h = b.y1 - b.y0;
+    let mut acc: Option<kurbo::Rect> = None;
+    let first_left = b.x0 + effect.offset_x;
+    let first_top = b.y0 + effect.offset_y;
+    for ix in 0..effect.count_x {
+        for iy in 0..effect.count_y {
+            let left = first_left + ix as f64 * effect.gap_x;
+            let top = first_top + iy as f64 * effect.gap_y;
+            let cx = left + w / 2.0;
+            let cy = top + h / 2.0;
+            let rot = (ix as f64 * effect.row_rotation + iy as f64 * effect.col_rotation).to_radians();
+            let pl = PathPlacement {
+                x: cx,
+                y: cy,
+                angle_rad: rot,
+                scale: 1.0,
+                opacity_mul: 1.0,
+            };
+            let inst = node_at_placement(source as &dyn FaceRenderable, &pl);
+            let bb = inst.bounds();
+            acc = Some(match acc {
+                Some(r) => r.union(bb),
+                None => bb,
+            });
+        }
+    }
+    acc.unwrap_or(b)
+}
+
+pub fn compute_circular_whole_bounds(source: &Node, effect: &CircularCloneEffect) -> kurbo::Rect {
+    let b = source.bounds();
+    let mut acc: Option<kurbo::Rect> = None;
+    let dx = effect.base_x - effect.origin_x;
+    let dy = effect.base_y - effect.origin_y;
+    let r = dx.hypot(dy).max(1.0);
+    let base_ang = dy.atan2(dx);
+    let n = effect.copies.max(3);
+    for i in 0..n {
+        let ang = base_ang + (i as f64 / n as f64) * std::f64::consts::TAU + effect.angle_offset.to_radians();
+        let x = effect.origin_x + r * ang.cos();
+        let y = effect.origin_y + r * ang.sin();
+        let pl = PathPlacement {
+            x,
+            y,
+            angle_rad: ang,
+            scale: 1.0,
+            opacity_mul: 1.0,
+        };
+        let inst = node_at_placement(source as &dyn FaceRenderable, &pl);
+        let bb = inst.bounds();
+        acc = Some(match acc {
+            Some(r) => r.union(bb),
+            None => bb,
+        });
+    }
+    acc.unwrap_or(b)
+}
+
+pub fn get_effective_bounds(node: &Node, document: &super::Document) -> kurbo::Rect {
+    let mut b = node.bounds();
+    if let Some(e) = document.tiling_effects.values().find(|e| e.source_id == node.id) {
+        b = b.union(compute_tiling_whole_bounds(node, e));
+    }
+    if let Some(e) = document.circular_effects.values().find(|e| e.source_id == node.id) {
+        b = b.union(compute_circular_whole_bounds(node, e));
+    }
+    b
 }
 
 fn transform_profile_point(
@@ -427,7 +568,7 @@ pub fn loft_sweep_bez(
     }
 
     // 1. Discretize path curve using the same placement logic (Loft forces dense step internally for accurate union).
-    let placements = effect_placements(effect, path, tolerance);
+    let placements = effect_placements(effect, path as &dyn PathMagic, tolerance);
     if placements.len() < 2 {
         return None;
     }
@@ -528,20 +669,43 @@ pub fn loft_sweep_node(
     Some(node)
 }
 
-pub fn node_at_placement(source: &Node, placement: &PathPlacement) -> Node {
-    let mut n = source.clone();
-    let b = n.bounds();
+pub fn node_at_placement(source: &dyn FaceRenderable, placement: &PathPlacement) -> Node {
+    let mut inst: Box<dyn FaceRenderable> = source.clone_renderable();
+    let b = inst.bounds();
     let cx = (b.x0 + b.x1) * 0.5;
     let cy = (b.y0 + b.y1) * 0.5;
-    n.translate(placement.x - cx, placement.y - cy);
+    inst.translate(placement.x - cx, placement.y - cy);
     if placement.scale.abs() > 1e-4 && (placement.scale - 1.0).abs() > 1e-4 {
-        n.scale_about_center(placement.scale as f64);
+        inst.scale_about_center(placement.scale as f64);
     }
     if placement.angle_rad.abs() > 1e-6 {
-        n.rotate_about_center(placement.angle_rad);
+        inst.rotate_about_center(placement.angle_rad);
     }
-    n.style.opacity = (n.style.opacity * placement.opacity_mul).clamp(0.0, 1.0);
-    n
+    let new_op = (inst.opacity() * placement.opacity_mul).clamp(0.0, 1.0);
+    inst.set_opacity(new_op);
+
+    // Recover concrete Node (all objects are Nodes in current light-A model)
+    if let Some(n) = inst.as_any().downcast_ref::<Node>() {
+        return n.clone();
+    }
+    // Fallback: clone original source and re-apply (should not happen)
+    if let Some(orig) = source.as_any().downcast_ref::<Node>() {
+        let mut n = orig.clone();
+        let b = n.bounds();
+        let cx = (b.x0 + b.x1) * 0.5;
+        let cy = (b.y0 + b.y1) * 0.5;
+        n.translate(placement.x - cx, placement.y - cy);
+        if placement.scale.abs() > 1e-4 && (placement.scale - 1.0).abs() > 1e-4 {
+            n.scale_about_center(placement.scale as f64);
+        }
+        if placement.angle_rad.abs() > 1e-6 {
+            n.rotate_about_center(placement.angle_rad);
+        }
+        n.style.opacity = (n.style.opacity * placement.opacity_mul).clamp(0.0, 1.0);
+        return n;
+    }
+    // Last resort dummy
+    Node::new(NodeKind::Rect { x: 0.0, y: 0.0, w: 8.0, h: 8.0, rx: 0.0 }, "dyn-fallback")
 }
 
 pub fn find_effect_for_pair<'a>(
@@ -593,7 +757,7 @@ mod tests {
             loft_end_opacity: 0.8,
             ..ObjectOnPathEffect::default()
         };
-        let placements = effect_placements(&effect, &path, 0.5);
+        let placements = effect_placements(&effect, &path as &dyn PathMagic, 0.5);
         assert!(placements.len() >= 18, "expected dense loft slices, got {}", placements.len());
         assert!((placements.last().unwrap().opacity_mul - 0.8).abs() < 0.05);
         assert!((placements.first().unwrap().opacity_mul - 1.0).abs() < 0.05);

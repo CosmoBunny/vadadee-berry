@@ -65,6 +65,8 @@ pub fn import_svg(path: &Path) -> Result<ProjectFile, IoError> {
         layers: vec![],
         defs: Default::default(),
         path_effects: Default::default(),
+        tiling_effects: Default::default(),
+        circular_effects: Default::default(),
     };
     let mut nodes = NodeStore::default();
     let mut layer_nodes = Vec::new();

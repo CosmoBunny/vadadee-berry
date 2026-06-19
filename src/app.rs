@@ -8,8 +8,8 @@ use crate::document::{
     default_gradient_stops, default_loft_gap_for_node, effect_placements, find_effect_for_pair,
     loft_sweep_node,
     has_effect_for_objects, hidden_effect_sources, node_at_placement, BezierHandleMode, Document,
-    Fill, FillKind,
-    GradientStop, Node, NodeId, NodeKind, ObjectOnPathEffect, OnPathMode, Paint, PathData,
+    FaceRenderable, Fill, FillKind,
+    GradientStop, Node, NodeId, NodeKind, ObjectOnPathEffect, OnPathMode, Paint, PathData, PathMagic, PathPlacement, Tiling, TilingEffect, CircularClone, CircularCloneEffect,
     PathEditTarget, ProjectFile, Stroke, TextStyle, text_display_name,
 };
 use crate::history::{snapshot_document, snapshot_project, History, ProjectEdit};
@@ -127,6 +127,22 @@ pub struct VadadeeBerryApp {
     pub ui_on_path_loft_opacity: f32,
     /// Measured height of the Object on Path panel (drives expand animation).
     pub ui_on_path_container_h: f32,
+    // Tiling params (2D)
+    pub ui_tiling_rows: usize,
+    pub ui_tiling_cols: usize,
+    pub ui_tiling_offset_x: f64,
+    pub ui_tiling_offset_y: f64,
+    pub ui_tiling_row_rot: f64,
+    pub ui_tiling_col_rot: f64,
+    pub ui_tiling_row_scale: f64,
+    pub ui_tiling_col_scale: f64,
+    pub ui_tiling_gap_x: f64,
+    pub ui_tiling_gap_y: f64,
+    // CircularClone params
+    pub ui_circular_copies: usize,
+    pub ui_circular_angle_offset: f64,
+    pub ui_circular_origin_x: f64,
+    pub ui_circular_origin_y: f64,
     pub ui_anim: UiAnimation,
     pub gradient_editor_focus: crate::gradient_ui::GradientEditorFocus,
     /// Cached textures for Image nodes (keyed by NodeId). Reloaded from .bytes on demand.
@@ -240,6 +256,20 @@ impl VadadeeBerryApp {
             ui_on_path_loft_scale: 1.0,
             ui_on_path_loft_opacity: 0.75,
             ui_on_path_container_h: 280.0,
+            ui_tiling_rows: 3,
+            ui_tiling_cols: 3,
+            ui_tiling_offset_x: 0.0,
+            ui_tiling_offset_y: 0.0,
+            ui_tiling_row_rot: 0.0,
+            ui_tiling_col_rot: 0.0,
+            ui_tiling_row_scale: 0.0,
+            ui_tiling_col_scale: 0.0,
+            ui_tiling_gap_x: 48.0,
+            ui_tiling_gap_y: 48.0,
+            ui_circular_copies: 6,
+            ui_circular_angle_offset: 0.0,
+            ui_circular_origin_x: 0.0,
+            ui_circular_origin_y: 0.0,
             ui_anim: {
                 let mut anim = UiAnimation::new();
                 anim.seed_status_board("Idle", 80.0, 56.0);
@@ -959,6 +989,7 @@ impl VadadeeBerryApp {
                     "Moving selection".into()
                 }
                 SelectDrag::Resize(_) => "Resizing".into(),
+                SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_) => "Editing effect".into(),
             });
         }
         if self.tools.select.marquee.is_some() {
@@ -1874,6 +1905,13 @@ impl VadadeeBerryApp {
 
             let hidden_sources =
                 hidden_effect_sources(&self.project.document.path_effects);
+            let mut hidden_sources = hidden_sources;
+            for e in self.project.document.tiling_effects.values() {
+                if e.hide_source { hidden_sources.insert(e.source_id); }
+            }
+            for e in self.project.document.circular_effects.values() {
+                if e.hide_source { hidden_sources.insert(e.source_id); }
+            }
             let loft_paths: std::collections::HashSet<NodeId> = self.project.document.path_effects.values()
                 .filter(|e| e.mode == OnPathMode::Loft)
                 .map(|e| e.path_id)
@@ -1890,10 +1928,48 @@ impl VadadeeBerryApp {
                 &self.fonts,
                 &self.image_textures,
             );
+
+            // Draw large selection outline for Tiling/Circular sources using effective bounds
+            for &id in &self.selection {
+                if self.node_has_tiling_or_circular(id) {
+                    if let Some(node) = self.project.nodes.get(id) {
+                        let eb = crate::document::get_effective_bounds(node, &self.project.document);
+                        let tl = self.viewport.doc_to_screen((eb.x0, eb.y0), origin);
+                        let br = self.viewport.doc_to_screen((eb.x1, eb.y1), origin);
+                        let r = egui::Rect::from_min_max(tl, br);
+                        painter.rect_stroke(
+                            r.expand(2.0),
+                            0.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 120, 215)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                }
+            }
             render::draw_path_effects(
                 &painter,
                 &self.project.nodes,
                 &self.project.document.path_effects,
+                &self.viewport,
+                origin,
+                &self.fonts,
+                &self.image_textures,
+                &self.selection,
+            );
+            render::draw_tiling_effects(
+                &painter,
+                &self.project.nodes,
+                &self.project.document.tiling_effects,
+                &self.viewport,
+                origin,
+                &self.fonts,
+                &self.image_textures,
+                &self.selection,
+            );
+            render::draw_circular_effects(
+                &painter,
+                &self.project.nodes,
+                &self.project.document.circular_effects,
                 &self.viewport,
                 origin,
                 &self.fonts,
@@ -1905,12 +1981,10 @@ impl VadadeeBerryApp {
                 if self.selection.len() == 1 {
                     if let Some(id) = self.selection.first() {
                         if let Some(node) = self.project.nodes.get(*id) {
-                            let sr = render::selection_screen_rect(
-                                node,
-                                &self.project.nodes,
-                                &self.viewport,
-                                origin,
-                            );
+                            let eb = crate::document::get_effective_bounds(node, &self.project.document);
+                            let tl = self.viewport.doc_to_screen((eb.x0, eb.y0), origin);
+                            let br = self.viewport.doc_to_screen((eb.x1, eb.y1), origin);
+                            let sr = egui::Rect::from_min_max(tl, br);
                             render::draw_transform_handles(&painter, sr);
                         }
                     }
@@ -1920,6 +1994,8 @@ impl VadadeeBerryApp {
                         &self.selection,
                         &self.viewport,
                         origin,
+                        &self.project.document.tiling_effects,
+                        &self.project.document.circular_effects,
                     ) {
                         render::draw_group_selection_bounds(&painter, sr);
                     }
@@ -2390,6 +2466,68 @@ impl VadadeeBerryApp {
         }
     }
 
+    pub fn sync_tiling_ui_from_selection(&mut self) {
+        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        if let Some(&oid) = objs.first() {
+            if let Some(effect) = self.project.document.tiling_effects.values().find(|e| e.source_id == oid) {
+                self.ui_tiling_rows = effect.count_y;
+                self.ui_tiling_cols = effect.count_x;
+                self.ui_tiling_offset_x = effect.offset_x;
+                self.ui_tiling_offset_y = effect.offset_y;
+                self.ui_tiling_row_rot = effect.row_rotation;
+                self.ui_tiling_col_rot = effect.col_rotation;
+                self.ui_tiling_row_scale = effect.row_scale;
+                self.ui_tiling_col_scale = effect.col_scale;
+                self.ui_tiling_gap_x = effect.gap_x;
+                self.ui_tiling_gap_y = effect.gap_y;
+            }
+        }
+    }
+
+    pub fn sync_circular_ui_from_selection(&mut self) {
+        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        if let Some(&oid) = objs.first() {
+            if let Some(effect) = self.project.document.circular_effects.values().find(|e| e.source_id == oid) {
+                self.ui_circular_copies = effect.copies;
+                self.ui_circular_angle_offset = effect.angle_offset;
+                self.ui_circular_origin_x = effect.origin_x;
+                self.ui_circular_origin_y = effect.origin_y;
+            }
+        }
+    }
+
+    fn get_tiling_gizmo_points(&self, id: NodeId) -> Option<[(f64, f64); 3]> {
+        if let Some(e) = self.project.document.tiling_effects.values().find(|e| e.source_id == id) {
+            if let Some(node) = self.project.nodes.get(id) {
+                let b = node.bounds();
+                let p0 = (b.x0 + e.offset_x, b.y0 + e.offset_y);
+                let p1 = (p0.0 + e.gap_x, p0.1);
+                let p2 = (p0.0, p0.1 + e.gap_y);
+                return Some([p0, p1, p2]);
+            }
+        }
+        None
+    }
+
+    fn get_circular_gizmo_points(&self, id: NodeId) -> Option<[(f64, f64); 3]> {
+        if let Some(e) = self.project.document.circular_effects.values().find(|e| e.source_id == id) {
+            let p0 = (e.base_x, e.base_y);
+            let p1 = (e.origin_x, e.origin_y);
+            let dx = e.base_x - e.origin_x;
+            let dy = e.base_y - e.origin_y;
+            let r = dx.hypot(dy).max(1.0);
+            let base_ang = dy.atan2(dx);
+            let ang1 = base_ang + (std::f64::consts::TAU / e.copies.max(3) as f64) + e.angle_offset.to_radians();
+            let p2 = (e.origin_x + r * ang1.cos(), e.origin_y + r * ang1.sin());
+            return Some([p0, p1, p2]);
+        }
+        None
+    }
+
     fn build_on_path_effect(&self, effect_id: uuid::Uuid, source_id: NodeId, path_id: NodeId) -> ObjectOnPathEffect {
         let gap = if self.ui_on_path_mode == OnPathMode::Loft {
             self
@@ -2453,6 +2591,25 @@ impl VadadeeBerryApp {
         has_effect_for_objects(&self.project.document.path_effects, &objects, path_id)
     }
 
+    pub fn selection_has_tiling_effect(&self) -> bool {
+        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        objs.iter().any(|&oid| self.project.document.tiling_effects.values().any(|e| e.source_id == oid))
+    }
+
+    pub fn selection_has_circular_effect(&self) -> bool {
+        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        objs.iter().any(|&oid| self.project.document.circular_effects.values().any(|e| e.source_id == oid))
+    }
+
+    fn node_has_tiling_or_circular(&self, id: NodeId) -> bool {
+        self.project.document.tiling_effects.values().any(|e| e.source_id == id) ||
+        self.project.document.circular_effects.values().any(|e| e.source_id == id)
+    }
+
     /// Commit object-on-path for the current path + object selection.
     pub fn apply_object_on_path_effect(&mut self) {
         let Some((objects, path_id)) = self.selection_path_and_objects() else {
@@ -2512,6 +2669,44 @@ impl VadadeeBerryApp {
             };
             let effect = self.build_on_path_effect(existing.id, source_id, path_id);
             self.project.document.path_effects.insert(existing.id, effect);
+        }
+    }
+
+    pub fn update_tiling_effects_live(&mut self) {
+        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        for oid in objs {
+            if let Some(existing) = self.project.document.tiling_effects.values().find(|e| e.source_id == oid).cloned() {
+                let mut effect = existing;
+                effect.count_y = self.ui_tiling_rows;
+                effect.count_x = self.ui_tiling_cols;
+                effect.offset_x = self.ui_tiling_offset_x;
+                effect.offset_y = self.ui_tiling_offset_y;
+                effect.row_rotation = self.ui_tiling_row_rot;
+                effect.col_rotation = self.ui_tiling_col_rot;
+                effect.row_scale = self.ui_tiling_row_scale;
+                effect.col_scale = self.ui_tiling_col_scale;
+                effect.gap_x = self.ui_tiling_gap_x;
+                effect.gap_y = self.ui_tiling_gap_y;
+                self.project.document.tiling_effects.insert(effect.id, effect);
+            }
+        }
+    }
+
+    pub fn update_circular_effects_live(&mut self) {
+        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        for oid in objs {
+            if let Some(existing) = self.project.document.circular_effects.values().find(|e| e.source_id == oid).cloned() {
+                let mut effect = existing;
+                effect.copies = self.ui_circular_copies;
+                effect.angle_offset = self.ui_circular_angle_offset;
+                effect.origin_x = self.ui_circular_origin_x;
+                effect.origin_y = self.ui_circular_origin_y;
+                self.project.document.circular_effects.insert(effect.id, effect);
+            }
         }
     }
 
@@ -2591,9 +2786,9 @@ impl VadadeeBerryApp {
                     child_ids.push(id);
                 }
             } else {
-                let placements = effect_placements(&effect, &path, tol);
+                let placements = effect_placements(&effect, &path as &dyn PathMagic, tol);
                 for (i, placement) in placements.iter().enumerate() {
-                    let mut node = node_at_placement(&source, placement);
+                    let mut node = node_at_placement(&source as &dyn FaceRenderable, placement);
                     node.name = format!("{} #{}", source.name, i + 1);
                     let id = node.id;
                     self.history
@@ -2627,6 +2822,230 @@ impl VadadeeBerryApp {
             "Baked {} instance(s) into group",
             child_ids.len()
         );
+    }
+
+    pub fn apply_tiling_magic(&mut self) {
+        let objects: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        if objects.is_empty() {
+            self.status_message = "Select object(s) to apply Tiling".into();
+            return;
+        }
+        let before_doc = snapshot_document(&self.project.document);
+        let mut after_doc = before_doc.clone();
+        let mut created = vec![];
+        for &source_id in &objects {
+            if after_doc.tiling_effects.values().any(|e| e.source_id == source_id) {
+                continue;
+            }
+            let Some(source) = self.project.nodes.get(source_id) else { continue; };
+            let b = source.bounds();
+            let w = (b.x1 - b.x0).abs().max(1.0);
+            let h = (b.y1 - b.y0).abs().max(1.0);
+            let effect_id = uuid::Uuid::new_v4();
+            let effect = TilingEffect {
+                id: effect_id,
+                source_id,
+                gap_x: w,
+                gap_y: h,
+                count_x: 3,
+                count_y: 3,
+                offset_x: 0.0,  // top-left offset for first
+                offset_y: 0.0,
+                row_rotation: 0.0,
+                col_rotation: 0.0,
+                row_scale: 0.0,
+                col_scale: 0.0,
+                hide_source: true,
+            };
+            after_doc.tiling_effects.insert(effect_id, effect);
+            created.push(source_id);
+            // sync ui
+            self.ui_tiling_gap_x = w;
+            self.ui_tiling_gap_y = h;
+            self.ui_tiling_rows = 3;
+            self.ui_tiling_cols = 3;
+            self.ui_tiling_offset_x = 0.0;
+            self.ui_tiling_offset_y = 0.0;
+            self.ui_tiling_row_rot = 0.0;
+            self.ui_tiling_col_rot = 0.0;
+            self.ui_tiling_row_scale = 0.0;
+            self.ui_tiling_col_scale = 0.0;
+        }
+        if created.is_empty() {
+            self.status_message = "No new Tiling effects".into();
+            return;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before: before_doc, after: after_doc },
+        );
+        self.status_message = format!("Enabled Tiling for {} object(s). Use container to bake.", created.len());
+    }
+
+    pub fn apply_circular_clone_magic(&mut self) {
+        let objects: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        if objects.is_empty() {
+            self.status_message = "Select object(s) to apply CircularClone".into();
+            return;
+        }
+        let before_doc = snapshot_document(&self.project.document);
+        let mut after_doc = before_doc.clone();
+        let mut created = vec![];
+        for &source_id in &objects {
+            if after_doc.circular_effects.values().any(|e| e.source_id == source_id) {
+                continue;
+            }
+            let Some(source) = self.project.nodes.get(source_id) else { continue; };
+            let b = source.bounds();
+            let ref_x = (b.x0 + b.x1) * 0.5;
+            let ref_y = (b.y0 + b.y1) * 0.5;
+            let r = ((b.x1 - b.x0).abs().max((b.y1 - b.y0).abs()) * 1.5).max(10.0);
+            let effect_id = uuid::Uuid::new_v4();
+            let effect = CircularCloneEffect {
+                id: effect_id,
+                source_id,
+                origin_x: ref_x,
+                origin_y: ref_y,
+                radius: r,
+                copies: 6,
+                angle_offset: 0.0,
+                base_x: ref_x,
+                base_y: ref_y,
+                hide_source: true,
+            };
+            after_doc.circular_effects.insert(effect_id, effect);
+            created.push(source_id);
+        }
+        if created.is_empty() {
+            self.status_message = "No new CircularClone effects".into();
+            return;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before: before_doc, after: after_doc },
+        );
+        self.status_message = format!("Enabled CircularClone for {} object(s). Use container to bake.", created.len());
+    }
+
+    pub fn remove_tiling_effect(&mut self) {
+        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        let before_doc = snapshot_document(&self.project.document);
+        let mut after_doc = before_doc.clone();
+        let mut removed = false;
+        for oid in &objs {
+            let keys: Vec<_> = after_doc.tiling_effects.iter().filter(|(_, e)| e.source_id == *oid).map(|(k, _)| *k).collect();
+            for k in keys {
+                after_doc.tiling_effects.swap_remove(&k);
+                removed = true;
+            }
+        }
+        if !removed { return; }
+        self.history.push(&mut self.project, ProjectEdit::PatchDocument { before: before_doc, after: after_doc });
+        self.status_message = "Removed Tiling effect(s)".into();
+    }
+
+    pub fn remove_circular_effect(&mut self) {
+        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        let before_doc = snapshot_document(&self.project.document);
+        let mut after_doc = before_doc.clone();
+        let mut removed = false;
+        for oid in &objs {
+            let keys: Vec<_> = after_doc.circular_effects.iter().filter(|(_, e)| e.source_id == *oid).map(|(k, _)| *k).collect();
+            for k in keys {
+                after_doc.circular_effects.swap_remove(&k);
+                removed = true;
+            }
+        }
+        if !removed { return; }
+        self.history.push(&mut self.project, ProjectEdit::PatchDocument { before: before_doc, after: after_doc });
+        self.status_message = "Removed CircularClone effect(s)".into();
+    }
+
+    pub fn bake_tiling(&mut self) {
+        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        let mut child_ids = Vec::new();
+        for &oid in &objs {
+            if let Some(effect) = self.project.document.tiling_effects.values().find(|e| e.source_id == oid).cloned() {
+                if let Some(source) = self.project.nodes.get(oid).cloned() {
+                    let src_face: &dyn FaceRenderable = &source;
+                    let b = source.bounds();
+                    let w = b.x1 - b.x0;
+                    let h = b.y1 - b.y0;
+                    let first_left = b.x0 + effect.offset_x;
+                    let first_top = b.y0 + effect.offset_y;
+                    for ix in 0..effect.count_x {
+                        for iy in 0..effect.count_y {
+                            let left = first_left + ix as f64 * effect.gap_x;
+                            let top = first_top + iy as f64 * effect.gap_y;
+                            let cx = left + w / 2.0;
+                            let cy = top + h / 2.0;
+                            let rot = (ix as f64 * effect.row_rotation + iy as f64 * effect.col_rotation).to_radians();
+                            let sc = 1.0 + (ix as f64 * effect.row_scale + iy as f64 * effect.col_scale);
+                            let pl = PathPlacement { x: cx, y: cy, angle_rad: rot, scale: sc as f32, opacity_mul: 1.0 };
+                            let mut node = node_at_placement(src_face, &pl);
+                            node.name = format!("{} #t{}_{}", source.name, ix, iy);
+                            let id = node.id;
+                            self.history.push(&mut self.project, ProjectEdit::InsertNode { node });
+                            child_ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        if !child_ids.is_empty() {
+            let group = Node::group(child_ids.clone(), "Tiled group".to_string());
+            let gid = group.id;
+            self.history.push(&mut self.project, ProjectEdit::InsertNode { node: group });
+            self.selection = vec![gid];
+            self.status_message = format!("Baked {} tiles", child_ids.len());
+        }
+    }
+
+    pub fn bake_circular(&mut self) {
+        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).cloned().collect();
+        let mut child_ids = Vec::new();
+        for &oid in &objs {
+            if let Some(effect) = self.project.document.circular_effects.values().find(|e| e.source_id == oid).cloned() {
+                if let Some(source) = self.project.nodes.get(oid).cloned() {
+                    let src_face: &dyn FaceRenderable = &source;
+                    let dx = effect.base_x - effect.origin_x;
+                    let dy = effect.base_y - effect.origin_y;
+                    let r = dx.hypot(dy).max(1.0);
+                    let base_ang = dy.atan2(dx);
+                    let n = effect.copies.max(3);
+                    for i in 0..n {
+                        let ang = base_ang + (i as f64 / n as f64) * std::f64::consts::TAU + effect.angle_offset.to_radians();
+                        let x = effect.origin_x + r * ang.cos();
+                        let y = effect.origin_y + r * ang.sin();
+                        let pl = PathPlacement { x, y, angle_rad: ang, scale: 1.0, opacity_mul: 1.0 };
+                        let mut node = node_at_placement(src_face, &pl);
+                        node.name = format!("{} #c{}", source.name, i + 1);
+                        let id = node.id;
+                        self.history.push(&mut self.project, ProjectEdit::InsertNode { node });
+                        child_ids.push(id);
+                    }
+                }
+            }
+        }
+        if !child_ids.is_empty() {
+            let group = Node::group(child_ids.clone(), "Circular group".to_string());
+            let gid = group.id;
+            self.history.push(&mut self.project, ProjectEdit::InsertNode { node: group });
+            self.selection = vec![gid];
+            self.status_message = format!("Baked {} circles", child_ids.len());
+        }
     }
 
     pub fn close_open_paths_in_selection(&mut self) {
@@ -2799,15 +3218,27 @@ impl VadadeeBerryApp {
             let mut bbox_only: Option<NodeId> = None;
             for id in self.project.document.ordered_node_ids().into_iter().rev() {
                 if let Some(node) = self.project.nodes.get(id) {
-                    if node.hit_test_with_store(
-                        &self.project.nodes,
-                        doc.0,
-                        doc.1,
-                        4.0 / self.viewport.zoom as f64,
-                    ) {
+                    let does_hit = if self.node_has_tiling_or_circular(id) {
+                        let eb = crate::document::get_effective_bounds(node, &self.project.document);
                         let pt = kurbo::Point::new(doc.0, doc.1);
-                        let precise = node.bez_path().contains(pt)
-                            || matches!(node.kind, NodeKind::Text { .. });
+                        let slop = 4.0 / self.viewport.zoom as f64;
+                        eb.inflate(slop, slop).contains(pt)
+                    } else {
+                        node.hit_test_with_store(
+                            &self.project.nodes,
+                            doc.0,
+                            doc.1,
+                            4.0 / self.viewport.zoom as f64,
+                        )
+                    };
+                    if does_hit {
+                        let pt = kurbo::Point::new(doc.0, doc.1);
+                        let precise = if self.node_has_tiling_or_circular(id) {
+                            true
+                        } else {
+                            node.bez_path().contains(pt)
+                                || matches!(node.kind, NodeKind::Text { .. })
+                        };
                         if precise {
                             hit = Some(id);
                             break;
@@ -2846,6 +3277,13 @@ impl VadadeeBerryApp {
                     self.sync_inspector_from_selection();
                     return;
                 }
+                if self.node_has_tiling_or_circular(id) {
+                    self.selection = vec![id];
+                    self.tools.active = ToolKind::Node;
+                    ui::promote_action_tab(self, ui::ActionTab::Geometry);
+                    self.sync_inspector_from_selection();
+                    return;
+                }
             }
         }
 
@@ -2853,22 +3291,49 @@ impl VadadeeBerryApp {
             // Resize handles take priority over move (must run on pointer-down, not click-up).
             if self.selection.len() == 1 {
                 if let Some(id) = self.selection.first().copied() {
-                    if let Some(node) = self.project.nodes.get(id) {
-                        let sr = render::selection_screen_rect(
-                            node,
-                            &self.project.nodes,
-                            &self.viewport,
-                            origin,
-                        );
-                        if let Some(handle) =
-                            render::hit_resize_handle(sr, screen, self.viewport.zoom)
-                        {
-                            self.tools.select.drag_mode = Some(SelectDrag::Resize(handle));
-                            self.tools.select.resize_anchor = node.bounds();
-                            self.tools.select.drag_snapshot = vec![(id, node.clone())];
-                            self.tools.select.last_doc = doc;
-                            self.sync_inspector_from_selection();
-                            return;
+                    if !self.node_has_tiling_or_circular(id) {
+                        if let Some(node) = self.project.nodes.get(id) {
+                            let sr = render::selection_screen_rect(
+                                node,
+                                &self.project.nodes,
+                                &self.viewport,
+                                origin,
+                            );
+                            if let Some(handle) =
+                                render::hit_resize_handle(sr, screen, self.viewport.zoom)
+                            {
+                                self.tools.select.drag_mode = Some(SelectDrag::Resize(handle));
+                                self.tools.select.resize_anchor = node.bounds();
+                                self.tools.select.drag_snapshot = vec![(id, node.clone())];
+                                self.tools.select.last_doc = doc;
+                                self.sync_inspector_from_selection();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Gizmo for Tiling / CircularClone (edit the 3 points / angle)
+            if self.selection.len() == 1 {
+                if let Some(id) = self.selection.first().copied() {
+                    let slop = 10.0 / (self.viewport.zoom as f64).max(0.1);
+                    if let Some(pts) = self.get_tiling_gizmo_points(id) {
+                        for (i, &(px, py)) in pts.iter().enumerate() {
+                            if (px - doc.0).hypot(py - doc.1) < slop {
+                                self.tools.select.drag_mode = Some(SelectDrag::TilingGizmo(i));
+                                self.tools.select.last_doc = doc;
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(pts) = self.get_circular_gizmo_points(id) {
+                        for (i, &(px, py)) in pts.iter().enumerate() {
+                            if (px - doc.0).hypot(py - doc.1) < slop {
+                                self.tools.select.drag_mode = Some(SelectDrag::CircularGizmo(i));
+                                self.tools.select.last_doc = doc;
+                                return;
+                            }
                         }
                     }
                 }
@@ -2902,15 +3367,27 @@ impl VadadeeBerryApp {
             let mut bbox_only: Option<NodeId> = None;
             for id in self.project.document.ordered_node_ids().into_iter().rev() {
                 if let Some(node) = self.project.nodes.get(id) {
-                    if node.hit_test_with_store(
-                        &self.project.nodes,
-                        doc.0,
-                        doc.1,
-                        4.0 / self.viewport.zoom as f64,
-                    ) {
+                    let does_hit = if self.node_has_tiling_or_circular(id) {
+                        let eb = crate::document::get_effective_bounds(node, &self.project.document);
                         let pt = kurbo::Point::new(doc.0, doc.1);
-                        let precise = node.bez_path().contains(pt)
-                            || matches!(node.kind, NodeKind::Text { .. });
+                        let slop = 4.0 / self.viewport.zoom as f64;
+                        eb.inflate(slop, slop).contains(pt)
+                    } else {
+                        node.hit_test_with_store(
+                            &self.project.nodes,
+                            doc.0,
+                            doc.1,
+                            4.0 / self.viewport.zoom as f64,
+                        )
+                    };
+                    if does_hit {
+                        let pt = kurbo::Point::new(doc.0, doc.1);
+                        let precise = if self.node_has_tiling_or_circular(id) {
+                            true
+                        } else {
+                            node.bez_path().contains(pt)
+                                || matches!(node.kind, NodeKind::Text { .. })
+                        };
                         if precise {
                             hit = Some(id);
                             break;
@@ -3002,6 +3479,35 @@ impl VadadeeBerryApp {
                             }
                         }
                     }
+                    SelectDrag::TilingGizmo(pt_idx) => {
+                        let dx = doc.0 - self.tools.select.last_doc.0;
+                        let dy = doc.1 - self.tools.select.last_doc.1;
+                        self.tools.select.last_doc = doc;
+                        if let Some(id) = self.selection.first().copied() {
+                            if let Some((_, e)) = self.project.document.tiling_effects.iter_mut().find(|(_, e)| e.source_id == id) {
+                                match pt_idx {
+                                    0 => { e.offset_x += dx; e.offset_y += dy; }
+                                    1 => { e.gap_x += dx; }
+                                    2 => { e.gap_y += dy; }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    SelectDrag::CircularGizmo(pt_idx) => {
+                        let dx = doc.0 - self.tools.select.last_doc.0;
+                        let dy = doc.1 - self.tools.select.last_doc.1;
+                        self.tools.select.last_doc = doc;
+                        if let Some(id) = self.selection.first().copied() {
+                            if let Some((_, e)) = self.project.document.circular_effects.iter_mut().find(|(_, e)| e.source_id == id) {
+                                match pt_idx {
+                                    0 => { e.base_x += dx; e.base_y += dy; }
+                                    1 => { e.origin_x += dx; e.origin_y += dy; }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                 }
             }
         } else if released {
@@ -3017,7 +3523,15 @@ impl VadadeeBerryApp {
                             self.project
                                 .nodes
                                 .get(*id)
-                                .is_some_and(|n| tools::node_bounds_intersects_marquee(n, rect))
+                                .is_some_and(|n| {
+                                    if self.node_has_tiling_or_circular(*id) {
+                                        let eb = crate::document::get_effective_bounds(n, &self.project.document);
+                                        let overlap = eb.intersect(rect);
+                                        overlap.width() > 0.0 && overlap.height() > 0.0
+                                    } else {
+                                        tools::node_bounds_intersects_marquee(n, rect)
+                                    }
+                                })
                         })
                         .collect();
                     if m.shift {
@@ -3033,8 +3547,12 @@ impl VadadeeBerryApp {
                     self.selection.clear();
                 }
                 self.sync_inspector_from_selection();
-            } else if self.tools.select.drag_mode.is_some() {
-                self.commit_drag_edits();
+            } else if let Some(mode) = self.tools.select.drag_mode.take() {
+                if !matches!(mode, SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_)) {
+                    self.commit_drag_edits();
+                } else {
+                    self.tools.select.drag_snapshot.clear();
+                }
             }
         }
     }
@@ -3747,15 +4265,27 @@ impl VadadeeBerryApp {
             let mut bbox_only: Option<NodeId> = None;
             for id in self.project.document.ordered_node_ids().into_iter().rev() {
                 if let Some(node) = self.project.nodes.get(id) {
-                    if node.hit_test_with_store(
-                        &self.project.nodes,
-                        doc.0,
-                        doc.1,
-                        4.0 / self.viewport.zoom as f64,
-                    ) {
+                    let does_hit = if self.node_has_tiling_or_circular(id) {
+                        let eb = crate::document::get_effective_bounds(node, &self.project.document);
                         let pt = kurbo::Point::new(doc.0, doc.1);
-                        let precise = node.bez_path().contains(pt)
-                            || matches!(node.kind, NodeKind::Text { .. });
+                        let slop = 4.0 / self.viewport.zoom as f64;
+                        eb.inflate(slop, slop).contains(pt)
+                    } else {
+                        node.hit_test_with_store(
+                            &self.project.nodes,
+                            doc.0,
+                            doc.1,
+                            4.0 / self.viewport.zoom as f64,
+                        )
+                    };
+                    if does_hit {
+                        let pt = kurbo::Point::new(doc.0, doc.1);
+                        let precise = if self.node_has_tiling_or_circular(id) {
+                            true
+                        } else {
+                            node.bez_path().contains(pt)
+                                || matches!(node.kind, NodeKind::Text { .. })
+                        };
                         if precise {
                             hit = Some(id);
                             break;

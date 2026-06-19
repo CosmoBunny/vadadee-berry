@@ -28,6 +28,12 @@ pub struct Document {
     /// Shared path effects (object-on-path, etc.) keyed by effect id.
     #[serde(default)]
     pub path_effects: IndexMap<Uuid, ObjectOnPathEffect>,
+    /// Tiling effects (separate from ObjectOnPath), keyed by effect id.
+    #[serde(default)]
+    pub tiling_effects: IndexMap<Uuid, TilingEffect>,
+    /// CircularClone effects (separate from ObjectOnPath), keyed by effect id.
+    #[serde(default)]
+    pub circular_effects: IndexMap<Uuid, CircularCloneEffect>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +66,8 @@ impl Document {
             }],
             defs: IndexMap::new(),
             path_effects: IndexMap::new(),
+            tiling_effects: IndexMap::new(),
+            circular_effects: IndexMap::new(),
         };
         ProjectFile::new(document, NodeStore::default())
     }

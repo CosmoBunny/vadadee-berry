@@ -968,6 +968,126 @@ impl PathData {
             self.verbs.retain(|v| *v != 4);
         }
     }
+
+    /// Public arc-length sampling entry points (used by PathMagic + effect code).
+    pub fn approximate_length(&self, tolerance: f64) -> f64 {
+        self._approx_len(tolerance)
+    }
+    pub fn sample_point_and_angle(&self, dist: f64, tolerance: f64) -> (f64, f64, f64) {
+        self._sample(dist, tolerance)
+    }
+
+    // --- arc-length sampling support for PathMagic (moved/adapted from path_effects for encapsulation)
+    fn _flatten(&self, tolerance: f64) -> Vec<(f64, f64)> {
+        let bez = self.to_bez();
+        let mut pts = Vec::new();
+        let els: Vec<kurbo::PathEl> = bez.elements().to_vec();
+        let mut i = 0usize;
+        while i < els.len() {
+            match els[i] {
+                kurbo::PathEl::MoveTo(p) => { pts.push((p.x, p.y)); i += 1; }
+                kurbo::PathEl::LineTo(p) => { pts.push((p.x, p.y)); i += 1; }
+                kurbo::PathEl::QuadTo(_, p2) => {
+                    let p0 = pts.last().copied().unwrap_or((p2.x, p2.y));
+                    let p1 = match els.get(i) {
+                        Some(kurbo::PathEl::QuadTo(p1, _)) => (p1.x, p1.y),
+                        _ => p0,
+                    };
+                    let steps = ((p0.0 - p2.x).hypot(p0.1 - p2.y) / tolerance).ceil() as usize;
+                    let steps = steps.clamp(2, 32);
+                    for s in 1..=steps {
+                        let t = s as f64 / steps as f64;
+                        let u = 1.0 - t;
+                        let x = u * u * p0.0 + 2.0 * u * t * p1.0 + t * t * p2.x;
+                        let y = u * u * p0.1 + 2.0 * u * t * p1.1 + t * t * p2.y;
+                        pts.push((x, y));
+                    }
+                    i += 1;
+                }
+                kurbo::PathEl::CurveTo(_, _, p3) => {
+                    let p0 = pts.last().copied().unwrap_or((p3.x, p3.y));
+                    let (p1, p2) = match els.get(i) {
+                        Some(kurbo::PathEl::CurveTo(p1, p2, _)) => ((p1.x, p1.y), (p2.x, p2.y)),
+                        _ => (p0, (p3.x, p3.y)),
+                    };
+                    let steps = ((p0.0 - p3.x).hypot(p0.1 - p3.y) / tolerance).ceil() as usize;
+                    let steps = steps.clamp(2, 48);
+                    for s in 1..=steps {
+                        let t = s as f64 / steps as f64;
+                        let u = 1.0 - t;
+                        let x = u * u * u * p0.0 + 3.0 * u * u * t * p1.0 + 3.0 * u * t * t * p2.0 + t * t * t * p3.x;
+                        let y = u * u * u * p0.1 + 3.0 * u * u * t * p1.1 + 3.0 * u * t * t * p2.1 + t * t * t * p3.y;
+                        pts.push((x, y));
+                    }
+                    i += 1;
+                }
+                kurbo::PathEl::ClosePath => {
+                    if let Some(start) = pts.first().copied() {
+                        if pts.last().map_or(true, |p| (p.0 - start.0).hypot(p.1 - start.1) > 1e-4) {
+                            pts.push(start);
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+        pts
+    }
+
+    fn _approx_len(&self, tolerance: f64) -> f64 {
+        let pts = self._flatten(tolerance);
+        if pts.len() < 2 { return 0.0; }
+        let mut len = 0.0;
+        for w in pts.windows(2) {
+            len += (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
+        }
+        len.max(1e-6)
+    }
+
+    fn _sample(&self, dist: f64, tolerance: f64) -> (f64, f64, f64) {
+        let mut pts = self._flatten(tolerance);
+        if pts.len() < 2 {
+            return (0.0, 0.0, 0.0);
+        }
+        let closed = self.is_closed();
+        if closed && pts.len() >= 2 {
+            let first = pts[0];
+            let last = pts[pts.len()-1];
+            if (first.0 - last.0).hypot(first.1 - last.1) > 1e-4 { pts.push(first); }
+        }
+        let mut cum = vec![0.0];
+        for w in pts.windows(2) {
+            let seg = (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
+            cum.push(cum.last().copied().unwrap_or(0.0) + seg);
+        }
+        let total = (*cum.last().unwrap_or(&0.0)).max(1e-6);
+        let mut d = dist;
+        if closed && total > 1e-6 {
+            d = d.rem_euclid(total);
+        } else {
+            d = d.clamp(0.0, total);
+        }
+        if d <= 0.0 {
+            let (x0, y0) = pts[0];
+            let (x1, y1) = pts.get(1).copied().unwrap_or((x0+1.0, y0));
+            return (x0, y0, (y1-y0).atan2(x1-x0));
+        }
+        for i in 1..cum.len() {
+            if cum[i] >= d {
+                let d0 = cum[i-1];
+                let d1 = cum[i];
+                let t = if (d1-d0).abs() < 1e-9 { 0.0 } else { (d - d0) / (d1 - d0) };
+                let (x0, y0) = pts[i-1];
+                let (x1, y1) = pts[i];
+                let x = x0 + (x1-x0)*t;
+                let y = y0 + (y1-y0)*t;
+                let ang = (y1 - y0).atan2(x1 - x0);
+                return (x, y, ang);
+            }
+        }
+        let (x, y) = *pts.last().unwrap();
+        (x, y, 0.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1000,6 +1120,205 @@ impl Transform2D {
         let xr = x * c - y * s;
         let yr = x * s + y * c;
         (xr + tx, yr + ty)
+    }
+}
+
+/// Marker trait for entities that can participate in object-on-path effects.
+pub trait ObjectOnPath {}
+
+/// FaceRenderable: any "facial" / profile object (rect, ellipse, polygon, closed path, arc...).
+/// Implemented by Node (light delegation approach). Used for sources in ObjectOnPath / Loft.
+pub trait FaceRenderable: ObjectOnPath {
+    fn bounds(&self) -> kurbo::Rect;
+    fn bez_path(&self) -> kurbo::BezPath;
+    fn fill(&self) -> &Fill;
+    fn stroke(&self) -> &Stroke;
+    fn opacity(&self) -> f32;
+    fn set_opacity(&mut self, opacity: f32);
+    fn translate(&mut self, dx: f64, dy: f64);
+    fn scale_about_center(&mut self, scale: f64);
+    fn rotate_about_center(&mut self, angle_rad: f64);
+    /// For dense placement in effects without losing full Node data (we downcast in practice).
+    fn clone_renderable(&self) -> Box<dyn FaceRenderable>;
+    /// Support for recovering concrete when needed.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// PathMagic: ONLY for real path spines (NodeKind::Path).
+/// Super-trait relation via ObjectOnPath. Provides arc-length sampling for on-path placement.
+pub trait PathMagic: ObjectOnPath {
+    fn to_bez(&self) -> kurbo::BezPath;
+    fn is_closed(&self) -> bool;
+    /// Approximate total length (uses internal flattening with tolerance).
+    fn total_length(&self, tolerance: f64) -> f64;
+    /// Sample (x, y, angle_rad) at arc distance along the path.
+    fn sample_at(&self, dist: f64, tolerance: f64) -> (f64, f64, f64);
+    fn clone_path(&self) -> Box<dyn PathMagic>;
+}
+
+/// Tiling is a *separate* trait of PathMagic (not part of ObjectOnPath).
+/// First determine the facial object's size (via FaceRenderable), then use that
+/// bounding size to determine the repeat gap for tiling/cloning.
+pub trait Tiling: PathMagic {
+    /// 2D gaps (gap_x, gap_y) from the "object"'s bounds (width for x, height for y).
+    fn gaps_for_object(&self, object: &dyn FaceRenderable) -> (f64, f64);
+}
+
+/// CircularClone is a *separate* trait of PathMagic (not part of ObjectOnPath).
+/// Clones around a specific editable origin point (6 sides default).
+/// The implementing "path" can serve as the editable center.
+pub trait CircularClone: PathMagic {
+    fn origin(&self) -> (f64, f64);
+    fn set_origin(&mut self, x: f64, y: f64);
+    fn radius(&self) -> f64;
+    fn set_radius(&mut self, r: f64);
+    fn sides(&self) -> usize;
+    fn set_sides(&mut self, n: usize);
+    /// Generate placement params for N circular copies.
+    /// Returns (x, y, angle) for each.
+    fn circular_placements(&self) -> Vec<(f64, f64, f64)>;
+}
+
+impl ObjectOnPath for Node {}
+impl ObjectOnPath for PathData {}
+
+impl FaceRenderable for Node {
+    fn bounds(&self) -> kurbo::Rect { self.bounds() }
+    fn bez_path(&self) -> kurbo::BezPath { self.bez_path() }
+    fn fill(&self) -> &Fill { &self.style.fill }
+    fn stroke(&self) -> &Stroke { &self.style.stroke }
+    fn opacity(&self) -> f32 { self.style.opacity }
+    fn set_opacity(&mut self, opacity: f32) { self.style.opacity = opacity; }
+    fn translate(&mut self, dx: f64, dy: f64) { Node::translate(self, dx, dy); }
+    fn scale_about_center(&mut self, scale: f64) { Node::scale_about_center(self, scale); }
+    fn rotate_about_center(&mut self, angle_rad: f64) { Node::rotate_about_center(self, angle_rad); }
+    fn clone_renderable(&self) -> Box<dyn FaceRenderable> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+impl PathMagic for Node {
+    fn to_bez(&self) -> kurbo::BezPath {
+        if let NodeKind::Path { path } = &self.kind {
+            path.to_bez()
+        } else {
+            kurbo::BezPath::new()
+        }
+    }
+    fn is_closed(&self) -> bool {
+        if let NodeKind::Path { path } = &self.kind {
+            path.is_closed()
+        } else {
+            false
+        }
+    }
+    fn total_length(&self, tolerance: f64) -> f64 {
+        if let NodeKind::Path { path } = &self.kind {
+            path.total_length(tolerance)
+        } else {
+            0.0
+        }
+    }
+    fn sample_at(&self, dist: f64, tolerance: f64) -> (f64, f64, f64) {
+        if let NodeKind::Path { path } = &self.kind {
+            path.sample_at(dist, tolerance)
+        } else {
+            (0.0, 0.0, 0.0)
+        }
+    }
+    fn clone_path(&self) -> Box<dyn PathMagic> { Box::new(self.clone()) }
+}
+
+impl PathMagic for PathData {
+    fn to_bez(&self) -> kurbo::BezPath { self.to_bez() }
+    fn is_closed(&self) -> bool { self.is_closed() }
+    fn total_length(&self, tolerance: f64) -> f64 { self._approx_len(tolerance) }
+    fn sample_at(&self, dist: f64, tolerance: f64) -> (f64, f64, f64) { self._sample(dist, tolerance) }
+    fn clone_path(&self) -> Box<dyn PathMagic> { Box::new(self.clone()) }
+}
+
+impl Tiling for Node {
+    fn gaps_for_object(&self, object: &dyn FaceRenderable) -> (f64, f64) {
+        let b = object.bounds();
+        let w = (b.x1 - b.x0).abs().max(1.0);
+        let h = (b.y1 - b.y0).abs().max(1.0);
+        (w, h)
+    }
+}
+
+impl Tiling for PathData {
+    fn gaps_for_object(&self, object: &dyn FaceRenderable) -> (f64, f64) {
+        let b = object.bounds();
+        let w = (b.x1 - b.x0).abs().max(1.0);
+        let h = (b.y1 - b.y0).abs().max(1.0);
+        (w, h)
+    }
+}
+
+impl CircularClone for Node {
+    fn origin(&self) -> (f64, f64) {
+        let b = self.bounds();
+        ((b.x0 + b.x1) * 0.5, (b.y0 + b.y1) * 0.5)
+    }
+    fn set_origin(&mut self, x: f64, y: f64) {
+        let b = self.bounds();
+        let cx = (b.x0 + b.x1) * 0.5;
+        let cy = (b.y0 + b.y1) * 0.5;
+        let dx = x - cx;
+        let dy = y - cy;
+        self.translate(dx, dy);
+    }
+    fn radius(&self) -> f64 {
+        let b = self.bounds();
+        let w = (b.x1 - b.x0).abs();
+        let h = (b.y1 - b.y0).abs();
+        (w.max(h) * 1.5).max(10.0)
+    }
+    fn set_radius(&mut self, _r: f64) {}
+    fn sides(&self) -> usize { 6 }
+    fn set_sides(&mut self, _n: usize) {}
+    fn circular_placements(&self) -> Vec<(f64, f64, f64)> {
+        let (cx, cy) = self.origin();
+        let r = self.radius();
+        let n = self.sides().max(3);
+        (0..n).map(|i| {
+            let ang = (i as f64 / n as f64) * std::f64::consts::TAU;
+            let x = cx + r * ang.cos();
+            let y = cy + r * ang.sin();
+            (x, y, ang)
+        }).collect()
+    }
+}
+
+impl CircularClone for PathData {
+    fn origin(&self) -> (f64, f64) {
+        let b = self.to_bez().bounding_box();
+        ((b.x0 + b.x1) * 0.5, (b.y0 + b.y1) * 0.5)
+    }
+    fn set_origin(&mut self, x: f64, y: f64) {
+        let b = self.to_bez().bounding_box();
+        let cx = (b.x0 + b.x1) * 0.5;
+        let cy = (b.y0 + b.y1) * 0.5;
+        let dx = x - cx;
+        let dy = y - cy;
+        for p in &mut self.points {
+            p[0] += dx;
+            p[1] += dy;
+        }
+    }
+    fn radius(&self) -> f64 { 48.0 }
+    fn set_radius(&mut self, _r: f64) {}
+    fn sides(&self) -> usize { 6 }
+    fn set_sides(&mut self, _n: usize) {}
+    fn circular_placements(&self) -> Vec<(f64, f64, f64)> {
+        let (cx, cy) = self.origin();
+        let r = self.radius();
+        let n = self.sides().max(3);
+        (0..n).map(|i| {
+            let ang = (i as f64 / n as f64) * std::f64::consts::TAU;
+            let x = cx + r * ang.cos();
+            let y = cy + r * ang.sin();
+            (x, y, ang)
+        }).collect()
     }
 }
 
@@ -1356,15 +1675,24 @@ impl Node {
                     (*x + *w, *y + *h),
                     (*x, *y + *h),
                 ];
-                let mapped: Vec<_> = corners.iter().map(|(px, py)| map(*px, *py)).collect();
-                let xs: Vec<_> = mapped.iter().map(|p| p.0).collect();
-                let ys: Vec<_> = mapped.iter().map(|p| p.1).collect();
-                *x = xs.iter().copied().fold(f64::INFINITY, f64::min);
-                *y = ys.iter().copied().fold(f64::INFINITY, f64::min);
-                *w = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max) - *x;
-                *h = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max) - *y;
+                let mapped: Vec<(f64, f64)> = corners.iter().map(|(px, py)| map(*px, *py)).collect();
+                let path = PathData::from_anchor_data(
+                    &mapped,
+                    &[],
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                    true,
+                );
+                self.kind = NodeKind::Path { path };
             }
             NodeKind::Ellipse { cx: ecx, cy: ecy, rx, ry } => {
+                if ( *rx - *ry ).abs() < 0.01 {
+                    // preserve circle size on rotation
+                    let (nx, ny) = map(*ecx, *ecy);
+                    *ecx = nx;
+                    *ecy = ny;
+                    return;
+                }
                 let (nx, ny) = map(*ecx, *ecy);
                 *ecx = nx;
                 *ecy = ny;
