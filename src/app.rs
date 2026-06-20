@@ -162,6 +162,7 @@ pub struct VadadeeBerryApp {
     pub toolbar_drag_active: bool,
     pub text_editor_rect: Option<egui::Rect>,
     pub last_android_text: String,
+    pub path_overlay_rect: Option<egui::Rect>,
 }
 
 impl VadadeeBerryApp {
@@ -293,6 +294,7 @@ impl VadadeeBerryApp {
             toolbar_drag_active: false,
             text_editor_rect: None,
             last_android_text: String::new(),
+            path_overlay_rect: None,
         }
     }
 
@@ -2184,6 +2186,68 @@ impl VadadeeBerryApp {
             );
         }
 
+        let mut path_rect = None;
+        let mut pen_finished = false;
+        let mut pen_cancelled = false;
+        if self.tools.active == ToolKind::Pen && !self.tools.pen.is_empty() {
+            let x = rect.center().x;
+            let y = rect.max.y - 80.0;
+            let overlay_pos = egui::pos2(x, y);
+            
+            egui::Area::new(egui::Id::new("path_drawing_overlay"))
+                .fixed_pos(overlay_pos)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .order(egui::Order::Foreground)
+                .show(ui.ctx(), |ui| {
+                    let inner_resp = egui::Frame::NONE
+                        .fill(egui::Color32::from_black_alpha(220))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(16, 10))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let tick_btn = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("✔")
+                                            .color(egui::Color32::from_rgb(0, 230, 118))
+                                            .strong()
+                                            .size(20.0)
+                                    )
+                                    .frame(false)
+                                );
+                                if tick_btn.clicked() {
+                                    pen_finished = true;
+                                }
+                                tick_btn.on_hover_text("Complete path drawing");
+
+                                ui.add_space(16.0);
+
+                                let cross_btn = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("✖")
+                                            .color(egui::Color32::from_rgb(255, 23, 68))
+                                            .strong()
+                                            .size(20.0)
+                                    )
+                                    .frame(false)
+                                );
+                                if cross_btn.clicked() {
+                                    pen_cancelled = true;
+                                }
+                                cross_btn.on_hover_text("Cancel path drawing");
+                            });
+                        });
+                    path_rect = Some(inner_resp.response.rect);
+                });
+        }
+        self.path_overlay_rect = path_rect;
+        if pen_finished {
+            self.finish_pen_path(self.tools.pen.was_closed);
+        }
+        if pen_cancelled {
+            self.tools.pen = Default::default();
+            self.status_message = "Path cancelled".into();
+        }
+
         ui::show_on_page_text_editor(self, ui, &response, origin);
         self.handle_canvas_input(&response, origin);
         response
@@ -2193,6 +2257,13 @@ impl VadadeeBerryApp {
         if let Some(editor_rect) = self.text_editor_rect {
             if let Some(pointer_pos) = response.ctx.input(|i| i.pointer.interact_pos()) {
                 if editor_rect.contains(pointer_pos) {
+                    return;
+                }
+            }
+        }
+        if let Some(overlay_rect) = self.path_overlay_rect {
+            if let Some(pointer_pos) = response.ctx.input(|i| i.pointer.interact_pos()) {
+                if overlay_rect.contains(pointer_pos) {
                     return;
                 }
             }

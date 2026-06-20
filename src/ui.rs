@@ -2181,21 +2181,48 @@ pub fn show_on_page_text_editor(
         .interactable(true)
         .show(&ctx, |ui| {
             ui.set_min_width(min_w);
-            // Frameless, fully transparent container — no elevated box, no label.
             let frame = egui::Frame::NONE;
             frame.show(ui, |ui| {
-                let resp = ui.add(
-                    egui::TextEdit::multiline(&mut app.ui_text_content)
-                        .font(font)
-                        .desired_rows(4)
-                        .desired_width(min_w)
-                        .hint_text("Type here…"),
-                );
-                app.text_editor_rect = Some(resp.rect);
-                if resp.changed() {
-                    app.patch_on_page_text_live(id);
-                }
-                focus_resp = Some(resp);
+                ui.vertical(|ui| {
+                    let tick_resp = ui.horizontal(|ui| {
+                        let btn_frame = egui::Frame::NONE
+                            .fill(egui::Color32::from_black_alpha(200))
+                            .corner_radius(4)
+                            .inner_margin(egui::Margin::symmetric(10, 6));
+                        btn_frame.show(ui, |ui| {
+                            let resp = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new("✔")
+                                        .color(egui::Color32::from_rgb(0, 230, 118))
+                                        .strong()
+                                        .size(16.0)
+                                )
+                                .frame(false)
+                            );
+                            if resp.clicked() {
+                                app.finish_on_page_text_edit();
+                            }
+                            resp
+                        })
+                    });
+                    ui.add_space(6.0); // margin between checkmark and text box
+
+                    let resp = ui.add(
+                        egui::TextEdit::multiline(&mut app.ui_text_content)
+                            .font(font)
+                            .desired_rows(4)
+                            .desired_width(min_w)
+                            .hint_text("Type here…"),
+                    );
+                    
+                    let union_rect = resp.rect.union(tick_resp.response.rect);
+                    app.text_editor_rect = Some(union_rect);
+
+                    if resp.changed() {
+                        app.patch_on_page_text_live(id);
+                    }
+                    focus_resp = Some(resp);
+                });
             });
         });
 
@@ -2231,7 +2258,36 @@ fn text_style_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, for_new_text: bool) 
         if for_new_text {
             ui.label(RichText::new("New text").strong());
         }
-        ui.label(RichText::new("Content").small().color(colors::TEXT_MUTED));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Content").small().color(colors::TEXT_MUTED));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let btn_frame = egui::Frame::NONE
+                    .fill(egui::Color32::from_black_alpha(200))
+                    .corner_radius(4)
+                    .inner_margin(egui::Margin::symmetric(8, 3));
+                btn_frame.show(ui, |ui| {
+                    let resp = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("✔")
+                                .color(egui::Color32::from_rgb(0, 230, 118))
+                                .strong()
+                                .size(12.0)
+                        )
+                        .frame(false)
+                    );
+                    if resp.clicked() {
+                        ui.ctx().memory_mut(|mem| mem.stop_text_input());
+                        #[cfg(target_os = "android")]
+                        {
+                            if let Some(android_app) = crate::ANDROID_APP.get() {
+                                android_app.hide_soft_input(false);
+                            }
+                        }
+                    }
+                });
+            });
+        });
+        ui.add_space(4.0);
         changed |= ui
             .add(
                 egui::TextEdit::multiline(&mut app.ui_text_content)
