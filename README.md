@@ -11,11 +11,35 @@ Vector graphics editor built with **egui** and GPU rendering via **wgpu** (throu
 | File I/O | `.vadadee-berry.json` native project + SVG import/export (`usvg` / `resvg`) |
 | Undo | `undo` crate command stack |
 
-## Run
+## Run (desktop)
 
 ```bash
 cargo run -p vadadee-berry
 ```
+
+## Android (native, no WebView)
+
+The mobile build uses **eframe + wgpu** via **GameActivity** (Vulkan/GLES), not a WebView or WASM shell.
+
+**Requirements:** Android SDK + NDK (side-by-side), `cargo-ndk`, JDK 17+.
+
+The Gradle dependency `androidx.games:games-activity` must be **4.4.0** to match the
+`android-activity` glue used by eframe/winit (older 2.x versions crash at startup with
+`NoSuchMethodError: onTouchEventNative`).
+
+```bash
+./scripts/build-android.sh
+```
+
+Output: `app/build/outputs/apk/debug/app-debug.apk`
+
+Install on a device:
+
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+File open/save dialogs are desktop-only for now; the editor UI and canvas run on device.
 
 ## UI
 

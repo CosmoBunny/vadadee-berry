@@ -1,0 +1,7 @@
+[
+{
+  "directory": "/home/angsudo/project/vadadee-berry/app/.cxx/Debug/4i48133m/arm64-v8a",
+  "command": "/home/angsudo/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android31 --sysroot=/home/angsudo/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Ddummy_EXPORTS -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -fno-limit-debug-info  -fPIC -o CMakeFiles/dummy.dir/src/main/cpp/dummy.cpp.o -c /home/angsudo/project/vadadee-berry/app/src/main/cpp/dummy.cpp",
+  "file": "/home/angsudo/project/vadadee-berry/app/src/main/cpp/dummy.cpp"
+}
+]

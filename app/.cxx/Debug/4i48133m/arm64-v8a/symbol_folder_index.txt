@@ -1,0 +1,1 @@
+/home/angsudo/project/vadadee-berry/app/build/intermediates/cxx/Debug/4i48133m/obj/arm64-v8a

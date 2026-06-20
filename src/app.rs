@@ -154,7 +154,7 @@ pub struct VadadeeBerryApp {
     pending_save_project: bool,
     pending_export_svg: bool,
     /// Tracks Ctrl+V for paste fallback when egui-winit swallows the hotkey (image-only clipboard).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
     paste_hotkey_was_down: bool,
     /// Multi-frame paste shown on the 2nd status-bar label ("Pasting…").
     paste_progress: Option<PasteProgress>,
@@ -282,7 +282,7 @@ impl VadadeeBerryApp {
             pending_open_svg: false,
             pending_save_project: false,
             pending_export_svg: false,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
             paste_hotkey_was_down: false,
             paste_progress: None,
         }
@@ -307,6 +307,12 @@ impl VadadeeBerryApp {
     }
 
     pub fn request_import_image(&mut self) {
+        #[cfg(target_os = "android")]
+        {
+            self.status_message = "Image import from files is not available on Android yet".into();
+            return;
+        }
+        #[cfg(not(target_os = "android"))]
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Images", &["png", "jpg", "jpeg"])
             .pick_file()
@@ -1167,40 +1173,48 @@ impl VadadeeBerryApp {
                         self.finish_paste("Layer locked".into());
                         return;
                     }
-                    let Ok(mut cb) = arboard::Clipboard::new() else {
-                        self.finish_paste("Nothing to paste".into());
+                    #[cfg(target_os = "android")]
+                    {
+                        self.finish_paste("System image paste is not available on Android".into());
                         return;
-                    };
-                    let Ok(img) = cb.get_image() else {
-                        self.finish_paste("Nothing to paste".into());
-                        return;
-                    };
-                    let w = img.width as u32;
-                    let h = img.height as u32;
-                    if w == 0 || h == 0 {
-                        self.finish_paste("Nothing to paste".into());
-                        return;
-                    };
-                    let Some(rgba_img) =
-                        image::RgbaImage::from_raw(w, h, img.bytes.into_owned())
-                    else {
-                        self.finish_paste("Nothing to paste".into());
-                        return;
-                    };
-                    let (cx, cy) = self.image_paste_doc_center();
-                    let disp_w = (w as f64).min(400.0);
-                    let disp_h = disp_w * (h as f64 / w.max(1) as f64);
-                    *rgba = Some(rgba_img);
-                    *placement = Some(ImagePastePlacement {
-                        x: cx - disp_w / 2.0,
-                        y: cy - disp_h / 2.0,
-                        width: disp_w,
-                        height: disp_h,
-                    });
-                    *step = 2;
-                    progress.label = "Pasting… 2/3 processing image".into();
-                    self.paste_progress = Some(progress);
-                    ctx.request_repaint();
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        let Ok(mut cb) = arboard::Clipboard::new() else {
+                            self.finish_paste("Nothing to paste".into());
+                            return;
+                        };
+                        let Ok(img) = cb.get_image() else {
+                            self.finish_paste("Nothing to paste".into());
+                            return;
+                        };
+                        let w = img.width as u32;
+                        let h = img.height as u32;
+                        if w == 0 || h == 0 {
+                            self.finish_paste("Nothing to paste".into());
+                            return;
+                        };
+                        let Some(rgba_img) =
+                            image::RgbaImage::from_raw(w, h, img.bytes.into_owned())
+                        else {
+                            self.finish_paste("Nothing to paste".into());
+                            return;
+                        };
+                        let (cx, cy) = self.image_paste_doc_center();
+                        let disp_w = (w as f64).min(400.0);
+                        let disp_h = disp_w * (h as f64 / w.max(1) as f64);
+                        *rgba = Some(rgba_img);
+                        *placement = Some(ImagePastePlacement {
+                            x: cx - disp_w / 2.0,
+                            y: cy - disp_h / 2.0,
+                            width: disp_w,
+                            height: disp_h,
+                        });
+                        *step = 2;
+                        progress.label = "Pasting… 2/3 processing image".into();
+                        self.paste_progress = Some(progress);
+                        ctx.request_repaint();
+                    }
                 }
                 2 => {
                     log::info!("CLIPBOARD: paste step 2/3 processing image");
@@ -1286,7 +1300,7 @@ impl VadadeeBerryApp {
         self.paste_progress.is_some()
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
     fn system_clipboard_has_image(&self) -> bool {
         arboard::Clipboard::new()
             .ok()
@@ -1294,7 +1308,7 @@ impl VadadeeBerryApp {
             .is_some_and(|img| img.width > 0 && img.height > 0)
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", target_os = "android"))]
     fn system_clipboard_has_image(&self) -> bool {
         false
     }
@@ -1389,55 +1403,69 @@ impl VadadeeBerryApp {
     }
 
     fn process_file_dialogs(&mut self) {
-        if self.pending_open_svg {
-            self.pending_open_svg = false;
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("SVG", &["svg"])
-                .pick_file()
-            {
-                match io::import_svg(&path) {
-                    Ok(mut p) => {
-                        let before = snapshot_project(&self.project);
-                        p.document.title = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("SVG")
-                            .to_string();
-                        let after = p;
-                        self.history.push(
-                            &mut self.project,
-                            ProjectEdit::SetDocument { before, after },
-                        );
-                        self.selection.clear();
-                        self.status_message = format!("Opened {}", path.display());
+        #[cfg(target_os = "android")]
+        {
+            if self.pending_open_svg || self.pending_save_project || self.pending_export_svg {
+                self.pending_open_svg = false;
+                self.pending_save_project = false;
+                self.pending_export_svg = false;
+                self.status_message =
+                    "Project/SVG file dialogs are not available on Android yet".into();
+            }
+            return;
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            if self.pending_open_svg {
+                self.pending_open_svg = false;
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("SVG", &["svg"])
+                    .pick_file()
+                {
+                    match io::import_svg(&path) {
+                        Ok(mut p) => {
+                            let before = snapshot_project(&self.project);
+                            p.document.title = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("SVG")
+                                .to_string();
+                            let after = p;
+                            self.history.push(
+                                &mut self.project,
+                                ProjectEdit::SetDocument { before, after },
+                            );
+                            self.selection.clear();
+                            self.status_message = format!("Opened {}", path.display());
+                        }
+                        Err(e) => self.status_message = format!("Open failed: {e}"),
                     }
-                    Err(e) => self.status_message = format!("Open failed: {e}"),
                 }
             }
-        }
-        if self.pending_save_project {
-            self.pending_save_project = false;
-            let default_name = io::default_project_filename(&self.project.document.title);
-            if let Some(path) = rfd::FileDialog::new()
-                .set_file_name(&default_name)
-                .add_filter("Vadadee Berry project", &[io::PROJECT_FILE_EXTENSION])
-                .save_file()
-            {
-                match io::save_project(&path, &self.project) {
-                    Ok(()) => self.status_message = format!("Saved {}", path.display()),
-                    Err(e) => self.status_message = format!("Save failed: {e}"),
+            if self.pending_save_project {
+                self.pending_save_project = false;
+                let default_name = io::default_project_filename(&self.project.document.title);
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name(&default_name)
+                    .add_filter("Vadadee Berry project", &[io::PROJECT_FILE_EXTENSION])
+                    .save_file()
+                {
+                    match io::save_project(&path, &self.project) {
+                        Ok(()) => self.status_message = format!("Saved {}", path.display()),
+                        Err(e) => self.status_message = format!("Save failed: {e}"),
+                    }
                 }
             }
-        }
-        if self.pending_export_svg {
-            self.pending_export_svg = false;
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("SVG", &["svg"])
-                .save_file()
-            {
-                match io::export_svg(&path, &self.project) {
-                    Ok(()) => self.status_message = format!("Exported {}", path.display()),
-                    Err(e) => self.status_message = format!("Export failed: {e}"),
+            if self.pending_export_svg {
+                self.pending_export_svg = false;
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("SVG", &["svg"])
+                    .save_file()
+                {
+                    match io::export_svg(&path, &self.project) {
+                        Ok(()) => self.status_message = format!("Exported {}", path.display()),
+                        Err(e) => self.status_message = format!("Export failed: {e}"),
+                    }
                 }
             }
         }
@@ -1556,7 +1584,7 @@ impl VadadeeBerryApp {
 
     /// egui-winit drops Ctrl+V when the clipboard has only image/png (no text), so no
     /// Event::Paste or Key::V reaches egui. Poll the physical hotkey as a fallback.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
     fn handle_paste_hotkey_fallback(&mut self, ctx: &Context, events_handled_paste: bool) {
         use device_query::{DeviceQuery, DeviceState, Keycode};
 
@@ -4363,7 +4391,7 @@ impl eframe::App for VadadeeBerryApp {
             self.advance_paste_operation(ctx);
         }
         let paste_from_events = self.handle_object_clipboard_shortcuts(ctx);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
         self.handle_paste_hotkey_fallback(ctx, paste_from_events);
         if self.ui_anim.needs_repaint() || self.paste_progress.is_some() {
             ctx.request_repaint();
