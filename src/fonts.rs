@@ -76,25 +76,26 @@ impl FontRegistry {
             stretch: fontdb::Stretch::Normal,
             style: fontdb::Style::Normal,
         };
-        let Some(id) = self.db.query(&query) else {
-            self.loaded.insert(family.to_string());
-            return;
-        };
-        let Some(bytes) = self
-            .db
-            .with_face_data(id, |data, _| data.to_vec())
-        else {
-            self.loaded.insert(family.to_string());
-            return;
-        };
+        
         let key = family.to_string();
         let mut defs = ctx.fonts(|f| f.definitions().clone());
-        defs.font_data
-            .insert(key.clone(), FontData::from_owned(bytes).into());
-        defs.families
-            .entry(FontFamily::Name(key.clone().into()))
-            .or_default()
-            .push(key.clone());
+        
+        if let Some(id) = self.db.query(&query) {
+            if let Some(bytes) = self.db.with_face_data(id, |data, _| data.to_vec()) {
+                defs.font_data.insert(key.clone(), FontData::from_owned(bytes).into());
+                defs.families
+                    .entry(FontFamily::Name(key.clone().into()))
+                    .or_default()
+                    .push(key.clone());
+                ctx.set_fonts(defs);
+                self.loaded.insert(key);
+                return;
+            }
+        }
+        
+        // Fallback: Bind the font family name to egui's default proportional fonts list so it never crashes.
+        let fallback_fonts = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+        defs.families.insert(FontFamily::Name(key.clone().into()), fallback_fonts);
         ctx.set_fonts(defs);
         self.loaded.insert(key);
     }
