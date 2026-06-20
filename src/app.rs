@@ -2186,6 +2186,9 @@ impl VadadeeBerryApp {
     }
 
     fn handle_canvas_input(&mut self, response: &egui::Response, origin: Pos2) {
+        if response.ctx.wants_pointer_input() {
+            return;
+        }
         let pointer = response.interact_pointer_pos();
         let primary_down = response.is_pointer_button_down_on();
         let primary_pressed = response.ctx.input(|i| {
