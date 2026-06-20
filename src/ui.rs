@@ -295,6 +295,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
         ToolKind::Polygon,
         ToolKind::Arc,
         ToolKind::Text,
+        ToolKind::Brush,
     ];
 
     let get_tool_icon = |tool: ToolKind, polygon_sides: u32| -> &'static str {
@@ -309,6 +310,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Polygon => icons::polygon_icon(polygon_sides),
             ToolKind::Arc => icons::ARC,
             ToolKind::Text => icons::TEXT,
+            ToolKind::Brush => icons::BRUSH,
         }
     };
 
@@ -324,6 +326,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Polygon => "Polygon (G)",
             ToolKind::Arc => "Arc / Chord (A)",
             ToolKind::Text => "Text (T)",
+            ToolKind::Brush => "Brush (B)",
         }
     };
 
@@ -370,7 +373,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     if app.toolbar_expanded && !app.toolbar_drag_active {
         if pointer_down {
             if let Some(pos) = pointer_pos {
-                if !rect.contains(pos) {
+                if !rect.contains(pos) && !ctx.memory(|mem| mem.any_popup_open()) {
                     app.toolbar_expanded = false;
                     ctx.request_repaint();
                 }
@@ -476,6 +479,65 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                 }
             }
         }
+
+        // Draw ColorPicker at index 11
+        if expand_t > 0.01 {
+            let (gx, gy) = get_grid_pos(11);
+            let cx = gx;
+            let cy = gy;
+            let scale = egui::lerp(0.6..=1.0, expand_t);
+            let btn_w = btn_size * scale;
+            let center = egui::Pos2::new(cx + btn_size / 2.0, cy + btn_size / 2.0);
+            let button_screen_rect = Rect::from_center_size(center, egui::vec2(btn_w, btn_w))
+                .translate(local_origin.to_vec2());
+
+            let button_alpha = alpha * expand_t;
+
+            if button_alpha > 0.01 {
+                let mut c = app.ui_fill_stops.first().map(|s| s.color.to_egui()).unwrap_or(egui::Color32::WHITE);
+                
+                // Render the color edit button inside the slot
+                ui.allocate_ui_at_rect(button_screen_rect, |ui| {
+                    ui.spacing_mut().interact_size = button_screen_rect.size();
+                    let resp = ui.color_edit_button_srgba(&mut c);
+                    if resp.changed() {
+                        let paint = crate::document::Paint {
+                            rgba: [
+                                c.r() as f32 / 255.0,
+                                c.g() as f32 / 255.0,
+                                c.b() as f32 / 255.0,
+                                c.a() as f32 / 255.0,
+                            ],
+                        };
+                        for s in app.ui_fill_stops.iter_mut() {
+                            s.color = paint;
+                        }
+                        for s in app.ui_stroke_stops.iter_mut() {
+                            s.color = paint;
+                        }
+                        app.apply_fill_to_selection();
+                        app.apply_stroke_to_selection();
+                    }
+                });
+
+                // Draw a sleek color wheel/palette icon on top of it so the user knows it's a picker
+                let icon_size = if is_android { 20.0 } else { 18.0 };
+                let brightness = c.r() as f32 * 0.299 + c.g() as f32 * 0.587 + c.b() as f32 * 0.114;
+                let text_color = if brightness > 150.0 {
+                    egui::Color32::BLACK.gamma_multiply(button_alpha)
+                } else {
+                    egui::Color32::WHITE.gamma_multiply(button_alpha)
+                };
+
+                ui.painter().text(
+                    button_screen_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icons::COLOR,
+                    icons::nerd_font_id(icon_size * scale),
+                    text_color,
+                );
+            }
+        }
     });
 
     let select_tool = |app: &mut VadadeeBerryApp, tool: ToolKind| {
@@ -483,6 +545,9 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
         match tool {
             ToolKind::Node | ToolKind::Polygon | ToolKind::Text | ToolKind::Arc => {
                 promote_action_tab(app, ActionTab::Geometry);
+            }
+            ToolKind::Pen | ToolKind::Brush => {
+                promote_action_tab(app, ActionTab::ColorStroke);
             }
             _ => {}
         }
@@ -506,16 +571,18 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                     }
                 }
             } else {
-                // Released outside -> collapse
-                app.toolbar_expanded = false;
+                // Released outside -> collapse (unless a popup is open)
+                if !ctx.memory(|mem| mem.any_popup_open()) {
+                    app.toolbar_expanded = false;
+                }
                 app.toolbar_drag_active = false;
             }
         } else {
             // Clicked open state click
             if let Some(tool) = hovered_tool {
                 select_tool(app, tool);
+                app.toolbar_expanded = false;
             }
-            app.toolbar_expanded = false;
         }
         ctx.request_repaint();
     }
@@ -1316,9 +1383,26 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         let selected = app.selection.contains(id);
         let icon = node_icon(&node.kind);
         let label = RichText::new(format!("{icon} {}", node.name)).font(nerd_font_id(13.0));
-        if ui.selectable_label(selected, label).clicked() {
-            app.set_selection(vec![*id]);
-        }
+        ui.horizontal(|ui| {
+            if ui.selectable_label(selected, label).clicked() {
+                app.set_selection(vec![*id]);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let delete_btn = ui.add(
+                    egui::Button::new(
+                        RichText::new("✖")
+                            .color(egui::Color32::from_rgb(255, 23, 68))
+                            .strong()
+                            .size(11.0)
+                    )
+                    .frame(false)
+                );
+                if delete_btn.clicked() {
+                    app.delete_nodes(&[*id]);
+                }
+                delete_btn.on_hover_text("Delete object");
+            });
+        });
     }
 }
 
@@ -2190,19 +2274,37 @@ pub fn show_on_page_text_editor(
                             .corner_radius(4)
                             .inner_margin(egui::Margin::symmetric(10, 6));
                         btn_frame.show(ui, |ui| {
-                            let resp = ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new("✔")
-                                        .color(egui::Color32::from_rgb(0, 230, 118))
-                                        .strong()
-                                        .size(16.0)
-                                )
-                                .frame(false)
-                            );
-                            if resp.clicked() {
-                                app.finish_on_page_text_edit();
-                            }
-                            resp
+                            ui.horizontal(|ui| {
+                                let resp = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("✔")
+                                            .color(egui::Color32::from_rgb(0, 230, 118))
+                                            .strong()
+                                            .size(16.0)
+                                    )
+                                    .frame(false)
+                                );
+                                if resp.clicked() {
+                                    app.finish_on_page_text_edit();
+                                }
+                                
+                                ui.add_space(8.0);
+                                
+                                let cross_resp = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("✖")
+                                            .color(egui::Color32::from_rgb(255, 23, 68))
+                                            .strong()
+                                            .size(16.0)
+                                    )
+                                    .frame(false)
+                                );
+                                if cross_resp.clicked() {
+                                    app.delete_on_page_text_node(id);
+                                }
+                                
+                                resp
+                            })
                         })
                     });
                     ui.add_space(6.0); // margin between checkmark and text box

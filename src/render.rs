@@ -2095,6 +2095,89 @@ pub fn draw_preview_polygon(
     ));
 }
 
+pub fn draw_brush_preview(
+    painter: &Painter,
+    viewport: &Viewport,
+    origin: Pos2,
+    points: &[([f64; 2], f64, f32)],
+    stroke_color: Color32,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    let n = points.len();
+    let mut left_pts = Vec::with_capacity(n);
+    let mut right_pts = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let (pos, _, w) = points[i];
+        let half_w = (w / 2.0) as f64;
+
+        let normal = if i == 0 {
+            let next_pos = points[1].0;
+            let dx = next_pos[0] - pos[0];
+            let dy = next_pos[1] - pos[1];
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 0.0001 {
+                [-dy / len, dx / len]
+            } else {
+                [0.0, 1.0]
+            }
+        } else if i == n - 1 {
+            let prev_pos = points[n - 2].0;
+            let dx = pos[0] - prev_pos[0];
+            let dy = pos[1] - prev_pos[1];
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 0.0001 {
+                [-dy / len, dx / len]
+            } else {
+                [0.0, 1.0]
+            }
+        } else {
+            let prev_pos = points[i - 1].0;
+            let next_pos = points[i + 1].0;
+            let dx1 = pos[0] - prev_pos[0];
+            let dy1 = pos[1] - prev_pos[1];
+            let len1 = (dx1 * dx1 + dy1 * dy1).sqrt();
+
+            let dx2 = next_pos[0] - pos[0];
+            let dy2 = next_pos[1] - pos[1];
+            let len2 = (dx2 * dx2 + dy2 * dy2).sqrt();
+
+            let nx1 = if len1 > 0.0001 { -dy1 / len1 } else { 0.0 };
+            let ny1 = if len1 > 0.0001 { dx1 / len1 } else { 1.0 };
+
+            let nx2 = if len2 > 0.0001 { -dy2 / len2 } else { 0.0 };
+            let ny2 = if len2 > 0.0001 { dx2 / len2 } else { 1.0 };
+
+            let nx = (nx1 + nx2) / 2.0;
+            let ny = (ny1 + ny2) / 2.0;
+            let nlen = (nx * nx + ny * ny).sqrt();
+            if nlen > 0.0001 {
+                [nx / nlen, ny / nlen]
+            } else {
+                [0.0, 1.0]
+            }
+        };
+
+        left_pts.push([pos[0] + normal[0] * half_w, pos[1] + normal[1] * half_w]);
+        right_pts.push([pos[0] - normal[0] * half_w, pos[1] - normal[1] * half_w]);
+    }
+
+    let mut screen_pts: Vec<Pos2> = Vec::with_capacity(n * 2);
+    for pt in &left_pts {
+        screen_pts.push(viewport.doc_to_screen((pt[0], pt[1]), origin));
+    }
+    for pt in right_pts.iter().rev() {
+        screen_pts.push(viewport.doc_to_screen((pt[0], pt[1]), origin));
+    }
+
+    painter.add(Shape::closed_line(
+        screen_pts,
+        Stroke::new(2.0, stroke_color),
+    ));
+}
+
 pub fn draw_preview_line(
     painter: &Painter,
     viewport: &Viewport,

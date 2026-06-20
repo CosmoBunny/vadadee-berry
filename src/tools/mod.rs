@@ -17,6 +17,7 @@ pub enum ToolKind {
     Pen,
     Text,
     Arc,
+    Brush,
 }
 
 impl ToolKind {
@@ -32,6 +33,7 @@ impl ToolKind {
             Self::Pen => "Pen",
             Self::Text => "Text",
             Self::Arc => "Arc",
+            Self::Brush => "Brush",
         }
     }
 
@@ -47,6 +49,7 @@ impl ToolKind {
             Self::Pen => Some(Key::P),
             Self::Text => Some(Key::T),
             Self::Arc => Some(Key::A),
+            Self::Brush => Some(Key::B),
         }
     }
 
@@ -56,6 +59,11 @@ impl ToolKind {
             Self::Rectangle | Self::Circle | Self::Ellipse | Self::Line | Self::Polygon | Self::Arc
         )
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BrushSession {
+    pub points: Vec<([f64; 2], f64, f32)>, // pos, time, width
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,6 +173,7 @@ pub struct ToolState {
     pub drag_shape: Option<DragNewShape>,
     pub pen: PenSession,
     pub select: SelectSession,
+    pub brush: BrushSession,
     pub space_pan: bool,
     /// Middle/right-button canvas pan in progress.
     pub canvas_pan_drag: bool,
@@ -248,6 +257,7 @@ impl ToolState {
                 ToolKind::Pen,
                 ToolKind::Text,
                 ToolKind::Arc,
+                ToolKind::Brush,
             ]
         };
         for tool in tools {

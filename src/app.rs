@@ -2184,6 +2184,27 @@ impl VadadeeBerryApp {
                 &self.tools.pen,
                 self.cursor_doc,
             );
+
+            if self.tools.active == ToolKind::Brush && !self.tools.brush.points.is_empty() {
+                let stroke_color = match &self.build_ui_stroke().style {
+                    Fill::Solid(p) => p.to_egui(),
+                    Fill::LinearGradient { stops, .. } | Fill::RadialGradient { stops, .. } => {
+                        if let Some(s) = stops.first() {
+                            s.color.to_egui()
+                        } else {
+                            egui::Color32::from_rgb(0, 120, 215)
+                        }
+                    }
+                    Fill::None => egui::Color32::from_rgb(0, 120, 215),
+                };
+                render::draw_brush_preview(
+                    &painter,
+                    &self.viewport,
+                    origin,
+                    &self.tools.brush.points,
+                    stroke_color,
+                );
+            }
         }
 
         let mut path_rect = None;
@@ -2254,6 +2275,10 @@ impl VadadeeBerryApp {
     }
 
     fn handle_canvas_input(&mut self, response: &egui::Response, origin: Pos2) {
+        if response.ctx.input(|i| i.multi_touch().is_some()) {
+            self.tools.brush.points.clear();
+            return;
+        }
         if let Some(editor_rect) = self.text_editor_rect {
             if let Some(pointer_pos) = response.ctx.input(|i| i.pointer.interact_pos()) {
                 if editor_rect.contains(pointer_pos) {
@@ -2358,6 +2383,16 @@ impl VadadeeBerryApp {
                 );
             }
             ToolKind::Text => self.tool_text(doc, primary_pressed),
+            ToolKind::Brush => {
+                let time = response.ctx.input(|i| i.time);
+                self.tool_brush(
+                    doc,
+                    time,
+                    primary_pressed,
+                    primary_down,
+                    primary_released_anywhere,
+                );
+            }
             ToolKind::Node => self.tool_node(
                 pos,
                 origin,
@@ -3296,6 +3331,74 @@ impl VadadeeBerryApp {
         }
     }
 
+    pub fn delete_nodes(&mut self, ids: &[NodeId]) {
+        if ids.is_empty() || !self.layer_editable() {
+            return;
+        }
+        let layer_index = self.project.document.active_layer_index;
+        let layer_nodes_before = self
+            .project
+            .document
+            .active_layer()
+            .map(|l| l.nodes.clone())
+            .unwrap_or_default();
+        let mut removed = Vec::new();
+        for id in ids {
+            if let Some(node) = self.project.nodes.get(*id).cloned() {
+                removed.push((*id, node));
+            }
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::RemoveNodes {
+                removed,
+                layer_index,
+                layer_nodes_before,
+            },
+        );
+        self.selection.retain(|id| !ids.contains(id));
+    }
+
+    pub fn delete_on_page_text_node(&mut self, id: NodeId) {
+        self.on_page_text_edit = None;
+        #[cfg(target_os = "android")]
+        {
+            if let Some(android_app) = crate::ANDROID_APP.get() {
+                android_app.hide_soft_input(false);
+            }
+        }
+        self.on_page_text_focus_pending = false;
+        
+        let newly = self.on_page_text_newly_created;
+        self.on_page_text_newly_created = false;
+        self.on_page_text_before = None;
+
+        if newly {
+            self.project.nodes.remove(id);
+            self.project.document.remove_from_layers(id);
+            self.selection.retain(|&s| s != id);
+        } else {
+            let layer_index = self.project.document.active_layer_index;
+            let layer_nodes_before = self
+                .project
+                .document
+                .active_layer()
+                .map(|l| l.nodes.clone())
+                .unwrap_or_default();
+            if let Some(node) = self.project.nodes.get(id).cloned() {
+                self.history.push(
+                    &mut self.project,
+                    ProjectEdit::RemoveNodes {
+                        removed: vec![(id, node)],
+                        layer_index,
+                        layer_nodes_before,
+                    },
+                );
+            }
+            self.selection.retain(|&s| s != id);
+        }
+    }
+
     pub fn set_text_style(&mut self, id: NodeId, style: TextStyle, x: f64, y: f64) {
         let Some(before) = self.project.nodes.get(id).cloned() else {
             return;
@@ -4137,6 +4240,16 @@ impl VadadeeBerryApp {
         let Some(canvas_rect) = self.canvas_screen_rect else {
             return;
         };
+        // Handle multi-touch zoom and pan first
+        if let Some(multi_touch) = ctx.input(|i| i.multi_touch()) {
+            if canvas_rect.contains(multi_touch.center_pos) {
+                if (multi_touch.zoom_delta - 1.0).abs() > 1e-4 {
+                    self.viewport.zoom_at(multi_touch.center_pos, self.canvas_origin, multi_touch.zoom_delta);
+                }
+                self.viewport.pan += multi_touch.translation_delta;
+                return;
+            }
+        }
         let hover = ctx.input(|i| i.pointer.hover_pos());
         let on_canvas = hover.is_some_and(|p| canvas_rect.contains(p));
         if !on_canvas {
@@ -4171,6 +4284,55 @@ impl VadadeeBerryApp {
         self.ui_text_content.clear();
         self.on_page_text_newly_created = true;
         self.begin_on_page_text_edit(id);
+    }
+
+    fn tool_brush(
+        &mut self,
+        doc: (f64, f64),
+        time: f64,
+        pressed: bool,
+        down: bool,
+        released: bool,
+    ) {
+        if pressed {
+            self.tools.brush.points.clear();
+            let base_w = self.ui_stroke_width;
+            self.tools.brush.points.push(([doc.0, doc.1], time, base_w));
+        } else if down {
+            if let Some(&(prev_pos, prev_time, prev_w)) = self.tools.brush.points.last() {
+                let dist = ((doc.0 - prev_pos[0]).powi(2) + (doc.1 - prev_pos[1]).powi(2)).sqrt();
+                if dist > 1.0 {
+                    let dt = time - prev_time;
+                    let speed = if dt > 0.0001 { dist / dt } else { 0.0 };
+                    let target_w = {
+                        let min_w = (self.ui_stroke_width * 0.3).max(1.0);
+                        let max_w = (self.ui_stroke_width * 2.0).max(4.0);
+                        let factor = (speed / 1200.0).min(1.0) as f32;
+                        max_w - (max_w - min_w) * factor
+                    };
+                    let alpha = 0.15;
+                    let new_w = prev_w * (1.0 - alpha) + target_w * alpha;
+                    self.tools.brush.points.push(([doc.0, doc.1], time, new_w));
+                }
+            }
+        }
+
+        if released {
+            let pts = &self.tools.brush.points;
+            if pts.len() >= 2 {
+                let bez = generate_brush_outline(pts);
+                let mut node = Node::path_from_bez(bez, "Brush");
+                node.style.fill = self.build_ui_stroke().style;
+                node.style.stroke = Stroke {
+                    style: Fill::none(),
+                    width: 0.0,
+                    line_join: crate::document::LineJoin::Miter,
+                    line_cap: crate::document::LineCap::Butt,
+                };
+                self.insert_node(node);
+            }
+            self.tools.brush.points.clear();
+        }
     }
 
     fn hit_path_segment(
@@ -4520,4 +4682,79 @@ impl eframe::App for VadadeeBerryApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         ui::chrome(self, ui);
     }
+}
+
+fn generate_brush_outline(points: &[([f64; 2], f64, f32)]) -> kurbo::BezPath {
+    let mut path = kurbo::BezPath::new();
+    if points.len() < 2 {
+        return path;
+    }
+    let n = points.len();
+    let mut left_pts = Vec::with_capacity(n);
+    let mut right_pts = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let (pos, _, w) = points[i];
+        let half_w = (w / 2.0) as f64;
+
+        let normal = if i == 0 {
+            let next_pos = points[1].0;
+            let dx = next_pos[0] - pos[0];
+            let dy = next_pos[1] - pos[1];
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 0.0001 {
+                [-dy / len, dx / len]
+            } else {
+                [0.0, 1.0]
+            }
+        } else if i == n - 1 {
+            let prev_pos = points[n - 2].0;
+            let dx = pos[0] - prev_pos[0];
+            let dy = pos[1] - prev_pos[1];
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 0.0001 {
+                [-dy / len, dx / len]
+            } else {
+                [0.0, 1.0]
+            }
+        } else {
+            let prev_pos = points[i - 1].0;
+            let next_pos = points[i + 1].0;
+            let dx1 = pos[0] - prev_pos[0];
+            let dy1 = pos[1] - prev_pos[1];
+            let len1 = (dx1 * dx1 + dy1 * dy1).sqrt();
+
+            let dx2 = next_pos[0] - pos[0];
+            let dy2 = next_pos[1] - pos[1];
+            let len2 = (dx2 * dx2 + dy2 * dy2).sqrt();
+
+            let nx1 = if len1 > 0.0001 { -dy1 / len1 } else { 0.0 };
+            let ny1 = if len1 > 0.0001 { dx1 / len1 } else { 1.0 };
+
+            let nx2 = if len2 > 0.0001 { -dy2 / len2 } else { 0.0 };
+            let ny2 = if len2 > 0.0001 { dx2 / len2 } else { 1.0 };
+
+            let nx = (nx1 + nx2) / 2.0;
+            let ny = (ny1 + ny2) / 2.0;
+            let nlen = (nx * nx + ny * ny).sqrt();
+            if nlen > 0.0001 {
+                [nx / nlen, ny / nlen]
+            } else {
+                [0.0, 1.0]
+            }
+        };
+
+        left_pts.push([pos[0] + normal[0] * half_w, pos[1] + normal[1] * half_w]);
+        right_pts.push([pos[0] - normal[0] * half_w, pos[1] - normal[1] * half_w]);
+    }
+
+    path.move_to(kurbo::Point::new(left_pts[0][0], left_pts[0][1]));
+    for pt in left_pts.iter().skip(1) {
+        path.line_to(kurbo::Point::new(pt[0], pt[1]));
+    }
+    for pt in right_pts.iter().rev() {
+        path.line_to(kurbo::Point::new(pt[0], pt[1]));
+    }
+    path.close_path();
+    path
 }
