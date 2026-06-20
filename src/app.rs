@@ -3167,6 +3167,12 @@ impl VadadeeBerryApp {
             self.on_page_text_newly_created = false;
             return;
         };
+        #[cfg(target_os = "android")]
+        {
+            if let Some(android_app) = crate::ANDROID_APP.get() {
+                android_app.hide_soft_input(false);
+            }
+        }
         self.on_page_text_focus_pending = false;
         self.patch_on_page_text_live(id);
 

@@ -2203,6 +2203,12 @@ pub fn show_on_page_text_editor(
         if let Some(r) = focus_resp {
             r.request_focus();
         }
+        #[cfg(target_os = "android")]
+        {
+            if let Some(android_app) = crate::ANDROID_APP.get() {
+                android_app.show_soft_input(true);
+            }
+        }
         app.on_page_text_focus_pending = false;
     }
 
