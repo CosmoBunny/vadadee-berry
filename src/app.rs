@@ -158,6 +158,8 @@ pub struct VadadeeBerryApp {
     paste_hotkey_was_down: bool,
     /// Multi-frame paste shown on the 2nd status-bar label ("Pasting…").
     paste_progress: Option<PasteProgress>,
+    pub toolbar_expanded: bool,
+    pub toolbar_drag_active: bool,
 }
 
 impl VadadeeBerryApp {
@@ -285,6 +287,8 @@ impl VadadeeBerryApp {
             #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
             paste_hotkey_was_down: false,
             paste_progress: None,
+            toolbar_expanded: false,
+            toolbar_drag_active: false,
         }
     }
 

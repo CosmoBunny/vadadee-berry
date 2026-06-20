@@ -257,129 +257,268 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 }
 
 fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
-    let edit_points_mode = app.tools.active == ToolKind::Node;
     let alpha = app.ui_anim.toolbar_alpha();
-    let tool_highlight = app.ui_anim.tool_highlight();
     let inset = theme::overlay_work_rect(work);
-    let rect = Rect::from_min_size(inset.min, egui::vec2(theme::TOOLBAR_WIDTH, inset.height()));
+
+    let is_android = cfg!(target_os = "android");
+    let btn_size = if is_android { 48.0 } else { 40.0 };
+    let spacing = if is_android { 8.0 } else { 6.0 };
+    let margin_x = 8.0;
+    let margin_y = 10.0;
+
+    let collapsed_inner_w = btn_size;
+    let collapsed_inner_h = btn_size;
+
+    let expanded_inner_w = 3.0 * btn_size + 2.0 * spacing;
+    let expanded_inner_h = 4.0 * btn_size + 3.0 * spacing;
+
+    // Use egui's built-in bool animator for smooth transitions
+    let expand_t = ctx.animate_bool(egui::Id::new("toolbar_expanded_anim"), app.toolbar_expanded);
+
+    let inner_w = egui::lerp(collapsed_inner_w..=expanded_inner_w, expand_t);
+    let inner_h = egui::lerp(collapsed_inner_h..=expanded_inner_h, expand_t);
+
+    let rect = Rect::from_min_size(
+        inset.min,
+        egui::vec2(inner_w + 2.0 * margin_x, inner_h + 2.0 * margin_y),
+    );
+
+    // Tools list
+    let tools = [
+        ToolKind::Select,
+        ToolKind::Node,
+        ToolKind::Pen,
+        ToolKind::Rectangle,
+        ToolKind::Circle,
+        ToolKind::Ellipse,
+        ToolKind::Line,
+        ToolKind::Polygon,
+        ToolKind::Arc,
+        ToolKind::Text,
+    ];
+
+    let get_tool_icon = |tool: ToolKind, polygon_sides: u32| -> &'static str {
+        match tool {
+            ToolKind::Select => icons::SELECT,
+            ToolKind::Node => icons::NODE,
+            ToolKind::Pen => icons::PEN,
+            ToolKind::Rectangle => icons::RECT,
+            ToolKind::Circle => icons::CIRCLE,
+            ToolKind::Ellipse => icons::ELLIPSE,
+            ToolKind::Line => icons::LINE,
+            ToolKind::Polygon => icons::polygon_icon(polygon_sides),
+            ToolKind::Arc => icons::ARC,
+            ToolKind::Text => icons::TEXT,
+        }
+    };
+
+    let get_tool_tip = |tool: ToolKind| -> &'static str {
+        match tool {
+            ToolKind::Select => "Select (V)",
+            ToolKind::Node => "Edit nodes (N)",
+            ToolKind::Pen => "Pen (P)",
+            ToolKind::Rectangle => "Rectangle (R)",
+            ToolKind::Circle => "Circle (C)",
+            ToolKind::Ellipse => "Ellipse (E)",
+            ToolKind::Line => "Line (L)",
+            ToolKind::Polygon => "Polygon (G)",
+            ToolKind::Arc => "Arc / Chord (A)",
+            ToolKind::Text => "Text (T)",
+        }
+    };
+
+    let get_grid_pos = |index: usize| -> (f32, f32) {
+        let col = index % 3;
+        let row = index / 3;
+        let x = col as f32 * (btn_size + spacing);
+        let y = row as f32 * (btn_size + spacing);
+        (x, y)
+    };
+
+    // Find active tool index
+    let active_index = tools.iter().position(|&t| t == app.tools.active).unwrap_or(0);
+    let (ax_grid, ay_grid) = get_grid_pos(active_index);
+
+    // Active button position lerps from (0,0) (collapsed) to its grid position
+    let ax = egui::lerp(0.0..=ax_grid, expand_t);
+    let ay = egui::lerp(0.0..=ay_grid, expand_t);
+
+    // Pointer events
+    let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
+    let pointer_down = ctx.input(|i| i.pointer.any_down());
+    let pointer_released = ctx.input(|i| i.pointer.any_released());
+
+    let collapsed_btn_rect = Rect::from_min_size(
+        rect.min + egui::vec2(margin_x, margin_y),
+        egui::vec2(btn_size, btn_size),
+    );
+
+    // 1. If collapsed, detect press/drag start on the collapsed button
+    if !app.toolbar_expanded {
+        if pointer_down {
+            if let Some(pos) = pointer_pos {
+                if collapsed_btn_rect.contains(pos) {
+                    app.toolbar_expanded = true;
+                    app.toolbar_drag_active = true;
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
+    // 2. Click outside when toggled open to collapse
+    if app.toolbar_expanded && !app.toolbar_drag_active {
+        if pointer_down {
+            if let Some(pos) = pointer_pos {
+                if !rect.contains(pos) {
+                    app.toolbar_expanded = false;
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
+    let mut hovered_tool: Option<ToolKind> = None;
 
     theme::show_overlay_area(ctx, "float_toolbar", rect, alpha, |ui| {
-        ui.vertical_centered(|ui| {
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("Tools")
-                    .small()
-                    .color(colors::TEXT_MUTED),
-            );
-            ui.add_space(4.0);
-            for (tool, icon, tip) in [
-                (ToolKind::Select, icons::SELECT, "Select (V)"),
-                (ToolKind::Node, icons::NODE, "Edit nodes (N)"),
-            ] {
-                let selected = app.tools.active == tool;
-                let pulse = if selected { tool_highlight } else { 0.0 };
-                if theme::accent_button(ui, selected, icon, tip, pulse).clicked() {
-                    app.tools.active = tool;
-                    if tool == ToolKind::Node {
-                        promote_action_tab(app, ActionTab::Geometry);
-                    }
-                }
-                ui.add_space(4.0);
-            }
-            if edit_points_mode {
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label(
-                    RichText::new("Edit points")
-                        .small()
-                        .strong()
-                        .color(colors::ACCENT),
-                );
-                ui.label(
-                    RichText::new("Ctrl+click multi-select points · Del removes · smooth in Geometry")
-                        .small()
-                        .color(colors::TEXT_MUTED),
-                );
+        // Track the mouse coordinates and find if any button is hovered
+        let local_origin = ui.max_rect().min; // Top-left of the inner frame (after margins)
+
+        for (i, &tool) in tools.iter().enumerate() {
+
+            // Get target grid position
+            let (gx, gy) = get_grid_pos(i);
+
+            // Interpolate position and size
+            let (cx, cy) = if i == active_index {
+                (ax, ay)
             } else {
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label(
-                    RichText::new("Create")
-                        .small()
-                        .color(colors::TEXT_MUTED),
-                );
-                ui.add_space(4.0);
-                for (tool, icon, tip) in [
-                    (ToolKind::Rectangle, icons::RECT, "Rectangle (R)"),
-                    (ToolKind::Circle, icons::CIRCLE, "Circle (C)"),
-                    (ToolKind::Ellipse, icons::ELLIPSE, "Ellipse (E)"),
-                    (ToolKind::Line, icons::LINE, "Line (L)"),
-                ] {
-                    let selected = app.tools.active == tool;
-                    let pulse = if selected { tool_highlight } else { 0.0 };
-                    if theme::accent_button(ui, selected, icon, tip, pulse).clicked() {
-                        app.tools.active = tool;
+                (gx, gy)
+            };
+
+            let scale = if i == active_index {
+                1.0
+            } else {
+                egui::lerp(0.6..=1.0, expand_t)
+            };
+
+            let btn_w = btn_size * scale;
+            let center = egui::Pos2::new(cx + btn_size / 2.0, cy + btn_size / 2.0);
+            let local_rect = Rect::from_center_size(center, egui::vec2(btn_w, btn_w));
+            let button_screen_rect = local_rect.translate(local_origin.to_vec2());
+
+            let is_hovered = pointer_pos.map_or(false, |pos| button_screen_rect.contains(pos));
+
+            // Only allow hover interaction when expanded
+            let hovered = is_hovered && (app.toolbar_expanded || expand_t > 0.9);
+            if hovered {
+                hovered_tool = Some(tool);
+            }
+
+            // Determine rendering alpha
+            let button_alpha = if i == active_index {
+                alpha
+            } else {
+                alpha * expand_t
+            };
+
+            if button_alpha > 0.01 {
+                let selected = app.tools.active == tool;
+
+                let fill = if selected {
+                    if hovered {
+                        colors::ACCENT.gamma_multiply(0.7).gamma_multiply(button_alpha)
+                    } else {
+                        colors::ACCENT.gamma_multiply(0.55).gamma_multiply(button_alpha)
                     }
-                    ui.add_space(4.0);
-                }
-                let poly_icon = icons::polygon_icon(app.polygon_sides);
-                let poly_selected = app.tools.active == ToolKind::Polygon;
-                if theme::accent_button(
-                    ui,
-                    poly_selected,
-                    poly_icon,
-                    "Polygon (G)",
-                    if poly_selected { tool_highlight } else { 0.0 },
-                )
-                .clicked()
-                {
-                    app.tools.active = ToolKind::Polygon;
-                    promote_action_tab(app, ActionTab::Geometry);
-                }
-                ui.add_space(4.0);
-                let pen_selected = app.tools.active == ToolKind::Pen;
-                if theme::accent_button(
-                    ui,
-                    pen_selected,
-                    icons::PEN,
-                    "Pen (P)",
-                    if pen_selected { tool_highlight } else { 0.0 },
-                )
-                .clicked()
-                {
-                    app.tools.active = ToolKind::Pen;
-                }
-                ui.add_space(4.0);
-                let text_selected = app.tools.active == ToolKind::Text;
-                if theme::accent_button(
-                    ui,
-                    text_selected,
-                    icons::TEXT,
-                    "Text (T)",
-                    if text_selected { tool_highlight } else { 0.0 },
-                )
-                .clicked()
-                {
-                    app.tools.active = ToolKind::Text;
-                    promote_action_tab(app, ActionTab::Geometry);
-                }
-                ui.add_space(4.0);
-                let arc_selected = app.tools.active == ToolKind::Arc;
-                if theme::accent_button(
-                    ui,
-                    arc_selected,
-                    icons::ARC,
-                    "Arc / Chord (A)",
-                    if arc_selected { tool_highlight } else { 0.0 },
-                )
-                .clicked()
-                {
-                    app.tools.active = ToolKind::Arc;
-                    promote_action_tab(app, ActionTab::Geometry);
+                } else if hovered {
+                    colors::BG_HOVER.gamma_multiply(button_alpha)
+                } else {
+                    colors::BG_ELEVATED.gamma_multiply(button_alpha)
+                };
+
+                let stroke_color = if selected {
+                    colors::ACCENT.gamma_multiply(button_alpha)
+                } else if hovered {
+                    colors::BORDER.gamma_multiply(button_alpha * 1.5)
+                } else {
+                    colors::BORDER.gamma_multiply(button_alpha)
+                };
+
+                let stroke_w = if selected || hovered { 1.5 } else { 1.0 };
+                let corner_radius = egui::CornerRadius::same(if is_android { 8 } else { 6 });
+
+                // Draw button rect
+                ui.painter().rect(
+                    button_screen_rect,
+                    corner_radius,
+                    fill,
+                    egui::Stroke::new(stroke_w, stroke_color),
+                    egui::StrokeKind::Inside,
+                );
+
+                // Draw icon text
+                let icon = get_tool_icon(tool, app.polygon_sides);
+                let icon_size = if is_android { 20.0 } else { 18.0 };
+                ui.painter().text(
+                    button_screen_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon,
+                    icons::nerd_font_id(icon_size * scale),
+                    colors::TEXT.gamma_multiply(button_alpha),
+                );
+
+                // Draw simple tooltip on desktop
+                if hovered && !is_android {
+                    egui::show_tooltip::<()>(ui.ctx(), ui.layer_id(), ui.make_persistent_id("tool_tip"), |ui| {
+                        ui.label(get_tool_tip(tool));
+                    });
                 }
             }
-        });
+        }
     });
+
+    let select_tool = |app: &mut VadadeeBerryApp, tool: ToolKind| {
+        app.tools.active = tool;
+        match tool {
+            ToolKind::Node | ToolKind::Polygon | ToolKind::Text | ToolKind::Arc => {
+                promote_action_tab(app, ActionTab::Geometry);
+            }
+            _ => {}
+        }
+    };
+
+    // 3. Handle release actions
+    if app.toolbar_expanded && pointer_released {
+        if app.toolbar_drag_active {
+            // Drag release
+            if let Some(tool) = hovered_tool {
+                // If it was just a quick tap inside the active button, don't drag-select, keep open
+                if let Some(pos) = pointer_pos {
+                    if collapsed_btn_rect.contains(pos) {
+                        // Toggled open state
+                        app.toolbar_drag_active = false;
+                    } else {
+                        // Drag-selected a tool!
+                        select_tool(app, tool);
+                        app.toolbar_expanded = false;
+                        app.toolbar_drag_active = false;
+                    }
+                }
+            } else {
+                // Released outside -> collapse
+                app.toolbar_expanded = false;
+                app.toolbar_drag_active = false;
+            }
+        } else {
+            // Clicked open state click
+            if let Some(tool) = hovered_tool {
+                select_tool(app, tool);
+            }
+            app.toolbar_expanded = false;
+        }
+        ctx.request_repaint();
+    }
 }
 
 /// Programmatic tab focus (tool switch, geometry, etc.).
