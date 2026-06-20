@@ -684,6 +684,21 @@ impl VadadeeBerryApp {
         }
     }
 
+    pub fn build_brush_fill(&self) -> Fill {
+        Fill::build(
+            self.ui_stroke_kind,
+            true,
+            &self.ui_stroke_stops,
+            self.ui_stroke_angle,
+            self.ui_stroke_line_x0,
+            self.ui_stroke_line_y0,
+            self.ui_stroke_line_x1,
+            self.ui_stroke_line_y1,
+            self.ui_stroke_radial_cx,
+            self.ui_stroke_radial_cy,
+        )
+    }
+
     pub fn apply_stroke_to_selection(&mut self) {
         for id in self.selection.clone() {
             let Some(before) = self.project.nodes.get(id).cloned() else {
@@ -2186,7 +2201,7 @@ impl VadadeeBerryApp {
             );
 
             if self.tools.active == ToolKind::Brush && !self.tools.brush.points.is_empty() {
-                let stroke_color = match &self.build_ui_stroke().style {
+                 let stroke_color = match &self.build_brush_fill() {
                     Fill::Solid(p) => p.to_egui(),
                     Fill::LinearGradient { stops, .. } | Fill::RadialGradient { stops, .. } => {
                         if let Some(s) = stops.first() {
@@ -2392,6 +2407,11 @@ impl VadadeeBerryApp {
                     primary_down,
                     primary_released_anywhere,
                 );
+            }
+            ToolKind::Eyedropper => {
+                if primary_pressed {
+                    self.tool_eyedropper(doc);
+                }
             }
             ToolKind::Node => self.tool_node(
                 pos,
@@ -3399,6 +3419,138 @@ impl VadadeeBerryApp {
         }
     }
 
+    pub fn apply_fill_style_to_active(&mut self, fill: &crate::document::Fill) {
+        match fill {
+            crate::document::Fill::None => {}
+            crate::document::Fill::Solid(paint) => {
+                self.ui_fill_kind = crate::document::FillKind::Solid;
+                self.ui_fill_stops = vec![
+                    crate::document::GradientStop { pos: 0.0, color: *paint },
+                    crate::document::GradientStop { pos: 1.0, color: *paint },
+                ];
+                self.fill_enabled = true;
+
+                self.ui_stroke_kind = crate::document::FillKind::Solid;
+                self.ui_stroke_stops = vec![
+                    crate::document::GradientStop { pos: 0.0, color: *paint },
+                    crate::document::GradientStop { pos: 1.0, color: *paint },
+                ];
+                self.stroke_enabled = true;
+            }
+            crate::document::Fill::LinearGradient {
+                angle_deg,
+                line_x0,
+                line_y0,
+                line_x1,
+                line_y1,
+                stops,
+            } => {
+                self.ui_fill_kind = crate::document::FillKind::LinearGradient;
+                self.ui_fill_stops = stops.clone();
+                self.ui_gradient_angle = *angle_deg;
+                self.ui_fill_line_x0 = *line_x0;
+                self.ui_fill_line_y0 = *line_y0;
+                self.ui_fill_line_x1 = *line_x1;
+                self.ui_fill_line_y1 = *line_y1;
+                self.fill_enabled = true;
+
+                self.ui_stroke_kind = crate::document::FillKind::LinearGradient;
+                self.ui_stroke_stops = stops.clone();
+                self.ui_stroke_angle = *angle_deg;
+                self.ui_stroke_line_x0 = *line_x0;
+                self.ui_stroke_line_y0 = *line_y0;
+                self.ui_stroke_line_x1 = *line_x1;
+                self.ui_stroke_line_y1 = *line_y1;
+                self.stroke_enabled = true;
+            }
+            crate::document::Fill::RadialGradient {
+                center_x,
+                center_y,
+                stops,
+            } => {
+                self.ui_fill_kind = crate::document::FillKind::RadialGradient;
+                self.ui_fill_stops = stops.clone();
+                self.ui_radial_cx = *center_x;
+                self.ui_radial_cy = *center_y;
+                self.fill_enabled = true;
+
+                self.ui_stroke_kind = crate::document::FillKind::RadialGradient;
+                self.ui_stroke_stops = stops.clone();
+                self.ui_stroke_radial_cx = *center_x;
+                self.ui_stroke_radial_cy = *center_y;
+                self.stroke_enabled = true;
+            }
+        }
+        self.apply_fill_to_selection();
+        self.apply_stroke_to_selection();
+    }
+
+    pub fn tool_eyedropper(&mut self, doc: (f64, f64)) {
+        let mut hit: Option<NodeId> = None;
+        let mut bbox_only: Option<NodeId> = None;
+        for id in self.project.document.ordered_node_ids().into_iter().rev() {
+            if let Some(node) = self.project.nodes.get(id) {
+                let does_hit = if self.node_has_tiling_or_circular(id) {
+                    let eb = crate::document::get_effective_bounds(node, &self.project.document);
+                    let pt = kurbo::Point::new(doc.0, doc.1);
+                    let slop = 4.0 / self.viewport.zoom as f64;
+                    eb.inflate(slop, slop).contains(pt)
+                } else {
+                    node.hit_test_with_store(
+                        &self.project.nodes,
+                        doc.0,
+                        doc.1,
+                        4.0 / self.viewport.zoom as f64,
+                    )
+                };
+                if does_hit {
+                    let pt = kurbo::Point::new(doc.0, doc.1);
+                    let precise = if self.node_has_tiling_or_circular(id) {
+                        true
+                    } else {
+                        node.bez_path().contains(pt)
+                            || matches!(node.kind, NodeKind::Text { .. })
+                    };
+                    if precise {
+                        hit = Some(id);
+                        break;
+                    } else if bbox_only.is_none() {
+                        bbox_only = Some(id);
+                    }
+                }
+            }
+        }
+        if hit.is_none() {
+            hit = bbox_only;
+        }
+        
+        let mut picked_fill = None;
+        let mut node_name = String::new();
+        if let Some(id) = hit {
+            if let Some(node) = self.project.nodes.get(id) {
+                node_name = node.name.clone();
+                let fill_to_copy = match &node.style.fill {
+                    crate::document::Fill::None => {
+                        match &node.style.stroke.style {
+                            crate::document::Fill::None => None,
+                            other => Some(other),
+                        }
+                    }
+                    other => Some(other),
+                };
+                if let Some(fill) = fill_to_copy {
+                    picked_fill = Some(fill.clone());
+                }
+            }
+        }
+        
+        if let Some(fill) = picked_fill {
+            self.apply_fill_style_to_active(&fill);
+            self.status_message = format!("Picked color from '{}'", node_name);
+        }
+        self.tools.active = ToolKind::Select;
+    }
+
     pub fn set_text_style(&mut self, id: NodeId, style: TextStyle, x: f64, y: f64) {
         let Some(before) = self.project.nodes.get(id).cloned() else {
             return;
@@ -4296,8 +4448,7 @@ impl VadadeeBerryApp {
     ) {
         if pressed {
             self.tools.brush.points.clear();
-            let base_w = self.ui_stroke_width;
-            self.tools.brush.points.push(([doc.0, doc.1], time, base_w));
+            self.tools.brush.points.push(([doc.0, doc.1], time, 0.0));
         } else if down {
             if let Some(&(prev_pos, prev_time, prev_w)) = self.tools.brush.points.last() {
                 let dist = ((doc.0 - prev_pos[0]).powi(2) + (doc.1 - prev_pos[1]).powi(2)).sqrt();
@@ -4311,18 +4462,22 @@ impl VadadeeBerryApp {
                         max_w - (max_w - min_w) * factor
                     };
                     let alpha = 0.15;
-                    let new_w = prev_w * (1.0 - alpha) + target_w * alpha;
+                    let prev_effective_w = if prev_w < 0.01 { target_w } else { prev_w };
+                    let new_w = prev_effective_w * (1.0 - alpha) + target_w * alpha;
                     self.tools.brush.points.push(([doc.0, doc.1], time, new_w));
                 }
             }
         }
 
         if released {
-            let pts = &self.tools.brush.points;
+            let mut pts = self.tools.brush.points.clone();
             if pts.len() >= 2 {
-                let bez = generate_brush_outline(pts);
+                if let Some(&(last_pos, last_time, _)) = pts.last() {
+                    pts.push((last_pos, last_time, 0.0));
+                }
+                let bez = generate_brush_outline(&pts);
                 let mut node = Node::path_from_bez(bez, "Brush");
-                node.style.fill = self.build_ui_stroke().style;
+                node.style.fill = self.build_brush_fill();
                 node.style.stroke = Stroke {
                     style: Fill::none(),
                     width: 0.0,

@@ -18,6 +18,7 @@ pub enum ToolKind {
     Text,
     Arc,
     Brush,
+    Eyedropper,
 }
 
 impl ToolKind {
@@ -34,6 +35,7 @@ impl ToolKind {
             Self::Text => "Text",
             Self::Arc => "Arc",
             Self::Brush => "Brush",
+            Self::Eyedropper => "Eyedropper",
         }
     }
 
@@ -50,6 +52,7 @@ impl ToolKind {
             Self::Text => Some(Key::T),
             Self::Arc => Some(Key::A),
             Self::Brush => Some(Key::B),
+            Self::Eyedropper => Some(Key::I),
         }
     }
 
@@ -258,6 +261,7 @@ impl ToolState {
                 ToolKind::Text,
                 ToolKind::Arc,
                 ToolKind::Brush,
+                ToolKind::Eyedropper,
             ]
         };
         for tool in tools {

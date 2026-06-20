@@ -2105,16 +2105,21 @@ pub fn draw_brush_preview(
     if points.len() < 2 {
         return;
     }
-    let n = points.len();
+    let mut pts = points.to_vec();
+    pts[0].2 = 0.0;
+    if let Some(&(last_pos, last_time, _)) = pts.last() {
+        pts.push((last_pos, last_time, 0.0));
+    }
+    let n = pts.len();
     let mut left_pts = Vec::with_capacity(n);
     let mut right_pts = Vec::with_capacity(n);
 
     for i in 0..n {
-        let (pos, _, w) = points[i];
+        let (pos, _, w) = pts[i];
         let half_w = (w / 2.0) as f64;
 
         let normal = if i == 0 {
-            let next_pos = points[1].0;
+            let next_pos = pts[1].0;
             let dx = next_pos[0] - pos[0];
             let dy = next_pos[1] - pos[1];
             let len = (dx * dx + dy * dy).sqrt();
@@ -2124,7 +2129,7 @@ pub fn draw_brush_preview(
                 [0.0, 1.0]
             }
         } else if i == n - 1 {
-            let prev_pos = points[n - 2].0;
+            let prev_pos = pts[n - 2].0;
             let dx = pos[0] - prev_pos[0];
             let dy = pos[1] - prev_pos[1];
             let len = (dx * dx + dy * dy).sqrt();
@@ -2134,8 +2139,8 @@ pub fn draw_brush_preview(
                 [0.0, 1.0]
             }
         } else {
-            let prev_pos = points[i - 1].0;
-            let next_pos = points[i + 1].0;
+            let prev_pos = pts[i - 1].0;
+            let next_pos = pts[i + 1].0;
             let dx1 = pos[0] - prev_pos[0];
             let dy1 = pos[1] - prev_pos[1];
             let len1 = (dx1 * dx1 + dy1 * dy1).sqrt();

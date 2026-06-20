@@ -12,6 +12,7 @@ pub const LAYER: &str = "󰌨";
 pub const COLOR: &str = "";
 pub const PEN: &str = "";
 pub const BRUSH: &str = "";
+pub const EYE_DROPPER: &str = "";
 pub const ELLIPSE: &str = "󰢓";
 pub const BEZIER: &str = "";
 pub const PATH_MAGIC: &str = "󱡄";

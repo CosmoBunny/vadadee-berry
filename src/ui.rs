@@ -270,7 +270,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     let collapsed_inner_h = btn_size;
 
     let expanded_inner_w = 3.0 * btn_size + 2.0 * spacing;
-    let expanded_inner_h = 4.0 * btn_size + 3.0 * spacing;
+    let expanded_inner_h = 5.0 * btn_size + 4.0 * spacing;
 
     // Use egui's built-in bool animator for smooth transitions
     let expand_t = ctx.animate_bool(egui::Id::new("toolbar_expanded_anim"), app.toolbar_expanded);
@@ -296,6 +296,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
         ToolKind::Arc,
         ToolKind::Text,
         ToolKind::Brush,
+        ToolKind::Eyedropper,
     ];
 
     let get_tool_icon = |tool: ToolKind, polygon_sides: u32| -> &'static str {
@@ -311,6 +312,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Arc => icons::ARC,
             ToolKind::Text => icons::TEXT,
             ToolKind::Brush => icons::BRUSH,
+            ToolKind::Eyedropper => icons::EYE_DROPPER,
         }
     };
 
@@ -327,6 +329,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Arc => "Arc / Chord (A)",
             ToolKind::Text => "Text (T)",
             ToolKind::Brush => "Brush (B)",
+            ToolKind::Eyedropper => "Eyedropper (I)",
         }
     };
 
@@ -480,9 +483,9 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             }
         }
 
-        // Draw ColorPicker at index 11
+        // Draw ColorPicker at index 12
         if expand_t > 0.01 {
-            let (gx, gy) = get_grid_pos(11);
+            let (gx, gy) = get_grid_pos(12);
             let cx = gx;
             let cy = gy;
             let scale = egui::lerp(0.6..=1.0, expand_t);
