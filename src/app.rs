@@ -160,6 +160,7 @@ pub struct VadadeeBerryApp {
     paste_progress: Option<PasteProgress>,
     pub toolbar_expanded: bool,
     pub toolbar_drag_active: bool,
+    pub text_editor_rect: Option<egui::Rect>,
 }
 
 impl VadadeeBerryApp {
@@ -289,6 +290,7 @@ impl VadadeeBerryApp {
             paste_progress: None,
             toolbar_expanded: false,
             toolbar_drag_active: false,
+            text_editor_rect: None,
         }
     }
 
@@ -2186,8 +2188,12 @@ impl VadadeeBerryApp {
     }
 
     fn handle_canvas_input(&mut self, response: &egui::Response, origin: Pos2) {
-        if response.ctx.wants_pointer_input() {
-            return;
+        if let Some(editor_rect) = self.text_editor_rect {
+            if let Some(pointer_pos) = response.ctx.input(|i| i.pointer.interact_pos()) {
+                if editor_rect.contains(pointer_pos) {
+                    return;
+                }
+            }
         }
         let pointer = response.interact_pointer_pos();
         let primary_down = response.is_pointer_button_down_on();

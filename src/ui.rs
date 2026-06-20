@@ -2139,6 +2139,7 @@ pub fn show_on_page_text_editor(
     origin: egui::Pos2,
 ) {
     let Some(id) = app.on_page_text_edit else {
+        app.text_editor_rect = None;
         return;
     };
     let (doc_x, doc_y, font_size, font_family) = {
@@ -2190,6 +2191,7 @@ pub fn show_on_page_text_editor(
                         .desired_width(min_w)
                         .hint_text("Type here…"),
                 );
+                app.text_editor_rect = Some(resp.rect);
                 if resp.changed() {
                     app.patch_on_page_text_live(id);
                 }
