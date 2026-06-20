@@ -2206,6 +2206,15 @@ pub fn show_on_page_text_editor(
         #[cfg(target_os = "android")]
         {
             if let Some(android_app) = crate::ANDROID_APP.get() {
+                let text = app.ui_text_content.clone();
+                app.last_android_text = text.clone();
+                let len = text.chars().count();
+                let state = winit::platform::android::activity::input::TextInputState {
+                    text: text.clone(),
+                    selection: winit::platform::android::activity::input::TextSpan { start: len, end: len },
+                    compose_region: None,
+                };
+                android_app.set_text_input_state(state);
                 android_app.show_soft_input(true);
             }
         }

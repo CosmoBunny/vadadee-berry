@@ -161,6 +161,7 @@ pub struct VadadeeBerryApp {
     pub toolbar_expanded: bool,
     pub toolbar_drag_active: bool,
     pub text_editor_rect: Option<egui::Rect>,
+    pub last_android_text: String,
 }
 
 impl VadadeeBerryApp {
@@ -291,6 +292,7 @@ impl VadadeeBerryApp {
             toolbar_expanded: false,
             toolbar_drag_active: false,
             text_editor_rect: None,
+            last_android_text: String::new(),
         }
     }
 
@@ -4405,6 +4407,31 @@ impl VadadeeBerryApp {
 
 impl eframe::App for VadadeeBerryApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "android")]
+        {
+            if let Some(id) = self.on_page_text_edit {
+                if let Some(android_app) = crate::ANDROID_APP.get() {
+                    let state = android_app.text_input_state();
+                    if state.text != self.last_android_text {
+                        self.ui_text_content = state.text.clone();
+                        self.last_android_text = state.text.clone();
+                        self.patch_on_page_text_live(id);
+                        ctx.request_repaint();
+                    } else if self.ui_text_content != self.last_android_text {
+                        let text = self.ui_text_content.clone();
+                        self.last_android_text = text.clone();
+                        let len = text.chars().count();
+                        let new_state = winit::platform::android::activity::input::TextInputState {
+                            text: text.clone(),
+                            selection: winit::platform::android::activity::input::TextSpan { start: len, end: len },
+                            compose_region: None,
+                        };
+                        android_app.set_text_input_state(new_state);
+                    }
+                }
+            }
+        }
+
         self.process_file_dialogs();
         if self.paste_progress.is_some() {
             self.advance_paste_operation(ctx);
