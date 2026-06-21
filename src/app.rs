@@ -63,7 +63,77 @@ struct PasteProgress {
     task: PasteTask,
 }
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Keyframe {
+    pub frame: usize,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeyframeTrack {
+    pub keyframes: Vec<Keyframe>,
+}
+
+impl KeyframeTrack {
+    pub fn insert(&mut self, frame: usize, value: f64) {
+        if let Some(pos) = self.keyframes.iter().position(|kf| kf.frame == frame) {
+            self.keyframes[pos].value = value;
+        } else {
+            self.keyframes.push(Keyframe { frame, value });
+            self.keyframes.sort_by_key(|kf| kf.frame);
+        }
+    }
+
+    pub fn interpolate(&self, frame: usize) -> Option<f64> {
+        if self.keyframes.is_empty() {
+            return None;
+        }
+        if frame <= self.keyframes[0].frame {
+            return Some(self.keyframes[0].value);
+        }
+        let last_idx = self.keyframes.len() - 1;
+        if frame >= self.keyframes[last_idx].frame {
+            return Some(self.keyframes[last_idx].value);
+        }
+        for i in 0..last_idx {
+            let kf0 = &self.keyframes[i];
+            let kf1 = &self.keyframes[i+1];
+            if frame >= kf0.frame && frame <= kf1.frame {
+                let range = (kf1.frame - kf0.frame) as f64;
+                if range < 1e-9 {
+                    return Some(kf0.value);
+                }
+                let t = (frame - kf0.frame) as f64 / range;
+                return Some(kf0.value + t * (kf1.value - kf0.value));
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NodeAnimation {
+    pub pos_x: KeyframeTrack,
+    pub pos_y: KeyframeTrack,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AnimationTimeline {
+    pub nodes: std::collections::HashMap<NodeId, NodeAnimation>,
+}
+
 pub struct VadadeeBerryApp {
+    pub anim_current_frame: usize,
+    pub anim_is_playing: bool,
+    pub anim_keyframing_mode: bool,
+    pub anim_show_timeline_window: bool,
+    pub anim_time_accumulator: f32,
+    pub anim_last_seen_frame: usize,
+    pub anim_last_applied_positions: std::collections::HashMap<NodeId, (f64, f64)>,
+    pub anim_timeline: AnimationTimeline,
+
     pub project: ProjectFile,
     pub viewport: Viewport,
     pub tools: ToolState,
@@ -187,6 +257,15 @@ impl VadadeeBerryApp {
         let fonts = FontRegistry::new();
         let default_font = fonts.default_family();
         Self {
+            anim_current_frame: 0,
+            anim_is_playing: false,
+            anim_keyframing_mode: false,
+            anim_show_timeline_window: false,
+            anim_time_accumulator: 0.0,
+            anim_last_seen_frame: 0,
+            anim_last_applied_positions: std::collections::HashMap::new(),
+            anim_timeline: AnimationTimeline::default(),
+
             project: Document::new_default_project(),
             viewport: Viewport::default(),
             tools: ToolState {
@@ -945,6 +1024,46 @@ impl VadadeeBerryApp {
             &mut self.project,
             ProjectEdit::PatchDocument { before, after },
         );
+    }
+
+    pub fn apply_animation_for_frame(&mut self, frame: usize) {
+        let updates: Vec<(NodeId, Option<f64>, Option<f64>)> = self.anim_timeline.nodes.iter()
+            .map(|(node_id, track)| {
+                let x = track.pos_x.interpolate(frame);
+                let y = track.pos_y.interpolate(frame);
+                (*node_id, x, y)
+            })
+            .collect();
+
+        for (node_id, target_x, target_y) in updates {
+            if let Some(node) = self.project.nodes.get_mut(node_id) {
+                let (curr_x, curr_y) = node.get_pos();
+                let dx = target_x.map(|tx| tx - curr_x).unwrap_or(0.0);
+                let dy = target_y.map(|ty| ty - curr_y).unwrap_or(0.0);
+                if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
+                    node.translate(dx, dy);
+                }
+            }
+        }
+    }
+
+    pub fn toggle_keyframing_mode(&mut self) {
+        self.anim_keyframing_mode = !self.anim_keyframing_mode;
+        if self.anim_keyframing_mode {
+            // Capture baseline at frame 0 for selected nodes
+            for id in &self.selection {
+                if let Some(node) = self.project.nodes.get(*id) {
+                    let pos = node.get_pos();
+                    let entry = self.anim_timeline.nodes.entry(*id).or_default();
+                    if entry.pos_x.keyframes.is_empty() {
+                        entry.pos_x.insert(0, pos.0);
+                    }
+                    if entry.pos_y.keyframes.is_empty() {
+                        entry.pos_y.insert(0, pos.1);
+                    }
+                }
+            }
+        }
     }
 
     pub fn add_layer(&mut self, name: &str) {
@@ -5344,6 +5463,81 @@ impl VadadeeBerryApp {
 
 impl eframe::App for VadadeeBerryApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // --- ANIMATION TIMELINE PLAYBACK & RECORDING ---
+        let mut frame_changed = false;
+        if self.anim_is_playing {
+            let dt = ctx.input(|i| i.stable_dt);
+            self.anim_time_accumulator += dt;
+            const FRAME_TIME: f32 = 1.0 / 30.0;
+            if self.anim_time_accumulator >= FRAME_TIME {
+                let steps = (self.anim_time_accumulator / FRAME_TIME) as usize;
+                self.anim_time_accumulator -= steps as f32 * FRAME_TIME;
+                self.anim_current_frame = (self.anim_current_frame + steps) % 101; // 0..=100
+                frame_changed = true;
+            }
+            ctx.request_repaint(); // Keep ticking
+        }
+
+        let frame_scrubbed = self.anim_current_frame != self.anim_last_seen_frame;
+        if frame_scrubbed || frame_changed {
+            self.apply_animation_for_frame(self.anim_current_frame);
+            self.anim_last_seen_frame = self.anim_current_frame;
+            self.anim_last_applied_positions.clear();
+            for id in &self.selection {
+                if let Some(node) = self.project.nodes.get(*id) {
+                    self.anim_last_applied_positions.insert(*id, node.get_pos());
+                }
+            }
+        } else if self.anim_keyframing_mode && !self.anim_is_playing {
+            // Capture baseline at 0
+            for id in &self.selection {
+                if let Some(node) = self.project.nodes.get(*id) {
+                    let pos = node.get_pos();
+                    let entry = self.anim_timeline.nodes.entry(*id).or_default();
+                    if entry.pos_x.keyframes.is_empty() {
+                        entry.pos_x.insert(0, pos.0);
+                    }
+                    if entry.pos_y.keyframes.is_empty() {
+                        entry.pos_y.insert(0, pos.1);
+                    }
+                }
+            }
+
+            // Ensure reference position is populated
+            for id in &self.selection {
+                if let Some(node) = self.project.nodes.get(*id) {
+                    self.anim_last_applied_positions.entry(*id).or_insert_with(|| node.get_pos());
+                }
+            }
+
+            // Detect user movement
+            let mut keyframes_updated = false;
+            for id in &self.selection {
+                if let Some(node) = self.project.nodes.get(*id) {
+                    let pos = node.get_pos();
+                    let last_pos = self.anim_last_applied_positions.get(id).copied();
+                    if let Some(last_pos) = last_pos {
+                        let dx = pos.0 - last_pos.0;
+                        let dy = pos.1 - last_pos.1;
+                        if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
+                            let entry = self.anim_timeline.nodes.entry(*id).or_default();
+                            entry.pos_x.insert(self.anim_current_frame, pos.0);
+                            entry.pos_y.insert(self.anim_current_frame, pos.1);
+                            keyframes_updated = true;
+                        }
+                    }
+                }
+            }
+            if keyframes_updated {
+                self.anim_last_applied_positions.clear();
+                for id in &self.selection {
+                    if let Some(node) = self.project.nodes.get(*id) {
+                        self.anim_last_applied_positions.insert(*id, node.get_pos());
+                    }
+                }
+            }
+        }
+
         #[cfg(target_os = "android")]
         {
             if let Some(id) = self.on_page_text_edit {

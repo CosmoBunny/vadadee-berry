@@ -1326,6 +1326,32 @@ impl CircularClone for PathData {
 }
 
 impl Node {
+    pub fn get_pos(&self) -> (f64, f64) {
+        match &self.kind {
+            NodeKind::Rect { x, y, .. } => (*x, *y),
+            NodeKind::Ellipse { cx, cy, .. } => (*cx, *cy),
+            NodeKind::Polygon { cx, cy, .. } => (*cx, *cy),
+            NodeKind::Path { path } => {
+                if path.points.is_empty() {
+                    (0.0, 0.0)
+                } else {
+                    (path.points[0][0], path.points[0][1])
+                }
+            }
+            NodeKind::Text { x, y, .. } => (*x, *y),
+            NodeKind::Group { .. } => (0.0, 0.0),
+            NodeKind::Image { x, y, .. } => (*x, *y),
+            NodeKind::Arc { cx, cy, .. } => (*cx, *cy),
+            NodeKind::BrushStroke { points } => {
+                if points.is_empty() {
+                    (0.0, 0.0)
+                } else {
+                    (points[0].0[0], points[0].0[1])
+                }
+            }
+        }
+    }
+
     pub fn new(kind: NodeKind, name: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),

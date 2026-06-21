@@ -116,6 +116,7 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             let ctx = ui.ctx().clone();
             floating_toolbar(app, &ctx, work);
             floating_action_bar(app, &ctx, work);
+            floating_timeline_window(app, &ctx, work);
         });
 
     let ctx = ui.ctx();
@@ -1287,7 +1288,7 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     }
 }
 
-fn status_bar(app: &VadadeeBerryApp, ui: &mut Ui) {
+fn status_bar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     let alpha = app.ui_anim.status_alpha();
     let tool_slide_out = app.ui_anim.status_tool_slide_out(120.0);
     let tool_slide_in = app.ui_anim.status_tool_slide_in(120.0);
@@ -1300,29 +1301,94 @@ fn status_bar(app: &VadadeeBerryApp, ui: &mut Ui) {
         .exact_size(26.0)
         .resizable(false)
         .show_inside(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                let current_coords_text = status_coords_text(app.cursor_doc);
-                let anim_coords_w = app.ui_anim.coords_seg_width();
-                theme::paint_powerline_status(
-                    ui,
-                    &app.ui_anim.status_tool_outgoing,
-                    &app.ui_anim.status_tool_incoming,
-                    tool_width,
-                    &app.ui_anim.status_msg_outgoing,
-                    &app.ui_anim.status_msg_incoming,
-                    msg_width,
-                    &current_coords_text,
-                    &current_coords_text,
-                    anim_coords_w,
-                    app.viewport.zoom,
-                    tool_slide_out,
-                    tool_slide_in,
-                    msg_slide_out,
-                    msg_slide_in,
-                    0.0,
-                    0.0,
-                    alpha,
+            ui.horizontal(|ui| {
+                let right_w = 200.0;
+                let left_w = ui.available_width() - right_w;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(left_w, ui.available_height()),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let current_coords_text = status_coords_text(app.cursor_doc);
+                        let anim_coords_w = app.ui_anim.coords_seg_width();
+                        theme::paint_powerline_status(
+                            ui,
+                            &app.ui_anim.status_tool_outgoing,
+                            &app.ui_anim.status_tool_incoming,
+                            tool_width,
+                            &app.ui_anim.status_msg_outgoing,
+                            &app.ui_anim.status_msg_incoming,
+                            msg_width,
+                            &current_coords_text,
+                            &current_coords_text,
+                            anim_coords_w,
+                            app.viewport.zoom,
+                            tool_slide_out,
+                            tool_slide_in,
+                            msg_slide_out,
+                            msg_slide_in,
+                            0.0,
+                            0.0,
+                            alpha,
+                        );
+                    }
                 );
+                
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    // timeline toggle
+                    let timeline_btn_icon = if app.anim_show_timeline_window { "" } else { "" };
+                    let timeline_btn_tooltip = if app.anim_show_timeline_window { "Hide timeline" } else { "Show timeline" };
+                    let btn_timeline = ui.button(RichText::new(timeline_btn_icon).font(nerd_font_id(12.0)));
+                    if btn_timeline.clicked() {
+                        app.anim_show_timeline_window = !app.anim_show_timeline_window;
+                    }
+                    btn_timeline.on_hover_text(timeline_btn_tooltip);
+
+                    ui.add_space(4.0);
+
+                    // playback controls
+                    let play_icon = if app.anim_is_playing { "" } else { "" };
+                    let play_tooltip = if app.anim_is_playing { "Pause" } else { "Play" };
+                    
+                    let btn_rewind = ui.button(RichText::new("").font(nerd_font_id(12.0)));
+                    if btn_rewind.clicked() {
+                        app.anim_current_frame = 0;
+                        app.anim_is_playing = false;
+                    }
+                    btn_rewind.on_hover_text("Back to start");
+
+                    let btn_prev = ui.button(RichText::new("").font(nerd_font_id(12.0)));
+                    if btn_prev.clicked() {
+                        app.anim_current_frame = if app.anim_current_frame == 0 { 100 } else { app.anim_current_frame - 1 };
+                    }
+                    btn_prev.on_hover_text("Backward (1 frame)");
+
+                    let btn_play = ui.button(RichText::new(play_icon).font(nerd_font_id(12.0)));
+                    if btn_play.clicked() {
+                        app.anim_is_playing = !app.anim_is_playing;
+                    }
+                    btn_play.on_hover_text(play_tooltip);
+
+                    let btn_next = ui.button(RichText::new("").font(nerd_font_id(12.0)));
+                    if btn_next.clicked() {
+                        app.anim_current_frame = (app.anim_current_frame + 1) % 101;
+                    }
+                    btn_next.on_hover_text("Forward (1 frame)");
+
+                    ui.add_space(4.0);
+
+                    // record toggle
+                    let rec_color = if app.anim_keyframing_mode { colors::POWERLINE_C } else { colors::TEXT_MUTED };
+                    let btn_rec = ui.button(
+                        RichText::new("󰜎")
+                            .font(nerd_font_id(12.0))
+                            .color(rec_color)
+                    );
+                    if btn_rec.clicked() {
+                        app.toggle_keyframing_mode();
+                    }
+                    btn_rec.on_hover_text(if app.anim_keyframing_mode { "Stop keyframing" } else { "Start keyframing (Record)" });
+                });
             });
         });
 }
@@ -1844,6 +1910,22 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             ui.add(egui::Slider::new(&mut app.tools.brush.size, 1.0..=100.0).text("Size"));
             ui.add(egui::Slider::new(&mut app.tools.brush.smoothness, 0.0..=1.0).text("Smoothness"));
             ui.add(egui::Slider::new(&mut app.tools.brush.heavy, 0.0..=1.0).text("Heavybrush"));
+
+            if app.tools.brush.brush_type == crate::tools::BrushType::Pen {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(RichText::new("Pen Tip 3D Preview").strong());
+                ui.add_space(4.0);
+                
+                let is_drawing = !app.tools.brush.points.is_empty();
+                let active_width = if is_drawing {
+                    app.tools.brush.points.last().map(|&(_, _, w)| w).unwrap_or(app.tools.brush.size)
+                } else {
+                    app.tools.brush.size
+                };
+                draw_3d_pen_tip(ui, active_width, is_drawing);
+            }
         });
         return;
     }
@@ -2630,4 +2712,264 @@ fn decimal_drag<'a, Num: egui::emath::Numeric>(value: &'a mut Num) -> egui::Drag
         let normalized = text.trim().replace(',', ".");
         normalized.parse::<f64>().ok()
     })
+}
+
+fn draw_3d_pen_tip(ui: &mut egui::Ui, active_width: f32, is_drawing: bool) {
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 130.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    // Background card styling
+    painter.rect(
+        rect,
+        egui::CornerRadius::same(6),
+        colors::BG_PANEL,
+        egui::Stroke::new(1.0, colors::BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let cx = rect.center().x;
+    let paper_y = rect.top() + 90.0;
+    
+    // Lively pressure parameter
+    let pressure = if is_drawing {
+        (active_width / 100.0).clamp(0.05, 1.0)
+    } else {
+        0.15
+    };
+
+    // Calculate tip position and footprint size
+    let base_y = rect.top() + 15.0;
+    let tip_y = paper_y - 12.0 + (pressure * 16.0); // Tip sinks down with pressure
+    
+    // Draw background grid lines on the "paper" (vanishing point perspective)
+    let paper_color = colors::BORDER.gamma_multiply(0.3);
+    for offset in [-60.0, -30.0, 0.0, 30.0, 60.0] {
+        let vp_y = rect.top() + 35.0;
+        let x0 = cx + offset * 0.2;
+        let x1 = cx + offset * 1.5;
+        painter.line_segment(
+            [egui::pos2(x0, vp_y + 10.0), egui::pos2(x1, rect.bottom() - 5.0)],
+            egui::Stroke::new(1.0, paper_color),
+        );
+    }
+    // Horizontal perspective lines
+    for py in [90.0, 100.0, 110.0, 120.0] {
+        let y_coord = rect.top() + py;
+        let width_factor = (py - 35.0) / 55.0;
+        let x_span = 80.0 * width_factor;
+        painter.line_segment(
+            [egui::pos2(cx - x_span, y_coord), egui::pos2(cx + x_span, y_coord)],
+            egui::Stroke::new(1.0, paper_color),
+        );
+    }
+
+    // Draw the pen tip cone
+    let pen_color = colors::ACCENT;
+    let pen_shaft_w = 14.0;
+    let pen_tip_w = 3.0 + pressure * 6.0;
+
+    // Draw pen shaft
+    let points = vec![
+        egui::pos2(cx - pen_shaft_w, base_y),
+        egui::pos2(cx + pen_shaft_w, base_y),
+        egui::pos2(cx + pen_tip_w, tip_y),
+        egui::pos2(cx - pen_tip_w, tip_y),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        colors::BG_ELEVATED,
+        egui::Stroke::new(1.5, colors::BORDER),
+    ));
+
+    // Highlight on pen shaft for 3D look
+    painter.line_segment(
+        [egui::pos2(cx - pen_shaft_w * 0.3, base_y), egui::pos2(cx - pen_tip_w * 0.3, tip_y)],
+        egui::Stroke::new(2.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
+    );
+
+    // Draw the dome tip
+    let tip_radius = 2.0 + pressure * 5.0;
+    painter.circle(
+        egui::pos2(cx, tip_y),
+        tip_radius,
+        pen_color,
+        egui::Stroke::new(1.0, colors::BORDER),
+    );
+
+    // Translucent depth illusion: overlay a semi-transparent paper layer below paper_y
+    let paper_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 1.0, paper_y),
+        egui::pos2(rect.right() - 1.0, rect.bottom() - 1.0),
+    );
+    painter.rect_filled(
+        paper_rect,
+        egui::CornerRadius::ZERO,
+        colors::BG_PANEL.gamma_multiply(0.85),
+    );
+
+    // Draw the paper horizon line
+    painter.line_segment(
+        [egui::pos2(rect.left() + 5.0, paper_y), egui::pos2(rect.right() - 5.0, paper_y)],
+        egui::Stroke::new(1.5, colors::BORDER),
+    );
+
+    // Draw footprint/shadow ellipse on the paper (at paper_y)
+    let footprint_rx = 2.0 + pressure * 14.0;
+    let footprint_ry = 1.0 + pressure * 7.0;
+    painter.add(egui::Shape::ellipse_filled(
+        egui::pos2(cx, paper_y),
+        egui::vec2(footprint_rx, footprint_ry),
+        colors::ACCENT.gamma_multiply(0.5),
+    ));
+    painter.add(egui::Shape::ellipse_stroke(
+        egui::pos2(cx, paper_y),
+        egui::vec2(footprint_rx, footprint_ry),
+        egui::Stroke::new(1.5, colors::ACCENT),
+    ));
+}
+
+fn draw_timeline_track(
+    ui: &mut egui::Ui,
+    label: &str,
+    track: &crate::app::KeyframeTrack,
+    current_frame: &mut usize,
+) {
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.allocate_ui(egui::vec2(50.0, 32.0), |ui| {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new(label).strong().color(colors::TEXT_MUTED));
+            });
+        });
+        
+        let track_width = ui.available_width() - 8.0;
+        let track_height = 32.0;
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(track_width, track_height),
+            egui::Sense::click_and_drag()
+        );
+        
+        let painter = ui.painter_at(rect);
+        
+        painter.rect_filled(
+            rect,
+            egui::CornerRadius::same(4),
+            colors::BG_DEEP,
+        );
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(1.0, colors::BORDER),
+            egui::StrokeKind::Inside,
+        );
+        
+        let n_frames = 100.0;
+        for f in (0..=100).step_by(10) {
+            let frac = f as f32 / n_frames as f32;
+            let x = rect.left() + frac * rect.width();
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(1.0, colors::BORDER.gamma_multiply(0.3)),
+            );
+        }
+        
+        for kf in &track.keyframes {
+            if kf.frame <= 100 {
+                let frac = kf.frame as f32 / n_frames as f32;
+                let kf_x = rect.left() + frac * rect.width();
+                let kf_y = rect.center().y;
+                painter.circle(
+                    egui::pos2(kf_x, kf_y),
+                    4.0,
+                    colors::POWERLINE_C,
+                    egui::Stroke::new(1.0, colors::BG_PANEL),
+                );
+            }
+        }
+        
+        let active_frac = *current_frame as f32 / n_frames as f32;
+        let playhead_x = rect.left() + active_frac * rect.width();
+        painter.line_segment(
+            [egui::pos2(playhead_x, rect.top()), egui::pos2(playhead_x, rect.bottom())],
+            egui::Stroke::new(1.5, colors::ACCENT),
+        );
+        
+        if response.clicked() || response.dragged() {
+            if let Some(mouse_pos) = response.interact_pointer_pos() {
+                let relative_x = mouse_pos.x - rect.left();
+                let raw_frame = (relative_x / rect.width() * n_frames).round();
+                *current_frame = raw_frame.clamp(0.0, n_frames) as usize;
+            }
+        }
+    });
+}
+
+fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new("ANIMATION TIMELINE").strong().color(colors::ACCENT));
+            
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if app.anim_keyframing_mode {
+                    let time = ui.input(|i| i.time);
+                    let rec_color = if (time * 2.0).sin() > 0.0 {
+                        egui::Color32::from_rgb(255, 80, 80)
+                    } else {
+                        colors::TEXT_MUTED
+                    };
+                    ui.label(RichText::new("● REC").strong().color(rec_color));
+                } else {
+                    ui.label(RichText::new("Idle").color(colors::TEXT_MUTED));
+                }
+                
+                ui.label(RichText::new(format!("Frame {}/100", app.anim_current_frame)).color(colors::TEXT));
+            });
+        });
+        
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        let selected_node_id = app.selection.first().copied();
+        let empty_track = crate::app::KeyframeTrack::default();
+        
+        let (track_x, track_y) = if let Some(node_id) = selected_node_id {
+            if let Some(anim) = app.anim_timeline.nodes.get(&node_id) {
+                (&anim.pos_x, &anim.pos_y)
+            } else {
+                (&empty_track, &empty_track)
+            }
+        } else {
+            (&empty_track, &empty_track)
+        };
+
+        let mut curr_frame = app.anim_current_frame;
+        draw_timeline_track(ui, "pos_x", track_x, &mut curr_frame);
+        
+        ui.add_space(6.0);
+        
+        draw_timeline_track(ui, "pos_y", track_y, &mut curr_frame);
+
+        if curr_frame != app.anim_current_frame {
+            app.anim_current_frame = curr_frame;
+        }
+    });
+}
+
+fn floating_timeline_window(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
+    if !app.anim_show_timeline_window {
+        return;
+    }
+    let inset = theme::overlay_work_rect(work);
+    let card_w = 480.0;
+    let card_h = 120.0;
+    let gap = theme::chrome_gap();
+    let left = inset.right() - card_w - gap;
+    let top = inset.bottom() - card_h - gap - 26.0; 
+    let rect = Rect::from_min_size(egui::pos2(left, top), egui::vec2(card_w, card_h));
+
+    theme::show_action_bar_area(ctx, "floating_timeline", rect, 1.0, |ui| {
+        timeline_interior(app, ui);
+    });
 }
