@@ -94,6 +94,7 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     };
     app.ui_anim.sync(
         app.action_bar_open,
+        app.anim_show_timeline_window,
         app.tools.active,
         app.action_tab,
         &action_text,
@@ -103,6 +104,7 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         coords_width,
     );
     app.ui_anim.advance_action_bar_slide(ui.ctx());
+    app.ui_anim.advance_timeline_slide(ui.ctx());
     app.ui_anim.tick(ui.ctx());
     status_bar(app, ui);
 
@@ -2958,18 +2960,26 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 }
 
 fn floating_timeline_window(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
-    if !app.anim_show_timeline_window {
+    let open_t = app.ui_anim.timeline_t;
+    let animating = app.ui_anim.timeline_running;
+    if !app.anim_show_timeline_window && !animating && open_t <= 0.001 {
         return;
     }
-    let inset = theme::overlay_work_rect(work);
-    let card_w = 480.0;
-    let card_h = 120.0;
-    let gap = theme::chrome_gap();
-    let left = inset.right() - card_w - gap;
-    let top = inset.bottom() - card_h - gap - 26.0; 
-    let rect = Rect::from_min_size(egui::pos2(left, top), egui::vec2(card_w, card_h));
 
-    theme::show_action_bar_area(ctx, "floating_timeline", rect, 1.0, |ui| {
+    let inset = theme::overlay_work_rect(work);
+    let gap = theme::chrome_gap() as f32;
+    let card_w = inset.width() - 2.0 * gap;
+    let card_h = 120.0;
+    
+    let left = inset.left() + gap;
+    let open_top = inset.bottom() - card_h - gap - 26.0;
+    let travel = card_h + gap + 26.0;
+    let top = open_top + (1.0 - open_t) * travel;
+    
+    let rect = Rect::from_min_size(egui::pos2(left, top), egui::vec2(card_w, card_h));
+    let opacity = egui::emath::easing::cubic_out(open_t);
+
+    theme::show_action_bar_area(ctx, "floating_timeline", rect, opacity, |ui| {
         timeline_interior(app, ui);
     });
 }

@@ -54,6 +54,12 @@ pub struct UiAnimation {
     status_tool_target_in: bool,
     status_msg_target_in: bool,
     coords_target_in: bool,
+    prev_show_timeline: bool,
+    pub timeline_t: f32,
+    timeline_from: f32,
+    timeline_to: f32,
+    timeline_elapsed: f32,
+    pub timeline_running: bool,
 }
 
 impl Default for UiAnimation {
@@ -173,6 +179,12 @@ impl UiAnimation {
             status_tool_target_in: true,
             status_msg_target_in: true,
             coords_target_in: true,
+            prev_show_timeline: false,
+            timeline_t: 0.0,
+            timeline_from: 0.0,
+            timeline_to: 0.0,
+            timeline_elapsed: 0.0,
+            timeline_running: false,
         };
         anim.play_intro();
         anim
@@ -209,6 +221,47 @@ impl UiAnimation {
         if !self.engine.is_animating("on_path_container", ID) {
             self.on_path_container_from = self.on_path_container_to;
         }
+    }
+
+    fn begin_timeline_slide(&mut self, to: f32) {
+        self.timeline_from = self.timeline_t;
+        self.timeline_to = to.clamp(0.0, 1.0);
+        self.timeline_elapsed = 0.0;
+        self.timeline_running = true;
+    }
+
+    pub fn advance_timeline_slide(&mut self, ctx: &Context) {
+        if !self.timeline_running {
+            return;
+        }
+        let raw_dt = ctx.input(|i| i.unstable_dt).max(0.0);
+        let steps = ((raw_dt / ACTION_BAR_MAX_DT).ceil() as u32)
+            .clamp(1, ACTION_BAR_MAX_STEPS_PER_FRAME);
+        for _ in 0..steps {
+            self.timeline_elapsed += ACTION_BAR_MAX_DT;
+            self.apply_timeline_pose();
+            if !self.timeline_running {
+                break;
+            }
+        }
+    }
+
+    fn apply_timeline_pose(&mut self) {
+        let u = (self.timeline_elapsed / ACTION_BAR_SLIDE_SECS).min(1.0);
+        self.timeline_t =
+            self.timeline_from + (self.timeline_to - self.timeline_from) * u;
+        if u >= 1.0 {
+            self.timeline_t = self.timeline_to;
+            self.timeline_running = false;
+        }
+    }
+
+    fn settle_timeline_pose(&mut self, show_timeline: bool) {
+        if self.timeline_running {
+            return;
+        }
+        let target = if show_timeline { 1.0 } else { 0.0 };
+        self.timeline_t = target;
     }
 
     fn begin_action_bar_slide(&mut self, to: f32) {
@@ -256,6 +309,7 @@ impl UiAnimation {
     pub fn sync(
         &mut self,
         action_bar_open: bool,
+        show_timeline: bool,
         active_tool: ToolKind,
         action_tab: ActionTab,
         status_message: &str,
@@ -269,6 +323,12 @@ impl UiAnimation {
             self.prev_action_bar_open = action_bar_open;
         } else {
             self.settle_action_bar_pose(action_bar_open);
+        }
+        if show_timeline != self.prev_show_timeline {
+            self.begin_timeline_slide(if show_timeline { 1.0 } else { 0.0 });
+            self.prev_show_timeline = show_timeline;
+        } else {
+            self.settle_timeline_pose(show_timeline);
         }
         if active_tool != self.prev_tool {
             let label = active_tool.label();
@@ -394,7 +454,7 @@ impl UiAnimation {
     /// True while a visible transition still needs another frame. Avoid calling
     /// `request_repaint` when this is false so the GPU can idle.
     pub fn needs_repaint(&self) -> bool {
-        if self.action_bar_running {
+        if self.action_bar_running || self.timeline_running {
             return true;
         }
         const TRACKS: &[&str] = &[
