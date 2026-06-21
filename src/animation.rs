@@ -51,6 +51,9 @@ pub struct UiAnimation {
     prev_on_path_container: bool,
     on_path_container_from: f32,
     on_path_container_to: f32,
+    status_tool_target_in: bool,
+    status_msg_target_in: bool,
+    coords_target_in: bool,
 }
 
 impl Default for UiAnimation {
@@ -167,6 +170,9 @@ impl UiAnimation {
             prev_on_path_container: false,
             on_path_container_from: 0.0,
             on_path_container_to: 0.0,
+            status_tool_target_in: true,
+            status_msg_target_in: true,
+            coords_target_in: true,
         };
         anim.play_intro();
         anim
@@ -177,13 +183,25 @@ impl UiAnimation {
         self.engine
             .update_progress(TRES16Bits::from_millis(dt_ms));
         if !self.engine.is_animating("status_sign", ID) {
-            self.status_msg_width_settled = self.status_msg_width_in;
+            self.status_msg_width_settled = if self.status_msg_target_in {
+                self.status_msg_width_in
+            } else {
+                self.status_msg_width_out
+            };
         }
         if !self.engine.is_animating("status_tool_sign", ID) {
-            self.status_tool_width_settled = self.status_tool_width_in;
+            self.status_tool_width_settled = if self.status_tool_target_in {
+                self.status_tool_width_in
+            } else {
+                self.status_tool_width_out
+            };
         }
         if !self.engine.is_animating("coords_sign", ID) {
-            self.coords_width_settled = self.coords_width_in;
+            self.coords_width_settled = if self.coords_target_in {
+                self.coords_width_in
+            } else {
+                self.coords_width_out
+            };
         }
         if !self.engine.is_animating("coords_presence", ID) {
             self.coords_from_w = self.coords_to_w;
@@ -253,11 +271,24 @@ impl UiAnimation {
             self.settle_action_bar_pose(action_bar_open);
         }
         if active_tool != self.prev_tool {
-            self.status_tool_outgoing = self.prev_tool.label().to_owned();
-            self.status_tool_incoming = active_tool.label().to_owned();
-            self.status_tool_width_out = self.status_tool_width_settled;
-            self.status_tool_width_in = tool_label_width;
-            self.engine.restart_progress("status_tool_sign", ID);
+            let label = active_tool.label();
+            let is_reverse = if self.status_tool_target_in {
+                label == self.status_tool_outgoing
+            } else {
+                label == self.status_tool_incoming
+            };
+
+            if is_reverse {
+                self.engine.reverse_animate("status_tool_sign", ID);
+                self.status_tool_target_in = !self.status_tool_target_in;
+            } else {
+                self.status_tool_outgoing = self.prev_tool.label().to_owned();
+                self.status_tool_incoming = active_tool.label().to_owned();
+                self.status_tool_width_out = self.status_tool_width_settled;
+                self.status_tool_width_in = tool_label_width;
+                self.engine.restart_progress("status_tool_sign", ID);
+                self.status_tool_target_in = true;
+            }
             self.engine.restart_progress("tool_pulse", ID);
             self.prev_tool = active_tool;
         }
@@ -269,17 +300,30 @@ impl UiAnimation {
             self.status_msg_incoming = status_message.to_owned();
             self.status_msg_width_out = self.status_msg_width_settled;
             self.status_msg_width_in = status_message_width;
-            self.prev_status_message = status_message.to_owned();
             self.status_slide_distance = self.status_msg_width_out.max(status_message_width) + 40.0;
             self.engine.restart_progress("status_sign", ID);
+            self.status_msg_target_in = true;
+            self.prev_status_message = status_message.to_owned();
         }
         if coords_text != self.prev_coords_text {
-            self.coords_outgoing = self.prev_coords_text.clone();
-            self.coords_incoming = coords_text.to_owned();
-            self.coords_width_out = self.coords_width_settled;
-            self.coords_width_in = coords_width;
+            let is_reverse = if self.coords_target_in {
+                coords_text == self.coords_outgoing
+            } else {
+                coords_text == self.coords_incoming
+            };
+
+            if is_reverse {
+                self.engine.reverse_animate("coords_sign", ID);
+                self.coords_target_in = !self.coords_target_in;
+            } else {
+                self.coords_outgoing = self.prev_coords_text.clone();
+                self.coords_incoming = coords_text.to_owned();
+                self.coords_width_out = self.coords_width_settled;
+                self.coords_width_in = coords_width;
+                self.engine.restart_progress("coords_sign", ID);
+                self.coords_target_in = true;
+            }
             self.prev_coords_text = coords_text.to_owned();
-            self.engine.restart_progress("coords_sign", ID);
         }
         let has_coords = coords_width > 1.0;
         if has_coords != self.prev_has_coords {
@@ -531,6 +575,9 @@ impl UiAnimation {
         self.engine.set_progress_max("coords_presence", ID);
         self.engine.set_progress_max("on_path_offer", ID);
         self.engine.set_progress_max("on_path_container", ID);
+        self.status_tool_target_in = true;
+        self.status_msg_target_in = true;
+        self.coords_target_in = true;
     }
 }
 
@@ -571,4 +618,3 @@ impl KramaFrameExt for KramaFrame<BTclasslist, BTframelist<TRES16Bits, i16>> {
         }
     }
 }
-

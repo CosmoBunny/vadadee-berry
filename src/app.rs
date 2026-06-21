@@ -147,12 +147,18 @@ pub struct VadadeeBerryApp {
     pub gradient_editor_focus: crate::gradient_ui::GradientEditorFocus,
     /// Cached textures for Image nodes (keyed by NodeId). Reloaded from .bytes on demand.
     image_textures: std::collections::HashMap<NodeId, egui::TextureHandle>,
+    /// Cached decoded RGBA images for Eyedropper sampling to avoid massive decode frame drops.
+    image_pixel_cache: std::collections::HashMap<NodeId, egui::ColorImage>,
     gradient_flow_drag: Option<GradientFlowDrag>,
     canvas_screen_rect: Option<egui::Rect>,
     canvas_origin: Pos2,
     pending_open_svg: bool,
     pending_save_project: bool,
     pending_export_svg: bool,
+    pub eyedropper_holding: bool,
+    pub eyedropper_releasing: bool,
+    pub eyedropper_t: f32,
+    pub eyedropper_target_pos: Option<(f64, f64)>,
     /// Tracks Ctrl+V for paste fallback when egui-winit swallows the hotkey (image-only clipboard).
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
     paste_hotkey_was_down: bool,
@@ -161,8 +167,18 @@ pub struct VadadeeBerryApp {
     pub toolbar_expanded: bool,
     pub toolbar_drag_active: bool,
     pub text_editor_rect: Option<egui::Rect>,
+    text_pan_restore: Option<egui::Vec2>,
+    text_pan_anim: Option<TextPanAnim>,
     pub last_android_text: String,
     pub path_overlay_rect: Option<egui::Rect>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextPanAnim {
+    from: egui::Vec2,
+    to: egui::Vec2,
+    elapsed: f32,
+    duration: f32,
 }
 
 impl VadadeeBerryApp {
@@ -248,6 +264,7 @@ impl VadadeeBerryApp {
             on_page_text_before: None,
             on_page_text_newly_created: false,
             image_textures: std::collections::HashMap::new(),
+            image_pixel_cache: std::collections::HashMap::new(),
             cursor_doc: None,
             action_bar_open: true,
             action_bar_width: 300.0,
@@ -287,12 +304,18 @@ impl VadadeeBerryApp {
             pending_open_svg: false,
             pending_save_project: false,
             pending_export_svg: false,
+            eyedropper_holding: false,
+            eyedropper_releasing: false,
+            eyedropper_t: 0.0,
+            eyedropper_target_pos: None,
             #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
             paste_hotkey_was_down: false,
             paste_progress: None,
             toolbar_expanded: false,
             toolbar_drag_active: false,
             text_editor_rect: None,
+            text_pan_restore: None,
+            text_pan_anim: None,
             last_android_text: String::new(),
             path_overlay_rect: None,
         }
@@ -376,6 +399,7 @@ impl VadadeeBerryApp {
 
     /// Drop on-page editor without pushing undo history (e.g. after undo/redo).
     fn dismiss_on_page_text_edit_without_history(&mut self) {
+        self.restore_text_focus_pan();
         self.on_page_text_edit = None;
         self.on_page_text_before = None;
         self.on_page_text_focus_pending = false;
@@ -485,7 +509,13 @@ impl VadadeeBerryApp {
                 let (scx, scy) = n.style.stroke.style.radial_center();
                 self.ui_stroke_radial_cx = scx;
                 self.ui_stroke_radial_cy = scy;
-                self.ui_stroke_width = n.style.stroke.width;
+                // Zero-stroke objects should not erase the reusable stroke width for new tools.
+                if !matches!(n.kind, NodeKind::BrushStroke { .. }) {
+                    if n.style.stroke.width > 0.01 {
+                        self.ui_stroke_width = n.style.stroke.width;
+                    }
+                    self.stroke_enabled = n.style.stroke.width > 0.01;
+                }
                 self.ui_stroke_line_join = n.style.stroke.line_join;
                 self.ui_stroke_line_cap = n.style.stroke.line_cap;
                 self.fill_enabled = n.style.fill.is_visible();
@@ -499,7 +529,6 @@ impl VadadeeBerryApp {
                     self.ui_text_bold = style.bold;
                     self.ui_text_italic = style.italic;
                 }
-                self.stroke_enabled = n.style.stroke.width > 0.01;
             }
         }
         self.sync_on_path_ui_from_selection();
@@ -686,16 +715,16 @@ impl VadadeeBerryApp {
 
     pub fn build_brush_fill(&self) -> Fill {
         Fill::build(
-            self.ui_stroke_kind,
+            self.tools.brush.fill_kind,
             true,
-            &self.ui_stroke_stops,
-            self.ui_stroke_angle,
-            self.ui_stroke_line_x0,
-            self.ui_stroke_line_y0,
-            self.ui_stroke_line_x1,
-            self.ui_stroke_line_y1,
-            self.ui_stroke_radial_cx,
-            self.ui_stroke_radial_cy,
+            &self.tools.brush.fill_stops,
+            self.tools.brush.gradient_angle,
+            self.tools.brush.fill_line_x0,
+            self.tools.brush.fill_line_y0,
+            self.tools.brush.fill_line_x1,
+            self.tools.brush.fill_line_y1,
+            self.tools.brush.radial_cx,
+            self.tools.brush.radial_cy,
         )
     }
 
@@ -1060,6 +1089,100 @@ impl VadadeeBerryApp {
             return self.status_message.clone();
         }
         "Idle".into()
+    }
+
+    pub fn selection_bounds(&self) -> Option<kurbo::Rect> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        let mut union_rect: Option<kurbo::Rect> = None;
+        for id in &self.selection {
+            if let Some(node) = self.project.nodes.get(*id) {
+                let bounds = node.bounds_with_store(&self.project.nodes);
+                if let Some(ref mut u) = union_rect {
+                    *u = u.union(bounds);
+                } else {
+                    union_rect = Some(bounds);
+                }
+            }
+        }
+        union_rect
+    }
+
+    pub fn resize_to_selection(&mut self) {
+        let Some(bounds) = self.selection_bounds() else {
+            return;
+        };
+        
+        let before = snapshot_project(&self.project);
+        
+        // Translate all nodes
+        let dx = -bounds.x0;
+        let dy = -bounds.y0;
+        for node in self.project.nodes.map.values_mut() {
+            node.translate(dx, dy);
+        }
+        
+        // Resize document
+        self.project.document.width = bounds.width().round();
+        self.project.document.height = bounds.height().round();
+        
+        let after = snapshot_project(&self.project);
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::SetDocument { before, after },
+        );
+
+        // Adjust viewport pan so that coordinates visually stay in the same place
+        self.viewport.pan.x -= dx as f32 * self.viewport.zoom;
+        self.viewport.pan.y -= dy as f32 * self.viewport.zoom;
+        
+        self.status_message = format!(
+            "Resized canvas to selected bounds: {}x{}",
+            self.project.document.width, self.project.document.height
+        );
+    }
+
+    pub fn copy_selection_as_png(&mut self, dpi_scale: f32) {
+        let Some(bounds) = self.selection_bounds() else {
+            self.status_message = "Copy PNG failed: no object selected".into();
+            return;
+        };
+
+        // 1. Generate selection SVG
+        let svg_str = io::export_selected_svg_string(&self.project, &self.selection, bounds);
+        
+        // 2. Render SVG to RGBA at DPI scale
+        let Some((w, h, bytes)) = io::render_svg_to_rgba(&svg_str, dpi_scale) else {
+            self.status_message = "Copy PNG failed: rasterization error".into();
+            return;
+        };
+        
+        // 3. Set image to system clipboard
+        #[cfg(not(target_os = "android"))]
+        {
+            match arboard::Clipboard::new() {
+                Ok(mut cb) => {
+                    let img = arboard::ImageData {
+                        width: w as usize,
+                        height: h as usize,
+                        bytes: std::borrow::Cow::from(bytes),
+                    };
+                    if let Err(e) = cb.set_image(img) {
+                        self.status_message = format!("Clipboard copy failed: {e}");
+                    } else {
+                        self.status_message = format!("Copied selection as PNG ({}x{}) to clipboard", w, h);
+                    }
+                }
+                Err(e) => {
+                    self.status_message = format!("Clipboard error: {e}");
+                }
+            }
+        }
+        #[cfg(target_os = "android")]
+        {
+            self.status_message = "Clipboard image copy not supported on Android".into();
+        }
     }
 
     pub fn copy_selection(&mut self) {
@@ -1514,21 +1637,35 @@ impl VadadeeBerryApp {
 
         // egui-winit turns Ctrl+C/V/X into Event::Copy/Cut/Paste (not Event::Key), so we must
         // listen for both. Ctrl+D/Z still arrive as Key events, which is why those worked.
-        let (want_copy, want_cut, want_paste) = ctx.input(|i| {
+        let (want_copy, want_copy_png, want_cut, want_paste) = ctx.input(|i| {
             let has_cmd = i.modifiers.command || i.modifiers.ctrl;
+            let has_shift = i.modifiers.shift;
             let mut copy = false;
+            let mut copy_png = false;
             let mut cut = false;
             let mut paste = false;
             for event in &i.events {
                 match event {
-                    Event::Copy => copy = true,
+                    Event::Copy => {
+                        if has_shift {
+                            copy_png = true;
+                        } else {
+                            copy = true;
+                        }
+                    }
                     Event::Cut => cut = true,
                     Event::Paste(_) => paste = true,
                     Event::Key {
                         key: Key::C,
                         pressed: true,
                         ..
-                    } if has_cmd => copy = true,
+                    } if has_cmd => {
+                        if has_shift {
+                            copy_png = true;
+                        } else {
+                            copy = true;
+                        }
+                    }
                     Event::Key {
                         key: Key::X,
                         pressed: true,
@@ -1542,10 +1679,10 @@ impl VadadeeBerryApp {
                     _ => {}
                 }
             }
-            (copy, cut, paste)
+            (copy, copy_png, cut, paste)
         });
 
-        if !(want_copy || want_cut || want_paste) {
+        if !(want_copy || want_copy_png || want_cut || want_paste) {
             return false;
         }
 
@@ -1560,6 +1697,10 @@ impl VadadeeBerryApp {
                 let _ = i.consume_key(egui::Modifiers::COMMAND, Key::C);
                 let _ = i.consume_key(egui::Modifiers::CTRL, Key::C);
             }
+            if want_copy_png {
+                let _ = i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::C);
+                let _ = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::C);
+            }
             if want_cut {
                 let _ = i.consume_key(egui::Modifiers::COMMAND, Key::X);
                 let _ = i.consume_key(egui::Modifiers::CTRL, Key::X);
@@ -1570,6 +1711,12 @@ impl VadadeeBerryApp {
             }
         });
 
+        if want_copy_png {
+            log::info!("CLIPBOARD: detected copy PNG shortcut");
+            self.copy_selection_as_png(ctx.pixels_per_point());
+            ctx.request_repaint();
+            return false;
+        }
         if want_copy {
             log::info!("CLIPBOARD: detected copy shortcut");
             self.copy_selection();
@@ -1634,6 +1781,11 @@ impl VadadeeBerryApp {
         ctx.input_mut(|i| {
             let cmd = i.modifiers.command || i.modifiers.ctrl;
             if cmd {
+                if i.modifiers.shift && i.key_pressed(Key::R) && !text_focused {
+                    let _ = i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::R);
+                    let _ = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::R);
+                    self.resize_to_selection();
+                }
                 if i.modifiers.shift && i.key_pressed(Key::Z) && !text_focused {
                     let _ = i.consume_key(egui::Modifiers::COMMAND, Key::Z);
                     let _ = i.consume_key(egui::Modifiers::CTRL, Key::Z);
@@ -1737,6 +1889,9 @@ impl VadadeeBerryApp {
         self.tools.select.node_drag_active = false;
         self.tools.select.drag_mode = None;
         if self.tools.active != ToolKind::Select {
+            if self.tools.active != ToolKind::Eyedropper {
+                self.tools.last_active_tool = self.tools.active;
+            }
             self.tools.active = ToolKind::Select;
             self.status_message = if was_pen {
                 "Pen cancelled".into()
@@ -1788,7 +1943,7 @@ impl VadadeeBerryApp {
 
     /// Load (or reload) texture for an Image node from its embedded bytes.
     fn ensure_image_texture(&mut self, id: NodeId, bytes: &[u8], ctx: &Context) {
-        if self.image_textures.contains_key(&id) {
+        if self.image_textures.contains_key(&id) && self.image_pixel_cache.contains_key(&id) {
             return;
         }
         if let Ok(dyn_img) = image::load_from_memory(bytes) {
@@ -1798,10 +1953,11 @@ impl VadadeeBerryApp {
             let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
             let handle = ctx.load_texture(
                 format!("vadadee-berry-img-{}", id),
-                color_image,
+                color_image.clone(),
                 egui::TextureOptions::default(),
             );
             self.image_textures.insert(id, handle);
+            self.image_pixel_cache.insert(id, color_image);
         }
     }
 
@@ -2218,6 +2374,10 @@ impl VadadeeBerryApp {
                     origin,
                     &self.tools.brush.points,
                     stroke_color,
+                    self.tools.brush.smoothness,
+                    self.tools.brush.heavy,
+                    self.cursor_doc,
+                    self.tools.brush.brush_type,
                 );
             }
         }
@@ -2290,6 +2450,50 @@ impl VadadeeBerryApp {
     }
 
     fn handle_canvas_input(&mut self, response: &egui::Response, origin: Pos2) {
+        if self.tools.active == ToolKind::Eyedropper || self.eyedropper_holding || self.eyedropper_releasing {
+            let hover_pos = response.ctx.input(|i| i.pointer.hover_pos());
+            let primary_pressed = response.ctx.input(|i| {
+                i.pointer.button_pressed(egui::PointerButton::Primary)
+            }) && response.contains_pointer();
+            let primary_down = response.is_pointer_button_down_on() || response.ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            let primary_released_anywhere = response.ctx.input(|i| {
+                i.pointer.button_released(egui::PointerButton::Primary)
+            });
+
+            let doc_pos = if let Some(hpos) = hover_pos {
+                let mut d = self.viewport.screen_to_doc(hpos, origin);
+                d = self.viewport.snap(d);
+                Some(d)
+            } else {
+                self.eyedropper_target_pos
+            };
+
+            let dpos = doc_pos.unwrap_or((0.0, 0.0));
+            self.tool_eyedropper_holding(
+                &response.ctx,
+                dpos,
+                primary_pressed,
+                primary_down,
+                primary_released_anywhere,
+            );
+
+            if self.eyedropper_holding || self.eyedropper_releasing {
+                if let Some(target) = self.eyedropper_target_pos {
+                    let painter = response.ctx.layer_painter(response.layer_id);
+                    let hovered_color = self.color_at_doc_pos(target);
+                    render::draw_eyedropper_magnifier(
+                        &painter,
+                        &self.viewport,
+                        origin,
+                        target,
+                        self.eyedropper_t,
+                        hovered_color,
+                    );
+                }
+            }
+            return;
+        }
+
         if response.ctx.input(|i| i.multi_touch().is_some()) {
             self.tools.brush.points.clear();
             return;
@@ -2400,19 +2604,24 @@ impl VadadeeBerryApp {
             ToolKind::Text => self.tool_text(doc, primary_pressed),
             ToolKind::Brush => {
                 let time = response.ctx.input(|i| i.time);
+                let pressure = response.ctx.input(|i| {
+                    for event in &i.events {
+                        if let egui::Event::Touch { force, .. } = event {
+                            return *force;
+                        }
+                    }
+                    None
+                });
                 self.tool_brush(
                     doc,
                     time,
                     primary_pressed,
                     primary_down,
                     primary_released_anywhere,
+                    pressure,
                 );
             }
-            ToolKind::Eyedropper => {
-                if primary_pressed {
-                    self.tool_eyedropper(doc);
-                }
-            }
+
             ToolKind::Node => self.tool_node(
                 pos,
                 origin,
@@ -2425,6 +2634,7 @@ impl VadadeeBerryApp {
                 primary_released_anywhere,
                 double_clicked,
             ),
+            ToolKind::Eyedropper => {}
         }
 
         if primary_released_anywhere
@@ -3277,6 +3487,83 @@ impl VadadeeBerryApp {
         self.on_page_text_focus_pending = true;
         self.selection = vec![id];
         self.sync_inspector_from_selection();
+        self.begin_text_focus_pan(id);
+    }
+
+    fn ease_text_pan(t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        1.0 - (1.0 - t).powi(3)
+    }
+
+    fn start_text_pan_anim(&mut self, to: egui::Vec2, duration: f32) {
+        let from = self.viewport.pan;
+        if (from - to).length_sq() < 0.5 {
+            return;
+        }
+        self.text_pan_anim = Some(TextPanAnim {
+            from,
+            to,
+            elapsed: 0.0,
+            duration,
+        });
+    }
+
+    fn begin_text_focus_pan(&mut self, id: NodeId) {
+        let Some(canvas) = self.canvas_screen_rect else {
+            return;
+        };
+        let Some(node) = self.project.nodes.get(id) else {
+            return;
+        };
+        let NodeKind::Text { x, y, style } = &node.kind else {
+            return;
+        };
+        if self.text_pan_restore.is_none() {
+            self.text_pan_restore = Some(self.viewport.pan);
+        }
+
+        let editor_w = ((crate::document::text_bounds(*x, *y, style).width() as f32)
+            * self.viewport.zoom)
+            .max(220.0);
+        let editor_h = (style.font_size * self.viewport.zoom * 5.0).max(160.0);
+        let margin = 72.0;
+        let desired = egui::pos2(
+            canvas.center().x - editor_w * 0.5,
+            canvas.center().y - editor_h * 0.45,
+        );
+        let min = canvas.min + egui::vec2(margin, margin);
+        let max = canvas.max - egui::vec2(editor_w + margin, editor_h + margin);
+        let target_screen = egui::pos2(
+            desired.x.clamp(min.x, max.x.max(min.x)),
+            desired.y.clamp(min.y, max.y.max(min.y)),
+        );
+
+        let current_screen = self.viewport.doc_to_screen((*x, *y), self.canvas_origin);
+        let to = self.viewport.pan + (target_screen - current_screen);
+        self.start_text_pan_anim(to, 0.28);
+    }
+
+    fn restore_text_focus_pan(&mut self) {
+        if let Some(to) = self.text_pan_restore.take() {
+            self.start_text_pan_anim(to, 0.32);
+        }
+    }
+
+    fn update_text_pan_animation(&mut self, ctx: &Context) {
+        let Some(mut anim) = self.text_pan_anim else {
+            return;
+        };
+        let dt = ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 30.0);
+        anim.elapsed += dt;
+        let t = Self::ease_text_pan(anim.elapsed / anim.duration.max(0.001));
+        self.viewport.pan = anim.from + (anim.to - anim.from) * t;
+        if anim.elapsed >= anim.duration {
+            self.viewport.pan = anim.to;
+            self.text_pan_anim = None;
+        } else {
+            self.text_pan_anim = Some(anim);
+            ctx.request_repaint();
+        }
     }
 
     pub(crate) fn patch_on_page_text_live(&mut self, id: NodeId) {
@@ -3295,6 +3582,7 @@ impl VadadeeBerryApp {
             self.on_page_text_newly_created = false;
             return;
         };
+        self.restore_text_focus_pan();
         #[cfg(target_os = "android")]
         {
             if let Some(android_app) = crate::ANDROID_APP.get() {
@@ -3381,6 +3669,7 @@ impl VadadeeBerryApp {
 
     pub fn delete_on_page_text_node(&mut self, id: NodeId) {
         self.on_page_text_edit = None;
+        self.restore_text_focus_pan();
         #[cfg(target_os = "android")]
         {
             if let Some(android_app) = crate::ANDROID_APP.get() {
@@ -3420,6 +3709,46 @@ impl VadadeeBerryApp {
     }
 
     pub fn apply_fill_style_to_active(&mut self, fill: &crate::document::Fill) {
+        if self.tools.active == ToolKind::Brush || (self.tools.active == ToolKind::Eyedropper && self.tools.last_active_tool == ToolKind::Brush) {
+            match fill {
+                crate::document::Fill::None => {}
+                crate::document::Fill::Solid(paint) => {
+                    self.tools.brush.fill_kind = crate::document::FillKind::Solid;
+                    self.tools.brush.fill_stops = vec![
+                        crate::document::GradientStop { pos: 0.0, color: *paint },
+                        crate::document::GradientStop { pos: 1.0, color: *paint },
+                    ];
+                }
+                crate::document::Fill::LinearGradient {
+                    angle_deg,
+                    line_x0,
+                    line_y0,
+                    line_x1,
+                    line_y1,
+                    stops,
+                } => {
+                    self.tools.brush.fill_kind = crate::document::FillKind::LinearGradient;
+                    self.tools.brush.fill_stops = stops.clone();
+                    self.tools.brush.gradient_angle = *angle_deg;
+                    self.tools.brush.fill_line_x0 = *line_x0;
+                    self.tools.brush.fill_line_y0 = *line_y0;
+                    self.tools.brush.fill_line_x1 = *line_x1;
+                    self.tools.brush.fill_line_y1 = *line_y1;
+                }
+                crate::document::Fill::RadialGradient {
+                    center_x,
+                    center_y,
+                    stops,
+                } => {
+                    self.tools.brush.fill_kind = crate::document::FillKind::RadialGradient;
+                    self.tools.brush.fill_stops = stops.clone();
+                    self.tools.brush.radial_cx = *center_x;
+                    self.tools.brush.radial_cy = *center_y;
+                }
+            }
+            return;
+        }
+
         match fill {
             crate::document::Fill::None => {}
             crate::document::Fill::Solid(paint) => {
@@ -3485,6 +3814,145 @@ impl VadadeeBerryApp {
         self.apply_stroke_to_selection();
     }
 
+    /// Sample the pixel color from an Image node at a document position.
+    fn sample_image_color(&self, node: &crate::document::Node, doc: (f64, f64)) -> Option<egui::Color32> {
+        if let NodeKind::Image { x, y, width, height, .. } = node.kind {
+            if width <= 0.0 || height <= 0.0 {
+                return None;
+            }
+            if let Some(color_image) = self.image_pixel_cache.get(&node.id) {
+                let iw = color_image.size[0] as u32;
+                let ih = color_image.size[1] as u32;
+                // Map doc position into pixel coordinates
+                let px = (((doc.0 - x) / width) * iw as f64).floor() as i64;
+                let py = (((doc.1 - y) / height) * ih as f64).floor() as i64;
+                if px >= 0 && py >= 0 && (px as u32) < iw && (py as u32) < ih {
+                    let pixel = color_image.pixels[(py as usize) * (iw as usize) + (px as usize)];
+                    if pixel.a() == 0 {
+                        return None;
+                    }
+                    return Some(pixel);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn color_at_doc_pos(&self, doc: (f64, f64)) -> egui::Color32 {
+        let mut hit: Option<NodeId> = None;
+        let mut bbox_only: Option<NodeId> = None;
+        for id in self.project.document.ordered_node_ids().into_iter().rev() {
+            if let Some(node) = self.project.nodes.get(id) {
+                let does_hit = if self.node_has_tiling_or_circular(id) {
+                    let eb = crate::document::get_effective_bounds(node, &self.project.document);
+                    let pt = kurbo::Point::new(doc.0, doc.1);
+                    let slop = 4.0 / self.viewport.zoom as f64;
+                    eb.inflate(slop, slop).contains(pt)
+                } else {
+                    node.hit_test_with_store(
+                        &self.project.nodes,
+                        doc.0,
+                        doc.1,
+                        4.0 / self.viewport.zoom as f64,
+                    )
+                };
+                if does_hit {
+                    let pt = kurbo::Point::new(doc.0, doc.1);
+                    let precise = if self.node_has_tiling_or_circular(id) {
+                        true
+                    } else {
+                        node.bez_path().contains(pt)
+                            || matches!(node.kind, NodeKind::Text { .. })
+                            || matches!(node.kind, NodeKind::Image { .. })
+                    };
+                    if precise {
+                        hit = Some(id);
+                        break;
+                    } else if bbox_only.is_none() && !matches!(node.kind, NodeKind::Image { .. }) {
+                        bbox_only = Some(id);
+                    }
+                }
+            }
+        }
+        if hit.is_none() {
+            hit = bbox_only;
+        }
+        if let Some(id) = hit {
+            if let Some(node) = self.project.nodes.get(id) {
+                // For Image nodes, sample the actual pixel color
+                if matches!(node.kind, NodeKind::Image { .. }) {
+                    if let Some(color) = self.sample_image_color(node, doc) {
+                        return color;
+                    }
+                    return egui::Color32::WHITE;
+                }
+                let fill_to_copy = match &node.style.fill {
+                    crate::document::Fill::None => {
+                        match &node.style.stroke.style {
+                            crate::document::Fill::None => None,
+                            other => Some(other),
+                        }
+                    }
+                    other => Some(other),
+                };
+                if let Some(fill) = fill_to_copy {
+                    return match fill {
+                        crate::document::Fill::Solid(color) => color.to_egui(),
+                        crate::document::Fill::LinearGradient { stops, .. }
+                        | crate::document::Fill::RadialGradient { stops, .. } => {
+                            stops.first().map(|s| s.color.to_egui()).unwrap_or(egui::Color32::WHITE)
+                        }
+                        crate::document::Fill::None => egui::Color32::WHITE,
+                    };
+                }
+            }
+        }
+        egui::Color32::WHITE
+    }
+
+    pub fn tool_eyedropper_holding(
+        &mut self,
+        ctx: &egui::Context,
+        doc: (f64, f64),
+        pressed: bool,
+        down: bool,
+        released: bool,
+    ) {
+        let dt = ctx.input(|i| i.stable_dt).min(0.1);
+
+        if pressed {
+            self.eyedropper_holding = true;
+            self.eyedropper_releasing = false;
+            self.eyedropper_t = 0.0;
+            self.eyedropper_target_pos = Some(doc);
+        }
+
+        let is_released = released || (!down && self.eyedropper_holding);
+        if is_released && self.eyedropper_holding {
+            self.eyedropper_holding = false;
+            self.eyedropper_releasing = true;
+        }
+
+        if self.eyedropper_holding {
+            self.eyedropper_target_pos = Some(doc);
+            if self.eyedropper_t < 1.0 {
+                self.eyedropper_t = (self.eyedropper_t + dt / 0.25).min(1.0);
+            }
+            ctx.request_repaint();
+        } else if self.eyedropper_releasing {
+            self.eyedropper_t = (self.eyedropper_t - dt / 0.20).max(0.0);
+            ctx.request_repaint();
+            if self.eyedropper_t <= 0.0 {
+                self.eyedropper_releasing = false;
+                if let Some(target) = self.eyedropper_target_pos {
+                    self.tool_eyedropper(target);
+                } else {
+                    self.tools.active = ToolKind::Select;
+                }
+            }
+        }
+    }
+
     pub fn tool_eyedropper(&mut self, doc: (f64, f64)) {
         let mut hit: Option<NodeId> = None;
         let mut bbox_only: Option<NodeId> = None;
@@ -3510,11 +3978,12 @@ impl VadadeeBerryApp {
                     } else {
                         node.bez_path().contains(pt)
                             || matches!(node.kind, NodeKind::Text { .. })
+                            || matches!(node.kind, NodeKind::Image { .. })
                     };
                     if precise {
                         hit = Some(id);
                         break;
-                    } else if bbox_only.is_none() {
+                    } else if bbox_only.is_none() && !matches!(node.kind, NodeKind::Image { .. }) {
                         bbox_only = Some(id);
                     }
                 }
@@ -3529,17 +3998,32 @@ impl VadadeeBerryApp {
         if let Some(id) = hit {
             if let Some(node) = self.project.nodes.get(id) {
                 node_name = node.name.clone();
-                let fill_to_copy = match &node.style.fill {
-                    crate::document::Fill::None => {
-                        match &node.style.stroke.style {
-                            crate::document::Fill::None => None,
-                            other => Some(other),
-                        }
+                // For Image nodes, sample pixel color directly
+                if matches!(node.kind, NodeKind::Image { .. }) {
+                    if let Some(color) = self.sample_image_color(node, doc) {
+                        let paint = crate::document::Paint {
+                            rgba: [
+                                color.r() as f32 / 255.0,
+                                color.g() as f32 / 255.0,
+                                color.b() as f32 / 255.0,
+                                color.a() as f32 / 255.0,
+                            ],
+                        };
+                        picked_fill = Some(crate::document::Fill::Solid(paint));
                     }
-                    other => Some(other),
-                };
-                if let Some(fill) = fill_to_copy {
-                    picked_fill = Some(fill.clone());
+                } else {
+                    let fill_to_copy = match &node.style.fill {
+                        crate::document::Fill::None => {
+                            match &node.style.stroke.style {
+                                crate::document::Fill::None => None,
+                                other => Some(other),
+                            }
+                        }
+                        other => Some(other),
+                    };
+                    if let Some(fill) = fill_to_copy {
+                        picked_fill = Some(fill.clone());
+                    }
                 }
             }
         }
@@ -3548,7 +4032,7 @@ impl VadadeeBerryApp {
             self.apply_fill_style_to_active(&fill);
             self.status_message = format!("Picked color from '{}'", node_name);
         }
-        self.tools.active = ToolKind::Select;
+        self.tools.active = self.tools.last_active_tool;
     }
 
     pub fn set_text_style(&mut self, id: NodeId, style: TextStyle, x: f64, y: f64) {
@@ -3662,7 +4146,7 @@ impl VadadeeBerryApp {
             }
         }
 
-        if pressed && !double_clicked {
+        if pressed {
             // Resize handles take priority over move (must run on pointer-down, not click-up).
             if self.selection.len() == 1 {
                 if let Some(id) = self.selection.first().copied() {
@@ -4445,26 +4929,79 @@ impl VadadeeBerryApp {
         pressed: bool,
         down: bool,
         released: bool,
+        pressure: Option<f32>,
     ) {
         if pressed {
             self.tools.brush.points.clear();
-            self.tools.brush.points.push(([doc.0, doc.1], time, 0.0));
+            let size = self.tools.brush.size;
+            let initial_w = if self.tools.brush.brush_type == crate::tools::BrushType::Pen {
+                let v = if let Some(p) = pressure { p as f64 } else { 1.0 };
+                let max_r = size as f64 / 2.0;
+                let y = (1.0 - v) * max_r;
+                let r = (max_r * max_r - y * y).max(0.0).sqrt();
+                (r * 2.0).max(1.0) as f32
+            } else {
+                size
+            };
+            self.tools.brush.points.push(([doc.0, doc.1], time, initial_w));
         } else if down {
             if let Some(&(prev_pos, prev_time, prev_w)) = self.tools.brush.points.last() {
-                let dist = ((doc.0 - prev_pos[0]).powi(2) + (doc.1 - prev_pos[1]).powi(2)).sqrt();
-                if dist > 1.0 {
+                let size = self.tools.brush.size;
+                let heavy = self.tools.brush.heavy;
+                let smoothness = self.tools.brush.smoothness;
+
+                let r = (heavy * 60.0) as f64;
+                let raw_dist = ((doc.0 - prev_pos[0]).powi(2) + (doc.1 - prev_pos[1]).powi(2)).sqrt();
+                if raw_dist > r + 1.0 {
+                    let stabilized_pos = if r > 0.0001 {
+                        let pull_ratio = r / raw_dist;
+                        [
+                            doc.0 - (doc.0 - prev_pos[0]) * pull_ratio,
+                            doc.1 - (doc.1 - prev_pos[1]) * pull_ratio,
+                        ]
+                    } else {
+                        [doc.0, doc.1]
+                    };
+
+                    let dist = ((stabilized_pos[0] - prev_pos[0]).powi(2) + (stabilized_pos[1] - prev_pos[1]).powi(2)).sqrt();
                     let dt = time - prev_time;
                     let speed = if dt > 0.0001 { dist / dt } else { 0.0 };
-                    let target_w = {
-                        let min_w = (self.ui_stroke_width * 0.3).max(1.0);
-                        let max_w = (self.ui_stroke_width * 2.0).max(4.0);
+
+                    let target_w = if self.tools.brush.brush_type == crate::tools::BrushType::Pen {
+                        let max_r = size as f64 / 2.0;
+                        let v = if let Some(p) = pressure {
+                            p as f64
+                        } else {
+                            let speed_factor = (speed / 1200.0).clamp(0.0, 1.0);
+                            1.0 - speed_factor
+                        };
+                        let v = v.clamp(0.0, 1.0);
+                        let y = (1.0 - v) * max_r;
+                        let r = (max_r * max_r - y * y).max(0.0).sqrt();
+                        (r * 2.0).max(1.0) as f32
+                    } else {
+                        let base_min = (size * 0.3).max(1.0);
+                        let base_max = (size * 2.0).max(4.0);
+                        let min_w = base_min + (base_max - base_min) * heavy;
+                        let max_w = base_max;
                         let factor = (speed / 1200.0).min(1.0) as f32;
                         max_w - (max_w - min_w) * factor
                     };
-                    let alpha = 0.15;
+
+                    let pos_smooth = smoothness.min(0.9) as f64;
+                    let smoothed_pos = [
+                        prev_pos[0] * pos_smooth + stabilized_pos[0] * (1.0 - pos_smooth),
+                        prev_pos[1] * pos_smooth + stabilized_pos[1] * (1.0 - pos_smooth),
+                    ];
+
                     let prev_effective_w = if prev_w < 0.01 { target_w } else { prev_w };
-                    let new_w = prev_effective_w * (1.0 - alpha) + target_w * alpha;
-                    self.tools.brush.points.push(([doc.0, doc.1], time, new_w));
+                    let max_change = (dist * 0.3).max(0.5);
+                    let delta = target_w - prev_effective_w;
+                    let target_w_limited = prev_effective_w + delta.clamp(-max_change as f32, max_change as f32);
+
+                    let alpha_w = (0.3 - 0.28 * smoothness).clamp(0.01, 1.0);
+                    let new_w = prev_effective_w * (1.0 - alpha_w) + target_w_limited * alpha_w;
+                    self.tools.brush.points.push((smoothed_pos, time, new_w));
                 }
             }
         }
@@ -4472,11 +5009,23 @@ impl VadadeeBerryApp {
         if released {
             let mut pts = self.tools.brush.points.clone();
             if pts.len() >= 2 {
-                if let Some(&(last_pos, last_time, _)) = pts.last() {
-                    pts.push((last_pos, last_time, 0.0));
+                if let Some(last) = pts.last_mut() {
+                    last.2 = 0.0;
                 }
-                let bez = generate_brush_outline(&pts);
-                let mut node = Node::path_from_bez(bez, "Brush");
+                
+                let mut node = if self.tools.brush.brush_type == crate::tools::BrushType::Pen {
+                    Node::new(NodeKind::BrushStroke {
+                        points: pts.iter().map(|(p, _, w)| (*p, *w)).collect(),
+                    }, "Pen Stroke")
+                } else {
+                    let bez = generate_brush_outline(
+                        &pts,
+                        self.tools.brush.smoothness,
+                        self.tools.brush.brush_type,
+                    );
+                    Node::path_from_bez(bez, "Brush")
+                };
+
                 node.style.fill = self.build_brush_fill();
                 node.style.stroke = Stroke {
                     style: Fill::none(),
@@ -4830,6 +5379,7 @@ impl eframe::App for VadadeeBerryApp {
         if self.ui_anim.needs_repaint() || self.paste_progress.is_some() {
             ctx.request_repaint();
         }
+        self.update_text_pan_animation(ctx);
         self.keyboard_shortcuts(ctx);
         self.canvas_wheel_zoom(ctx);
     }
@@ -4839,7 +5389,11 @@ impl eframe::App for VadadeeBerryApp {
     }
 }
 
-fn generate_brush_outline(points: &[([f64; 2], f64, f32)]) -> kurbo::BezPath {
+fn generate_brush_outline(
+    points: &[([f64; 2], f64, f32)],
+    smoothness: f32,
+    brush_type: crate::tools::BrushType,
+) -> kurbo::BezPath {
     let mut path = kurbo::BezPath::new();
     if points.len() < 2 {
         return path;
@@ -4903,13 +5457,44 @@ fn generate_brush_outline(points: &[([f64; 2], f64, f32)]) -> kurbo::BezPath {
         right_pts.push([pos[0] - normal[0] * half_w, pos[1] - normal[1] * half_w]);
     }
 
-    path.move_to(kurbo::Point::new(left_pts[0][0], left_pts[0][1]));
-    for pt in left_pts.iter().skip(1) {
-        path.line_to(kurbo::Point::new(pt[0], pt[1]));
+    let mut right_pts_rev = right_pts.clone();
+    right_pts_rev.reverse();
+
+    crate::render::append_smoothed_points(&mut path, &left_pts, smoothness, true);
+
+    if brush_type == crate::tools::BrushType::Pen && n > 0 {
+        let end_idx = n - 1;
+        let c = points[end_idx].0;
+        let r = (points[end_idx].2 as f64) / 2.0;
+        if r > 0.1 {
+            let dx = left_pts[end_idx][0] - c[0];
+            let dy = left_pts[end_idx][1] - c[1];
+            let start_angle = dy.atan2(dx);
+            let sweep = std::f64::consts::PI;
+            let arc = kurbo::Arc::new((c[0], c[1]), (r, r), start_angle, sweep, 0.0);
+            for el in arc.to_path(0.1).elements().iter().skip(1) {
+                path.push(*el);
+            }
+        }
     }
-    for pt in right_pts.iter().rev() {
-        path.line_to(kurbo::Point::new(pt[0], pt[1]));
+
+    crate::render::append_smoothed_points(&mut path, &right_pts_rev, smoothness, false);
+
+    if brush_type == crate::tools::BrushType::Pen && n > 0 {
+        let c = points[0].0;
+        let r = (points[0].2 as f64) / 2.0;
+        if r > 0.1 {
+            let dx = right_pts[0][0] - c[0];
+            let dy = right_pts[0][1] - c[1];
+            let start_angle = dy.atan2(dx);
+            let sweep = std::f64::consts::PI;
+            let arc = kurbo::Arc::new((c[0], c[1]), (r, r), start_angle, sweep, 0.0);
+            for el in arc.to_path(0.1).elements().iter().skip(1) {
+                path.push(*el);
+            }
+        }
     }
+
     path.close_path();
     path
 }

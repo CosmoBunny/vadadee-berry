@@ -1521,28 +1521,18 @@ pub fn draw_node(
             }
 
             if closed && has_fill {
-                match fill {
-                    Fill::Solid(p) => {
-                        let c = paint_to_color(*p, opacity);
-                        for s in bez_to_fill_shapes(&bez, viewport, origin, c, true) {
-                            painter.add(s);
-                        }
-                    }
-                    _ => {
-                        let bounds = node.bounds();
-                        let doc_bounds = (bounds.x0, bounds.y0, bounds.x1, bounds.y1);
-                        let mesh = clipped_gradient_mesh_from_bez(
-                            &bez,
-                            viewport,
-                            origin,
-                            doc_bounds,
-                            fill,
-                            opacity,
-                        );
-                        if !mesh.vertices.is_empty() {
-                            painter.add(Shape::mesh(mesh));
-                        }
-                    }
+                let bounds = node.bounds();
+                let doc_bounds = (bounds.x0, bounds.y0, bounds.x1, bounds.y1);
+                let mesh = clipped_gradient_mesh_from_bez(
+                    &bez,
+                    viewport,
+                    origin,
+                    doc_bounds,
+                    fill,
+                    opacity,
+                );
+                if !mesh.vertices.is_empty() {
+                    painter.add(Shape::mesh(mesh));
                 }
             }
 
@@ -1653,6 +1643,55 @@ pub fn draw_node(
             }
         }
         NodeKind::Group { .. } => {}
+        NodeKind::BrushStroke { points } => {
+            let color = match fill {
+                Fill::Solid(p) => paint_to_color(*p, opacity),
+                _ => paint_to_color(Paint::from_hex(0x000000, 1.0), opacity),
+            };
+
+            let mut prev_pt: Option<([f64; 2], f32)> = None;
+            for &(pos, width) in points {
+                if let Some((prev_pos, prev_width)) = prev_pt {
+                    let dx = pos[0] - prev_pos[0];
+                    let dy = pos[1] - prev_pos[1];
+                    let dist = dx.hypot(dy);
+                    let step = (1.0 / (viewport.zoom as f64)).max(0.5).min(width as f64 / 8.0).max(0.1);
+                    if dist > step {
+                        let steps = (dist / step).ceil() as usize;
+                        for s in 1..steps {
+                            let t = s as f64 / steps as f64;
+                            let ix = prev_pos[0] + dx * t;
+                            let iy = prev_pos[1] + dy * t;
+                            let iw = prev_width + (width - prev_width) * (t as f32);
+                            let center = viewport.doc_to_screen((ix, iy), origin);
+                            let radius = (iw / 2.0) * viewport.zoom;
+                            if radius > 0.0 {
+                                painter.circle_filled(center, radius, color);
+                            }
+                        }
+                    }
+                }
+                let center = viewport.doc_to_screen((pos[0], pos[1]), origin);
+                let radius = (width / 2.0) * viewport.zoom;
+                if radius > 0.0 {
+                    painter.circle_filled(center, radius, color);
+                }
+                prev_pt = Some((pos, width));
+            }
+
+            if selected {
+                let stroke_pts: Vec<Pos2> = points
+                    .iter()
+                    .map(|&(pos, _)| viewport.doc_to_screen((pos[0], pos[1]), origin))
+                    .collect();
+                if stroke_pts.len() >= 2 {
+                    painter.add(Shape::line(
+                        stroke_pts,
+                        Stroke::new(1.0, Color32::from_rgb(0, 120, 215)),
+                    ));
+                }
+            }
+        }
     }
 
     if selected {
@@ -2095,20 +2134,116 @@ pub fn draw_preview_polygon(
     ));
 }
 
+pub fn append_smoothed_points(path: &mut kurbo::BezPath, pts: &[[f64; 2]], smoothness: f32, is_first: bool) {
+    if pts.is_empty() {
+        return;
+    }
+    if is_first {
+        path.move_to(kurbo::Point::new(pts[0][0], pts[0][1]));
+    } else {
+        path.line_to(kurbo::Point::new(pts[0][0], pts[0][1]));
+    }
+    
+    let n = pts.len();
+    if n < 3 {
+        for pt in pts.iter().skip(1) {
+            path.line_to(kurbo::Point::new(pt[0], pt[1]));
+        }
+        return;
+    }
+
+    for i in 1..(n - 1) {
+        let p_curr = pts[i];
+        let p_next = pts[i + 1];
+        let mx = (p_curr[0] + p_next[0]) / 2.0;
+        let my = (p_curr[1] + p_next[1]) / 2.0;
+        
+        let end_x = p_curr[0] * (1.0 - smoothness as f64) + mx * smoothness as f64;
+        let end_y = p_curr[1] * (1.0 - smoothness as f64) + my * smoothness as f64;
+        
+        path.quad_to(
+            kurbo::Point::new(p_curr[0], p_curr[1]),
+            kurbo::Point::new(end_x, end_y),
+        );
+    }
+    path.line_to(kurbo::Point::new(pts[n - 1][0], pts[n - 1][1]));
+}
+
 pub fn draw_brush_preview(
     painter: &Painter,
     viewport: &Viewport,
     origin: Pos2,
     points: &[([f64; 2], f64, f32)],
     stroke_color: Color32,
+    smoothness: f32,
+    heavy: f32,
+    cursor_doc: Option<(f64, f64)>,
+    brush_type: crate::tools::BrushType,
 ) {
+    if points.is_empty() {
+        return;
+    }
+
+    if brush_type == crate::tools::BrushType::Pen {
+        let mut prev_pt: Option<([f64; 2], f32)> = None;
+        for &(pos, _, width) in points {
+            if let Some((prev_pos, prev_width)) = prev_pt {
+                let dx = pos[0] - prev_pos[0];
+                let dy = pos[1] - prev_pos[1];
+                let dist = dx.hypot(dy);
+                let step = (1.0 / (viewport.zoom as f64)).max(0.5).min(width as f64 / 8.0).max(0.1);
+                if dist > step {
+                    let steps = (dist / step).ceil() as usize;
+                    for s in 1..steps {
+                        let t = s as f64 / steps as f64;
+                        let ix = prev_pos[0] + dx * t;
+                        let iy = prev_pos[1] + dy * t;
+                        let iw = prev_width + (width - prev_width) * (t as f32);
+                        let center = viewport.doc_to_screen((ix, iy), origin);
+                        let radius = (iw / 2.0) * viewport.zoom;
+                        if radius > 0.0 {
+                            painter.circle_filled(center, radius, stroke_color);
+                        }
+                    }
+                }
+            }
+            let center = viewport.doc_to_screen((pos[0], pos[1]), origin);
+            let radius = (width / 2.0) * viewport.zoom;
+            if radius > 0.0 {
+                painter.circle_filled(center, radius, stroke_color);
+            }
+            prev_pt = Some((pos, width));
+        }
+
+        // Draw guide if heavy is active
+        if heavy > 0.001 {
+            if let Some(cursor) = cursor_doc {
+                let cursor_screen = viewport.doc_to_screen(cursor, origin);
+                let r_screen = (heavy * 60.0) as f32 * viewport.zoom;
+                painter.circle_stroke(
+                    cursor_screen,
+                    r_screen,
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(200, 200, 200, 80)),
+                );
+                if let Some(&(last_pos, _, _)) = points.last() {
+                    let last_screen = viewport.doc_to_screen((last_pos[0], last_pos[1]), origin);
+                    painter.line_segment(
+                        [cursor_screen, last_screen],
+                        egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(200, 200, 200, 120)),
+                    );
+                }
+            }
+        }
+        return;
+    }
+
     if points.len() < 2 {
         return;
     }
     let mut pts = points.to_vec();
     pts[0].2 = 0.0;
-    if let Some(&(last_pos, last_time, _)) = pts.last() {
-        pts.push((last_pos, last_time, 0.0));
+    if let Some(last) = pts.last_mut() {
+        last.2 = 0.0;
     }
     let n = pts.len();
     let mut left_pts = Vec::with_capacity(n);
@@ -2169,18 +2304,77 @@ pub fn draw_brush_preview(
         right_pts.push([pos[0] - normal[0] * half_w, pos[1] - normal[1] * half_w]);
     }
 
-    let mut screen_pts: Vec<Pos2> = Vec::with_capacity(n * 2);
-    for pt in &left_pts {
-        screen_pts.push(viewport.doc_to_screen((pt[0], pt[1]), origin));
+    let mut path = kurbo::BezPath::new();
+    let mut right_pts_rev = right_pts.clone();
+    right_pts_rev.reverse();
+
+    append_smoothed_points(&mut path, &left_pts, smoothness, true);
+
+    if brush_type == crate::tools::BrushType::Pen && n > 0 {
+        let end_idx = n - 1;
+        let c = pts[end_idx].0;
+        let r = (pts[end_idx].2 as f64) / 2.0;
+        if r > 0.1 {
+            let dx = left_pts[end_idx][0] - c[0];
+            let dy = left_pts[end_idx][1] - c[1];
+            let start_angle = dy.atan2(dx);
+            let sweep = std::f64::consts::PI;
+            let arc = kurbo::Arc::new((c[0], c[1]), (r, r), start_angle, sweep, 0.0);
+            for el in arc.to_path(0.1).elements().iter().skip(1) {
+                path.push(*el);
+            }
+        }
     }
-    for pt in right_pts.iter().rev() {
-        screen_pts.push(viewport.doc_to_screen((pt[0], pt[1]), origin));
+
+    append_smoothed_points(&mut path, &right_pts_rev, smoothness, false);
+
+    if brush_type == crate::tools::BrushType::Pen && n > 0 {
+        let c = pts[0].0;
+        let r = (pts[0].2 as f64) / 2.0;
+        if r > 0.1 {
+            let dx = right_pts[0][0] - c[0];
+            let dy = right_pts[0][1] - c[1];
+            let start_angle = dy.atan2(dx);
+            let sweep = std::f64::consts::PI;
+            let arc = kurbo::Arc::new((c[0], c[1]), (r, r), start_angle, sweep, 0.0);
+            for el in arc.to_path(0.1).elements().iter().skip(1) {
+                path.push(*el);
+            }
+        }
     }
+
+    path.close_path();
+
+    let (screen_pts, _) = polyline_from_bez(&path, viewport, origin, true);
 
     painter.add(Shape::closed_line(
         screen_pts,
         Stroke::new(2.0, stroke_color),
     ));
+
+    // Draw pull-string / joystick guide if heavy is active
+    if heavy > 0.001 {
+        if let Some(cursor) = cursor_doc {
+            let cursor_screen = viewport.doc_to_screen(cursor, origin);
+            let r_screen = (heavy * 60.0) as f32 * viewport.zoom;
+            
+            // Draw stabilizer circle (faint semi-transparent gray)
+            painter.circle_stroke(
+                cursor_screen,
+                r_screen,
+                egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(200, 200, 200, 80)),
+            );
+            
+            // Draw pull string line from cursor to last stabilized point
+            if let Some(&(last_pos, _, _)) = points.last() {
+                let last_screen = viewport.doc_to_screen((last_pos[0], last_pos[1]), origin);
+                painter.line_segment(
+                    [cursor_screen, last_screen],
+                    egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(200, 200, 200, 120)),
+                );
+            }
+        }
+    }
 }
 
 pub fn draw_preview_line(
@@ -2561,6 +2755,125 @@ pub fn radial_from_bounds_drag(bounds: kurbo::Rect, doc: (f64, f64)) -> (f32, f3
 
 pub fn linear_norm_from_bounds_drag(bounds: kurbo::Rect, doc: (f64, f64)) -> (f32, f32) {
     radial_from_bounds_drag(bounds, doc)
+}
+pub fn draw_eyedropper_magnifier(
+    painter: &Painter,
+    viewport: &Viewport,
+    origin: Pos2,
+    target_doc: (f64, f64),
+    t: f32, // progress 0.0 ..= 1.0
+    hovered_color: Color32,
+) {
+    if t <= 0.001 {
+        return;
+    }
+    let cubic_out = |x: f32| {
+        let f = x - 1.0;
+        f * f * f + 1.0
+    };
+    let scale = cubic_out(t);
+    let radius = 64.0 * scale;
+
+    let center = viewport.doc_to_screen(target_doc, origin);
+
+    // 1. Draw outer drop shadow / glow
+    painter.circle_filled(
+        center,
+        radius + 6.0,
+        Color32::from_black_alpha(40),
+    );
+
+    // 2. Draw zoomed-in grid pattern inside the glass
+    let glass_bg = Color32::from_black_alpha(180);
+    painter.circle_filled(center, radius, glass_bg);
+
+    // Draw grid lines inside the circle
+    let r_grid = radius - 3.0; // grid bounds
+    let step = 8.0;
+    let mut x_offset = -r_grid;
+    while x_offset <= r_grid {
+        if x_offset.abs() > 0.01 { // skip center line
+            let h = (r_grid * r_grid - x_offset * x_offset).sqrt();
+            painter.line_segment(
+                [
+                    Pos2::new(center.x + x_offset, center.y - h),
+                    Pos2::new(center.x + x_offset, center.y + h),
+                ],
+                Stroke::new(1.0, Color32::from_white_alpha(30)),
+            );
+        }
+        x_offset += step;
+    }
+    let mut y_offset = -r_grid;
+    while y_offset <= r_grid {
+        if y_offset.abs() > 0.01 { // skip center line
+            let w = (r_grid * r_grid - y_offset * y_offset).sqrt();
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - w, center.y + y_offset),
+                    Pos2::new(center.x + w, center.y + y_offset),
+                ],
+                Stroke::new(1.0, Color32::from_white_alpha(30)),
+            );
+        }
+        y_offset += step;
+    }
+
+    // 3. Draw central crosshair
+    painter.circle_filled(center, 3.0, Color32::WHITE);
+    painter.circle_stroke(center, 3.0, Stroke::new(1.0, Color32::BLACK));
+
+    // 4. Draw outer preview ring showing the hovered color
+    let ring_thickness = 6.0;
+    let ring_radius = radius - ring_thickness / 2.0;
+    painter.circle_stroke(
+        center,
+        ring_radius,
+        Stroke::new(ring_thickness, hovered_color),
+    );
+
+    // Draw thin white border around the outer edge, and thin dark border inside
+    painter.circle_stroke(
+        center,
+        radius,
+        Stroke::new(1.0, Color32::WHITE),
+    );
+    painter.circle_stroke(
+        center,
+        radius - ring_thickness,
+        Stroke::new(1.0, Color32::BLACK),
+    );
+
+    // 5. Draw hex color text below the circle
+    let font_id = FontId::new(10.0, FontFamily::Monospace);
+    let hex_str = format!(
+        "#{:02X}{:02X}{:02X}",
+        hovered_color.r(),
+        hovered_color.g(),
+        hovered_color.b()
+    );
+    let text_pos = Pos2::new(center.x, center.y + radius + 15.0);
+    let text_galley = painter.layout_no_wrap(hex_str, font_id, Color32::WHITE);
+    let rect_w = text_galley.size().x + 8.0;
+    let rect_h = text_galley.size().y + 4.0;
+    let text_rect = Rect::from_center_size(text_pos, Vec2::new(rect_w, rect_h));
+    
+    painter.rect_filled(
+        text_rect,
+        4.0,
+        Color32::from_black_alpha(200),
+    );
+    painter.rect_stroke(
+        text_rect,
+        4.0,
+        Stroke::new(1.0, Color32::from_white_alpha(50)),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(
+        Pos2::new(text_rect.left() + 4.0, text_rect.top() + 2.0),
+        text_galley,
+        Color32::WHITE,
+    );
 }
 
 #[cfg(test)]

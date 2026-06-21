@@ -232,6 +232,16 @@ fn node_to_svg_fragment(node: &Node) -> String {
             let d = bez.to_svg();
             format!(r#"<path d="{d}" {fill} {stroke} opacity="{op}"/>"#)
         }
+        NodeKind::BrushStroke { points } => {
+            let mut svg = String::new();
+            for (pos, width) in points {
+                let r = width / 2.0;
+                if r > 0.1 {
+                    svg.push_str(&format!(r#"<circle cx="{}" cy="{}" r="{}" {fill} opacity="{op}"/>"#, pos[0], pos[1], r));
+                }
+            }
+            svg
+        }
     };
     format!("{defs}{body}")
 }
@@ -395,4 +405,46 @@ fn path_to_svg_d(path: &PathData) -> String {
         }
     }
     out
+}
+
+use crate::document::NodeId;
+use kurbo::Rect;
+
+pub fn export_selected_svg_string(project: &ProjectFile, selection: &[NodeId], bounds: Rect) -> String {
+    let w = bounds.width();
+    let h = bounds.height();
+    let mut svg = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
+<g transform="translate({tx}, {ty})">
+"#,
+        tx = -bounds.x0,
+        ty = -bounds.y0
+    );
+    for id in selection {
+        let Some(node) = project.nodes.get(*id) else { continue };
+        svg.push_str(&node_to_svg_fragment(node));
+    }
+    svg.push_str("</g>\n</svg>\n");
+    svg
+}
+
+pub fn render_svg_to_rgba(svg_data: &str, scale: f32) -> Option<(u32, u32, Vec<u8>)> {
+    let opt = usvg::Options::default();
+    let tree = usvg::Tree::from_str(svg_data, &opt).ok()?;
+
+    let pixmap_size = tree.size().to_int_size();
+    let pixel_w = (pixmap_size.width() as f32 * scale).round() as u32;
+    let pixel_h = (pixmap_size.height() as f32 * scale).round() as u32;
+    
+    if pixel_w == 0 || pixel_h == 0 {
+        return None;
+    }
+    
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(pixel_w, pixel_h)?;
+    
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    
+    Some((pixel_w, pixel_h, pixmap.take()))
 }

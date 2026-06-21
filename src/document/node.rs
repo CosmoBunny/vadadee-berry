@@ -171,6 +171,9 @@ pub enum NodeKind {
         /// - ToOrigin: pie slice (arc + lines from center to start and end)
         join: ArcJoin,
     },
+    BrushStroke {
+        points: Vec<([f64; 2], f32)>, // pos, width
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1494,6 +1497,7 @@ impl Node {
                     join: *join,
                 }
             }
+            NodeKind::BrushStroke { .. } => GeometryProfile::Unsupported,
         }
     }
 
@@ -1562,6 +1566,24 @@ impl Node {
             NodeKind::Group { .. } => Rect::ZERO,
             NodeKind::Image { x, y, width, height, .. } => Rect::new(*x, *y, *x + *width, *y + *height),
             NodeKind::Arc { cx, cy, radius, .. } => Rect::new(cx - radius, cy - radius, cx + radius, cy + radius),
+            NodeKind::BrushStroke { points } => {
+                let mut min_x = f64::MAX;
+                let mut min_y = f64::MAX;
+                let mut max_x = f64::MIN;
+                let mut max_y = f64::MIN;
+                for (pos, width) in points {
+                    let r = (*width as f64) / 2.0;
+                    min_x = min_x.min(pos[0] - r);
+                    min_y = min_y.min(pos[1] - r);
+                    max_x = max_x.max(pos[0] + r);
+                    max_y = max_y.max(pos[1] + r);
+                }
+                if min_x <= max_x {
+                    Rect::new(min_x, min_y, max_x, max_y)
+                } else {
+                    Rect::ZERO
+                }
+            }
         }
     }
 
@@ -1603,6 +1625,16 @@ impl Node {
             NodeKind::Arc { cx, cy, radius, start_angle_rad, sweep_angle_rad, join } => {
                 build_arc_bez(*cx, *cy, *radius, *start_angle_rad, *sweep_angle_rad, *join)
             }
+            NodeKind::BrushStroke { points } => {
+                let mut path = BezPath::new();
+                if let Some(&(first_pos, _)) = points.first() {
+                    path.move_to(kurbo::Point::new(first_pos[0], first_pos[1]));
+                    for &(pos, _) in points.iter().skip(1) {
+                        path.line_to(kurbo::Point::new(pos[0], pos[1]));
+                    }
+                }
+                path
+            }
         }
     }
 
@@ -1626,6 +1658,36 @@ impl Node {
     pub fn hit_test(&self, doc_x: f64, doc_y: f64, stroke_slop: f64) -> bool {
         use kurbo::Shape;
         let pt = kurbo::Point::new(doc_x, doc_y);
+        if let NodeKind::BrushStroke { points } = &self.kind {
+            let mut prev_pt: Option<([f64; 2], f64)> = None;
+            let slop = stroke_slop.max(2.0);
+            for &(pos, width) in points {
+                let r = (width as f64 / 2.0) + slop;
+                let dx = doc_x - pos[0];
+                let dy = doc_y - pos[1];
+                if dx * dx + dy * dy <= r * r {
+                    return true;
+                }
+                if let Some((prev_pos, prev_r)) = prev_pt {
+                    let segment_dx = pos[0] - prev_pos[0];
+                    let segment_dy = pos[1] - prev_pos[1];
+                    let len_sq = segment_dx * segment_dx + segment_dy * segment_dy;
+                    if len_sq > 1e-8 {
+                        let t = ((doc_x - prev_pos[0]) * segment_dx + (doc_y - prev_pos[1]) * segment_dy) / len_sq;
+                        let t = t.clamp(0.0, 1.0);
+                        let proj_x = prev_pos[0] + t * segment_dx;
+                        let proj_y = prev_pos[1] + t * segment_dy;
+                        let dist_sq = (doc_x - proj_x).powi(2) + (doc_y - proj_y).powi(2);
+                        let interpolated_r = prev_r + t * (r - prev_r);
+                        if dist_sq <= interpolated_r * interpolated_r {
+                            return true;
+                        }
+                    }
+                }
+                prev_pt = Some((pos, r));
+            }
+            return false;
+        }
         if let NodeKind::Text { x, y, style } = &self.kind {
             let tol = stroke_slop.max(2.0);
             return text_bounds(*x, *y, style).inflate(tol, tol).contains(pt);
@@ -1731,6 +1793,13 @@ impl Node {
                 *acx = nx;
                 *acy = ny;
             }
+            NodeKind::BrushStroke { points } => {
+                for (pos, _) in points {
+                    let (nx, ny) = map(pos[0], pos[1]);
+                    pos[0] = nx;
+                    pos[1] = ny;
+                }
+            }
             NodeKind::Polygon { .. } | NodeKind::Group { .. } => {}
         }
     }
@@ -1784,6 +1853,13 @@ impl Node {
             | NodeKind::Ellipse { .. }
             | NodeKind::Arc { .. }
             | NodeKind::Group { .. } => {}
+            NodeKind::BrushStroke { points } => {
+                for pt in points.iter_mut() {
+                    pt.0[0] = cx + (pt.0[0] - cx) * scale;
+                    pt.0[1] = cy + (pt.0[1] - cy) * scale;
+                    pt.1 *= scale as f32;
+                }
+            }
         }
     }
 
@@ -1819,6 +1895,12 @@ impl Node {
             NodeKind::Arc { cx, cy, .. } => {
                 *cx += dx;
                 *cy += dy;
+            }
+            NodeKind::BrushStroke { points } => {
+                for pt in points.iter_mut() {
+                    pt.0[0] += dx;
+                    pt.0[1] += dy;
+                }
             }
         }
     }
@@ -1883,6 +1965,7 @@ impl Node {
                 *cy = bounds.y0 + h / 2.0;
                 *radius = (w.min(h) / 2.0).max(1.0);
             }
+            NodeKind::BrushStroke { .. } => {}
         }
     }
 
@@ -1994,6 +2077,7 @@ impl Node {
             NodeKind::Path { path } => path_anchor_positions(path),
             NodeKind::Text { x, y, .. } => vec![(*x, *y)],
             NodeKind::Group { .. } => vec![],
+            NodeKind::BrushStroke { .. } => vec![],
             NodeKind::Image { x, y, width, height, .. } => vec![
                 (*x + *width * 0.5, *y + *height * 0.5), // center
                 (*x, *y),
@@ -2102,13 +2186,41 @@ impl Node {
                 4 => { let x1 = *ix + *iw; *ix = x.min(x1-1.); *ih = (y-*iy).max(1.); *iw = (x1-*ix).max(1.); }
                 _ => {}
             },
-            NodeKind::Arc { cx, cy, radius, .. } => match index {
+            NodeKind::Arc { cx, cy, radius, start_angle_rad, sweep_angle_rad, .. } => match index {
                 0 => { *cx = x; *cy = y; }
-                1 | 2 | 3 => { // rim or arc ends -> adjust radius (simple)
+                1 => { // rim midpoint -> adjust radius only
+                    *radius = ((x - *cx).hypot(y - *cy)).max(1.0);
+                }
+                2 => { // start angle point
+                    let angle = (y - *cy).atan2(x - *cx);
+                    let end_angle = *start_angle_rad + *sweep_angle_rad;
+                    *start_angle_rad = angle;
+                    let mut new_sweep = end_angle - angle;
+                    // Keep sweep angle in the same visual range (-2PI to 2PI)
+                    while new_sweep > std::f64::consts::PI * 2.0 {
+                        new_sweep -= std::f64::consts::PI * 2.0;
+                    }
+                    while new_sweep < -std::f64::consts::PI * 2.0 {
+                        new_sweep += std::f64::consts::PI * 2.0;
+                    }
+                    *sweep_angle_rad = new_sweep;
+                    *radius = ((x - *cx).hypot(y - *cy)).max(1.0);
+                }
+                3 => { // end angle point
+                    let angle = (y - *cy).atan2(x - *cx);
+                    let mut new_sweep = angle - *start_angle_rad;
+                    while new_sweep > std::f64::consts::PI * 2.0 {
+                        new_sweep -= std::f64::consts::PI * 2.0;
+                    }
+                    while new_sweep < -std::f64::consts::PI * 2.0 {
+                        new_sweep += std::f64::consts::PI * 2.0;
+                    }
+                    *sweep_angle_rad = new_sweep;
                     *radius = ((x - *cx).hypot(y - *cy)).max(1.0);
                 }
                 _ => {}
             }
+            NodeKind::BrushStroke { .. } => {}
         }
     }
 }

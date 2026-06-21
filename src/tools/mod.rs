@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use egui::{Key, Pos2, Ui, Vec2};
 
-use crate::document::{Node, NodeId, PathData, PathEditTarget};
+use crate::document::{Node, NodeId, PathData, PathEditTarget, FillKind, GradientStop, Paint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ToolKind {
@@ -64,9 +64,57 @@ impl ToolKind {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrushType {
+    #[default]
+    Standard,
+    Pen,
+}
+
+#[derive(Debug, Clone)]
 pub struct BrushSession {
+    pub brush_type: BrushType,
     pub points: Vec<([f64; 2], f64, f32)>, // pos, time, width
+    pub size: f32,
+    pub smoothness: f32,
+    pub heavy: f32,
+    pub fill_kind: FillKind,
+    pub fill_stops: Vec<GradientStop>,
+    pub fill_stop_sel: usize,
+    pub gradient_angle: f32,
+    pub fill_line_x0: f32,
+    pub fill_line_y0: f32,
+    pub fill_line_x1: f32,
+    pub fill_line_y1: f32,
+    pub radial_cx: f32,
+    pub radial_cy: f32,
+    pub fill_edit_gradient_line: bool,
+}
+
+impl Default for BrushSession {
+    fn default() -> Self {
+        Self {
+            brush_type: BrushType::Standard,
+            points: Vec::new(),
+            size: 16.0,
+            smoothness: 0.5,
+            heavy: 0.2,
+            fill_kind: FillKind::Solid,
+            fill_stops: vec![
+                GradientStop { pos: 0.0, color: Paint::from_hex(0x000000, 1.0) },
+                GradientStop { pos: 1.0, color: Paint::from_hex(0x000000, 1.0) },
+            ],
+            fill_stop_sel: 0,
+            gradient_angle: 0.0,
+            fill_line_x0: 0.0,
+            fill_line_y0: 0.0,
+            fill_line_x1: 1.0,
+            fill_line_y1: 0.0,
+            radial_cx: 0.5,
+            radial_cy: 0.5,
+            fill_edit_gradient_line: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -173,6 +221,7 @@ pub struct SelectSession {
 #[derive(Debug, Default)]
 pub struct ToolState {
     pub active: ToolKind,
+    pub last_active_tool: ToolKind,
     pub drag_shape: Option<DragNewShape>,
     pub pen: PenSession,
     pub select: SelectSession,
@@ -267,6 +316,9 @@ impl ToolState {
         for tool in tools {
             if let Some(key) = tool.shortcut() {
                 if ui.input(|i| i.key_pressed(key)) {
+                    if self.active != ToolKind::Eyedropper {
+                        self.last_active_tool = self.active;
+                    }
                     self.active = *tool;
                 }
             }

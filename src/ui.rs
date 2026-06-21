@@ -497,7 +497,11 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             let button_alpha = alpha * expand_t;
 
             if button_alpha > 0.01 {
-                let mut c = app.ui_fill_stops.first().map(|s| s.color.to_egui()).unwrap_or(egui::Color32::WHITE);
+                let mut c = if app.tools.active == ToolKind::Brush {
+                    app.tools.brush.fill_stops.first().map(|s| s.color.to_egui()).unwrap_or(egui::Color32::WHITE)
+                } else {
+                    app.ui_fill_stops.first().map(|s| s.color.to_egui()).unwrap_or(egui::Color32::WHITE)
+                };
                 
                 // Render the color edit button inside the slot
                 ui.allocate_ui_at_rect(button_screen_rect, |ui| {
@@ -512,14 +516,20 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                                 c.a() as f32 / 255.0,
                             ],
                         };
-                        for s in app.ui_fill_stops.iter_mut() {
-                            s.color = paint;
+                        if app.tools.active == ToolKind::Brush {
+                            for s in app.tools.brush.fill_stops.iter_mut() {
+                                s.color = paint;
+                            }
+                        } else {
+                            for s in app.ui_fill_stops.iter_mut() {
+                                s.color = paint;
+                            }
+                            for s in app.ui_stroke_stops.iter_mut() {
+                                s.color = paint;
+                            }
+                            app.apply_fill_to_selection();
+                            app.apply_stroke_to_selection();
                         }
-                        for s in app.ui_stroke_stops.iter_mut() {
-                            s.color = paint;
-                        }
-                        app.apply_fill_to_selection();
-                        app.apply_stroke_to_selection();
                     }
                 });
 
@@ -544,6 +554,12 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     });
 
     let select_tool = |app: &mut VadadeeBerryApp, tool: ToolKind| {
+        if app.tools.active != ToolKind::Eyedropper {
+            app.tools.last_active_tool = app.tools.active;
+        }
+        if tool != ToolKind::Brush && app.ui_stroke_width <= 0.01 {
+            app.ui_stroke_width = 2.0;
+        }
         app.tools.active = tool;
         match tool {
             ToolKind::Node | ToolKind::Polygon | ToolKind::Text | ToolKind::Arc => {
@@ -897,33 +913,33 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label("Rows");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_rows).range(1..=20)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_tiling_rows).range(1..=20)).changed();
             ui.label("Cols");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_cols).range(1..=20)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_tiling_cols).range(1..=20)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Gap X");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_gap_x).speed(1.0)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_tiling_gap_x).speed(1.0)).changed();
             ui.label("Y");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_gap_y).speed(1.0)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_tiling_gap_y).speed(1.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Offset X");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_offset_x).speed(1.0)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_tiling_offset_x).speed(1.0)).changed();
             ui.label("Y");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_offset_y).speed(1.0)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_tiling_offset_y).speed(1.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Row Rot °");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_row_rot).speed(1.0)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_tiling_row_rot).speed(1.0)).changed();
             ui.label("Col Rot °");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_col_rot).speed(1.0)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_tiling_col_rot).speed(1.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Row Scale");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_row_scale).speed(0.01)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_tiling_row_scale).speed(0.01)).changed();
             ui.label("Col Scale");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_tiling_col_scale).speed(0.01)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_tiling_col_scale).speed(0.01)).changed();
         });
         ui.horizontal(|ui| {
             if ui.button("Bake as group").clicked() {
@@ -947,15 +963,15 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label("Copies");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_circular_copies).range(3..=32)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_circular_copies).range(3..=32)).changed();
             ui.label("Angle °");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_circular_angle_offset).speed(1.0)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_circular_angle_offset).speed(1.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Origin X");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_circular_origin_x).speed(1.0)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_circular_origin_x).speed(1.0)).changed();
             ui.label("Y");
-            changed |= ui.add(egui::DragValue::new(&mut app.ui_circular_origin_y).speed(1.0)).changed();
+            changed |= ui.add(decimal_drag(&mut app.ui_circular_origin_y).speed(1.0)).changed();
         });
         ui.horizontal(|ui| {
             if ui.button("Bake as group").clicked() {
@@ -1181,14 +1197,14 @@ fn object_on_path_controls(ui: &mut Ui, app: &mut VadadeeBerryApp) -> bool {
     match app.ui_on_path_mode {
         OnPathMode::GapDuplicate => {
             ui.add(
-                egui::DragValue::new(&mut app.ui_on_path_gap)
+                decimal_drag(&mut app.ui_on_path_gap)
                     .range(1.0..=2000.0)
                     .suffix(" px"),
             );
         }
         OnPathMode::EvenlySpaced => {
             ui.add(
-                egui::DragValue::new(&mut app.ui_on_path_count)
+                decimal_drag(&mut app.ui_on_path_count)
                     .range(2..=64)
                     .prefix("Count "),
             );
@@ -1246,6 +1262,16 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     page_section(app, ui);
     ui.add_space(8.0);
     ui.separator();
+
+    if !app.selection.is_empty() {
+        ui.label(RichText::new("Selection Options").strong());
+        if ui.button("Resize as selected").clicked() {
+            app.resize_to_selection();
+        }
+        ui.add_space(8.0);
+        ui.separator();
+    }
+
     ui.label(RichText::new("Export").strong());
     if ui.button("Export SVG…").clicked() {
         app.request_export_svg();
@@ -1319,8 +1345,8 @@ fn page_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         ui.label("Size");
         let mut w = app.project.document.width as f32;
         let mut h = app.project.document.height as f32;
-        let ch = ui.add(egui::DragValue::new(&mut w).range(64.0..=8192.0).suffix("w"));
-        let ch2 = ui.add(egui::DragValue::new(&mut h).range(64.0..=8192.0).suffix("h"));
+        let ch = ui.add(decimal_drag(&mut w).range(64.0..=8192.0).suffix("w"));
+        let ch2 = ui.add(decimal_drag(&mut h).range(64.0..=8192.0).suffix("h"));
         if ch.changed() || ch2.changed() {
             app.set_page_size(w as f64, h as f64);
         }
@@ -1410,6 +1436,84 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 }
 
 fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+    if app.tools.active == ToolKind::Brush {
+        theme::constraint_block(ui, |ui| {
+            ui.label(RichText::new("Brush Fill").strong());
+            ui.label("Type");
+            let mut changed = paint_kind_selector(ui, &mut app.tools.brush.fill_kind);
+            if app.tools.brush.fill_kind == FillKind::Solid {
+                changed |= solid_color_editor(ui, &mut app.tools.brush.fill_stops);
+            } else {
+                let strip = gradient_strip_editor(
+                    ui,
+                    ui.id().with("brush_gradient_strip"),
+                    GradientEditorFocus::Fill,
+                    &mut app.tools.brush.fill_stops,
+                    &mut app.tools.brush.fill_stop_sel,
+                );
+                changed |= strip.changed;
+                if strip.focus == GradientEditorFocus::Fill {
+                    app.gradient_editor_focus = GradientEditorFocus::Fill;
+                }
+                if app.tools.brush.fill_kind == FillKind::LinearGradient {
+                    if linear_gradient_angle_dial(
+                        ui,
+                        ui.id().with("brush_angle_dial"),
+                        &mut app.tools.brush.gradient_angle,
+                    ) {
+                        let mut line = (
+                            app.tools.brush.fill_line_x0,
+                            app.tools.brush.fill_line_y0,
+                            app.tools.brush.fill_line_x1,
+                            app.tools.brush.fill_line_y1,
+                        );
+                        apply_angle_to_flow_line(app.tools.brush.gradient_angle, &mut line);
+                        app.tools.brush.fill_line_x0 = line.0;
+                        app.tools.brush.fill_line_y0 = line.1;
+                        app.tools.brush.fill_line_x1 = line.2;
+                        app.tools.brush.fill_line_y1 = line.3;
+                        changed = true;
+                    }
+                }
+                if matches!(
+                    app.tools.brush.fill_kind,
+                    FillKind::LinearGradient | FillKind::RadialGradient
+                ) {
+                    if ui
+                        .checkbox(&mut app.tools.brush.fill_edit_gradient_line, "Edit gradient line")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if app.tools.brush.fill_edit_gradient_line {
+                        if gradient_flow_line_editor(
+                            ui,
+                            ui.id().with("brush_flow_line"),
+                            app.tools.brush.fill_kind,
+                            &mut app.tools.brush.fill_line_x0,
+                            &mut app.tools.brush.fill_line_y0,
+                            &mut app.tools.brush.fill_line_x1,
+                            &mut app.tools.brush.fill_line_y1,
+                            &mut app.tools.brush.radial_cx,
+                            &mut app.tools.brush.radial_cy,
+                            1.0,
+                        ) {
+                            if app.tools.brush.fill_kind == FillKind::LinearGradient {
+                                app.tools.brush.gradient_angle = sync_angle_from_flow_line((
+                                    app.tools.brush.fill_line_x0,
+                                    app.tools.brush.fill_line_y0,
+                                    app.tools.brush.fill_line_x1,
+                                    app.tools.brush.fill_line_y1,
+                                ));
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        });
+        return;
+    }
     if app.selection.is_empty() {
         ui.label(RichText::new("Select an object").color(colors::TEXT_MUTED));
         return;
@@ -1717,6 +1821,33 @@ fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 }
 
 fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+    if app.tools.active == ToolKind::Brush {
+        theme::constraint_block(ui, |ui| {
+            ui.label(
+                RichText::new(format!("{} Brush settings", icons::BRUSH))
+                    .font(nerd_font_id(14.0))
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            
+            egui::ComboBox::from_label("Type")
+                .selected_text(match app.tools.brush.brush_type {
+                    crate::tools::BrushType::Standard => "Standard",
+                    crate::tools::BrushType::Pen => "Pen",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut app.tools.brush.brush_type, crate::tools::BrushType::Standard, "Standard");
+                    ui.selectable_value(&mut app.tools.brush.brush_type, crate::tools::BrushType::Pen, "Pen");
+                });
+            
+            ui.add_space(4.0);
+            ui.add(egui::Slider::new(&mut app.tools.brush.size, 1.0..=100.0).text("Size"));
+            ui.add(egui::Slider::new(&mut app.tools.brush.smoothness, 0.0..=1.0).text("Smoothness"));
+            ui.add(egui::Slider::new(&mut app.tools.brush.heavy, 0.0..=1.0).text("Heavybrush"));
+        });
+        return;
+    }
+
     if app.selection.is_empty() {
         if app.tools.active == ToolKind::Polygon {
             theme::constraint_block(ui, |ui| {
@@ -1886,8 +2017,8 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             constraint_origin(ui, &mut x, &mut y, &mut changed);
             theme::constraint_block(ui, |ui| {
                 ui.label(RichText::new("Size").small().color(colors::TEXT_MUTED));
-                changed |= ui.add(egui::DragValue::new(&mut w).prefix("W:")).changed();
-                changed |= ui.add(egui::DragValue::new(&mut h).prefix("H:")).changed();
+                changed |= ui.add(decimal_drag(&mut w).prefix("W:")).changed();
+                changed |= ui.add(decimal_drag(&mut h).prefix("H:")).changed();
             });
             theme::constraint_block(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1898,7 +2029,7 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     );
                     ui.label("Border radius");
                 });
-                changed |= ui.add(egui::DragValue::new(&mut rx)).changed();
+                changed |= ui.add(decimal_drag(&mut rx)).changed();
             });
             if changed {
                 app.set_rect_geometry(id, x, y, w, h, rx);
@@ -1917,7 +2048,7 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             constraint_origin(ui, &mut cx, &mut cy, &mut changed);
             theme::constraint_block(ui, |ui| {
                 ui.label(RichText::new("Radius").small().color(colors::TEXT_MUTED));
-                changed |= ui.add(egui::DragValue::new(&mut r)).changed();
+                changed |= ui.add(decimal_drag(&mut r)).changed();
             });
             if changed {
                 app.set_circle_geometry(id, cx, cy, r);
@@ -1938,8 +2069,8 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             constraint_origin(ui, &mut cx, &mut cy, &mut changed);
             theme::constraint_block(ui, |ui| {
                 ui.label(RichText::new("Radii").small().color(colors::TEXT_MUTED));
-                changed |= ui.add(egui::DragValue::new(&mut rx).prefix("RX:")).changed();
-                changed |= ui.add(egui::DragValue::new(&mut ry).prefix("RY:")).changed();
+                changed |= ui.add(decimal_drag(&mut rx).prefix("RX:")).changed();
+                changed |= ui.add(decimal_drag(&mut ry).prefix("RY:")).changed();
             });
             if changed {
                 app.set_ellipse_geometry(id, cx, cy, rx, ry);
@@ -1970,10 +2101,10 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     .add(egui::Slider::new(&mut n_sides, 3..=24).text("Sides"))
                     .changed();
                 changed |= ui
-                    .add(egui::DragValue::new(&mut r).prefix("Radius:"))
+                    .add(decimal_drag(&mut r).prefix("Radius:"))
                     .changed();
                 changed |= ui
-                    .add(egui::DragValue::new(&mut rot).prefix("Rotation °:"))
+                    .add(decimal_drag(&mut rot).prefix("Rotation °:"))
                     .changed();
             });
             if changed {
@@ -1998,8 +2129,8 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             constraint_origin(ui, &mut x0, &mut y0, &mut changed);
             theme::constraint_block(ui, |ui| {
                 ui.label(RichText::new("End").small().color(colors::TEXT_MUTED));
-                changed |= ui.add(egui::DragValue::new(&mut x1).prefix("X:")).changed();
-                changed |= ui.add(egui::DragValue::new(&mut y1).prefix("Y:")).changed();
+                changed |= ui.add(decimal_drag(&mut x1).prefix("X:")).changed();
+                changed |= ui.add(decimal_drag(&mut y1).prefix("Y:")).changed();
             });
             ui.horizontal(|ui| {
                 ui.label(format!("Length: {length:.2}"));
@@ -2050,20 +2181,22 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
             theme::constraint_block(ui, |ui| {
                 ui.label(RichText::new("Radius").small().color(colors::TEXT_MUTED));
-                changed |= ui.add(egui::DragValue::new(&mut r).range(0.5..=10000.0)).changed();
+                changed |= ui.add(decimal_drag(&mut r).range(0.5..=10000.0).speed(0.5).fixed_decimals(1)).changed();
 
                 ui.label(RichText::new("Angles (degrees)").small().color(colors::TEXT_MUTED));
-                changed |= ui.add(egui::DragValue::new(&mut start).prefix("Start: ").suffix("°")).changed();
-                changed |= ui.add(egui::DragValue::new(&mut sweep).prefix("Sweep: ").suffix("°")).changed();
+                let mut end = start + sweep;
+                changed |= ui.add(decimal_drag(&mut start).prefix("Start: ").suffix("°").speed(1.0).fixed_decimals(1)).changed();
+                changed |= ui.add(decimal_drag(&mut end).prefix("End: ").suffix("°").speed(1.0).fixed_decimals(1)).changed();
+                sweep = end - start;
             });
 
-            ui.label(RichText::new("Joining").small().color(colors::TEXT_MUTED));
+            ui.label(RichText::new("Fill type").small().color(colors::TEXT_MUTED));
             ui.vertical(|ui| {
                 for mode in [ArcJoin::NoJoin, ArcJoin::Chord, ArcJoin::ToOrigin] {
                     let label = match mode {
-                        ArcJoin::NoJoin => "No join",
-                        ArcJoin::Chord => "End to start",
-                        ArcJoin::ToOrigin => "To origin",
+                        ArcJoin::NoJoin => "None",
+                        ArcJoin::Chord => "Chord",
+                        ArcJoin::ToOrigin => "Sector",
                     };
                     if ui.selectable_label(current_join == mode, label).clicked() {
                         current_join = mode;
@@ -2471,6 +2604,7 @@ fn node_icon(kind: &NodeKind) -> &'static str {
         NodeKind::Group { .. } => icons::OBJECT,
         NodeKind::Image { .. } => icons::OBJECT,
         NodeKind::Arc { .. } => icons::ARC,
+        NodeKind::BrushStroke { .. } => icons::BRUSH,
     }
 }
 
@@ -2485,8 +2619,15 @@ fn constraint_origin(ui: &mut Ui, x: &mut f64, y: &mut f64, changed: &mut bool) 
             ui.label(RichText::new("Origin").strong());
         });
         ui.horizontal(|ui| {
-            *changed |= ui.add(egui::DragValue::new(x).prefix("X:")).changed();
-            *changed |= ui.add(egui::DragValue::new(y).prefix("Y:")).changed();
+            *changed |= ui.add(decimal_drag(x).prefix("X:")).changed();
+            *changed |= ui.add(decimal_drag(y).prefix("Y:")).changed();
         });
     });
+}
+
+fn decimal_drag<'a, Num: egui::emath::Numeric>(value: &'a mut Num) -> egui::DragValue<'a> {
+    egui::DragValue::new(value).custom_parser(|text| {
+        let normalized = text.trim().replace(',', ".");
+        normalized.parse::<f64>().ok()
+    })
 }
