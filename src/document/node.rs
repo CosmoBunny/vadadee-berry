@@ -4,7 +4,7 @@ use kurbo::{BezPath, Rect, Shape};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{Fill, NodeStyle, Stroke};
+use super::{Fill, NodeStyle, Paint, Stroke};
 
 pub type NodeId = Uuid;
 
@@ -1326,6 +1326,37 @@ impl CircularClone for PathData {
 }
 
 impl Node {
+    pub fn get_rotation(&self) -> f64 {
+        self.transform.rotation_rad
+    }
+
+    pub fn set_rotation(&mut self, rad: f64) {
+        let delta = rad - self.transform.rotation_rad;
+        if delta.abs() > 1e-9 {
+            self.rotate_about_center(delta);
+        }
+        self.transform.rotation_rad = rad;
+    }
+
+    pub fn get_opacity(&self) -> f32 {
+        self.style.opacity
+    }
+
+    pub fn set_opacity(&mut self, opacity: f32) {
+        self.style.opacity = opacity;
+    }
+
+    pub fn get_color(&self) -> [f32; 4] {
+        match &self.style.fill {
+            Fill::Solid(paint) => paint.rgba,
+            _ => [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+
+    pub fn set_color(&mut self, rgba: [f32; 4]) {
+        self.style.fill = Fill::Solid(Paint { rgba });
+    }
+
     pub fn get_pos(&self) -> (f64, f64) {
         match &self.kind {
             NodeKind::Rect { x, y, .. } => (*x, *y),

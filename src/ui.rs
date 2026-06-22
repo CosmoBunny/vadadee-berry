@@ -1,7 +1,7 @@
 use egui::{scroll_area::ScrollBarVisibility, Context, FontFamily, FontId, Rect, RichText, ScrollArea, Ui};
 
 use crate::animation::action_bar_overlay_rect;
-use crate::app::VadadeeBerryApp;
+use crate::app::{KeyframeTrack, VadadeeBerryApp};
 use crate::document::{
     compute_whole_object_bounds, compute_tiling_whole_bounds, compute_circular_whole_bounds, default_loft_gap_for_node, find_effect_for_pair, ArcJoin, FillKind, GeometryProfile, LineCap,
     LineJoin, NodeKind, OnPathMode, PathData, TextStyle, A4_HEIGHT_PX, A4_WIDTH_PX,
@@ -24,6 +24,7 @@ pub enum ActionTab {
     Objects,
     Geometry,
     PathMagic,
+    Animation,
 }
 
 impl ActionTab {
@@ -35,6 +36,7 @@ impl ActionTab {
             Self::Objects,
             Self::Geometry,
             Self::PathMagic,
+            Self::Animation,
         ]
     }
 
@@ -46,6 +48,7 @@ impl ActionTab {
             Self::Objects => "Objects",
             Self::Geometry => "Geometry",
             Self::PathMagic => "Path magic",
+            Self::Animation => "Animation",
         }
     }
 
@@ -57,6 +60,7 @@ impl ActionTab {
             Self::Objects => icons::OBJECT,
             Self::Geometry => icons::RECT,
             Self::PathMagic => icons::PATH_MAGIC,
+            Self::Animation => "",
         }
     }
 }
@@ -718,6 +722,7 @@ fn action_bar_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ActionTab::Objects => objects_section(app, ui),
                     ActionTab::Geometry => geometry_section(app, ui),
                     ActionTab::PathMagic => path_magic_section(app, ui),
+                    ActionTab::Animation => animation_section(app, ui),
                 }
             });
     });
@@ -1300,7 +1305,7 @@ fn status_bar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     let msg_width = app.ui_anim.status_message_seg_width();
     egui::Panel::bottom("status")
         .frame(theme::bar_frame(alpha))
-        .exact_size(26.0)
+        .exact_size(30.0)
         .resizable(false)
         .show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -2830,17 +2835,28 @@ fn draw_3d_pen_tip(ui: &mut egui::Ui, active_width: f32, is_drawing: bool) {
     ));
 }
 
+struct TrackPlotInfo<'a> {
+    label: &'static str,
+    track: &'a mut crate::app::KeyframeTrack,
+    color: egui::Color32,
+    default_val: f64,
+}
+
 fn draw_timeline_track(
     ui: &mut egui::Ui,
-    label: &str,
-    track: &crate::app::KeyframeTrack,
+    track_label: &str,
+    node_id: Option<crate::document::NodeId>,
+    plots: &mut [TrackPlotInfo<'_>],
     current_frame: &mut usize,
+    timeline_scroll: &mut f32,
+    edit_mode: bool,
+    dragged_keyframe: &mut Option<(crate::document::NodeId, String, usize)>,
 ) {
     ui.horizontal(|ui| {
         ui.add_space(4.0);
-        ui.allocate_ui(egui::vec2(50.0, 32.0), |ui| {
+        ui.allocate_ui(egui::vec2(60.0, 32.0), |ui| {
             ui.centered_and_justified(|ui| {
-                ui.label(RichText::new(label).strong().color(colors::TEXT_MUTED));
+                ui.label(RichText::new(track_label).strong().color(colors::TEXT_MUTED));
             });
         });
         
@@ -2865,43 +2881,225 @@ fn draw_timeline_track(
             egui::StrokeKind::Inside,
         );
         
-        let n_frames = 100.0;
-        for f in (0..=100).step_by(10) {
-            let frac = f as f32 / n_frames as f32;
-            let x = rect.left() + frac * rect.width();
+        let start_frame = *timeline_scroll;
+        let visible_frames = 100.0;
+        let end_frame = start_frame + visible_frames;
+        
+        // Draw vertical grid lines every 10 frames in the visible range
+        let grid_start = ((start_frame / 10.0).floor() * 10.0) as i32;
+        let grid_end = (end_frame / 10.0).ceil() as i32 * 10;
+        
+        for f in (grid_start..=grid_end).step_by(10) {
+            if f >= 0 {
+                let frac = (f as f32 - start_frame) / visible_frames;
+                if frac >= 0.0 && frac <= 1.0 {
+                    let x = rect.left() + frac * rect.width();
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(1.0, colors::BORDER.gamma_multiply(0.3)),
+                    );
+                    
+                    if f % 20 == 0 {
+                        let font = egui::FontId::new(9.0, egui::FontFamily::Proportional);
+                        painter.text(
+                            egui::pos2(x, rect.top() + 2.0),
+                            egui::Align2::CENTER_TOP,
+                            f.to_string(),
+                            font,
+                            colors::TEXT_MUTED.gamma_multiply(0.5),
+                        );
+                    }
+                }
+            }
+        }
+        
+        let padding = 6.0;
+        // Compute min and max values across all plots to scale y-axis
+        let mut val_min = f64::MAX;
+        let mut val_max = f64::MIN;
+        let mut has_any_kf = false;
+        for plot in plots.iter() {
+            if !plot.track.keyframes.is_empty() {
+                has_any_kf = true;
+                for kf in &plot.track.keyframes {
+                    val_min = val_min.min(kf.value);
+                    val_max = val_max.max(kf.value);
+                }
+            }
+        }
+        if !has_any_kf || val_min >= val_max {
+            if has_any_kf {
+                val_min = val_min - 50.0;
+                val_max = val_max + 50.0;
+            } else {
+                val_min = 0.0;
+                val_max = 100.0;
+            }
+        }
+        
+        // Keyframe dragging/shifting in edit mode
+        if edit_mode {
+            let mut drag_to_apply = None; // (plot_label, orig_frame, target_frame)
+            
+            if let (Some(n_id), Some((drag_n_id, drag_lbl, drag_orig_frame))) = (node_id, dragged_keyframe.clone()) {
+                if n_id == drag_n_id {
+                    if ui.input(|i| i.pointer.any_down()) {
+                        if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
+                            let relative_x = mpos.x - rect.left();
+                            let raw_frame = start_frame + (relative_x / rect.width() * visible_frames);
+                            let target_frame = raw_frame.round().max(0.0) as usize;
+                            
+                            if target_frame != drag_orig_frame {
+                                drag_to_apply = Some((drag_lbl.clone(), drag_orig_frame, target_frame));
+                            }
+                        }
+                    } else {
+                        *dragged_keyframe = None;
+                    }
+                }
+            }
+            
+            // Check if we need to start a new drag
+            if dragged_keyframe.is_none() {
+                if let Some(n_id) = node_id {
+                    for plot in plots.iter() {
+                        for kf in &plot.track.keyframes {
+                            let kf_frame = kf.frame as f32;
+                            if kf_frame >= start_frame && kf_frame <= end_frame {
+                                let frac_x = (kf_frame - start_frame) / visible_frames;
+                                let kf_x = rect.left() + frac_x * rect.width();
+                                let frac_y = (kf.value - val_min) / (val_max - val_min);
+                                let kf_y = rect.bottom() - padding - (frac_y as f32) * (rect.height() - 2.0 * padding);
+                                let center = egui::pos2(kf_x, kf_y);
+                                
+                                let mouse_pos = ui.input(|i| i.pointer.hover_pos());
+                                let is_hovered = if let Some(mpos) = mouse_pos {
+                                    mpos.distance(center) < 8.0
+                                } else {
+                                    false
+                                };
+                                
+                                if is_hovered && ui.input(|i| i.pointer.any_pressed()) {
+                                    *dragged_keyframe = Some((n_id, plot.label.to_string(), kf.frame));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Apply frame shift
+            if let Some((lbl, orig_f, target_f)) = drag_to_apply {
+                for plot in plots.iter_mut() {
+                    if plot.label == lbl {
+                        plot.track.keyframes.retain(|kf| kf.frame != target_f || kf.frame == orig_f);
+                        if let Some(pos) = plot.track.keyframes.iter().position(|kf| kf.frame == orig_f) {
+                            plot.track.keyframes[pos].frame = target_f;
+                            plot.track.keyframes.sort_by_key(|kf| kf.frame);
+                            if let Some((_, _, drag_f)) = dragged_keyframe.as_mut() {
+                                *drag_f = target_f;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Draw linear lines between keyframes
+        for plot in plots.iter() {
+            let mut pts = Vec::new();
+            for f in grid_start..=grid_end {
+                if f >= 0 {
+                    let val = plot.track.interpolate(f as usize).unwrap_or(plot.default_val);
+                    let frac_x = (f as f32 - start_frame) / visible_frames;
+                    let x = rect.left() + frac_x * rect.width();
+                    let frac_y = (val - val_min) / (val_max - val_min);
+                    let y = rect.bottom() - padding - (frac_y as f32) * (rect.height() - 2.0 * padding);
+                    pts.push(egui::pos2(x, y));
+                }
+            }
+            if pts.len() > 1 {
+                for window in pts.windows(2) {
+                    painter.line_segment([window[0], window[1]], egui::Stroke::new(1.5, plot.color));
+                }
+            }
+        }
+        
+        // Draw keyframe points (circles)
+        for plot in plots.iter() {
+            for kf in &plot.track.keyframes {
+                let kf_frame = kf.frame as f32;
+                if kf_frame >= start_frame && kf_frame <= end_frame {
+                    let frac_x = (kf_frame - start_frame) / visible_frames;
+                    let kf_x = rect.left() + frac_x * rect.width();
+                    let frac_y = (kf.value - val_min) / (val_max - val_min);
+                    let kf_y = rect.bottom() - padding - (frac_y as f32) * (rect.height() - 2.0 * padding);
+                    let center = egui::pos2(kf_x, kf_y);
+                    
+                    let mouse_pos = ui.input(|i| i.pointer.hover_pos());
+                    let is_hovered = if let Some(mpos) = mouse_pos {
+                        mpos.distance(center) < 8.0
+                    } else {
+                        false
+                    };
+                    
+                    let is_being_dragged = if let (Some(n_id), Some((drag_n_id, drag_lbl, drag_orig_frame))) = (node_id, &dragged_keyframe) {
+                        n_id == *drag_n_id && plot.label == drag_lbl && kf.frame == *drag_orig_frame
+                    } else {
+                        false
+                    };
+                    
+                    let kf_color = if is_hovered || is_being_dragged {
+                        colors::ACCENT
+                    } else {
+                        plot.color
+                    };
+                    
+                    painter.circle(
+                        center,
+                        4.5,
+                        kf_color,
+                        egui::Stroke::new(1.0, colors::BG_PANEL),
+                    );
+                    
+                    if edit_mode && is_hovered {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                }
+            }
+        }
+        
+        // Draw active frame line (playhead)
+        let active_frame_f = *current_frame as f32;
+        if active_frame_f >= start_frame && active_frame_f <= end_frame {
+            let active_frac = (active_frame_f - start_frame) / visible_frames;
+            let playhead_x = rect.left() + active_frac * rect.width();
             painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.0, colors::BORDER.gamma_multiply(0.3)),
+                [egui::pos2(playhead_x, rect.top()), egui::pos2(playhead_x, rect.bottom())],
+                egui::Stroke::new(1.5, colors::ACCENT),
             );
         }
         
-        for kf in &track.keyframes {
-            if kf.frame <= 100 {
-                let frac = kf.frame as f32 / n_frames as f32;
-                let kf_x = rect.left() + frac * rect.width();
-                let kf_y = rect.center().y;
-                painter.circle(
-                    egui::pos2(kf_x, kf_y),
-                    4.0,
-                    colors::POWERLINE_C,
-                    egui::Stroke::new(1.0, colors::BG_PANEL),
-                );
-            }
+        // Mouse wheel scroll to pan timeline (horizontal scroll only!)
+        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+        if scroll_delta.x != 0.0 && response.hovered() {
+            *timeline_scroll = (*timeline_scroll - scroll_delta.x * 0.1).max(0.0);
         }
         
-        let active_frac = *current_frame as f32 / n_frames as f32;
-        let playhead_x = rect.left() + active_frac * rect.width();
-        painter.line_segment(
-            [egui::pos2(playhead_x, rect.top()), egui::pos2(playhead_x, rect.bottom())],
-            egui::Stroke::new(1.5, colors::ACCENT),
-        );
-        
-        if response.clicked() || response.dragged() {
+        // Drag interaction
+        if dragged_keyframe.is_some() {
+            // Dragging keyframe: do not scrub playhead
+        } else if response.dragged_by(egui::PointerButton::Primary) || response.clicked_by(egui::PointerButton::Primary) {
             if let Some(mouse_pos) = response.interact_pointer_pos() {
                 let relative_x = mouse_pos.x - rect.left();
-                let raw_frame = (relative_x / rect.width() * n_frames).round();
-                *current_frame = raw_frame.clamp(0.0, n_frames) as usize;
+                let raw_frame = start_frame + (relative_x / rect.width() * visible_frames);
+                *current_frame = raw_frame.round().max(0.0) as usize;
             }
+        } else if response.dragged_by(egui::PointerButton::Secondary) {
+            let delta_x = ui.input(|i| i.pointer.delta().x);
+            let frames_pan = delta_x / rect.width() * visible_frames;
+            *timeline_scroll = (*timeline_scroll - frames_pan).max(0.0);
         }
     });
 }
@@ -2912,6 +3110,16 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             ui.add_space(4.0);
             ui.label(RichText::new("ANIMATION TIMELINE").strong().color(colors::ACCENT));
             
+            // Align "Edit mode" button to top-center
+            let width_left = ui.available_width();
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add_space((width_left * 0.5 - 75.0).max(0.0));
+                
+                let edit_color = if app.anim_edit_mode { colors::POWERLINE_C } else { colors::TEXT_MUTED };
+                let btn_edit = ui.toggle_value(&mut app.anim_edit_mode, RichText::new("Edit mode").strong().color(edit_color));
+                btn_edit.on_hover_text("Edit properties of the keyframe at the current frame in the sidebar");
+            });
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if app.anim_keyframing_mode {
                     let time = ui.input(|i| i.time);
@@ -2925,7 +3133,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ui.label(RichText::new("Idle").color(colors::TEXT_MUTED));
                 }
                 
-                ui.label(RichText::new(format!("Frame {}/100", app.anim_current_frame)).color(colors::TEXT));
+                ui.label(RichText::new(format!("Frame {}", app.anim_current_frame)).color(colors::TEXT));
             });
         });
         
@@ -2934,27 +3142,141 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         ui.add_space(6.0);
 
         let selected_node_id = app.selection.first().copied();
-        let empty_track = crate::app::KeyframeTrack::default();
-        
-        let (track_x, track_y) = if let Some(node_id) = selected_node_id {
-            if let Some(anim) = app.anim_timeline.nodes.get(&node_id) {
-                (&anim.pos_x, &anim.pos_y)
-            } else {
-                (&empty_track, &empty_track)
-            }
-        } else {
-            (&empty_track, &empty_track)
-        };
-
         let mut curr_frame = app.anim_current_frame;
-        draw_timeline_track(ui, "pos_x", track_x, &mut curr_frame);
+        let mut scroll = app.anim_timeline_scroll;
+        let edit_mode = app.anim_edit_mode;
         
-        ui.add_space(6.0);
+        let mut dragged = app.anim_dragged_keyframe.clone();
         
-        draw_timeline_track(ui, "pos_y", track_y, &mut curr_frame);
+        if let Some(node_id) = selected_node_id {
+            if let Some(anim) = app.anim_timeline.nodes.get_mut(&node_id) {
+                // Determine which tracks have keyframes
+                let has_pos = !anim.pos_x.keyframes.is_empty() || !anim.pos_y.keyframes.is_empty();
+                let has_rot = !anim.rotation.keyframes.is_empty();
+                let has_op = !anim.opacity.keyframes.is_empty();
+                let has_col = !anim.color_r.keyframes.is_empty() 
+                    || !anim.color_g.keyframes.is_empty() 
+                    || !anim.color_b.keyframes.is_empty() 
+                    || !anim.color_a.keyframes.is_empty();
+                
+                ScrollArea::vertical()
+                    .id_salt("timeline_tracks_scroll")
+                    .max_height(80.0)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        
+                        if has_pos {
+                            let mut plots = vec![
+                                TrackPlotInfo {
+                                    label: "pos_x",
+                                    track: &mut anim.pos_x,
+                                    color: egui::Color32::from_rgb(0, 200, 0), // green
+                                    default_val: 0.0,
+                                },
+                                TrackPlotInfo {
+                                    label: "pos_y",
+                                    track: &mut anim.pos_y,
+                                    color: egui::Color32::from_rgb(200, 0, 0), // red
+                                    default_val: 0.0,
+                                },
+                            ];
+                            draw_timeline_track(
+                                ui,
+                                "Position",
+                                Some(node_id),
+                                &mut plots,
+                                &mut curr_frame,
+                                &mut scroll,
+                                edit_mode,
+                                &mut dragged,
+                            );
+                        }
+                        
+                        if has_rot {
+                            let mut plots = vec![
+                                TrackPlotInfo {
+                                    label: "rotation",
+                                    track: &mut anim.rotation,
+                                    color: colors::ACCENT,
+                                    default_val: 0.0,
+                                },
+                            ];
+                            draw_timeline_track(
+                                ui,
+                                "Rotation",
+                                Some(node_id),
+                                &mut plots,
+                                &mut curr_frame,
+                                &mut scroll,
+                                edit_mode,
+                                &mut dragged,
+                            );
+                        }
+                        
+                        if has_op {
+                            let mut plots = vec![
+                                TrackPlotInfo {
+                                    label: "opacity",
+                                    track: &mut anim.opacity,
+                                    color: egui::Color32::from_rgb(150, 150, 150),
+                                    default_val: 1.0,
+                                },
+                            ];
+                            draw_timeline_track(
+                                ui,
+                                "Opacity",
+                                Some(node_id),
+                                &mut plots,
+                                &mut curr_frame,
+                                &mut scroll,
+                                edit_mode,
+                                &mut dragged,
+                            );
+                        }
+                        
+                        if has_col {
+                            let mut plots = vec![
+                                TrackPlotInfo {
+                                    label: "color_r",
+                                    track: &mut anim.color_r,
+                                    color: egui::Color32::from_rgb(255, 100, 100),
+                                    default_val: 1.0,
+                                },
+                                TrackPlotInfo {
+                                    label: "color_g",
+                                    track: &mut anim.color_g,
+                                    color: egui::Color32::from_rgb(100, 255, 100),
+                                    default_val: 1.0,
+                                },
+                                TrackPlotInfo {
+                                    label: "color_b",
+                                    track: &mut anim.color_b,
+                                    color: egui::Color32::from_rgb(100, 100, 255),
+                                    default_val: 1.0,
+                                },
+                            ];
+                            draw_timeline_track(
+                                ui,
+                                "Color",
+                                Some(node_id),
+                                &mut plots,
+                                &mut curr_frame,
+                                &mut scroll,
+                                edit_mode,
+                                &mut dragged,
+                            );
+                        }
+                    });
+            }
+        }
+        
+        app.anim_dragged_keyframe = dragged;
 
         if curr_frame != app.anim_current_frame {
             app.anim_current_frame = curr_frame;
+        }
+        if scroll != app.anim_timeline_scroll {
+            app.anim_timeline_scroll = scroll;
         }
     });
 }
@@ -2968,12 +3290,19 @@ fn floating_timeline_window(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect
 
     let inset = theme::overlay_work_rect(work);
     let gap = theme::chrome_gap() as f32;
-    let card_w = inset.width() - 2.0 * gap;
+    let action_bar_open_amount = app.ui_anim.action_bar_open_t();
+    let action_bar_visible_width = app.action_bar_width * action_bar_open_amount;
+    let width_reduction = if action_bar_open_amount > 0.001 {
+        action_bar_visible_width + gap
+    } else {
+        0.0
+    };
+    let card_w = inset.width() - 2.0 * gap - width_reduction;
     let card_h = 120.0;
     
     let left = inset.left() + gap;
-    let open_top = inset.bottom() - card_h - gap - 26.0;
-    let travel = card_h + gap + 26.0;
+    let open_top = inset.bottom() - card_h - gap - 30.0;
+    let travel = card_h + gap + 30.0;
     let top = open_top + (1.0 - open_t) * travel;
     
     let rect = Rect::from_min_size(egui::pos2(left, top), egui::vec2(card_w, card_h));
@@ -2982,4 +3311,184 @@ fn floating_timeline_window(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect
     theme::show_action_bar_area(ctx, "floating_timeline", rect, opacity, |ui| {
         timeline_interior(app, ui);
     });
+}
+
+fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+    if app.selection.is_empty() {
+        ui.label(RichText::new("Select one object to edit animation properties").color(colors::TEXT_MUTED));
+        return;
+    }
+    let id = app.selection[0];
+    
+    let (name, curr_pos, curr_rot, curr_op, curr_color) = {
+        let Some(node) = app.project.nodes.get(id) else {
+            return;
+        };
+        (
+            node.name.clone(),
+            node.get_pos(),
+            node.get_rotation(),
+            node.get_opacity() as f64,
+            node.get_color(),
+        )
+    };
+    
+    ui.label(RichText::new(format!("Animation for {}", name)).strong().color(colors::ACCENT));
+    ui.add_space(4.0);
+    ui.label(RichText::new(format!("Current Frame: {}", app.anim_current_frame)).strong());
+    ui.separator();
+    ui.add_space(4.0);
+
+    let mut entry = app.anim_timeline.nodes.entry(id).or_default().clone();
+    let frame = app.anim_current_frame;
+
+    let mut render_prop_row = |ui: &mut Ui, label: &str, track: &mut KeyframeTrack, default_val: f64, min: f64, max: f64, speed: f64| -> (bool, Option<f64>) {
+        let has_kf = track.keyframes.iter().any(|kf| kf.frame == frame);
+        let val = track.interpolate(frame).unwrap_or(default_val);
+        
+        let mut ret = (false, None);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).strong());
+            ui.add_space(10.0);
+            
+            if has_kf {
+                let mut v = val;
+                let drag = ui.add(egui::DragValue::new(&mut v).range(min..=max).speed(speed));
+                if drag.changed() {
+                    track.insert(frame, v);
+                    ret = (true, Some(v));
+                }
+                
+                if ui.button("🗑").on_hover_text("Delete keyframe").clicked() {
+                    track.keyframes.retain(|kf| kf.frame != frame);
+                    ret = (true, None);
+                }
+            } else {
+                ui.label(RichText::new(format!("{:.2} (interpolated)", val)).color(colors::TEXT_MUTED));
+                if ui.button("+").on_hover_text("Add keyframe").clicked() {
+                    track.insert(frame, val);
+                    ret = (true, Some(val));
+                }
+            }
+        });
+        ui.add_space(4.0);
+        ret
+    };
+
+    let mut entry_changed = false;
+
+    let mut track_x = entry.pos_x.clone();
+    let (changed_x, val_x) = render_prop_row(ui, "Position X", &mut track_x, curr_pos.0, -10000.0, 10000.0, 1.0);
+    if changed_x {
+        entry.pos_x = track_x;
+        entry_changed = true;
+        if let Some(vx) = val_x {
+            if let Some(n) = app.project.nodes.get_mut(id) {
+                let p = n.get_pos();
+                n.translate(vx - p.0, 0.0);
+            }
+        }
+    }
+
+    let mut track_y = entry.pos_y.clone();
+    let (changed_y, val_y) = render_prop_row(ui, "Position Y", &mut track_y, curr_pos.1, -10000.0, 10000.0, 1.0);
+    if changed_y {
+        entry.pos_y = track_y;
+        entry_changed = true;
+        if let Some(vy) = val_y {
+            if let Some(n) = app.project.nodes.get_mut(id) {
+                let p = n.get_pos();
+                n.translate(0.0, vy - p.1);
+            }
+        }
+    }
+
+    let mut track_rot = entry.rotation.clone();
+    let (changed_rot, val_rot) = render_prop_row(ui, "Rotation", &mut track_rot, curr_rot.to_degrees(), -360.0, 360.0, 1.0);
+    if changed_rot {
+        entry.rotation = track_rot;
+        entry_changed = true;
+        if let Some(vrot) = val_rot {
+            if let Some(n) = app.project.nodes.get_mut(id) {
+                n.set_rotation(vrot.to_radians());
+            }
+        }
+    }
+
+    let mut track_op = entry.opacity.clone();
+    let (changed_op, val_op) = render_prop_row(ui, "Opacity", &mut track_op, curr_op, 0.0, 1.0, 0.01);
+    if changed_op {
+        entry.opacity = track_op;
+        entry_changed = true;
+        if let Some(vop) = val_op {
+            if let Some(n) = app.project.nodes.get_mut(id) {
+                n.set_opacity(vop as f32);
+            }
+        }
+    }
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Fill Color").strong());
+        ui.add_space(10.0);
+        
+        let has_r = entry.color_r.keyframes.iter().any(|kf| kf.frame == frame);
+        
+        let r = entry.color_r.interpolate(frame).unwrap_or(curr_color[0] as f64) as f32;
+        let g = entry.color_g.interpolate(frame).unwrap_or(curr_color[1] as f64) as f32;
+        let b = entry.color_b.interpolate(frame).unwrap_or(curr_color[2] as f64) as f32;
+        let a = entry.color_a.interpolate(frame).unwrap_or(curr_color[3] as f64) as f32;
+        
+        let mut color_color32 = egui::Color32::from_rgba_unmultiplied(
+            (r * 255.0) as u8,
+            (g * 255.0) as u8,
+            (b * 255.0) as u8,
+            (a * 255.0) as u8,
+        );
+        
+        if has_r {
+            if ui.color_edit_button_srgba(&mut color_color32).changed() {
+                let rgba = color_color32.to_array();
+                let rf = rgba[0] as f64 / 255.0;
+                let gf = rgba[1] as f64 / 255.0;
+                let bf = rgba[2] as f64 / 255.0;
+                let af = rgba[3] as f64 / 255.0;
+                
+                entry.color_r.insert(frame, rf);
+                entry.color_g.insert(frame, gf);
+                entry.color_b.insert(frame, bf);
+                entry.color_a.insert(frame, af);
+                entry_changed = true;
+                
+                if let Some(n) = app.project.nodes.get_mut(id) {
+                    n.set_color([rf as f32, gf as f32, bf as f32, af as f32]);
+                }
+            }
+            
+            if ui.button("🗑").on_hover_text("Delete color keyframe").clicked() {
+                entry.color_r.keyframes.retain(|kf| kf.frame != frame);
+                entry.color_g.keyframes.retain(|kf| kf.frame != frame);
+                entry.color_b.keyframes.retain(|kf| kf.frame != frame);
+                entry.color_a.keyframes.retain(|kf| kf.frame != frame);
+                entry_changed = true;
+            }
+        } else {
+            let mut display_color = egui::Color32::from_rgba_unmultiplied(
+                (r * 255.0) as u8,
+                (g * 255.0) as u8,
+                (b * 255.0) as u8,
+                (a * 255.0) as u8,
+            );
+            ui.color_edit_button_srgba(&mut display_color);
+            ui.label(RichText::new(" (interpolated)").color(colors::TEXT_MUTED));
+            if ui.button("+").on_hover_text("Add color keyframe").clicked() {
+                entry.color_r.insert(frame, r as f64);
+                entry.color_g.insert(frame, g as f64);
+                entry.color_b.insert(frame, b as f64);
+                entry.color_a.insert(frame, a as f64);
+                entry_changed = true;
+            }
+        }
+    });
+
+    app.anim_timeline.nodes.insert(id, entry);
 }

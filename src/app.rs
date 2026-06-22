@@ -113,10 +113,24 @@ impl KeyframeTrack {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AnimAppliedState {
+    pub pos: (f64, f64),
+    pub rotation: f64,
+    pub opacity: f32,
+    pub color: [f32; 4],
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeAnimation {
     pub pos_x: KeyframeTrack,
     pub pos_y: KeyframeTrack,
+    pub rotation: KeyframeTrack,
+    pub opacity: KeyframeTrack,
+    pub color_r: KeyframeTrack,
+    pub color_g: KeyframeTrack,
+    pub color_b: KeyframeTrack,
+    pub color_a: KeyframeTrack,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -131,8 +145,11 @@ pub struct VadadeeBerryApp {
     pub anim_show_timeline_window: bool,
     pub anim_time_accumulator: f32,
     pub anim_last_seen_frame: usize,
-    pub anim_last_applied_positions: std::collections::HashMap<NodeId, (f64, f64)>,
+    pub anim_last_applied_states: std::collections::HashMap<NodeId, AnimAppliedState>,
     pub anim_timeline: AnimationTimeline,
+    pub anim_timeline_scroll: f32,
+    pub anim_edit_mode: bool,
+    pub anim_dragged_keyframe: Option<(NodeId, String, usize)>,
 
     pub project: ProjectFile,
     pub viewport: Viewport,
@@ -263,8 +280,11 @@ impl VadadeeBerryApp {
             anim_show_timeline_window: false,
             anim_time_accumulator: 0.0,
             anim_last_seen_frame: 0,
-            anim_last_applied_positions: std::collections::HashMap::new(),
+            anim_last_applied_states: std::collections::HashMap::new(),
             anim_timeline: AnimationTimeline::default(),
+            anim_timeline_scroll: 0.0,
+            anim_edit_mode: false,
+            anim_dragged_keyframe: None,
 
             project: Document::new_default_project(),
             viewport: Viewport::default(),
@@ -1026,22 +1046,65 @@ impl VadadeeBerryApp {
         );
     }
 
+    pub fn get_max_animation_frame(&self) -> usize {
+        let mut max_f = 100;
+        for anim in self.anim_timeline.nodes.values() {
+            let tracks = [
+                &anim.pos_x, &anim.pos_y, &anim.rotation, &anim.opacity,
+                &anim.color_r, &anim.color_g, &anim.color_b, &anim.color_a
+            ];
+            for t in tracks {
+                if let Some(last) = t.keyframes.last() {
+                    max_f = max_f.max(last.frame);
+                }
+            }
+        }
+        max_f
+    }
+
     pub fn apply_animation_for_frame(&mut self, frame: usize) {
-        let updates: Vec<(NodeId, Option<f64>, Option<f64>)> = self.anim_timeline.nodes.iter()
+        let updates: Vec<(NodeId, Option<f64>, Option<f64>, Option<f64>, Option<f32>, Option<[f32; 4]>)> = self.anim_timeline.nodes.iter()
             .map(|(node_id, track)| {
                 let x = track.pos_x.interpolate(frame);
                 let y = track.pos_y.interpolate(frame);
-                (*node_id, x, y)
+                let rot = track.rotation.interpolate(frame);
+                let opacity = track.opacity.interpolate(frame).map(|o| o as f32);
+                let r = track.color_r.interpolate(frame);
+                let g = track.color_g.interpolate(frame);
+                let b = track.color_b.interpolate(frame);
+                let a = track.color_a.interpolate(frame);
+                let color = if let (Some(r), Some(g), Some(b), Some(a)) = (r, g, b, a) {
+                    Some([r as f32, g as f32, b as f32, a as f32])
+                } else {
+                    None
+                };
+                (*node_id, x, y, rot, opacity, color)
             })
             .collect();
 
-        for (node_id, target_x, target_y) in updates {
+        for (node_id, target_x, target_y, target_rot, target_op, target_color) in updates {
             if let Some(node) = self.project.nodes.get_mut(node_id) {
+                // Apply position
                 let (curr_x, curr_y) = node.get_pos();
                 let dx = target_x.map(|tx| tx - curr_x).unwrap_or(0.0);
                 let dy = target_y.map(|ty| ty - curr_y).unwrap_or(0.0);
                 if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
                     node.translate(dx, dy);
+                }
+                
+                // Apply rotation
+                if let Some(rot) = target_rot {
+                    node.set_rotation(rot);
+                }
+                
+                // Apply opacity
+                if let Some(op) = target_op {
+                    node.set_opacity(op);
+                }
+                
+                // Apply color
+                if let Some(color) = target_color {
+                    node.set_color(color);
                 }
             }
         }
@@ -1054,12 +1117,33 @@ impl VadadeeBerryApp {
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
                     let pos = node.get_pos();
+                    let rot = node.get_rotation();
+                    let op = node.get_opacity() as f64;
+                    let color = node.get_color();
                     let entry = self.anim_timeline.nodes.entry(*id).or_default();
                     if entry.pos_x.keyframes.is_empty() {
                         entry.pos_x.insert(0, pos.0);
                     }
                     if entry.pos_y.keyframes.is_empty() {
                         entry.pos_y.insert(0, pos.1);
+                    }
+                    if entry.rotation.keyframes.is_empty() {
+                        entry.rotation.insert(0, rot);
+                    }
+                    if entry.opacity.keyframes.is_empty() {
+                        entry.opacity.insert(0, op);
+                    }
+                    if entry.color_r.keyframes.is_empty() {
+                        entry.color_r.insert(0, color[0] as f64);
+                    }
+                    if entry.color_g.keyframes.is_empty() {
+                        entry.color_g.insert(0, color[1] as f64);
+                    }
+                    if entry.color_b.keyframes.is_empty() {
+                        entry.color_b.insert(0, color[2] as f64);
+                    }
+                    if entry.color_a.keyframes.is_empty() {
+                        entry.color_a.insert(0, color[3] as f64);
                     }
                 }
             }
@@ -1200,6 +1284,12 @@ impl VadadeeBerryApp {
     pub fn derive_action_status(&self, ctx: &Context) -> String {
         if let Some(progress) = &self.paste_progress {
             return progress.label.clone();
+        }
+        if self.anim_is_playing {
+            return format!("Playing animation (Frame {})", self.anim_current_frame);
+        }
+        if self.anim_keyframing_mode {
+            return format!("Recording keyframes (Frame {})", self.anim_current_frame);
         }
         if let Some(live) = self.live_action_status(ctx) {
             return live;
@@ -5472,7 +5562,8 @@ impl eframe::App for VadadeeBerryApp {
             if self.anim_time_accumulator >= FRAME_TIME {
                 let steps = (self.anim_time_accumulator / FRAME_TIME) as usize;
                 self.anim_time_accumulator -= steps as f32 * FRAME_TIME;
-                self.anim_current_frame = (self.anim_current_frame + steps) % 101; // 0..=100
+                let max_frame = self.get_max_animation_frame();
+                self.anim_current_frame = (self.anim_current_frame + steps) % (max_frame + 1);
                 frame_changed = true;
             }
             ctx.request_repaint(); // Keep ticking
@@ -5482,10 +5573,15 @@ impl eframe::App for VadadeeBerryApp {
         if frame_scrubbed || frame_changed {
             self.apply_animation_for_frame(self.anim_current_frame);
             self.anim_last_seen_frame = self.anim_current_frame;
-            self.anim_last_applied_positions.clear();
+            self.anim_last_applied_states.clear();
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
-                    self.anim_last_applied_positions.insert(*id, node.get_pos());
+                    self.anim_last_applied_states.insert(*id, AnimAppliedState {
+                        pos: node.get_pos(),
+                        rotation: node.get_rotation(),
+                        opacity: node.get_opacity(),
+                        color: node.get_color(),
+                    });
                 }
             }
         } else if self.anim_keyframing_mode && !self.anim_is_playing {
@@ -5493,6 +5589,9 @@ impl eframe::App for VadadeeBerryApp {
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
                     let pos = node.get_pos();
+                    let rot = node.get_rotation();
+                    let op = node.get_opacity() as f64;
+                    let color = node.get_color();
                     let entry = self.anim_timeline.nodes.entry(*id).or_default();
                     if entry.pos_x.keyframes.is_empty() {
                         entry.pos_x.insert(0, pos.0);
@@ -5500,40 +5599,113 @@ impl eframe::App for VadadeeBerryApp {
                     if entry.pos_y.keyframes.is_empty() {
                         entry.pos_y.insert(0, pos.1);
                     }
+                    if entry.rotation.keyframes.is_empty() {
+                        entry.rotation.insert(0, rot);
+                    }
+                    if entry.opacity.keyframes.is_empty() {
+                        entry.opacity.insert(0, op);
+                    }
+                    if entry.color_r.keyframes.is_empty() {
+                        entry.color_r.insert(0, color[0] as f64);
+                    }
+                    if entry.color_g.keyframes.is_empty() {
+                        entry.color_g.insert(0, color[1] as f64);
+                    }
+                    if entry.color_b.keyframes.is_empty() {
+                        entry.color_b.insert(0, color[2] as f64);
+                    }
+                    if entry.color_a.keyframes.is_empty() {
+                        entry.color_a.insert(0, color[3] as f64);
+                    }
                 }
             }
 
-            // Ensure reference position is populated
+            // Ensure reference state is populated
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
-                    self.anim_last_applied_positions.entry(*id).or_insert_with(|| node.get_pos());
+                    self.anim_last_applied_states.entry(*id).or_insert_with(|| AnimAppliedState {
+                        pos: node.get_pos(),
+                        rotation: node.get_rotation(),
+                        opacity: node.get_opacity(),
+                        color: node.get_color(),
+                    });
                 }
             }
 
-            // Detect user movement
+            // Detect user modifications
             let mut keyframes_updated = false;
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
                     let pos = node.get_pos();
-                    let last_pos = self.anim_last_applied_positions.get(id).copied();
-                    if let Some(last_pos) = last_pos {
-                        let dx = pos.0 - last_pos.0;
-                        let dy = pos.1 - last_pos.1;
+                    let rot = node.get_rotation();
+                    let op = node.get_opacity();
+                    let color = node.get_color();
+                    
+                    let last_state = self.anim_last_applied_states.get(id);
+                    if let Some(last) = last_state {
+                        let mut changed = false;
+                        
+                        let dx = pos.0 - last.pos.0;
+                        let dy = pos.1 - last.pos.1;
                         if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
+                            changed = true;
+                        }
+                        
+                        if (rot - last.rotation).abs() > 1e-9 {
+                            changed = true;
+                        }
+                        
+                        if (op - last.opacity).abs() > 1e-6 {
+                            changed = true;
+                        }
+                        
+                        for i in 0..4 {
+                            if (color[i] - last.color[i]).abs() > 1e-6 {
+                                changed = true;
+                            }
+                        }
+                        
+                        if changed {
                             let entry = self.anim_timeline.nodes.entry(*id).or_default();
                             entry.pos_x.insert(self.anim_current_frame, pos.0);
                             entry.pos_y.insert(self.anim_current_frame, pos.1);
+                            entry.rotation.insert(self.anim_current_frame, rot);
+                            entry.opacity.insert(self.anim_current_frame, op as f64);
+                            entry.color_r.insert(self.anim_current_frame, color[0] as f64);
+                            entry.color_g.insert(self.anim_current_frame, color[1] as f64);
+                            entry.color_b.insert(self.anim_current_frame, color[2] as f64);
+                            entry.color_a.insert(self.anim_current_frame, color[3] as f64);
                             keyframes_updated = true;
                         }
                     }
                 }
             }
             if keyframes_updated {
-                self.anim_last_applied_positions.clear();
+                self.anim_last_applied_states.clear();
                 for id in &self.selection {
                     if let Some(node) = self.project.nodes.get(*id) {
-                        self.anim_last_applied_positions.insert(*id, node.get_pos());
+                        self.anim_last_applied_states.insert(*id, AnimAppliedState {
+                            pos: node.get_pos(),
+                            rotation: node.get_rotation(),
+                            opacity: node.get_opacity(),
+                            color: node.get_color(),
+                        });
                     }
+                }
+            }
+        }
+
+        // Manage Animation action tab availability dynamically
+        let has_anim_tab = self.action_tab_order.contains(&ui::ActionTab::Animation);
+        if self.anim_show_timeline_window {
+            if !has_anim_tab {
+                self.action_tab_order.push(ui::ActionTab::Animation);
+            }
+        } else {
+            if has_anim_tab {
+                self.action_tab_order.retain(|t| *t != ui::ActionTab::Animation);
+                if self.action_tab == ui::ActionTab::Animation {
+                    self.action_tab = ui::ActionTab::Layer; // Fallback
                 }
             }
         }
