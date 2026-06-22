@@ -272,6 +272,7 @@ pub fn draw_text_glyphs(
     stroke_join: LineJoin,
     stroke_cap: LineCap,
     opacity: f32,
+    rotation_rad: f64,
 ) -> bool {
     let Some(bytes) = fonts.query_face_bytes(&style.font_family, style.bold, style.italic) else {
         return false;
@@ -286,8 +287,8 @@ pub fn draw_text_glyphs(
 
     let tolerance = (0.15 / viewport.zoom.max(0.2)).clamp(0.02, 0.15);
 
-    if let Some(sw) = stroke_width_screen.filter(|w| stroke_style.is_visible() && *w > 0.01) {
-        if let Some(mesh) = tessellate_stroke_mesh(
+    let mut stroke_mesh = if let Some(sw) = stroke_width_screen.filter(|w| stroke_style.is_visible() && *w > 0.01) {
+        tessellate_stroke_mesh(
             &path,
             stroke_style,
             opacity,
@@ -295,15 +296,42 @@ pub fn draw_text_glyphs(
             stroke_join,
             stroke_cap,
             tolerance,
-        ) {
-            painter.add(Shape::mesh(mesh));
+        )
+    } else {
+        None
+    };
+
+    let mut fill_mesh = if fill.is_visible() {
+        tessellate_fill_mesh(&path, fill, opacity, bbox, tolerance)
+    } else {
+        None
+    };
+
+    if rotation_rad.abs() > 1e-9 {
+        let center = bbox.center();
+        let c = rotation_rad.cos() as f32;
+        let s = rotation_rad.sin() as f32;
+        let rotate_mesh = |mesh: &mut Mesh| {
+            for v in &mut mesh.vertices {
+                let dx = v.pos.x - center.x;
+                let dy = v.pos.y - center.y;
+                v.pos.x = center.x + dx * c - dy * s;
+                v.pos.y = center.y + dx * s + dy * c;
+            }
+        };
+        if let Some(m) = &mut stroke_mesh {
+            rotate_mesh(m);
+        }
+        if let Some(m) = &mut fill_mesh {
+            rotate_mesh(m);
         }
     }
 
-    if fill.is_visible() {
-        if let Some(mesh) = tessellate_fill_mesh(&path, fill, opacity, bbox, tolerance) {
-            painter.add(Shape::mesh(mesh));
-        }
+    if let Some(mesh) = stroke_mesh {
+        painter.add(Shape::mesh(mesh));
+    }
+    if let Some(mesh) = fill_mesh {
+        painter.add(Shape::mesh(mesh));
     }
 
     true

@@ -1569,6 +1569,7 @@ pub fn draw_node(
                 stroke_join,
                 stroke_cap,
                 opacity,
+                node.get_rotation(),
             );
         }
         NodeKind::Image { x, y, width, height, .. } => {
@@ -1717,7 +1718,16 @@ pub fn selection_screen_rect(
     let bounds = node.bounds_with_store(nodes);
     let tl = viewport.doc_to_screen((bounds.x0, bounds.y0), origin);
     let br = viewport.doc_to_screen((bounds.x1, bounds.y1), origin);
-    Rect::from_min_max(tl, br)
+    let mut r = Rect::from_min_max(tl, br);
+    if r.width() < 16.0 {
+        r.min.x -= 8.0;
+        r.max.x += 8.0;
+    }
+    if r.height() < 16.0 {
+        r.min.y -= 8.0;
+        r.max.y += 8.0;
+    }
+    r
 }
 
 pub fn selection_union_screen_rect(
@@ -2494,6 +2504,7 @@ fn draw_text_node(
     stroke_join: LineJoin,
     stroke_cap: LineCap,
     opacity: f32,
+    rotation_rad: f64,
 ) {
     if crate::text_glyph::draw_text_glyphs(
         painter,
@@ -2509,6 +2520,7 @@ fn draw_text_node(
         stroke_join,
         stroke_cap,
         opacity,
+        rotation_rad,
     ) {
         return;
     }

@@ -1357,18 +1357,11 @@ fn status_bar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     let play_icon = if app.anim_is_playing { "" } else { "" };
                     let play_tooltip = if app.anim_is_playing { "Pause" } else { "Play" };
                     
-                    let btn_rewind = ui.button(RichText::new("").font(nerd_font_id(12.0)));
-                    if btn_rewind.clicked() {
-                        app.anim_current_frame = 0;
-                        app.anim_is_playing = false;
+                    let btn_next = ui.button(RichText::new("").font(nerd_font_id(12.0)));
+                    if btn_next.clicked() {
+                        app.anim_current_frame = (app.anim_current_frame + 1) % 101;
                     }
-                    btn_rewind.on_hover_text("Back to start");
-
-                    let btn_prev = ui.button(RichText::new("").font(nerd_font_id(12.0)));
-                    if btn_prev.clicked() {
-                        app.anim_current_frame = if app.anim_current_frame == 0 { 100 } else { app.anim_current_frame - 1 };
-                    }
-                    btn_prev.on_hover_text("Backward (1 frame)");
+                    btn_next.on_hover_text("Forward (1 frame)");
 
                     let btn_play = ui.button(RichText::new(play_icon).font(nerd_font_id(12.0)));
                     if btn_play.clicked() {
@@ -1376,11 +1369,18 @@ fn status_bar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     }
                     btn_play.on_hover_text(play_tooltip);
 
-                    let btn_next = ui.button(RichText::new("").font(nerd_font_id(12.0)));
-                    if btn_next.clicked() {
-                        app.anim_current_frame = (app.anim_current_frame + 1) % 101;
+                    let btn_prev = ui.button(RichText::new("").font(nerd_font_id(12.0)));
+                    if btn_prev.clicked() {
+                        app.anim_current_frame = if app.anim_current_frame == 0 { 100 } else { app.anim_current_frame - 1 };
                     }
-                    btn_next.on_hover_text("Forward (1 frame)");
+                    btn_prev.on_hover_text("Backward (1 frame)");
+
+                    let btn_rewind = ui.button(RichText::new("").font(nerd_font_id(12.0)));
+                    if btn_rewind.clicked() {
+                        app.anim_current_frame = 0;
+                        app.anim_is_playing = false;
+                    }
+                    btn_rewind.on_hover_text("Back to start");
 
                     ui.add_space(4.0);
 
@@ -2851,6 +2851,9 @@ fn draw_timeline_track(
     timeline_scroll: &mut f32,
     edit_mode: bool,
     dragged_keyframe: &mut Option<(crate::document::NodeId, String, usize)>,
+    selected_keyframe: &mut Option<(crate::document::NodeId, String, usize)>,
+    graph_editor_track: &mut Option<(crate::document::NodeId, String)>,
+    graph_editor_target_track: &mut Option<(crate::document::NodeId, String)>,
 ) {
     ui.horizontal(|ui| {
         ui.add_space(4.0);
@@ -2981,6 +2984,7 @@ fn draw_timeline_track(
                                 
                                 if is_hovered && ui.input(|i| i.pointer.any_pressed()) {
                                     *dragged_keyframe = Some((n_id, plot.label.to_string(), kf.frame));
+                                    *selected_keyframe = Some((n_id, plot.label.to_string(), kf.frame));
                                     break;
                                 }
                             }
@@ -3049,19 +3053,47 @@ fn draw_timeline_track(
                     } else {
                         false
                     };
+
+                    let is_selected = if let (Some(n_id), Some(&(ref sel_n_id, ref sel_lbl, ref sel_frame))) = (node_id, selected_keyframe.as_ref()) {
+                        n_id == *sel_n_id && plot.label == sel_lbl && kf.frame == *sel_frame
+                    } else {
+                        false
+                    };
                     
                     let kf_color = if is_hovered || is_being_dragged {
                         colors::ACCENT
                     } else {
                         plot.color
                     };
+
+                    let stroke_color = if is_selected {
+                        colors::ACCENT
+                    } else {
+                        colors::BG_PANEL
+                    };
+                    let stroke_w = if is_selected { 2.0 } else { 1.0 };
+                    let radius = if is_selected { 6.0 } else { 4.5 };
                     
-                    painter.circle(
-                        center,
-                        4.5,
-                        kf_color,
-                        egui::Stroke::new(1.0, colors::BG_PANEL),
-                    );
+                    if kf.interpolation == crate::app::InterpolationMode::Bezier {
+                        let pts = [
+                            egui::pos2(center.x, center.y - radius),
+                            egui::pos2(center.x + radius, center.y),
+                            egui::pos2(center.x, center.y + radius),
+                            egui::pos2(center.x - radius, center.y),
+                        ];
+                        painter.add(egui::Shape::convex_polygon(
+                            pts.to_vec(),
+                            kf_color,
+                            egui::Stroke::new(stroke_w, stroke_color),
+                        ));
+                    } else {
+                        painter.circle(
+                            center,
+                            radius,
+                            kf_color,
+                            egui::Stroke::new(stroke_w, stroke_color),
+                        );
+                    }
                     
                     if edit_mode && is_hovered {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -3087,6 +3119,22 @@ fn draw_timeline_track(
             *timeline_scroll = (*timeline_scroll - scroll_delta.x * 0.1).max(0.0);
         }
         
+        // Double-click track to open graph editor
+        let double_clicked_track = response.double_clicked();
+        if double_clicked_track {
+            if let Some(n_id) = node_id {
+                let label = plots[0].label.to_string();
+                let new_track = (n_id, label);
+                if let Some(current) = graph_editor_track.as_ref() {
+                    if current != &new_track {
+                        *graph_editor_target_track = Some(new_track);
+                    }
+                } else {
+                    *graph_editor_track = Some(new_track);
+                }
+            }
+        }
+
         // Drag interaction
         if dragged_keyframe.is_some() {
             // Dragging keyframe: do not scrub playhead
@@ -3134,6 +3182,31 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 }
                 
                 ui.label(RichText::new(format!("Frame {}", app.anim_current_frame)).color(colors::TEXT));
+
+                if let Some((n_id, track_lbl, frame)) = app.anim_selected_keyframe.clone() {
+                    if let Some(anim) = app.anim_timeline.nodes.get_mut(&n_id) {
+                        if let Some(track) = anim.get_track_mut(&track_lbl) {
+                            if let Some(kf) = track.keyframes.iter_mut().find(|k| k.frame == frame) {
+                                let mut selected_mode = kf.interpolation;
+                                ui.add_space(8.0);
+                                egui::ComboBox::from_id_salt("kf_interp_combo")
+                                    .selected_text(match selected_mode {
+                                        crate::app::InterpolationMode::Linear => "Linear",
+                                        crate::app::InterpolationMode::Bezier => "Bezier/Smooth",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        if ui.selectable_value(&mut selected_mode, crate::app::InterpolationMode::Linear, "Linear").clicked() {
+                                            kf.interpolation = crate::app::InterpolationMode::Linear;
+                                        }
+                                        if ui.selectable_value(&mut selected_mode, crate::app::InterpolationMode::Bezier, "Bezier/Smooth").clicked() {
+                                            kf.interpolation = crate::app::InterpolationMode::Bezier;
+                                        }
+                                    });
+                                ui.label(RichText::new(format!("Keyframe (Frame {}):", frame)).color(colors::TEXT_MUTED));
+                            }
+                        }
+                    }
+                }
             });
         });
         
@@ -3149,6 +3222,11 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         let mut dragged = app.anim_dragged_keyframe.clone();
         
         if let Some(node_id) = selected_node_id {
+            let mut temp_selected_kf = app.anim_selected_keyframe.clone();
+            let mut temp_graph_track = app.anim_graph_editor_track.clone();
+            let mut temp_target_track = app.anim_graph_editor_target_track.clone();
+            let geom_floats = app.get_node_geom_floats(node_id);
+
             if let Some(anim) = app.anim_timeline.nodes.get_mut(&node_id) {
                 // Determine which tracks have keyframes
                 let has_pos = !anim.pos_x.keyframes.is_empty() || !anim.pos_y.keyframes.is_empty();
@@ -3189,6 +3267,9 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut scroll,
                                 edit_mode,
                                 &mut dragged,
+                                &mut temp_selected_kf,
+                                &mut temp_graph_track,
+                                &mut temp_target_track,
                             );
                         }
                         
@@ -3210,6 +3291,9 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut scroll,
                                 edit_mode,
                                 &mut dragged,
+                                &mut temp_selected_kf,
+                                &mut temp_graph_track,
+                                &mut temp_target_track,
                             );
                         }
                         
@@ -3231,6 +3315,9 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut scroll,
                                 edit_mode,
                                 &mut dragged,
+                                &mut temp_selected_kf,
+                                &mut temp_graph_track,
+                                &mut temp_target_track,
                             );
                         }
                         
@@ -3264,6 +3351,9 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut scroll,
                                 edit_mode,
                                 &mut dragged,
+                                &mut temp_selected_kf,
+                                &mut temp_graph_track,
+                                &mut temp_target_track,
                             );
                         }
 
@@ -3290,12 +3380,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 } else {
                                     "geom_unknown"
                                 };
-                                let default_val = if let Some(node) = app.project.nodes.get(node_id) {
-                                    let geom = node.get_geom_floats();
-                                    if i < geom.len() { geom[i] } else { 0.0 }
-                                } else {
-                                    0.0
-                                };
+                                let default_val = if i < geom_floats.len() { geom_floats[i] } else { 0.0 };
                                 
                                 let track_name = if let Some(node) = app.project.nodes.get(node_id) {
                                     match &node.kind {
@@ -3355,11 +3440,17 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                     &mut scroll,
                                     edit_mode,
                                     &mut dragged,
+                                    &mut temp_selected_kf,
+                                    &mut temp_graph_track,
+                                    &mut temp_target_track,
                                 );
                             }
                         }
                     });
             }
+            app.anim_selected_keyframe = temp_selected_kf;
+            app.anim_graph_editor_track = temp_graph_track;
+            app.anim_graph_editor_target_track = temp_target_track;
         }
         
         app.anim_dragged_keyframe = dragged;
@@ -3400,8 +3491,333 @@ fn floating_timeline_window(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect
     let rect = Rect::from_min_size(egui::pos2(left, top), egui::vec2(card_w, card_h));
     let opacity = egui::emath::easing::cubic_out(open_t);
 
+    // Render Graph Editor if open/opening
+    if app.anim_graph_editor_t > 0.001 {
+        let graph_h = 180.0;
+        let graph_top = top - gap - graph_h * app.anim_graph_editor_t;
+        let graph_rect = Rect::from_min_size(egui::pos2(left, graph_top), egui::vec2(card_w, graph_h));
+        let graph_opacity = egui::emath::easing::cubic_out(app.anim_graph_editor_t) * opacity;
+        
+        theme::show_action_bar_area(ctx, "graph_editor", graph_rect, graph_opacity, |ui| {
+            graph_editor_interior(app, ui);
+        });
+    }
+
     theme::show_action_bar_area(ctx, "floating_timeline", rect, opacity, |ui| {
         timeline_interior(app, ui);
+    });
+}
+
+fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
+    let Some((node_id, track_lbl)) = app.anim_graph_editor_track.clone() else {
+        return;
+    };
+    
+    // Resolve human-readable track name
+    let track_name = if let Some(node) = app.project.nodes.get(node_id) {
+        let base_len = node.get_geom_floats().len();
+        match track_lbl.as_str() {
+            "pos_x" => "Position X".to_string(),
+            "pos_y" => "Position Y".to_string(),
+            "rotation" => "Rotation".to_string(),
+            "opacity" => "Opacity".to_string(),
+            "color_r" => "Color Red".to_string(),
+            "color_g" => "Color Green".to_string(),
+            "color_b" => "Color Blue".to_string(),
+            "color_a" => "Color Alpha".to_string(),
+            _ if track_lbl.starts_with("geom_") => {
+                if let Ok(idx) = track_lbl["geom_".len()..].parse::<usize>() {
+                    if idx < base_len {
+                        match &node.kind {
+                            NodeKind::Rect { .. } => match idx {
+                                0 => "Width".to_string(),
+                                1 => "Height".to_string(),
+                                2 => "Corner Rad".to_string(),
+                                _ => format!("Geom {}", idx),
+                            },
+                            NodeKind::Ellipse { .. } => match idx {
+                                0 => "Radius X".to_string(),
+                                1 => "Radius Y".to_string(),
+                                _ => format!("Geom {}", idx),
+                            },
+                            NodeKind::Polygon { .. } => match idx {
+                                0 => "Radius".to_string(),
+                                1 => "Sides".to_string(),
+                                _ => format!("Geom {}", idx),
+                            },
+                            NodeKind::Arc { .. } => match idx {
+                                0 => "Radius".to_string(),
+                                1 => "Start Ang".to_string(),
+                                2 => "Sweep Ang".to_string(),
+                                _ => format!("Geom {}", idx),
+                            },
+                            NodeKind::Path { .. } => {
+                                let pt_idx = idx / 2;
+                                let is_y = idx % 2 == 1;
+                                format!("Pt {} {}", pt_idx, if is_y { "Y" } else { "X" })
+                            }
+                            NodeKind::BrushStroke { .. } => {
+                                let pt_idx = idx / 3;
+                                match idx % 3 {
+                                    0 => format!("Stroke {} X", pt_idx),
+                                    1 => format!("Stroke {} Y", pt_idx),
+                                    _ => format!("Stroke {} W", pt_idx),
+                                }
+                            }
+                            _ => format!("Geom {}", idx),
+                        }
+                    } else {
+                        // Resolve path magic property names
+                        let mut local_idx = idx - base_len;
+                        let mut resolved_name = None;
+                        
+                        if let Some(_) = app.project.document.tiling_effects.values().find(|e| e.source_id == node_id) {
+                            if local_idx < 10 {
+                                resolved_name = Some(match local_idx {
+                                    0 => "Tiling Gap X".to_string(),
+                                    1 => "Tiling Gap Y".to_string(),
+                                    2 => "Tiling Count X".to_string(),
+                                    3 => "Tiling Count Y".to_string(),
+                                    4 => "Tiling Offset X".to_string(),
+                                    5 => "Tiling Offset Y".to_string(),
+                                    6 => "Tiling Row Rot".to_string(),
+                                    7 => "Tiling Col Rot".to_string(),
+                                    8 => "Tiling Row Scale".to_string(),
+                                    9 => "Tiling Col Scale".to_string(),
+                                    _ => unreachable!(),
+                                });
+                            } else {
+                                local_idx -= 10;
+                            }
+                        }
+                        
+                        if resolved_name.is_none() {
+                            if let Some(_) = app.project.document.circular_effects.values().find(|e| e.source_id == node_id) {
+                                if local_idx < 7 {
+                                    resolved_name = Some(match local_idx {
+                                        0 => "Circular X".to_string(),
+                                        1 => "Circular Y".to_string(),
+                                        2 => "Circular Radius".to_string(),
+                                        3 => "Circular Copies".to_string(),
+                                        4 => "Circular Angle".to_string(),
+                                        5 => "Circular Base X".to_string(),
+                                        6 => "Circular Base Y".to_string(),
+                                        _ => unreachable!(),
+                                    });
+                                } else {
+                                    local_idx -= 7;
+                                }
+                            }
+                        }
+                        
+                        if resolved_name.is_none() {
+                            if let Some(_) = app.project.document.path_effects.values().find(|e| e.source_id == node_id) {
+                                if local_idx < 5 {
+                                    resolved_name = Some(match local_idx {
+                                        0 => "Path Gap".to_string(),
+                                        1 => "Path Count".to_string(),
+                                        2 => "Path Offset".to_string(),
+                                        3 => "Path End Scale".to_string(),
+                                        4 => "Path End Opacity".to_string(),
+                                        _ => unreachable!(),
+                                    });
+                                }
+                            }
+                        }
+                        
+                        resolved_name.unwrap_or_else(|| format!("Property {}", idx))
+                    }
+                } else {
+                    track_lbl.clone()
+                }
+            }
+            _ => track_lbl.clone(),
+        }
+    } else {
+        track_lbl.clone()
+    };
+    
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("GRAPH EDITOR: {}", track_name)).strong().color(colors::ACCENT));
+            
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(RichText::new("✕").strong()).clicked() {
+                    app.anim_graph_editor_track = None;
+                }
+            });
+        });
+        
+        ui.add_space(4.0);
+        
+        let Some(anim) = app.anim_timeline.nodes.get_mut(&node_id) else {
+            return;
+        };
+        let Some(track) = anim.get_track_mut(&track_lbl) else {
+            return;
+        };
+        
+        if track.keyframes.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new("No keyframes on this track.").color(colors::TEXT_MUTED));
+            });
+            return;
+        }
+        
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width() - 8.0, 136.0),
+            egui::Sense::click_and_drag()
+        );
+        let painter = ui.painter_at(rect);
+        
+        painter.rect_filled(rect, egui::CornerRadius::same(4), colors::BG_DEEP);
+        painter.rect_stroke(rect, egui::CornerRadius::same(4), egui::Stroke::new(1.0, colors::BORDER), egui::StrokeKind::Inside);
+        
+        let padding = 12.0;
+        
+        // Find min/max values
+        let mut val_min = f64::MAX;
+        let mut val_max = f64::MIN;
+        for kf in &track.keyframes {
+            val_min = val_min.min(kf.value);
+            val_max = val_max.max(kf.value);
+        }
+        if val_min >= val_max {
+            val_min -= 1.0;
+            val_max += 1.0;
+        } else {
+            let span = val_max - val_min;
+            val_min -= span * 0.15;
+            val_max += span * 0.15;
+        }
+        
+        // Draw grid
+        for f in (0..=100).step_by(10) {
+            let x = rect.left() + (f as f32 / 100.0) * rect.width();
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(1.0, colors::BORDER.gamma_multiply(0.2)),
+            );
+        }
+        for i in 0..=4 {
+            let frac = i as f32 / 4.0;
+            let y = rect.bottom() - padding - frac * (rect.height() - 2.0 * padding);
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                egui::Stroke::new(1.0, colors::BORDER.gamma_multiply(0.2)),
+            );
+            
+            // Draw value label
+            let val = val_min + (frac as f64) * (val_max - val_min);
+            let font = egui::FontId::new(9.0, egui::FontFamily::Proportional);
+            painter.text(
+                egui::pos2(rect.left() + 4.0, y - 2.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("{:.1}", val),
+                font,
+                colors::TEXT_MUTED.gamma_multiply(0.6),
+            );
+        }
+        
+        // Draw graph curve
+        let mut curve_pts = Vec::new();
+        for f in 0..=100 {
+            let val = track.interpolate(f).unwrap_or(0.0);
+            let x = rect.left() + (f as f32 / 100.0) * rect.width();
+            let frac_y = (val - val_min) / (val_max - val_min);
+            let y = rect.bottom() - padding - (frac_y as f32) * (rect.height() - 2.0 * padding);
+            curve_pts.push(egui::pos2(x, y));
+        }
+        for window in curve_pts.windows(2) {
+            painter.line_segment([window[0], window[1]], egui::Stroke::new(1.5, colors::ACCENT));
+        }
+        
+        // Draw keyframe nodes
+        let mut clicked_any = false;
+        let mut next_dragged_kf = app.anim_graph_editor_dragged_kf;
+        
+        for (i, kf) in track.keyframes.iter().enumerate() {
+            let x = rect.left() + (kf.frame as f32 / 100.0) * rect.width();
+            let frac_y = (kf.value - val_min) / (val_max - val_min);
+            let y = rect.bottom() - padding - (frac_y as f32) * (rect.height() - 2.0 * padding);
+            let center = egui::pos2(x, y);
+            
+            let mpos = ui.input(|i| i.pointer.hover_pos());
+            let is_hovered = mpos.map_or(false, |mp| mp.distance(center) < 8.0);
+            
+            let is_selected = app.anim_selected_keyframe.as_ref().map_or(false, |&(s_id, ref s_lbl, s_f)| {
+                s_id == node_id && s_lbl == &track_lbl && s_f == kf.frame
+            });
+            
+            let is_dragged = app.anim_graph_editor_dragged_kf == Some(i);
+            
+            let kf_color = if is_hovered || is_dragged {
+                colors::ACCENT
+            } else {
+                colors::POWERLINE_C
+            };
+            
+            let stroke_color = if is_selected {
+                colors::ACCENT
+            } else {
+                colors::BG_PANEL
+            };
+            let stroke_w = if is_selected { 2.0 } else { 1.0 };
+            let radius = if is_selected { 6.0 } else { 4.5 };
+            
+            if kf.interpolation == crate::app::InterpolationMode::Bezier {
+                let pts = [
+                    egui::pos2(center.x, center.y - radius),
+                    egui::pos2(center.x + radius, center.y),
+                    egui::pos2(center.x, center.y + radius),
+                    egui::pos2(center.x - radius, center.y),
+                ];
+                painter.add(egui::Shape::convex_polygon(pts.to_vec(), kf_color, egui::Stroke::new(stroke_w, stroke_color)));
+            } else {
+                painter.circle(center, radius, kf_color, egui::Stroke::new(stroke_w, stroke_color));
+            }
+            
+            if is_hovered && ui.input(|i| i.pointer.any_pressed()) {
+                next_dragged_kf = Some(i);
+                app.anim_selected_keyframe = Some((node_id, track_lbl.clone(), kf.frame));
+                clicked_any = true;
+            }
+        }
+        
+        app.anim_graph_editor_dragged_kf = next_dragged_kf;
+        
+        // Handle drag value updates
+        if let Some(idx) = app.anim_graph_editor_dragged_kf {
+            if ui.input(|i| i.pointer.any_down()) {
+                if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let target_frame = (((mpos.x - rect.left()) / rect.width()) * 100.0).clamp(0.0, 100.0).round() as usize;
+                    let target_frac_y = (rect.bottom() - padding - mpos.y) / (rect.height() - 2.0 * padding);
+                    let target_val = val_min + (target_frac_y as f64) * (val_max - val_min);
+                    
+                    let track = anim.get_track_mut(&track_lbl).unwrap();
+                    track.keyframes[idx].value = target_val;
+                    track.keyframes[idx].frame = target_frame;
+                    track.keyframes.sort_by_key(|k| k.frame);
+                    
+                    if let Some(new_idx) = track.keyframes.iter().position(|k| k.frame == target_frame && k.value == target_val) {
+                        app.anim_graph_editor_dragged_kf = Some(new_idx);
+                        app.anim_selected_keyframe = Some((node_id, track_lbl.clone(), target_frame));
+                    }
+                    
+                    app.apply_animation_for_frame(app.anim_current_frame);
+                }
+            } else {
+                app.anim_graph_editor_dragged_kf = None;
+            }
+        }
+        
+        // Draw playhead line
+        let playhead_x = rect.left() + (app.anim_current_frame as f32 / 100.0) * rect.width();
+        painter.line_segment(
+            [egui::pos2(playhead_x, rect.top()), egui::pos2(playhead_x, rect.bottom())],
+            egui::Stroke::new(1.0, colors::ACCENT.gamma_multiply(0.4)),
+        );
     });
 }
 
@@ -3584,10 +4000,10 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
     // Handle geometry tracks
     let mut geom_floats = {
-        let Some(node) = app.project.nodes.get(id) else {
+        let Some(_) = app.project.nodes.get(id) else {
             return;
         };
-        node.get_geom_floats()
+        app.get_node_geom_floats(id)
     };
     
     if !geom_floats.is_empty() {
@@ -3603,7 +4019,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
         // Gather human-readable labels and config
         let (geom_info, is_arc) = if let Some(node) = app.project.nodes.get(id) {
-            let info = match &node.kind {
+            let mut info = match &node.kind {
                 NodeKind::Rect { .. } => vec![
                     ("Width".to_string(), 0.0, 10000.0, 1.0),
                     ("Height".to_string(), 0.0, 10000.0, 1.0),
@@ -3641,6 +4057,37 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 }
                 _ => Vec::new(),
             };
+            
+            // Append path magic properties to info:
+            if let Some(_) = app.project.document.tiling_effects.values().find(|e| e.source_id == id) {
+                info.push(("Tiling Gap X".to_string(), -10000.0, 10000.0, 1.0));
+                info.push(("Tiling Gap Y".to_string(), -10000.0, 10000.0, 1.0));
+                info.push(("Tiling Count X".to_string(), 1.0, 1000.0, 1.0));
+                info.push(("Tiling Count Y".to_string(), 1.0, 1000.0, 1.0));
+                info.push(("Tiling Offset X".to_string(), -10000.0, 10000.0, 1.0));
+                info.push(("Tiling Offset Y".to_string(), -10000.0, 10000.0, 1.0));
+                info.push(("Tiling Row Rot".to_string(), -360.0, 360.0, 1.0));
+                info.push(("Tiling Col Rot".to_string(), -360.0, 360.0, 1.0));
+                info.push(("Tiling Row Scale".to_string(), -100.0, 100.0, 0.05));
+                info.push(("Tiling Col Scale".to_string(), -100.0, 100.0, 0.05));
+            }
+            if let Some(_) = app.project.document.circular_effects.values().find(|e| e.source_id == id) {
+                info.push(("Circular X".to_string(), -10000.0, 10000.0, 1.0));
+                info.push(("Circular Y".to_string(), -10000.0, 10000.0, 1.0));
+                info.push(("Circular Radius".to_string(), 0.0, 10000.0, 1.0));
+                info.push(("Circular Copies".to_string(), 1.0, 1000.0, 1.0));
+                info.push(("Circular Angle".to_string(), -360.0, 360.0, 1.0));
+                info.push(("Circular Base X".to_string(), -10000.0, 10000.0, 1.0));
+                info.push(("Circular Base Y".to_string(), -10000.0, 10000.0, 1.0));
+            }
+            if let Some(_) = app.project.document.path_effects.values().find(|e| e.source_id == id) {
+                info.push(("Path Gap".to_string(), 0.1, 10000.0, 1.0));
+                info.push(("Path Count".to_string(), 1.0, 1000.0, 1.0));
+                info.push(("Path Offset".to_string(), -10000.0, 10000.0, 1.0));
+                info.push(("Path End Scale".to_string(), 0.0, 10.0, 0.05));
+                info.push(("Path End Opacity".to_string(), 0.0, 1.0, 0.02));
+            }
+
             let is_arc = matches!(node.kind, NodeKind::Arc { .. });
             (info, is_arc)
         } else {
@@ -3695,9 +4142,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 if let Some(vg) = val_geom {
                     let rad_vg = if is_arc_angle { vg.to_radians() } else { vg };
                     geom_floats[i] = rad_vg;
-                    if let Some(n) = app.project.nodes.get_mut(id) {
-                        n.set_geom_floats(&geom_floats);
-                    }
+                    app.set_node_geom_floats(id, &geom_floats);
                 }
             }
         }

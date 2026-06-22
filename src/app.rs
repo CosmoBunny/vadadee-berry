@@ -65,10 +65,24 @@ struct PasteProgress {
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InterpolationMode {
+    Linear,
+    Bezier,
+}
+
+impl Default for InterpolationMode {
+    fn default() -> Self {
+        Self::Linear
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Keyframe {
     pub frame: usize,
     pub value: f64,
+    #[serde(default)]
+    pub interpolation: InterpolationMode,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -81,7 +95,7 @@ impl KeyframeTrack {
         if let Some(pos) = self.keyframes.iter().position(|kf| kf.frame == frame) {
             self.keyframes[pos].value = value;
         } else {
-            self.keyframes.push(Keyframe { frame, value });
+            self.keyframes.push(Keyframe { frame, value, interpolation: InterpolationMode::Linear });
             self.keyframes.sort_by_key(|kf| kf.frame);
         }
     }
@@ -105,7 +119,10 @@ impl KeyframeTrack {
                 if range < 1e-9 {
                     return Some(kf0.value);
                 }
-                let t = (frame - kf0.frame) as f64 / range;
+                let mut t = (frame - kf0.frame) as f64 / range;
+                if kf0.interpolation == InterpolationMode::Bezier {
+                    t = t * t * (3.0 - 2.0 * t);
+                }
                 return Some(kf0.value + t * (kf1.value - kf0.value));
             }
         }
@@ -136,6 +153,26 @@ pub struct NodeAnimation {
     pub geom_tracks: Vec<KeyframeTrack>,
 }
 
+impl NodeAnimation {
+    pub fn get_track_mut(&mut self, label: &str) -> Option<&mut KeyframeTrack> {
+        match label {
+            "pos_x" => Some(&mut self.pos_x),
+            "pos_y" => Some(&mut self.pos_y),
+            "rotation" => Some(&mut self.rotation),
+            "opacity" => Some(&mut self.opacity),
+            "color_r" => Some(&mut self.color_r),
+            "color_g" => Some(&mut self.color_g),
+            "color_b" => Some(&mut self.color_b),
+            "color_a" => Some(&mut self.color_a),
+            _ if label.starts_with("geom_") => {
+                let idx: usize = label["geom_".len()..].parse().ok()?;
+                self.geom_tracks.get_mut(idx)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnimationTimeline {
     pub nodes: std::collections::HashMap<NodeId, NodeAnimation>,
@@ -153,6 +190,11 @@ pub struct VadadeeBerryApp {
     pub anim_timeline_scroll: f32,
     pub anim_edit_mode: bool,
     pub anim_dragged_keyframe: Option<(NodeId, String, usize)>,
+    pub anim_selected_keyframe: Option<(NodeId, String, usize)>,
+    pub anim_graph_editor_track: Option<(NodeId, String)>,
+    pub anim_graph_editor_target_track: Option<(NodeId, String)>,
+    pub anim_graph_editor_t: f32,
+    pub anim_graph_editor_dragged_kf: Option<usize>,
 
     pub project: ProjectFile,
     pub viewport: Viewport,
@@ -288,6 +330,11 @@ impl VadadeeBerryApp {
             anim_timeline_scroll: 0.0,
             anim_edit_mode: false,
             anim_dragged_keyframe: None,
+            anim_selected_keyframe: None,
+            anim_graph_editor_track: None,
+            anim_graph_editor_target_track: None,
+            anim_graph_editor_t: 0.0,
+            anim_graph_editor_dragged_kf: None,
 
             project: Document::new_default_project(),
             viewport: Viewport::default(),
@@ -1121,9 +1168,137 @@ impl VadadeeBerryApp {
 
                 // Apply geometry
                 if let Some(geom) = target_geom {
-                    node.set_geom_floats(&geom);
+                    self.set_node_geom_floats(node_id, &geom);
                 }
             }
+        }
+    }
+
+    pub fn get_node_geom_floats(&self, id: NodeId) -> Vec<f64> {
+        let mut v = if let Some(node) = self.project.nodes.get(id) {
+            node.get_geom_floats()
+        } else {
+            return Vec::new();
+        };
+
+        if let Some(tiling) = self.project.document.tiling_effects.values().find(|e| e.source_id == id) {
+            v.push(tiling.gap_x);
+            v.push(tiling.gap_y);
+            v.push(tiling.count_x as f64);
+            v.push(tiling.count_y as f64);
+            v.push(tiling.offset_x);
+            v.push(tiling.offset_y);
+            v.push(tiling.row_rotation);
+            v.push(tiling.col_rotation);
+            v.push(tiling.row_scale);
+            v.push(tiling.col_scale);
+        }
+
+        if let Some(circ) = self.project.document.circular_effects.values().find(|e| e.source_id == id) {
+            v.push(circ.origin_x);
+            v.push(circ.origin_y);
+            v.push(circ.radius);
+            v.push(circ.copies as f64);
+            v.push(circ.angle_offset);
+            v.push(circ.base_x);
+            v.push(circ.base_y);
+        }
+
+        if let Some(oop) = self.project.document.path_effects.values().find(|e| e.source_id == id) {
+            v.push(oop.gap);
+            v.push(oop.count as f64);
+            v.push(oop.start_offset);
+            v.push(oop.loft_end_scale as f64);
+            v.push(oop.loft_end_opacity as f64);
+        }
+
+        v
+    }
+
+    pub fn set_node_geom_floats(&mut self, id: NodeId, floats: &[f64]) {
+        let base_len = if let Some(node) = self.project.nodes.get(id) {
+            node.get_geom_floats().len()
+        } else {
+            0
+        };
+
+        if base_len > 0 && floats.len() >= base_len {
+            if let Some(node) = self.project.nodes.get_mut(id) {
+                node.set_geom_floats(&floats[..base_len]);
+            }
+        }
+
+        let mut idx = base_len;
+
+        let mut has_tiling = false;
+        if let Some(tiling_id) = self.project.document.tiling_effects.values()
+            .find(|e| e.source_id == id)
+            .map(|e| e.id)
+        {
+            if floats.len() >= idx + 10 {
+                if let Some(tiling) = self.project.document.tiling_effects.get_mut(&tiling_id) {
+                    tiling.gap_x = floats[idx];
+                    tiling.gap_y = floats[idx + 1];
+                    tiling.count_x = floats[idx + 2].round().max(1.0) as usize;
+                    tiling.count_y = floats[idx + 3].round().max(1.0) as usize;
+                    tiling.offset_x = floats[idx + 4];
+                    tiling.offset_y = floats[idx + 5];
+                    tiling.row_rotation = floats[idx + 6];
+                    tiling.col_rotation = floats[idx + 7];
+                    tiling.row_scale = floats[idx + 8];
+                    tiling.col_scale = floats[idx + 9];
+                    has_tiling = true;
+                }
+                idx += 10;
+            }
+        }
+
+        let mut has_circular = false;
+        if let Some(circ_id) = self.project.document.circular_effects.values()
+            .find(|e| e.source_id == id)
+            .map(|e| e.id)
+        {
+            if floats.len() >= idx + 7 {
+                if let Some(circ) = self.project.document.circular_effects.get_mut(&circ_id) {
+                    circ.origin_x = floats[idx];
+                    circ.origin_y = floats[idx + 1];
+                    circ.radius = floats[idx + 2];
+                    circ.copies = floats[idx + 3].round().max(1.0) as usize;
+                    circ.angle_offset = floats[idx + 4];
+                    circ.base_x = floats[idx + 5];
+                    circ.base_y = floats[idx + 6];
+                    has_circular = true;
+                }
+                idx += 7;
+            }
+        }
+
+        let mut has_oop = false;
+        if let Some(oop_id) = self.project.document.path_effects.values()
+            .find(|e| e.source_id == id)
+            .map(|e| e.id)
+        {
+            if floats.len() >= idx + 5 {
+                if let Some(oop) = self.project.document.path_effects.get_mut(&oop_id) {
+                    oop.gap = floats[idx];
+                    oop.count = floats[idx + 1].round().max(1.0) as usize;
+                    oop.start_offset = floats[idx + 2];
+                    oop.loft_end_scale = floats[idx + 3] as f32;
+                    oop.loft_end_opacity = floats[idx + 4] as f32;
+                    has_oop = true;
+                }
+                idx += 5;
+            }
+        }
+
+        if has_tiling {
+            self.sync_tiling_ui_from_selection();
+        }
+        if has_circular {
+            self.sync_circular_ui_from_selection();
+        }
+        if has_oop {
+            self.sync_on_path_ui_from_selection();
         }
     }
 
@@ -2057,6 +2232,111 @@ impl VadadeeBerryApp {
                     self.delete_selection();
                 }
             }
+
+            if !text_focused {
+                // Play/pause on Space
+                if i.key_pressed(Key::Space) {
+                    self.anim_is_playing = !self.anim_is_playing;
+                    let _ = i.consume_key(egui::Modifiers::NONE, Key::Space);
+                }
+                
+                // Back to start on Ctrl + Left Arrow
+                if cmd && i.key_pressed(Key::ArrowLeft) {
+                    self.anim_current_frame = 0;
+                    self.anim_is_playing = false;
+                    let _ = i.consume_key(egui::Modifiers::CTRL, Key::ArrowLeft);
+                    let _ = i.consume_key(egui::Modifiers::COMMAND, Key::ArrowLeft);
+                }
+
+                // Arrow keys nudging selected objects / points
+                let mut nudge_dx: f64 = 0.0;
+                let mut nudge_dy: f64 = 0.0;
+                let step = if i.modifiers.shift { 10.0 } else { 1.0 };
+                
+                if i.key_pressed(Key::ArrowLeft) && !cmd {
+                    nudge_dx = -step;
+                    let _ = i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
+                    let _ = i.consume_key(egui::Modifiers::SHIFT, Key::ArrowLeft);
+                }
+                if i.key_pressed(Key::ArrowRight) && !cmd {
+                    nudge_dx = step;
+                    let _ = i.consume_key(egui::Modifiers::NONE, Key::ArrowRight);
+                    let _ = i.consume_key(egui::Modifiers::SHIFT, Key::ArrowRight);
+                }
+                if i.key_pressed(Key::ArrowUp) && !cmd {
+                    nudge_dy = -step;
+                    let _ = i.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                    let _ = i.consume_key(egui::Modifiers::SHIFT, Key::ArrowUp);
+                }
+                if i.key_pressed(Key::ArrowDown) && !cmd {
+                    nudge_dy = step;
+                    let _ = i.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                    let _ = i.consume_key(egui::Modifiers::SHIFT, Key::ArrowDown);
+                }
+
+                if nudge_dx.abs() > 1e-5 || nudge_dy.abs() > 1e-5 {
+                    if self.tools.active == ToolKind::Node && !self.tools.select.selected_path_points.is_empty() {
+                        // Nudge selected path points
+                        for (id, pi) in self.tools.select.selected_path_points.clone() {
+                            if let Some(before) = self.project.nodes.get(id).cloned() {
+                                let mut after = before.clone();
+                                if let NodeKind::Path { path } = &mut after.kind {
+                                    path.move_anchors_by(&[pi], nudge_dx, nudge_dy);
+                                }
+                                if before != after {
+                                    if let Some(node_mut) = self.project.nodes.get_mut(id) {
+                                        *node_mut = after.clone();
+                                    }
+                                    self.history.push(
+                                        &mut self.project,
+                                        ProjectEdit::PatchNode { id, before, after },
+                                    );
+                                }
+                            }
+                        }
+                    } else if !self.selection.is_empty() {
+                        // Nudge selected objects
+                        for id in self.selection.clone() {
+                            if let Some(before) = self.project.nodes.get(id).cloned() {
+                                let mut after = before.clone();
+                                let child_ids = if let NodeKind::Group { children } = &after.kind {
+                                    Some(children.clone())
+                                } else {
+                                    None
+                                };
+                                if let Some(kids) = child_ids {
+                                    for cid in kids {
+                                        if let Some(c_before) = self.project.nodes.get(cid).cloned() {
+                                            let mut c_after = c_before.clone();
+                                            c_after.translate(nudge_dx, nudge_dy);
+                                            if c_before != c_after {
+                                                if let Some(c_mut) = self.project.nodes.get_mut(cid) {
+                                                    *c_mut = c_after.clone();
+                                                }
+                                                self.history.push(
+                                                    &mut self.project,
+                                                    ProjectEdit::PatchNode { id: cid, before: c_before, after: c_after },
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    after.translate(nudge_dx, nudge_dy);
+                                    if before != after {
+                                        if let Some(node_mut) = self.project.nodes.get_mut(id) {
+                                            *node_mut = after.clone();
+                                        }
+                                        self.history.push(
+                                            &mut self.project,
+                                            ProjectEdit::PatchNode { id, before, after },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         });
     }
 
@@ -2384,7 +2664,15 @@ impl VadadeeBerryApp {
                             let eb = crate::document::get_effective_bounds(node, &self.project.document);
                             let tl = self.viewport.doc_to_screen((eb.x0, eb.y0), origin);
                             let br = self.viewport.doc_to_screen((eb.x1, eb.y1), origin);
-                            let sr = egui::Rect::from_min_max(tl, br);
+                            let mut sr = egui::Rect::from_min_max(tl, br);
+                            if sr.width() < 16.0 {
+                                sr.min.x -= 8.0;
+                                sr.max.x += 8.0;
+                            }
+                            if sr.height() < 16.0 {
+                                sr.min.y -= 8.0;
+                                sr.max.y += 8.0;
+                            }
                             render::draw_transform_handles(&painter, sr, self.tools.select.select_rotation_mode);
                         }
                     }
@@ -5357,11 +5645,46 @@ impl VadadeeBerryApp {
         _released_anywhere: bool,
         double_clicked: bool,
     ) {
-        if released && !self.tools.select.drag_snapshot.is_empty() {
-            self.commit_drag_edits();
-            self.tools.select.node_drag_origin = None;
-            self.tools.select.node_drag_active = false;
-            return;
+        if released {
+            if let Some(m) = self.tools.select.marquee.take() {
+                if tools::marquee_is_drag(m.origin_doc, m.current_doc) {
+                    let rect = tools::marquee_rect(m.origin_doc, m.current_doc);
+                    let mut newly_selected = Vec::new();
+                    for id in &self.selection {
+                        if let Some(node) = self.project.nodes.get(*id) {
+                            if let NodeKind::Path { path } = &node.kind {
+                                let anchors = path.anchor_positions();
+                                for (idx, &pos) in anchors.iter().enumerate() {
+                                    let pt = kurbo::Point::new(pos.0, pos.1);
+                                    if rect.contains(pt) {
+                                        newly_selected.push((*id, idx));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if m.shift {
+                        for item in newly_selected {
+                            if !self.tools.select.selected_path_points.contains(&item) {
+                                self.tools.select.selected_path_points.push(item);
+                            }
+                        }
+                    } else {
+                        self.tools.select.selected_path_points = newly_selected;
+                    }
+                } else if !m.shift {
+                    self.tools.select.clear_path_point_selection();
+                }
+                self.sync_inspector_from_selection();
+                return;
+            }
+
+            if !self.tools.select.drag_snapshot.is_empty() {
+                self.commit_drag_edits();
+                self.tools.select.node_drag_origin = None;
+                self.tools.select.node_drag_active = false;
+                return;
+            }
         }
 
         if double_clicked {
@@ -5427,12 +5750,9 @@ impl VadadeeBerryApp {
                     .is_some_and(|n| matches!(n.kind, NodeKind::Path { .. }))
                 {
                     if matches!(target, PathEditTarget::Anchor(_)) {
-                        self.tools.select.toggle_path_point(id, pi, ctrl);
-                        if ctrl {
-                            ui::promote_action_tab(self, ui::ActionTab::Geometry);
-                            self.status_message =
-                                format!("{} point(s) selected", self.tools.select.selected_path_points.len());
-                            return;
+                        let is_already_selected = self.tools.select.selected_path_points.iter().any(|&(sid, idx)| sid == id && idx == pi);
+                        if !is_already_selected || ctrl || shift {
+                            self.tools.select.toggle_path_point(id, pi, ctrl || shift);
                         }
                     } else {
                         self.tools.select.set_single_path_point(id, pi);
@@ -5474,14 +5794,14 @@ impl VadadeeBerryApp {
                     let does_hit = if self.node_has_tiling_or_circular(id) {
                         let eb = crate::document::get_effective_bounds(node, &self.project.document);
                         let pt = kurbo::Point::new(doc.0, doc.1);
-                        let slop = 4.0 / self.viewport.zoom as f64;
+                        let slop = 16.0 / self.viewport.zoom as f64;
                         eb.inflate(slop, slop).contains(pt)
                     } else {
                         node.hit_test_with_store(
                             &self.project.nodes,
                             doc.0,
                             doc.1,
-                            4.0 / self.viewport.zoom as f64,
+                            16.0 / self.viewport.zoom as f64,
                         )
                     };
                     if does_hit {
@@ -5520,14 +5840,24 @@ impl VadadeeBerryApp {
                     self.tools.select.selected_path_segment = None;
                 }
                 self.sync_inspector_from_selection();
-            } else if !shift {
-                self.tools.select.clear_path_point_selection();
+            } else {
+                if !shift {
+                    self.tools.select.clear_path_point_selection();
+                }
+                self.tools.select.marquee = Some(MarqueeSelect {
+                    origin_doc: doc,
+                    current_doc: doc,
+                    shift,
+                });
             }
+            self.tools.select.last_doc = doc;
             return;
         }
 
         if down {
-            if let (Some((id, _)), Some(target)) = (
+            if let Some(marquee) = self.tools.select.marquee.as_mut() {
+                marquee.current_doc = doc;
+            } else if let (Some((id, _)), Some(target)) = (
                 self.tools.select.drag_snapshot.first(),
                 self.tools.select.node_edit_target,
             ) {
@@ -5564,6 +5894,30 @@ impl VadadeeBerryApp {
 
 impl eframe::App for VadadeeBerryApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // Graph editor transition animation tick
+        let dt = ctx.input(|i| i.stable_dt);
+        let target_t = if self.anim_graph_editor_track.is_some() && self.anim_graph_editor_target_track.is_none() {
+            1.0
+        } else {
+            0.0
+        };
+
+        if (self.anim_graph_editor_t - target_t).abs() > 0.001 {
+            let speed = 6.0;
+            if self.anim_graph_editor_t < target_t {
+                self.anim_graph_editor_t = (self.anim_graph_editor_t + dt * speed).min(target_t);
+            } else {
+                self.anim_graph_editor_t = (self.anim_graph_editor_t - dt * speed).max(target_t);
+            }
+            ctx.request_repaint();
+        } else {
+            self.anim_graph_editor_t = target_t;
+            if target_t == 0.0 && self.anim_graph_editor_target_track.is_some() {
+                self.anim_graph_editor_track = self.anim_graph_editor_target_track.take();
+                ctx.request_repaint();
+            }
+        }
+
         // --- ANIMATION TIMELINE PLAYBACK & RECORDING ---
         let mut frame_changed = false;
         if self.anim_is_playing {
@@ -5587,12 +5941,13 @@ impl eframe::App for VadadeeBerryApp {
             self.anim_last_applied_states.clear();
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
+                    let gf = self.get_node_geom_floats(*id);
                     self.anim_last_applied_states.insert(*id, AnimAppliedState {
                         pos: node.get_pos(),
                         rotation: node.get_rotation(),
                         opacity: node.get_opacity(),
                         color: node.get_color(),
-                        geom_floats: node.get_geom_floats(),
+                        geom_floats: gf,
                     });
                 }
             }
@@ -5600,12 +5955,13 @@ impl eframe::App for VadadeeBerryApp {
             // Ensure reference state is populated
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
+                    let gf = self.get_node_geom_floats(*id);
                     self.anim_last_applied_states.entry(*id).or_insert_with(|| AnimAppliedState {
                         pos: node.get_pos(),
                         rotation: node.get_rotation(),
                         opacity: node.get_opacity(),
                         color: node.get_color(),
-                        geom_floats: node.get_geom_floats(),
+                        geom_floats: gf,
                     });
                 }
             }
@@ -5618,7 +5974,7 @@ impl eframe::App for VadadeeBerryApp {
                     let rot = node.get_rotation();
                     let op = node.get_opacity();
                     let color = node.get_color();
-                    let geom = node.get_geom_floats();
+                    let geom = self.get_node_geom_floats(*id);
                     
                     let last_state = self.anim_last_applied_states.get(id);
                     if let Some(last) = last_state {
@@ -5718,12 +6074,13 @@ impl eframe::App for VadadeeBerryApp {
                 self.anim_last_applied_states.clear();
                 for id in &self.selection {
                     if let Some(node) = self.project.nodes.get(*id) {
+                        let gf = self.get_node_geom_floats(*id);
                         self.anim_last_applied_states.insert(*id, AnimAppliedState {
                             pos: node.get_pos(),
                             rotation: node.get_rotation(),
                             opacity: node.get_opacity(),
                             color: node.get_color(),
-                            geom_floats: node.get_geom_floats(),
+                            geom_floats: gf,
                         });
                     }
                 }
