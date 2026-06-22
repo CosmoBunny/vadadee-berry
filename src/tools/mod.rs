@@ -190,6 +190,7 @@ pub enum ResizeHandle {
 pub enum SelectDrag {
     Move,
     Resize(ResizeHandle),
+    Rotate,
     TilingGizmo(usize),   // 0 = origin (first), 1 = col end, 2 = row end
     CircularGizmo(usize), // 0 = first/base pos, 1 = origin
 }
@@ -216,6 +217,9 @@ pub struct SelectSession {
     pub selected_path_segment: Option<(NodeId, usize, usize)>,
     pub node_drag_origin: Option<(f64, f64)>,
     pub node_drag_active: bool,
+    pub select_rotation_mode: bool,
+    pub rotate_center: Option<(f64, f64)>,
+    pub rotate_start_angle: f64,
 }
 
 #[derive(Debug, Default)]

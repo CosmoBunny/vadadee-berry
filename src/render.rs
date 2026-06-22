@@ -1759,12 +1759,26 @@ pub fn draw_group_selection_bounds(painter: &Painter, screen_rect: Rect) {
     );
 }
 
-pub fn draw_transform_handles(painter: &Painter, screen_rect: Rect) {
+pub fn draw_transform_handles(painter: &Painter, screen_rect: Rect, rotation_mode: bool) {
     let r = screen_rect;
-    painter.rect_stroke(r, 0.0, Stroke::new(1.0, colors::SELECTION), egui::StrokeKind::Outside);
-    for c in handle_positions(r) {
-        painter.circle_filled(c, 5.0, Color32::WHITE);
-        painter.circle_stroke(c, 5.0, Stroke::new(1.5, colors::SELECTION));
+    let stroke_color = if rotation_mode { colors::POWERLINE_C } else { colors::SELECTION };
+    painter.rect_stroke(r, 0.0, Stroke::new(1.0, stroke_color), egui::StrokeKind::Outside);
+    
+    let positions = handle_positions(r);
+    for (i, c) in positions.into_iter().enumerate() {
+        let is_corner = i == 0 || i == 2 || i == 4 || i == 6; // Nw, Ne, Se, Sw
+        if rotation_mode {
+            if is_corner {
+                painter.circle_filled(c, 5.0, colors::POWERLINE_C);
+                painter.circle_stroke(c, 5.0, Stroke::new(1.0, Color32::WHITE));
+            } else {
+                painter.circle_filled(c, 3.0, colors::BG_DEEP);
+                painter.circle_stroke(c, 3.0, Stroke::new(1.0, colors::BORDER));
+            }
+        } else {
+            painter.circle_filled(c, 5.0, Color32::WHITE);
+            painter.circle_stroke(c, 5.0, Stroke::new(1.5, colors::SELECTION));
+        }
     }
 }
 

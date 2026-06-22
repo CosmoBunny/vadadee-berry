@@ -119,6 +119,7 @@ pub struct AnimAppliedState {
     pub rotation: f64,
     pub opacity: f32,
     pub color: [f32; 4],
+    pub geom_floats: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -131,6 +132,8 @@ pub struct NodeAnimation {
     pub color_g: KeyframeTrack,
     pub color_b: KeyframeTrack,
     pub color_a: KeyframeTrack,
+    #[serde(default)]
+    pub geom_tracks: Vec<KeyframeTrack>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1063,7 +1066,7 @@ impl VadadeeBerryApp {
     }
 
     pub fn apply_animation_for_frame(&mut self, frame: usize) {
-        let updates: Vec<(NodeId, Option<f64>, Option<f64>, Option<f64>, Option<f32>, Option<[f32; 4]>)> = self.anim_timeline.nodes.iter()
+        let updates: Vec<(NodeId, Option<f64>, Option<f64>, Option<f64>, Option<f32>, Option<[f32; 4]>, Option<Vec<f64>>)> = self.anim_timeline.nodes.iter()
             .map(|(node_id, track)| {
                 let x = track.pos_x.interpolate(frame);
                 let y = track.pos_y.interpolate(frame);
@@ -1078,11 +1081,20 @@ impl VadadeeBerryApp {
                 } else {
                     None
                 };
-                (*node_id, x, y, rot, opacity, color)
+                let geom = if !track.geom_tracks.is_empty() {
+                    let mut g_vals = Vec::new();
+                    for t in &track.geom_tracks {
+                        g_vals.push(t.interpolate(frame).unwrap_or(0.0));
+                    }
+                    Some(g_vals)
+                } else {
+                    None
+                };
+                (*node_id, x, y, rot, opacity, color, geom)
             })
             .collect();
 
-        for (node_id, target_x, target_y, target_rot, target_op, target_color) in updates {
+        for (node_id, target_x, target_y, target_rot, target_op, target_color, target_geom) in updates {
             if let Some(node) = self.project.nodes.get_mut(node_id) {
                 // Apply position
                 let (curr_x, curr_y) = node.get_pos();
@@ -1106,48 +1118,17 @@ impl VadadeeBerryApp {
                 if let Some(color) = target_color {
                     node.set_color(color);
                 }
+
+                // Apply geometry
+                if let Some(geom) = target_geom {
+                    node.set_geom_floats(&geom);
+                }
             }
         }
     }
 
     pub fn toggle_keyframing_mode(&mut self) {
         self.anim_keyframing_mode = !self.anim_keyframing_mode;
-        if self.anim_keyframing_mode {
-            // Capture baseline at frame 0 for selected nodes
-            for id in &self.selection {
-                if let Some(node) = self.project.nodes.get(*id) {
-                    let pos = node.get_pos();
-                    let rot = node.get_rotation();
-                    let op = node.get_opacity() as f64;
-                    let color = node.get_color();
-                    let entry = self.anim_timeline.nodes.entry(*id).or_default();
-                    if entry.pos_x.keyframes.is_empty() {
-                        entry.pos_x.insert(0, pos.0);
-                    }
-                    if entry.pos_y.keyframes.is_empty() {
-                        entry.pos_y.insert(0, pos.1);
-                    }
-                    if entry.rotation.keyframes.is_empty() {
-                        entry.rotation.insert(0, rot);
-                    }
-                    if entry.opacity.keyframes.is_empty() {
-                        entry.opacity.insert(0, op);
-                    }
-                    if entry.color_r.keyframes.is_empty() {
-                        entry.color_r.insert(0, color[0] as f64);
-                    }
-                    if entry.color_g.keyframes.is_empty() {
-                        entry.color_g.insert(0, color[1] as f64);
-                    }
-                    if entry.color_b.keyframes.is_empty() {
-                        entry.color_b.insert(0, color[2] as f64);
-                    }
-                    if entry.color_a.keyframes.is_empty() {
-                        entry.color_a.insert(0, color[3] as f64);
-                    }
-                }
-            }
-        }
     }
 
     pub fn add_layer(&mut self, name: &str) {
@@ -1252,6 +1233,7 @@ impl VadadeeBerryApp {
                     "Moving selection".into()
                 }
                 SelectDrag::Resize(_) => "Resizing".into(),
+                SelectDrag::Rotate => "Rotating".into(),
                 SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_) => "Editing effect".into(),
             });
         }
@@ -2403,7 +2385,7 @@ impl VadadeeBerryApp {
                             let tl = self.viewport.doc_to_screen((eb.x0, eb.y0), origin);
                             let br = self.viewport.doc_to_screen((eb.x1, eb.y1), origin);
                             let sr = egui::Rect::from_min_max(tl, br);
-                            render::draw_transform_handles(&painter, sr);
+                            render::draw_transform_handles(&painter, sr, self.tools.select.select_rotation_mode);
                         }
                     }
                 } else if self.selection.len() > 1 {
@@ -4323,40 +4305,24 @@ impl VadadeeBerryApp {
                 self.tools.select.drag_mode = None;
                 self.tools.select.marquee = None;
                 self.tools.select.drag_snapshot.clear();
-                if self
-                    .project
-                    .nodes
-                    .get(id)
-                    .is_some_and(|n| matches!(n.kind, NodeKind::Text { .. }))
-                {
-                    self.on_page_text_newly_created = false;
-                    self.begin_on_page_text_edit(id);
-                    return;
-                }
-                if self
-                    .project
-                    .nodes
-                    .get(id)
-                    .is_some_and(|n| matches!(n.kind, NodeKind::Path { .. }))
-                {
-                    self.selection = vec![id];
-                    self.tools.active = ToolKind::Node;
-                    ui::promote_action_tab(self, ui::ActionTab::Geometry);
-                    self.sync_inspector_from_selection();
-                    return;
-                }
-                if self.node_has_tiling_or_circular(id) {
-                    self.selection = vec![id];
-                    self.tools.active = ToolKind::Node;
-                    ui::promote_action_tab(self, ui::ActionTab::Geometry);
-                    self.sync_inspector_from_selection();
-                    return;
+                if let Some(node) = self.project.nodes.get(id) {
+                    if matches!(node.kind, NodeKind::Text { .. }) {
+                        self.on_page_text_newly_created = false;
+                        self.begin_on_page_text_edit(id);
+                        return;
+                    } else if !matches!(node.kind, NodeKind::Group { .. }) {
+                        self.selection = vec![id];
+                        self.tools.active = ToolKind::Node;
+                        ui::promote_action_tab(self, ui::ActionTab::Geometry);
+                        self.sync_inspector_from_selection();
+                        return;
+                    }
                 }
             }
         }
 
         if pressed {
-            // Resize handles take priority over move (must run on pointer-down, not click-up).
+            // Resize / Rotate handles take priority over move (must run on pointer-down, not click-up).
             if self.selection.len() == 1 {
                 if let Some(id) = self.selection.first().copied() {
                     if !self.node_has_tiling_or_circular(id) {
@@ -4370,12 +4336,27 @@ impl VadadeeBerryApp {
                             if let Some(handle) =
                                 render::hit_resize_handle(sr, screen, self.viewport.zoom)
                             {
-                                self.tools.select.drag_mode = Some(SelectDrag::Resize(handle));
-                                self.tools.select.resize_anchor = node.bounds();
-                                self.tools.select.drag_snapshot = vec![(id, node.clone())];
-                                self.tools.select.last_doc = doc;
-                                self.sync_inspector_from_selection();
-                                return;
+                                if self.tools.select.select_rotation_mode {
+                                    if matches!(handle, tools::ResizeHandle::Nw | tools::ResizeHandle::Ne | tools::ResizeHandle::Se | tools::ResizeHandle::Sw) {
+                                        self.tools.select.drag_mode = Some(SelectDrag::Rotate);
+                                        let b = node.bounds();
+                                        let cx = (b.x0 + b.x1) * 0.5;
+                                        let cy = (b.y0 + b.y1) * 0.5;
+                                        self.tools.select.rotate_center = Some((cx, cy));
+                                        self.tools.select.rotate_start_angle = (doc.1 - cy).atan2(doc.0 - cx);
+                                        self.tools.select.drag_snapshot = vec![(id, node.clone())];
+                                        self.tools.select.last_doc = doc;
+                                        self.sync_inspector_from_selection();
+                                        return;
+                                    }
+                                } else {
+                                    self.tools.select.drag_mode = Some(SelectDrag::Resize(handle));
+                                    self.tools.select.resize_anchor = node.bounds();
+                                    self.tools.select.drag_snapshot = vec![(id, node.clone())];
+                                    self.tools.select.last_doc = doc;
+                                    self.sync_inspector_from_selection();
+                                    return;
+                                }
                             }
                         }
                     }
@@ -4485,6 +4466,7 @@ impl VadadeeBerryApp {
                     }
                 } else if !self.selection.contains(&id) {
                     self.selection = vec![id];
+                    self.tools.select.select_rotation_mode = false;
                 }
                 if !self.selection.is_empty() {
                     self.tools.select.drag_mode = Some(SelectDrag::Move);
@@ -4576,6 +4558,22 @@ impl VadadeeBerryApp {
                             }
                         }
                     }
+                    SelectDrag::Rotate => {
+                        if let Some(&(id, ref original_node)) = self.tools.select.drag_snapshot.first() {
+                            if let Some(center) = self.tools.select.rotate_center {
+                                let dx = doc.0 - center.0;
+                                let dy = doc.1 - center.1;
+                                let current_angle = dy.atan2(dx);
+                                let delta_angle = current_angle - self.tools.select.rotate_start_angle;
+                                let mut node = original_node.clone();
+                                let original_rot = original_node.get_rotation();
+                                node.set_rotation(original_rot + delta_angle);
+                                if let Some(n) = self.project.nodes.get_mut(id) {
+                                    *n = node;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         } else if released {
@@ -4613,10 +4611,23 @@ impl VadadeeBerryApp {
                     }
                 } else if !m.shift {
                     self.selection.clear();
+                    self.tools.select.select_rotation_mode = false;
                 }
                 self.sync_inspector_from_selection();
             } else if let Some(mode) = self.tools.select.drag_mode.take() {
                 if !matches!(mode, SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_)) {
+                    if matches!(mode, SelectDrag::Move) && self.selection.len() == 1 {
+                        if let Some(&(id, ref before)) = self.tools.select.drag_snapshot.first() {
+                            if let Some(node) = self.project.nodes.get(id) {
+                                let d_pos = node.get_pos();
+                                let b_pos = before.get_pos();
+                                let dist = (d_pos.0 - b_pos.0).hypot(d_pos.1 - b_pos.1);
+                                if dist < 2.0 / self.viewport.zoom as f64 {
+                                    self.tools.select.select_rotation_mode = !self.tools.select.select_rotation_mode;
+                                }
+                            }
+                        }
+                    }
                     self.commit_drag_edits();
                 } else {
                     self.tools.select.drag_snapshot.clear();
@@ -5581,45 +5592,11 @@ impl eframe::App for VadadeeBerryApp {
                         rotation: node.get_rotation(),
                         opacity: node.get_opacity(),
                         color: node.get_color(),
+                        geom_floats: node.get_geom_floats(),
                     });
                 }
             }
         } else if self.anim_keyframing_mode && !self.anim_is_playing {
-            // Capture baseline at 0
-            for id in &self.selection {
-                if let Some(node) = self.project.nodes.get(*id) {
-                    let pos = node.get_pos();
-                    let rot = node.get_rotation();
-                    let op = node.get_opacity() as f64;
-                    let color = node.get_color();
-                    let entry = self.anim_timeline.nodes.entry(*id).or_default();
-                    if entry.pos_x.keyframes.is_empty() {
-                        entry.pos_x.insert(0, pos.0);
-                    }
-                    if entry.pos_y.keyframes.is_empty() {
-                        entry.pos_y.insert(0, pos.1);
-                    }
-                    if entry.rotation.keyframes.is_empty() {
-                        entry.rotation.insert(0, rot);
-                    }
-                    if entry.opacity.keyframes.is_empty() {
-                        entry.opacity.insert(0, op);
-                    }
-                    if entry.color_r.keyframes.is_empty() {
-                        entry.color_r.insert(0, color[0] as f64);
-                    }
-                    if entry.color_g.keyframes.is_empty() {
-                        entry.color_g.insert(0, color[1] as f64);
-                    }
-                    if entry.color_b.keyframes.is_empty() {
-                        entry.color_b.insert(0, color[2] as f64);
-                    }
-                    if entry.color_a.keyframes.is_empty() {
-                        entry.color_a.insert(0, color[3] as f64);
-                    }
-                }
-            }
-
             // Ensure reference state is populated
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
@@ -5628,6 +5605,7 @@ impl eframe::App for VadadeeBerryApp {
                         rotation: node.get_rotation(),
                         opacity: node.get_opacity(),
                         color: node.get_color(),
+                        geom_floats: node.get_geom_floats(),
                     });
                 }
             }
@@ -5640,41 +5618,97 @@ impl eframe::App for VadadeeBerryApp {
                     let rot = node.get_rotation();
                     let op = node.get_opacity();
                     let color = node.get_color();
+                    let geom = node.get_geom_floats();
                     
                     let last_state = self.anim_last_applied_states.get(id);
                     if let Some(last) = last_state {
-                        let mut changed = false;
+                        let mut changed_pos = false;
+                        let mut changed_rot = false;
+                        let mut changed_op = false;
+                        let mut changed_col = false;
+                        let mut changed_geom = false;
                         
                         let dx = pos.0 - last.pos.0;
                         let dy = pos.1 - last.pos.1;
                         if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
-                            changed = true;
+                            changed_pos = true;
                         }
                         
                         if (rot - last.rotation).abs() > 1e-9 {
-                            changed = true;
+                            changed_rot = true;
                         }
                         
                         if (op - last.opacity).abs() > 1e-6 {
-                            changed = true;
+                            changed_op = true;
                         }
                         
                         for i in 0..4 {
                             if (color[i] - last.color[i]).abs() > 1e-6 {
-                                changed = true;
+                                changed_col = true;
                             }
                         }
                         
-                        if changed {
+                        if geom.len() == last.geom_floats.len() {
+                            for i in 0..geom.len() {
+                                if (geom[i] - last.geom_floats[i]).abs() > 1e-6 {
+                                    changed_geom = true;
+                                    break;
+                                }
+                            }
+                        } else if !geom.is_empty() {
+                            changed_geom = true;
+                        }
+                        
+                        if changed_pos || changed_rot || changed_op || changed_col || changed_geom {
                             let entry = self.anim_timeline.nodes.entry(*id).or_default();
-                            entry.pos_x.insert(self.anim_current_frame, pos.0);
-                            entry.pos_y.insert(self.anim_current_frame, pos.1);
-                            entry.rotation.insert(self.anim_current_frame, rot);
-                            entry.opacity.insert(self.anim_current_frame, op as f64);
-                            entry.color_r.insert(self.anim_current_frame, color[0] as f64);
-                            entry.color_g.insert(self.anim_current_frame, color[1] as f64);
-                            entry.color_b.insert(self.anim_current_frame, color[2] as f64);
-                            entry.color_a.insert(self.anim_current_frame, color[3] as f64);
+                            
+                            if changed_pos {
+                                if entry.pos_x.keyframes.is_empty() {
+                                    entry.pos_x.insert(0, last.pos.0);
+                                }
+                                if entry.pos_y.keyframes.is_empty() {
+                                    entry.pos_y.insert(0, last.pos.1);
+                                }
+                                entry.pos_x.insert(self.anim_current_frame, pos.0);
+                                entry.pos_y.insert(self.anim_current_frame, pos.1);
+                            }
+                            if changed_rot {
+                                if entry.rotation.keyframes.is_empty() {
+                                    entry.rotation.insert(0, last.rotation);
+                                }
+                                entry.rotation.insert(self.anim_current_frame, rot);
+                            }
+                            if changed_op {
+                                if entry.opacity.keyframes.is_empty() {
+                                    entry.opacity.insert(0, last.opacity as f64);
+                                }
+                                entry.opacity.insert(self.anim_current_frame, op as f64);
+                            }
+                            if changed_col {
+                                if entry.color_r.keyframes.is_empty() {
+                                    entry.color_r.insert(0, last.color[0] as f64);
+                                    entry.color_g.insert(0, last.color[1] as f64);
+                                    entry.color_b.insert(0, last.color[2] as f64);
+                                    entry.color_a.insert(0, last.color[3] as f64);
+                                }
+                                entry.color_r.insert(self.anim_current_frame, color[0] as f64);
+                                entry.color_g.insert(self.anim_current_frame, color[1] as f64);
+                                entry.color_b.insert(self.anim_current_frame, color[2] as f64);
+                                entry.color_a.insert(self.anim_current_frame, color[3] as f64);
+                            }
+                            if changed_geom {
+                                while entry.geom_tracks.len() < geom.len() {
+                                    entry.geom_tracks.push(KeyframeTrack::default());
+                                }
+                                for i in 0..geom.len() {
+                                    let baseline = if i < last.geom_floats.len() { last.geom_floats[i] } else { geom[i] };
+                                    if entry.geom_tracks[i].keyframes.is_empty() {
+                                        entry.geom_tracks[i].insert(0, baseline);
+                                    }
+                                    entry.geom_tracks[i].insert(self.anim_current_frame, geom[i]);
+                                }
+                            }
+                            
                             keyframes_updated = true;
                         }
                     }
@@ -5689,6 +5723,7 @@ impl eframe::App for VadadeeBerryApp {
                             rotation: node.get_rotation(),
                             opacity: node.get_opacity(),
                             color: node.get_color(),
+                            geom_floats: node.get_geom_floats(),
                         });
                     }
                 }

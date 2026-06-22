@@ -2280,6 +2280,87 @@ impl Node {
             NodeKind::BrushStroke { .. } => {}
         }
     }
+
+    pub fn get_geom_floats(&self) -> Vec<f64> {
+        match &self.kind {
+            NodeKind::Rect { w, h, rx, .. } => vec![*w, *h, *rx],
+            NodeKind::Ellipse { rx, ry, .. } => vec![*rx, *ry],
+            NodeKind::Polygon { r, sides, .. } => vec![*r, *sides as f64],
+            NodeKind::Arc { radius, start_angle_rad, sweep_angle_rad, .. } => vec![*radius, *start_angle_rad, *sweep_angle_rad],
+            NodeKind::Path { path } => {
+                let mut v = Vec::new();
+                for p in &path.points {
+                    v.push(p[0]);
+                    v.push(p[1]);
+                }
+                v
+            }
+            NodeKind::BrushStroke { points } => {
+                let mut v = Vec::new();
+                for (pos, w) in points {
+                    v.push(pos[0]);
+                    v.push(pos[1]);
+                    v.push(*w as f64);
+                }
+                v
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn set_geom_floats(&mut self, floats: &[f64]) {
+        if floats.is_empty() {
+            return;
+        }
+        match &mut self.kind {
+            NodeKind::Rect { w, h, rx, .. } => {
+                if floats.len() >= 3 {
+                    *w = floats[0];
+                    *h = floats[1];
+                    *rx = floats[2];
+                }
+            }
+            NodeKind::Ellipse { rx, ry, .. } => {
+                if floats.len() >= 2 {
+                    *rx = floats[0];
+                    *ry = floats[1];
+                }
+            }
+            NodeKind::Polygon { r, sides, .. } => {
+                if floats.len() >= 2 {
+                    *r = floats[0];
+                    *sides = (floats[1].round() as u32).max(3);
+                }
+            }
+            NodeKind::Arc { radius, start_angle_rad, sweep_angle_rad, .. } => {
+                if floats.len() >= 3 {
+                    *radius = floats[0];
+                    *start_angle_rad = floats[1];
+                    *sweep_angle_rad = floats[2];
+                }
+            }
+            NodeKind::Path { path } => {
+                let num_points = floats.len() / 2;
+                if num_points == path.points.len() {
+                    for i in 0..num_points {
+                        path.points[i][0] = floats[i * 2];
+                        path.points[i][1] = floats[i * 2 + 1];
+                    }
+                }
+            }
+            NodeKind::BrushStroke { points } => {
+                let num_points = floats.len() / 3;
+                if num_points == points.len() {
+                    for i in 0..num_points {
+                        points[i].0[0] = floats[i * 3];
+                        points[i].0[1] = floats[i * 3 + 1];
+                        points[i].1 = floats[i * 3 + 2] as f32;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub fn text_display_name(content: &str) -> String {

@@ -3266,6 +3266,98 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut dragged,
                             );
                         }
+
+                        let has_geom = anim.geom_tracks.iter().any(|t| !t.keyframes.is_empty());
+                        if has_geom {
+                            static GEOM_LABELS: &[&str] = &[
+                                "geom_0", "geom_1", "geom_2", "geom_3", "geom_4", "geom_5", "geom_6", "geom_7", "geom_8", "geom_9",
+                                "geom_10", "geom_11", "geom_12", "geom_13", "geom_14", "geom_15", "geom_16", "geom_17", "geom_18", "geom_19",
+                                "geom_20", "geom_21", "geom_22", "geom_23", "geom_24", "geom_25", "geom_26", "geom_27", "geom_28", "geom_29",
+                                "geom_30", "geom_31", "geom_32", "geom_33", "geom_34", "geom_35", "geom_36", "geom_37", "geom_38", "geom_39",
+                                "geom_40", "geom_41", "geom_42", "geom_43", "geom_44", "geom_45", "geom_46", "geom_47", "geom_48", "geom_49",
+                                "geom_50", "geom_51", "geom_52", "geom_53", "geom_54", "geom_55", "geom_56", "geom_57", "geom_58", "geom_59",
+                                "geom_60", "geom_61", "geom_62", "geom_63", "geom_64", "geom_65", "geom_66", "geom_67", "geom_68", "geom_69",
+                                "geom_70", "geom_71", "geom_72", "geom_73", "geom_74", "geom_75", "geom_76", "geom_77", "geom_78", "geom_79",
+                                "geom_80", "geom_81", "geom_82", "geom_83", "geom_84", "geom_85", "geom_86", "geom_87", "geom_88", "geom_89",
+                                "geom_90", "geom_91", "geom_92", "geom_93", "geom_94", "geom_95", "geom_96", "geom_97", "geom_98", "geom_99",
+                            ];
+                            for (i, track) in anim.geom_tracks.iter_mut().enumerate() {
+                                if track.keyframes.is_empty() {
+                                    continue;
+                                }
+                                let label = if i < GEOM_LABELS.len() {
+                                    GEOM_LABELS[i]
+                                } else {
+                                    "geom_unknown"
+                                };
+                                let default_val = if let Some(node) = app.project.nodes.get(node_id) {
+                                    let geom = node.get_geom_floats();
+                                    if i < geom.len() { geom[i] } else { 0.0 }
+                                } else {
+                                    0.0
+                                };
+                                
+                                let track_name = if let Some(node) = app.project.nodes.get(node_id) {
+                                    match &node.kind {
+                                        NodeKind::Rect { .. } => match i {
+                                            0 => "Width".to_string(),
+                                            1 => "Height".to_string(),
+                                            2 => "Corner Rad".to_string(),
+                                            _ => format!("Geom {}", i),
+                                        },
+                                        NodeKind::Ellipse { .. } => match i {
+                                            0 => "Radius X".to_string(),
+                                            1 => "Radius Y".to_string(),
+                                            _ => format!("Geom {}", i),
+                                        },
+                                        NodeKind::Polygon { .. } => match i {
+                                            0 => "Radius".to_string(),
+                                            1 => "Sides".to_string(),
+                                            _ => format!("Geom {}", i),
+                                        },
+                                        NodeKind::Arc { .. } => match i {
+                                            0 => "Radius".to_string(),
+                                            1 => "Start Ang".to_string(),
+                                            2 => "Sweep Ang".to_string(),
+                                            _ => format!("Geom {}", i),
+                                        },
+                                        NodeKind::Path { .. } => {
+                                            let pt_idx = i / 2;
+                                            let is_y = i % 2 == 1;
+                                            format!("Pt {} {}", pt_idx, if is_y { "Y" } else { "X" })
+                                        }
+                                        NodeKind::BrushStroke { .. } => {
+                                            let pt_idx = i / 3;
+                                            match i % 3 {
+                                                0 => format!("Stroke {} X", pt_idx),
+                                                1 => format!("Stroke {} Y", pt_idx),
+                                                _ => format!("Stroke {} W", pt_idx),
+                                            }
+                                        }
+                                        _ => format!("Geom {}", i),
+                                    }
+                                } else {
+                                    format!("Geom {}", i)
+                                };
+
+                                let mut plots = vec![TrackPlotInfo {
+                                    label,
+                                    track,
+                                    color: colors::POWERLINE_C,
+                                    default_val,
+                                }];
+                                draw_timeline_track(
+                                    ui,
+                                    &track_name,
+                                    Some(node_id),
+                                    &mut plots,
+                                    &mut curr_frame,
+                                    &mut scroll,
+                                    edit_mode,
+                                    &mut dragged,
+                                );
+                            }
+                        }
                     });
             }
         }
@@ -3489,6 +3581,127 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             }
         }
     });
+
+    // Handle geometry tracks
+    let mut geom_floats = {
+        let Some(node) = app.project.nodes.get(id) else {
+            return;
+        };
+        node.get_geom_floats()
+    };
+    
+    if !geom_floats.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new("Geometry Properties").strong().color(colors::POWERLINE_C));
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Ensure we have enough keyframe tracks for each geometry float
+        while entry.geom_tracks.len() < geom_floats.len() {
+            entry.geom_tracks.push(crate::app::KeyframeTrack::default());
+        }
+
+        // Gather human-readable labels and config
+        let (geom_info, is_arc) = if let Some(node) = app.project.nodes.get(id) {
+            let info = match &node.kind {
+                NodeKind::Rect { .. } => vec![
+                    ("Width".to_string(), 0.0, 10000.0, 1.0),
+                    ("Height".to_string(), 0.0, 10000.0, 1.0),
+                    ("Corner Radius".to_string(), 0.0, 500.0, 0.5),
+                ],
+                NodeKind::Ellipse { .. } => vec![
+                    ("Radius X".to_string(), 0.0, 10000.0, 1.0),
+                    ("Radius Y".to_string(), 0.0, 10000.0, 1.0),
+                ],
+                NodeKind::Polygon { .. } => vec![
+                    ("Radius".to_string(), 0.0, 10000.0, 1.0),
+                    ("Sides".to_string(), 3.0, 100.0, 1.0),
+                ],
+                NodeKind::Arc { .. } => vec![
+                    ("Radius".to_string(), 0.0, 10000.0, 1.0),
+                    ("Start Angle (deg)".to_string(), -360.0, 360.0, 1.0),
+                    ("Sweep Angle (deg)".to_string(), -360.0, 360.0, 1.0),
+                ],
+                NodeKind::Path { path } => {
+                    let mut v = Vec::new();
+                    for i in 0..path.points.len() {
+                        v.push((format!("Point {} X", i), -10000.0, 10000.0, 1.0));
+                        v.push((format!("Point {} Y", i), -10000.0, 10000.0, 1.0));
+                    }
+                    v
+                }
+                NodeKind::BrushStroke { points } => {
+                    let mut v = Vec::new();
+                    for i in 0..points.len() {
+                        v.push((format!("Stroke {} X", i), -10000.0, 10000.0, 1.0));
+                        v.push((format!("Stroke {} Y", i), -10000.0, 10000.0, 1.0));
+                        v.push((format!("Stroke {} Width", i), 0.1, 500.0, 0.5));
+                    }
+                    v
+                }
+                _ => Vec::new(),
+            };
+            let is_arc = matches!(node.kind, NodeKind::Arc { .. });
+            (info, is_arc)
+        } else {
+            (Vec::new(), false)
+        };
+
+        for i in 0..geom_floats.len() {
+            let (label, min, max, speed) = if i < geom_info.len() {
+                geom_info[i].clone()
+            } else {
+                (format!("Property {}", i), -10000.0, 10000.0, 1.0)
+            };
+
+            let is_arc_angle = is_arc && (i == 1 || i == 2);
+            
+            let mut track_geom = entry.geom_tracks[i].clone();
+            
+            // Adjust defaults/values for radian <-> degree conversion
+            let current_val = if is_arc_angle {
+                geom_floats[i].to_degrees()
+            } else {
+                geom_floats[i]
+            };
+
+            // In order to use render_prop_row correctly, we convert values in track_geom to degrees temporarily if it's an angle track
+            if is_arc_angle {
+                for kf in &mut track_geom.keyframes {
+                    kf.value = kf.value.to_degrees();
+                }
+            }
+
+            let (changed_geom, val_geom) = render_prop_row(
+                ui,
+                &label,
+                &mut track_geom,
+                current_val,
+                min,
+                max,
+                speed,
+            );
+
+            if changed_geom {
+                // If value changed or deleted, convert back to radians if necessary
+                if is_arc_angle {
+                    for kf in &mut track_geom.keyframes {
+                        kf.value = kf.value.to_radians();
+                    }
+                }
+                entry.geom_tracks[i] = track_geom;
+                entry_changed = true;
+
+                if let Some(vg) = val_geom {
+                    let rad_vg = if is_arc_angle { vg.to_radians() } else { vg };
+                    geom_floats[i] = rad_vg;
+                    if let Some(n) = app.project.nodes.get_mut(id) {
+                        n.set_geom_floats(&geom_floats);
+                    }
+                }
+            }
+        }
+    }
 
     app.anim_timeline.nodes.insert(id, entry);
 }
