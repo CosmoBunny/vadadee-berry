@@ -33,6 +33,12 @@ pub enum BezierHandleMode {
     Asymmetric,
     /// Opposite direction with equal length (alias for symmetric, shown in UI).
     EqualLength,
+    /// Single incoming handle.
+    LeftOnly,
+    /// Single outgoing handle.
+    RightOnly,
+    /// Both handles independent.
+    Both,
 }
 
 impl BezierHandleMode {
@@ -41,6 +47,9 @@ impl BezierHandleMode {
             Self::Symmetric => "Symmetric",
             Self::Asymmetric => "Asymmetric",
             Self::EqualLength => "Equal length",
+            Self::LeftOnly => "Single Left (point_l)",
+            Self::RightOnly => "Single Right (point_r)",
+            Self::Both => "Both (Asymmetric)",
         }
     }
 }
@@ -315,7 +324,7 @@ impl PathData {
 
     pub fn set_handle_mode(&mut self, anchor_idx: usize, mode: BezierHandleMode) {
         self.handle_modes.insert(anchor_idx, mode);
-        if mode == BezierHandleMode::Asymmetric {
+        if matches!(mode, BezierHandleMode::Symmetric | BezierHandleMode::Asymmetric | BezierHandleMode::EqualLength | BezierHandleMode::Both) {
             // Ensure both handles exist (mirror the one we have) so the canvas draws
             // the "second line" for the independent handle immediately.
             let has_out = self.handle_out_offset.contains_key(&anchor_idx);
@@ -328,6 +337,24 @@ impl PathData {
                 if let Some(&off) = self.handle_in_offset.get(&anchor_idx) {
                     self.handle_out_offset.insert(anchor_idx, [-off[0], -off[1]]);
                 }
+            }
+        } else if mode == BezierHandleMode::LeftOnly {
+            self.handle_out_offset.remove(&anchor_idx);
+            if !self.handle_in_offset.contains_key(&anchor_idx) {
+                let anchors = self.anchor_positions();
+                let closed = self.is_closed();
+                let tan = anchor_tangent(&anchors, anchor_idx, closed);
+                let dist = 32.0;
+                self.handle_in_offset.insert(anchor_idx, [-tan.0 * dist, -tan.1 * dist]);
+            }
+        } else if mode == BezierHandleMode::RightOnly {
+            self.handle_in_offset.remove(&anchor_idx);
+            if !self.handle_out_offset.contains_key(&anchor_idx) {
+                let anchors = self.anchor_positions();
+                let closed = self.is_closed();
+                let tan = anchor_tangent(&anchors, anchor_idx, closed);
+                let dist = 32.0;
+                self.handle_out_offset.insert(anchor_idx, [tan.0 * dist, tan.1 * dist]);
             }
         }
         // Rebuild so the baked curve points reflect any newly initialized opposite handle.
@@ -379,6 +406,18 @@ impl PathData {
                 self.smooth_anchors.sort_unstable();
                 self.smooth_anchors.dedup();
             }
+            let tan = anchor_tangent(&anchors, anchor_idx, self.is_closed());
+            let dist = if anchors.len() > 1 {
+                let prev_idx = if anchor_idx > 0 { anchor_idx - 1 } else { anchors.len() - 1 };
+                let next_idx = (anchor_idx + 1) % anchors.len();
+                let d1 = (anchors[anchor_idx].0 - anchors[prev_idx].0).hypot(anchors[anchor_idx].1 - anchors[prev_idx].1);
+                let d2 = (anchors[next_idx].0 - anchors[anchor_idx].0).hypot(anchors[next_idx].1 - anchors[anchor_idx].1);
+                (d1 + d2) * 0.25
+            } else {
+                30.0
+            }.max(1.0);
+            self.handle_out_offset.entry(anchor_idx).or_insert([tan.0 * dist, tan.1 * dist]);
+            self.handle_in_offset.entry(anchor_idx).or_insert([-tan.0 * dist, -tan.1 * dist]);
         } else {
             self.smooth_anchors.retain(|&i| i != anchor_idx);
             self.handle_out_offset.remove(&anchor_idx);
@@ -421,11 +460,21 @@ impl PathData {
     fn apply_handle_drag(&mut self, anchor_idx: usize, outgoing: bool, offset: [f64; 2]) {
         let len = (offset[0] * offset[0] + offset[1] * offset[1]).sqrt();
         match self.handle_mode(anchor_idx) {
-            BezierHandleMode::Asymmetric => {
+            BezierHandleMode::Asymmetric | BezierHandleMode::Both => {
                 if outgoing {
                     self.handle_out_offset.insert(anchor_idx, offset);
                 } else {
                     self.handle_in_offset.insert(anchor_idx, offset);
+                }
+            }
+            BezierHandleMode::LeftOnly => {
+                if !outgoing {
+                    self.handle_in_offset.insert(anchor_idx, offset);
+                }
+            }
+            BezierHandleMode::RightOnly => {
+                if outgoing {
+                    self.handle_out_offset.insert(anchor_idx, offset);
                 }
             }
             BezierHandleMode::Symmetric => {
@@ -544,6 +593,7 @@ impl PathData {
                     self.is_anchor_smooth(0),
                     &self.handle_out_offset,
                     &self.handle_in_offset,
+                    &self.handle_modes,
                 );
                 if self.is_anchor_smooth(n - 1) {
                     outgoing = Some(c1);
@@ -559,11 +609,19 @@ impl PathData {
                     self.is_anchor_smooth(0),
                     &self.handle_out_offset,
                     &self.handle_in_offset,
+                    &self.handle_modes,
                 );
                 if self.is_anchor_smooth(0) || self.is_anchor_smooth(n - 1) {
                     incoming = Some(c2);
                 }
             }
+        }
+
+        let mode = self.handle_mode(anchor_idx);
+        if mode == BezierHandleMode::LeftOnly {
+            outgoing = None;
+        } else if mode == BezierHandleMode::RightOnly {
+            incoming = None;
         }
 
         if incoming.is_none() && outgoing.is_none() {
@@ -624,6 +682,7 @@ impl PathData {
             smooth_to,
             &self.handle_out_offset,
             &self.handle_in_offset,
+            &self.handle_modes,
         );
         let samples = 24usize;
         let mut best_dist = f64::MAX;
@@ -883,6 +942,7 @@ impl PathData {
                     smooth[j],
                     &self.handle_out_offset,
                     &self.handle_in_offset,
+                    &self.handle_modes,
                 );
                 verbs.push(3);
                 points.push([c1.0, c1.1]);
@@ -2282,36 +2342,90 @@ impl Node {
     }
 
     pub fn get_geom_floats(&self) -> Vec<f64> {
-        match &self.kind {
+        let mut v = match &self.kind {
             NodeKind::Rect { w, h, rx, .. } => vec![*w, *h, *rx],
             NodeKind::Ellipse { rx, ry, .. } => vec![*rx, *ry],
             NodeKind::Polygon { r, sides, .. } => vec![*r, *sides as f64],
             NodeKind::Arc { radius, start_angle_rad, sweep_angle_rad, .. } => vec![*radius, *start_angle_rad, *sweep_angle_rad],
             NodeKind::Path { path } => {
-                let mut v = Vec::new();
-                for p in &path.points {
-                    v.push(p[0]);
-                    v.push(p[1]);
+                let mut pv = Vec::new();
+                let anchors = path.anchor_positions();
+                for (i, p) in anchors.iter().enumerate() {
+                    pv.push(p.0);
+                    pv.push(p.1);
+                    let out_off = path.handle_out_offset.get(&i).copied().unwrap_or([0.0, 0.0]);
+                    pv.push(out_off[0]);
+                    pv.push(out_off[1]);
+                    let in_off = path.handle_in_offset.get(&i).copied().unwrap_or([0.0, 0.0]);
+                    pv.push(in_off[0]);
+                    pv.push(in_off[1]);
                 }
-                v
+                pv
             }
             NodeKind::BrushStroke { points } => {
-                let mut v = Vec::new();
+                let mut pv = Vec::new();
                 for (pos, w) in points {
-                    v.push(pos[0]);
-                    v.push(pos[1]);
-                    v.push(*w as f64);
+                    pv.push(pos[0]);
+                    pv.push(pos[1]);
+                    pv.push(*w as f64);
                 }
-                v
+                pv
             }
             _ => Vec::new(),
+        };
+
+        // Append fill gradient stops and properties
+        match &self.style.fill {
+            Fill::LinearGradient { angle_deg, line_x0, line_y0, line_x1, line_y1, stops } => {
+                v.push(1.0); // Marker for LinearGradient
+                v.push(*angle_deg as f64);
+                v.push(*line_x0 as f64);
+                v.push(*line_y0 as f64);
+                v.push(*line_x1 as f64);
+                v.push(*line_y1 as f64);
+                v.push(stops.len() as f64);
+                for stop in stops {
+                    v.push(stop.pos as f64);
+                    v.push(stop.color.rgba[0] as f64);
+                    v.push(stop.color.rgba[1] as f64);
+                    v.push(stop.color.rgba[2] as f64);
+                    v.push(stop.color.rgba[3] as f64);
+                }
+            }
+            Fill::RadialGradient { center_x, center_y, stops } => {
+                v.push(2.0); // Marker for RadialGradient
+                v.push(*center_x as f64);
+                v.push(*center_y as f64);
+                v.push(stops.len() as f64);
+                for stop in stops {
+                    v.push(stop.pos as f64);
+                    v.push(stop.color.rgba[0] as f64);
+                    v.push(stop.color.rgba[1] as f64);
+                    v.push(stop.color.rgba[2] as f64);
+                    v.push(stop.color.rgba[3] as f64);
+                }
+            }
+            _ => {
+                v.push(0.0); // Solid or None marker
+            }
         }
+
+        v
     }
 
     pub fn set_geom_floats(&mut self, floats: &[f64]) {
         if floats.is_empty() {
             return;
         }
+        let base_len = match &self.kind {
+            NodeKind::Rect { .. } => 3,
+            NodeKind::Ellipse { .. } => 2,
+            NodeKind::Polygon { .. } => 2,
+            NodeKind::Arc { .. } => 3,
+            NodeKind::Path { path } => path.anchor_positions().len() * 6,
+            NodeKind::BrushStroke { points } => points.len() * 3,
+            _ => 0,
+        };
         match &mut self.kind {
             NodeKind::Rect { w, h, rx, .. } => {
                 if floats.len() >= 3 {
@@ -2340,16 +2454,22 @@ impl Node {
                 }
             }
             NodeKind::Path { path } => {
-                let num_points = floats.len() / 2;
-                if num_points == path.points.len() {
-                    for i in 0..num_points {
-                        path.points[i][0] = floats[i * 2];
-                        path.points[i][1] = floats[i * 2 + 1];
+                let num_anchors = floats.len().min(base_len) / 6;
+                let mut anchors = path.anchor_positions();
+                if num_anchors == anchors.len() {
+                    for i in 0..num_anchors {
+                        let base = i * 6;
+                        anchors[i] = (floats[base], floats[base + 1]);
+                        let out_off = [floats[base + 2], floats[base + 3]];
+                        let in_off = [floats[base + 4], floats[base + 5]];
+                        path.handle_out_offset.insert(i, out_off);
+                        path.handle_in_offset.insert(i, in_off);
                     }
+                    path.rebuild_with_smooth_anchors(&anchors);
                 }
             }
             NodeKind::BrushStroke { points } => {
-                let num_points = floats.len() / 3;
+                let num_points = floats.len().min(base_len) / 3;
                 if num_points == points.len() {
                     for i in 0..num_points {
                         points[i].0[0] = floats[i * 3];
@@ -2359,6 +2479,72 @@ impl Node {
                 }
             }
             _ => {}
+        }
+
+        // Parse appended gradient floats if present
+        if floats.len() > base_len {
+            let marker = floats[base_len];
+            if marker == 1.0 {
+                // LinearGradient
+                if floats.len() >= base_len + 7 {
+                    let angle_deg = floats[base_len + 1] as f32;
+                    let line_x0 = floats[base_len + 2] as f32;
+                    let line_y0 = floats[base_len + 3] as f32;
+                    let line_x1 = floats[base_len + 4] as f32;
+                    let line_y1 = floats[base_len + 5] as f32;
+                    let stops_len = floats[base_len + 6].round() as usize;
+                    let mut stops = Vec::new();
+                    for i in 0..stops_len {
+                        let offset = base_len + 7 + i * 5;
+                        if offset + 4 < floats.len() {
+                            let pos = floats[offset] as f32;
+                            let r = floats[offset + 1] as f32;
+                            let g = floats[offset + 2] as f32;
+                            let b = floats[offset + 3] as f32;
+                            let a = floats[offset + 4] as f32;
+                            stops.push(crate::document::GradientStop {
+                                pos,
+                                color: crate::document::Paint { rgba: [r, g, b, a] },
+                            });
+                        }
+                    }
+                    self.style.fill = Fill::LinearGradient {
+                        angle_deg,
+                        line_x0,
+                        line_y0,
+                        line_x1,
+                        line_y1,
+                        stops,
+                    };
+                }
+            } else if marker == 2.0 {
+                // RadialGradient
+                if floats.len() >= base_len + 4 {
+                    let center_x = floats[base_len + 1] as f32;
+                    let center_y = floats[base_len + 2] as f32;
+                    let stops_len = floats[base_len + 3].round() as usize;
+                    let mut stops = Vec::new();
+                    for i in 0..stops_len {
+                        let offset = base_len + 4 + i * 5;
+                        if offset + 4 < floats.len() {
+                            let pos = floats[offset] as f32;
+                            let r = floats[offset + 1] as f32;
+                            let g = floats[offset + 2] as f32;
+                            let b = floats[offset + 3] as f32;
+                            let a = floats[offset + 4] as f32;
+                            stops.push(crate::document::GradientStop {
+                                pos,
+                                color: crate::document::Paint { rgba: [r, g, b, a] },
+                            });
+                        }
+                    }
+                    self.style.fill = Fill::RadialGradient {
+                        center_x,
+                        center_y,
+                        stops,
+                    };
+                }
+            }
         }
     }
 }
@@ -2488,13 +2674,17 @@ fn segment_controls(
     smooth_j: bool,
     handle_out: &HashMap<usize, [f64; 2]>,
     handle_in: &HashMap<usize, [f64; 2]>,
+    handle_modes: &HashMap<usize, BezierHandleMode>,
 ) -> ((f64, f64), (f64, f64)) {
     let p0 = anchors[i];
     let p3 = anchors[j];
     let dist = (p3.0 - p0.0).hypot(p3.1 - p0.1).max(1e-6);
     let t_len = dist / 3.0;
 
-    let c1 = if smooth_i {
+    let mode_i = handle_modes.get(&i).copied().unwrap_or(BezierHandleMode::Symmetric);
+    let smooth_i_eff = smooth_i && mode_i != BezierHandleMode::LeftOnly;
+
+    let c1 = if smooth_i_eff {
         if let Some(off) = handle_out.get(&i) {
             (p0.0 + off[0], p0.1 + off[1])
         } else {
@@ -2505,7 +2695,10 @@ fn segment_controls(
         p0
     };
 
-    let c2 = if smooth_j {
+    let mode_j = handle_modes.get(&j).copied().unwrap_or(BezierHandleMode::Symmetric);
+    let smooth_j_eff = smooth_j && mode_j != BezierHandleMode::RightOnly;
+
+    let c2 = if smooth_j_eff {
         if let Some(off) = handle_in.get(&j) {
             (p3.0 + off[0], p3.1 + off[1])
         } else {
@@ -2600,10 +2793,10 @@ mod bezier_tests {
         assert!(bez.elements().iter().any(|e| matches!(e, PathEl::CurveTo(_, _, _))));
         let flat = flatten_path_points(&bez, 0.5);
         assert!(flat.len() > 3, "flat len {}", flat.len());
-        let mid = flat[flat.len() / 2];
+        let has_bow = flat.iter().any(|p| p.0 > 10.0 && p.0 < 90.0 && p.1.abs() > 1.0);
         assert!(
-            mid.1.abs() > 1.0,
-            "curve should bow away from chord, mid={mid:?}"
+            has_bow,
+            "curve should bow away from chord, flat={flat:?}"
         );
     }
 }

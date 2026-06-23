@@ -3131,14 +3131,45 @@ fn draw_timeline_track(
             *timeline_scroll = (*timeline_scroll - scroll_delta.x * 0.1).max(0.0);
         }
         
-        // Double-click track to open graph editor
+        // Find if a specific plot's keyframe is hovered
+        let mut hovered_plot_lbl = None;
+        if let Some(n_id) = node_id {
+            for plot in plots.iter() {
+                for kf in &plot.track.keyframes {
+                    let kf_frame = kf.frame as f32;
+                    if kf_frame >= start_frame && kf_frame <= end_frame {
+                        let frac_x = (kf_frame - start_frame) / visible_frames;
+                        let kf_x = rect.left() + frac_x * rect.width();
+                        let frac_y = (kf.value - val_min) / (val_max - val_min);
+                        let kf_y = rect.bottom() - padding - (frac_y as f32) * (rect.height() - 2.0 * padding);
+                        let center = egui::pos2(kf_x, kf_y);
+                        
+                        let mouse_pos = ui.input(|i| i.pointer.hover_pos());
+                        if let Some(mpos) = mouse_pos {
+                            if mpos.distance(center) < 8.0 {
+                                hovered_plot_lbl = Some(plot.label.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                if hovered_plot_lbl.is_some() {
+                    break;
+                }
+            }
+        }
+        
+        // Double-click track to open/toggle graph editor
         let double_clicked_track = response.double_clicked();
         if double_clicked_track {
             if let Some(n_id) = node_id {
-                let label = plots[0].label.to_string();
+                let label = hovered_plot_lbl.unwrap_or_else(|| plots[0].label.to_string());
                 let new_track = (n_id, label);
                 if let Some(current) = graph_editor_track.as_ref() {
-                    if current != &new_track {
+                    if current == &new_track {
+                        // Toggle close
+                        *graph_editor_track = None;
+                    } else {
                         *graph_editor_target_track = Some(new_track);
                     }
                 } else {
@@ -3569,135 +3600,32 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
     };
     
     // Resolve current node state for default values
-    let (node_pos, node_rot, node_op, node_col) = if let Some(node) = app.project.nodes.get(node_id) {
+    let (node_pos, node_rot, node_op, node_col, geom_floats) = if let Some(node) = app.project.nodes.get(node_id) {
         (
             node.get_pos(),
             node.get_rotation(),
             node.get_opacity() as f64,
             node.get_color(),
+            node.get_geom_floats(),
         )
     } else {
-        ((0.0, 0.0), 0.0, 1.0, [1.0, 1.0, 1.0, 1.0])
+        ((0.0, 0.0), 0.0, 1.0, [1.0, 1.0, 1.0, 1.0], Vec::new())
     };
     
     // Resolve human-readable track name
-    let track_name = if let Some(node) = app.project.nodes.get(node_id) {
-        let base_len = node.get_geom_floats().len();
-        match track_lbl.as_str() {
-            "pos_x" | "pos_y" => "Position".to_string(),
-            "rotation" => "Rotation".to_string(),
-            "opacity" => "Opacity".to_string(),
-            "color_r" | "color_g" | "color_b" | "color_a" => "Color".to_string(),
-            _ if track_lbl.starts_with("geom_") => {
-                if let Ok(idx) = track_lbl["geom_".len()..].parse::<usize>() {
-                    if idx < base_len {
-                        match &node.kind {
-                            NodeKind::Rect { .. } => match idx {
-                                0 => "Width".to_string(),
-                                1 => "Height".to_string(),
-                                2 => "Corner Rad".to_string(),
-                                _ => format!("Geom {}", idx),
-                            },
-                            NodeKind::Ellipse { .. } => match idx {
-                                0 => "Radius X".to_string(),
-                                1 => "Radius Y".to_string(),
-                                _ => format!("Geom {}", idx),
-                            },
-                            NodeKind::Polygon { .. } => match idx {
-                                0 => "Radius".to_string(),
-                                1 => "Sides".to_string(),
-                                _ => format!("Geom {}", idx),
-                            },
-                            NodeKind::Arc { .. } => match idx {
-                                0 => "Radius".to_string(),
-                                1 => "Start Ang".to_string(),
-                                2 => "Sweep Ang".to_string(),
-                                _ => format!("Geom {}", idx),
-                            },
-                            NodeKind::Path { .. } => {
-                                let pt_idx = idx / 2;
-                                let is_y = idx % 2 == 1;
-                                format!("Pt {} {}", pt_idx, if is_y { "Y" } else { "X" })
-                            }
-                            NodeKind::BrushStroke { .. } => {
-                                let pt_idx = idx / 3;
-                                match idx % 3 {
-                                    0 => format!("Stroke {} X", pt_idx),
-                                    1 => format!("Stroke {} Y", pt_idx),
-                                    _ => format!("Stroke {} W", pt_idx),
-                                }
-                            }
-                            _ => format!("Geom {}", idx),
-                        }
-                    } else {
-                        // Resolve path magic property names
-                        let mut local_idx = idx - base_len;
-                        let mut resolved_name = None;
-                        
-                        if let Some(_) = app.project.document.tiling_effects.values().find(|e| e.source_id == node_id) {
-                            if local_idx < 10 {
-                                resolved_name = Some(match local_idx {
-                                    0 => "Tiling Gap X".to_string(),
-                                    1 => "Tiling Gap Y".to_string(),
-                                    2 => "Tiling Count X".to_string(),
-                                    3 => "Tiling Count Y".to_string(),
-                                    4 => "Tiling Offset X".to_string(),
-                                    5 => "Tiling Offset Y".to_string(),
-                                    6 => "Tiling Row Rot".to_string(),
-                                    7 => "Tiling Col Rot".to_string(),
-                                    8 => "Tiling Row Scale".to_string(),
-                                    9 => "Tiling Col Scale".to_string(),
-                                    _ => unreachable!(),
-                                });
-                            } else {
-                                local_idx -= 10;
-                            }
-                        }
-                        
-                        if resolved_name.is_none() {
-                            if let Some(_) = app.project.document.circular_effects.values().find(|e| e.source_id == node_id) {
-                                if local_idx < 7 {
-                                    resolved_name = Some(match local_idx {
-                                        0 => "Circular X".to_string(),
-                                        1 => "Circular Y".to_string(),
-                                        2 => "Circular Radius".to_string(),
-                                        3 => "Circular Copies".to_string(),
-                                        4 => "Circular Angle".to_string(),
-                                        5 => "Circular Base X".to_string(),
-                                        6 => "Circular Base Y".to_string(),
-                                        _ => unreachable!(),
-                                    });
-                                } else {
-                                    local_idx -= 7;
-                                }
-                            }
-                        }
-                        
-                        if resolved_name.is_none() {
-                            if let Some(_) = app.project.document.path_effects.values().find(|e| e.source_id == node_id) {
-                                if local_idx < 5 {
-                                    resolved_name = Some(match local_idx {
-                                        0 => "Path Gap".to_string(),
-                                        1 => "Path Count".to_string(),
-                                        2 => "Path Offset".to_string(),
-                                        3 => "Path End Scale".to_string(),
-                                        4 => "Path End Opacity".to_string(),
-                                        _ => unreachable!(),
-                                    });
-                                }
-                            }
-                        }
-                        
-                        resolved_name.unwrap_or_else(|| format!("Property {}", idx))
-                    }
-                } else {
-                    track_lbl.clone()
-                }
+    let track_name = match track_lbl.as_str() {
+        "pos_x" | "pos_y" => "Position".to_string(),
+        "rotation" => "Rotation".to_string(),
+        "opacity" => "Opacity".to_string(),
+        "color_r" | "color_g" | "color_b" | "color_a" => "Color".to_string(),
+        _ if track_lbl.starts_with("geom_") => {
+            if let Ok(idx) = track_lbl["geom_".len()..].parse::<usize>() {
+                app.get_node_geom_track_name(node_id, idx)
+            } else {
+                track_lbl.clone()
             }
-            _ => track_lbl.clone(),
         }
-    } else {
-        track_lbl.clone()
+        _ => track_lbl.clone(),
     };
     
     ui.vertical(|ui| {
@@ -3706,7 +3634,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             ui.label(RichText::new(format!("GRAPH EDITOR: {}", track_name)).strong().color(colors::ACCENT));
             
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(RichText::new("✕").strong()).clicked() {
+                if ui.button(RichText::new(icons::CLOSE).font(icons::nerd_font_id(12.0))).clicked() {
                     app.anim_graph_editor_track = None;
                 }
                 
@@ -3747,7 +3675,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
         
         let default_val = if track_lbl.starts_with("geom_") {
             if let Ok(idx) = track_lbl["geom_".len()..].parse::<usize>() {
-                app.get_node_geom_floats(node_id).get(idx).copied().unwrap_or(0.0)
+                geom_floats.get(idx).copied().unwrap_or(0.0)
             } else {
                 0.0
             }
@@ -3771,23 +3699,110 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             0.0
         };
 
-        let Some(anim) = app.anim_timeline.nodes.get_mut(&node_id) else {
+        let Some(anim) = app.anim_timeline.nodes.get(&node_id) else {
             return;
         };
         
         // Resolve all tracks to display in this graph plot
-        let mut tracks_to_draw = Vec::new(); // Vec<(label, color, track, default_val)>
+        let mut tracks_to_draw = Vec::new(); // Vec<(String, Color32, &KeyframeTrack, f64)>
         
         if track_lbl == "pos_x" || track_lbl == "pos_y" {
-            tracks_to_draw.push(("pos_x", egui::Color32::from_rgb(0, 200, 0), &mut anim.pos_x, node_pos.0));
-            tracks_to_draw.push(("pos_y", egui::Color32::from_rgb(200, 0, 0), &mut anim.pos_y, node_pos.1));
+            tracks_to_draw.push(("pos_x".to_string(), egui::Color32::from_rgb(0, 200, 0), &anim.pos_x, node_pos.0));
+            tracks_to_draw.push(("pos_y".to_string(), egui::Color32::from_rgb(200, 0, 0), &anim.pos_y, node_pos.1));
         } else if track_lbl.starts_with("color_") {
-            tracks_to_draw.push(("color_r", egui::Color32::from_rgb(255, 100, 100), &mut anim.color_r, node_col[0] as f64));
-            tracks_to_draw.push(("color_g", egui::Color32::from_rgb(100, 255, 100), &mut anim.color_g, node_col[1] as f64));
-            tracks_to_draw.push(("color_b", egui::Color32::from_rgb(100, 100, 255), &mut anim.color_b, node_col[2] as f64));
+            tracks_to_draw.push(("color_r".to_string(), egui::Color32::from_rgb(255, 100, 100), &anim.color_r, node_col[0] as f64));
+            tracks_to_draw.push(("color_g".to_string(), egui::Color32::from_rgb(100, 255, 100), &anim.color_g, node_col[1] as f64));
+            tracks_to_draw.push(("color_b".to_string(), egui::Color32::from_rgb(100, 100, 255), &anim.color_b, node_col[2] as f64));
+        } else if track_lbl.starts_with("geom_") {
+            if let Ok(idx) = track_lbl["geom_".len()..].parse::<usize>() {
+                // Check if this belongs to a 2D pair (like Path X/Y, or BrushStroke X/Y)
+                let mut grouped = false;
+                if let Some(node) = app.project.nodes.get(node_id) {
+                    let base_len = node.get_geom_floats().len();
+                    if idx < base_len {
+                        match &node.kind {
+                            NodeKind::Path { .. } => {
+                                let anchor_idx = idx / 6;
+                                let sub_idx = idx % 6;
+                                if sub_idx == 0 || sub_idx == 1 {
+                                    // Pt X and Pt Y
+                                    let idx_x = anchor_idx * 6;
+                                    let idx_y = anchor_idx * 6 + 1;
+                                    let lbl_x = format!("geom_{}", idx_x);
+                                    let lbl_y = format!("geom_{}", idx_y);
+                                    let def_x = geom_floats.get(idx_x).copied().unwrap_or(0.0);
+                                    let def_y = geom_floats.get(idx_y).copied().unwrap_or(0.0);
+                                    if let Some(t_x) = anim.get_track(&lbl_x) {
+                                        tracks_to_draw.push((lbl_x, egui::Color32::from_rgb(0, 200, 0), t_x, def_x));
+                                    }
+                                    if let Some(t_y) = anim.get_track(&lbl_y) {
+                                        tracks_to_draw.push((lbl_y, egui::Color32::from_rgb(200, 0, 0), t_y, def_y));
+                                    }
+                                    grouped = true;
+                                } else if sub_idx == 2 || sub_idx == 3 {
+                                    // Pt Out X and Pt Out Y
+                                    let idx_x = anchor_idx * 6 + 2;
+                                    let idx_y = anchor_idx * 6 + 3;
+                                    let lbl_x = format!("geom_{}", idx_x);
+                                    let lbl_y = format!("geom_{}", idx_y);
+                                    let def_x = geom_floats.get(idx_x).copied().unwrap_or(0.0);
+                                    let def_y = geom_floats.get(idx_y).copied().unwrap_or(0.0);
+                                    if let Some(t_x) = anim.get_track(&lbl_x) {
+                                        tracks_to_draw.push((lbl_x, egui::Color32::from_rgb(0, 200, 200), t_x, def_x));
+                                    }
+                                    if let Some(t_y) = anim.get_track(&lbl_y) {
+                                        tracks_to_draw.push((lbl_y, egui::Color32::from_rgb(200, 0, 200), t_y, def_y));
+                                    }
+                                    grouped = true;
+                                } else if sub_idx == 4 || sub_idx == 5 {
+                                    // Pt In X and Pt In Y
+                                    let idx_x = anchor_idx * 6 + 4;
+                                    let idx_y = anchor_idx * 6 + 5;
+                                    let lbl_x = format!("geom_{}", idx_x);
+                                    let lbl_y = format!("geom_{}", idx_y);
+                                    let def_x = geom_floats.get(idx_x).copied().unwrap_or(0.0);
+                                    let def_y = geom_floats.get(idx_y).copied().unwrap_or(0.0);
+                                    if let Some(t_x) = anim.get_track(&lbl_x) {
+                                        tracks_to_draw.push((lbl_x, egui::Color32::from_rgb(100, 200, 100), t_x, def_x));
+                                    }
+                                    if let Some(t_y) = anim.get_track(&lbl_y) {
+                                        tracks_to_draw.push((lbl_y, egui::Color32::from_rgb(200, 100, 200), t_y, def_y));
+                                    }
+                                    grouped = true;
+                                }
+                            }
+                            NodeKind::BrushStroke { .. } => {
+                                let pt_idx = idx / 3;
+                                let sub_idx = idx % 3;
+                                if sub_idx == 0 || sub_idx == 1 {
+                                    let idx_x = pt_idx * 3;
+                                    let idx_y = pt_idx * 3 + 1;
+                                    let lbl_x = format!("geom_{}", idx_x);
+                                    let lbl_y = format!("geom_{}", idx_y);
+                                    let def_x = geom_floats.get(idx_x).copied().unwrap_or(0.0);
+                                    let def_y = geom_floats.get(idx_y).copied().unwrap_or(0.0);
+                                    if let Some(t_x) = anim.get_track(&lbl_x) {
+                                        tracks_to_draw.push((lbl_x, egui::Color32::from_rgb(0, 200, 0), t_x, def_x));
+                                    }
+                                    if let Some(t_y) = anim.get_track(&lbl_y) {
+                                        tracks_to_draw.push((lbl_y, egui::Color32::from_rgb(200, 0, 0), t_y, def_y));
+                                    }
+                                    grouped = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !grouped {
+                    if let Some(t) = anim.get_track(&track_lbl) {
+                        tracks_to_draw.push((track_lbl.clone(), colors::ACCENT, t, default_val));
+                    }
+                }
+            }
         } else {
-            if let Some(t) = anim.get_track_mut(&track_lbl) {
-                tracks_to_draw.push((track_lbl.as_str(), colors::ACCENT, t, default_val));
+            if let Some(t) = anim.get_track(&track_lbl) {
+                tracks_to_draw.push((track_lbl.clone(), colors::ACCENT, t, default_val));
             }
         }
         
@@ -3865,32 +3880,41 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             );
         }
         
+        // Setup screen/graph space mapping closures
+        let to_screen = |f: f64, v: f64| -> egui::Pos2 {
+            let x = rect.left() + (f as f32 / 100.0) * rect.width();
+            let frac_y = (v - val_min) / (val_max - val_min);
+            let y = rect.bottom() - padding - (frac_y as f32) * (rect.height() - 2.0 * padding);
+            egui::pos2(x, y)
+        };
+        
+        let to_graph = |pos: egui::Pos2| -> (f64, f64) {
+            let frame = (((pos.x - rect.left()) / rect.width()) * 100.0) as f64;
+            let target_frac_y = (rect.bottom() - padding - pos.y) / (rect.height() - 2.0 * padding);
+            let value = val_min + (target_frac_y as f64) * (val_max - val_min);
+            (frame, value)
+        };
+        
         // Draw graph curves
         for (_lbl, color, track, default_val) in &tracks_to_draw {
             let mut curve_pts = Vec::new();
             for f in 0..=100 {
                 let val = track.interpolate(f).unwrap_or(*default_val);
-                let x = rect.left() + (f as f32 / 100.0) * rect.width();
-                let frac_y = (val - val_min) / (val_max - val_min);
-                let y = rect.bottom() - padding - (frac_y as f32) * (rect.height() - 2.0 * padding);
-                curve_pts.push(egui::pos2(x, y));
+                curve_pts.push(to_screen(f as f64, val));
             }
             for window in curve_pts.windows(2) {
                 painter.line_segment([window[0], window[1]], egui::Stroke::new(1.5, *color));
             }
         }
         
-        // Draw keyframe nodes for all visible tracks
+        // Draw keyframe nodes and Bezier handles
         let mut _clicked_any = false;
         let mut next_dragged_kf = app.anim_graph_editor_dragged_kf.clone();
         
         for (lbl, color, track, _) in &tracks_to_draw {
             let track_lbl_str = lbl.to_string();
             for (_i, kf) in track.keyframes.iter().enumerate() {
-                let x = rect.left() + (kf.frame as f32 / 100.0) * rect.width();
-                let frac_y = (kf.value - val_min) / (val_max - val_min);
-                let y = rect.bottom() - padding - (frac_y as f32) * (rect.height() - 2.0 * padding);
-                let center = egui::pos2(x, y);
+                let center = to_screen(kf.frame as f64, kf.value);
                 
                 let mpos = ui.input(|i| i.pointer.hover_pos());
                 let is_hovered = mpos.map_or(false, |mp| mp.distance(center) < 8.0);
@@ -3916,6 +3940,51 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                 };
                 let stroke_w = if is_selected { 2.0 } else { 1.0 };
                 let radius = if is_selected { 6.0 } else { 4.5 };
+                
+                // Draw Bezier handles if selected and interpolation is Bezier
+                if is_selected && kf.interpolation == crate::app::InterpolationMode::Bezier {
+                    let draw_left = matches!(kf.handle_mode, crate::document::BezierHandleMode::LeftOnly | crate::document::BezierHandleMode::Both | crate::document::BezierHandleMode::Symmetric | crate::document::BezierHandleMode::Asymmetric | crate::document::BezierHandleMode::EqualLength);
+                    let draw_right = matches!(kf.handle_mode, crate::document::BezierHandleMode::RightOnly | crate::document::BezierHandleMode::Both | crate::document::BezierHandleMode::Symmetric | crate::document::BezierHandleMode::Asymmetric | crate::document::BezierHandleMode::EqualLength);
+                    
+                    let handle_color = egui::Color32::from_rgb(250, 200, 50); // yellow
+                    let line_stroke = egui::Stroke::new(1.0, colors::TEXT_MUTED.gamma_multiply(0.6));
+                    
+                    if draw_left {
+                        let left_pt = to_screen(kf.frame as f64 + kf.handle_left.0, kf.value + kf.handle_left.1);
+                        painter.line_segment([center, left_pt], line_stroke);
+                        
+                        let is_h = mpos.map_or(false, |mp| mp.distance(left_pt) < 6.0);
+                        let is_d = app.anim_graph_editor_dragged_handle.as_ref().map_or(false, |(t, f, is_l)| {
+                            t == &track_lbl_str && *f == kf.frame && *is_l
+                        });
+                        
+                        let pt_color = if is_h || is_d { colors::ACCENT } else { handle_color };
+                        painter.circle_filled(left_pt, 4.0, pt_color);
+                        
+                        if is_h && ui.input(|i| i.pointer.any_pressed()) {
+                            app.anim_graph_editor_dragged_handle = Some((track_lbl_str.clone(), kf.frame, true));
+                            _clicked_any = true;
+                        }
+                    }
+                    
+                    if draw_right {
+                        let right_pt = to_screen(kf.frame as f64 + kf.handle_right.0, kf.value + kf.handle_right.1);
+                        painter.line_segment([center, right_pt], line_stroke);
+                        
+                        let is_h = mpos.map_or(false, |mp| mp.distance(right_pt) < 6.0);
+                        let is_d = app.anim_graph_editor_dragged_handle.as_ref().map_or(false, |(t, f, is_l)| {
+                            t == &track_lbl_str && *f == kf.frame && !*is_l
+                        });
+                        
+                        let pt_color = if is_h || is_d { colors::ACCENT } else { handle_color };
+                        painter.circle_filled(right_pt, 4.0, pt_color);
+                        
+                        if is_h && ui.input(|i| i.pointer.any_pressed()) {
+                            app.anim_graph_editor_dragged_handle = Some((track_lbl_str.clone(), kf.frame, false));
+                            _clicked_any = true;
+                        }
+                    }
+                }
                 
                 if kf.interpolation == crate::app::InterpolationMode::Bezier {
                     let pts = [
@@ -3947,27 +4016,100 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                     let target_frac_y = (rect.bottom() - padding - mpos.y) / (rect.height() - 2.0 * padding);
                     let target_val = val_min + (target_frac_y as f64) * (val_max - val_min);
                     
-                    let track = anim.get_track_mut(&drag_lbl).unwrap();
-                    if let Some(idx) = track.keyframes.iter().position(|k| k.frame == drag_frame) {
-                        let old_frame = track.keyframes[idx].frame;
-                        
-                        let has_other_at_frame = track.keyframes.iter().enumerate()
-                            .any(|(k_idx, k)| k_idx != idx && k.frame == target_frame);
-                        
-                        let final_frame = if has_other_at_frame { old_frame } else { target_frame };
-                        
-                        track.keyframes[idx].value = target_val;
-                        track.keyframes[idx].frame = final_frame;
-                        track.keyframes.sort_by_key(|k| k.frame);
-                        
-                        app.anim_graph_editor_dragged_kf = Some((drag_lbl.clone(), final_frame));
-                        app.anim_selected_keyframe = Some((node_id, drag_lbl.clone(), final_frame));
-                        
-                        app.apply_animation_for_frame(app.anim_current_frame);
+                    if let Some(anim_mut) = app.anim_timeline.nodes.get_mut(&node_id) {
+                        if let Some(track) = anim_mut.get_track_mut(&drag_lbl) {
+                            if let Some(idx) = track.keyframes.iter().position(|k| k.frame == drag_frame) {
+                                let old_frame = track.keyframes[idx].frame;
+                                
+                                let has_other_at_frame = track.keyframes.iter().enumerate()
+                                    .any(|(k_idx, k)| k_idx != idx && k.frame == target_frame);
+                                
+                                let final_frame = if has_other_at_frame { old_frame } else { target_frame };
+                                
+                                track.keyframes[idx].value = target_val;
+                                track.keyframes[idx].frame = final_frame;
+                                track.keyframes.sort_by_key(|k| k.frame);
+                                
+                                app.anim_graph_editor_dragged_kf = Some((drag_lbl.clone(), final_frame));
+                                app.anim_selected_keyframe = Some((node_id, drag_lbl.clone(), final_frame));
+                            }
+                        }
                     }
+                    app.apply_animation_for_frame(app.anim_current_frame);
                 }
             } else {
                 app.anim_graph_editor_dragged_kf = None;
+            }
+        }
+        
+        // Handle drag handle updates
+        if let Some((drag_lbl, drag_frame, is_left)) = app.anim_graph_editor_dragged_handle.clone() {
+            if ui.input(|i| i.pointer.any_down()) {
+                if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
+                    if let Some(anim_mut) = app.anim_timeline.nodes.get_mut(&node_id) {
+                        if let Some(track) = anim_mut.get_track_mut(&drag_lbl) {
+                            if let Some(idx) = track.keyframes.iter().position(|k| k.frame == drag_frame) {
+                                let kf = &mut track.keyframes[idx];
+                                let (m_frame, m_val) = to_graph(mpos);
+                                
+                                let delta_frame = m_frame - kf.frame as f64;
+                                let delta_value = m_val - kf.value;
+                                
+                                // Update the dragged handle offset
+                                if is_left {
+                                    let df = delta_frame.min(0.0);
+                                    kf.handle_left = (df, delta_value);
+                                    
+                                    // Apply handle constraints based on mode
+                                    match kf.handle_mode {
+                                        crate::document::BezierHandleMode::Symmetric => {
+                                            kf.handle_right = (-df, -delta_value);
+                                        }
+                                        crate::document::BezierHandleMode::EqualLength => {
+                                            kf.handle_right = (-df, -delta_value);
+                                        }
+                                        crate::document::BezierHandleMode::Asymmetric => {
+                                            let r_len = (kf.handle_right.0 * kf.handle_right.0 + kf.handle_right.1 * kf.handle_right.1).sqrt();
+                                            let l_len = (df * df + delta_value * delta_value).sqrt();
+                                            if l_len > 1e-6 && r_len > 1e-6 {
+                                                let dir_x = -df / l_len;
+                                                let dir_y = -delta_value / l_len;
+                                                kf.handle_right = (dir_x * r_len, dir_y * r_len);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                } else {
+                                    let df = delta_frame.max(0.0);
+                                    kf.handle_right = (df, delta_value);
+                                    
+                                    // Apply handle constraints based on mode
+                                    match kf.handle_mode {
+                                        crate::document::BezierHandleMode::Symmetric => {
+                                            kf.handle_left = (-df, -delta_value);
+                                        }
+                                        crate::document::BezierHandleMode::EqualLength => {
+                                            kf.handle_left = (-df, -delta_value);
+                                        }
+                                        crate::document::BezierHandleMode::Asymmetric => {
+                                            let l_len = (kf.handle_left.0 * kf.handle_left.0 + kf.handle_left.1 * kf.handle_left.1).sqrt();
+                                            let r_len = (df * df + delta_value * delta_value).sqrt();
+                                            if r_len > 1e-6 && l_len > 1e-6 {
+                                                let dir_x = -df / r_len;
+                                                let dir_y = -delta_value / r_len;
+                                                kf.handle_left = (dir_x * l_len, dir_y * l_len);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    app.apply_animation_for_frame(app.anim_current_frame);
+                }
+            } else {
+                app.anim_graph_editor_dragged_handle = None;
             }
         }
         
@@ -4347,5 +4489,113 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     }
 
+    // Selected keyframe panel inside Action Bar > Animation Tab
+    let mut delete_kf_target = None; // (track, frame)
+    if let Some((sel_node_id, ref sel_track_lbl, sel_frame)) = app.anim_selected_keyframe.clone() {
+        if sel_node_id == id {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("SELECTED KEYFRAME").strong().color(colors::ACCENT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(RichText::new(icons::CLOSE).font(nerd_font_id(12.0))).clicked() {
+                            app.anim_selected_keyframe = None;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                
+                if let Some(track) = entry.get_track_mut(&sel_track_lbl) {
+                    if let Some(kf) = track.keyframes.iter_mut().find(|k| k.frame == sel_frame) {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("Track: {}", sel_track_lbl)).color(colors::TEXT_MUTED));
+                            ui.add_space(10.0);
+                            ui.label(RichText::new(format!("Frame: {}", kf.frame)).color(colors::TEXT_MUTED));
+                        });
+                        ui.add_space(4.0);
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("Value:");
+                            let drag = ui.add(egui::DragValue::new(&mut kf.value).speed(0.1));
+                            if drag.changed() {
+                                entry_changed = true;
+                            }
+                        });
+                        ui.add_space(4.0);
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("Interpolation:");
+                            let mut interp = kf.interpolation;
+                            let combo = egui::ComboBox::from_id_salt("act_kf_interp_combo")
+                                .selected_text(match interp {
+                                    crate::app::InterpolationMode::Linear => "Linear",
+                                    crate::app::InterpolationMode::Bezier => "Bezier/Smooth",
+                                })
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_value(&mut interp, crate::app::InterpolationMode::Linear, "Linear").clicked() {
+                                        kf.interpolation = crate::app::InterpolationMode::Linear;
+                                        entry_changed = true;
+                                    }
+                                    if ui.selectable_value(&mut interp, crate::app::InterpolationMode::Bezier, "Bezier/Smooth").clicked() {
+                                        kf.interpolation = crate::app::InterpolationMode::Bezier;
+                                        entry_changed = true;
+                                    }
+                                });
+                        });
+                        
+                        if kf.interpolation == crate::app::InterpolationMode::Bezier {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new("Bezier Handle Mode:").strong());
+                            
+                            use crate::document::BezierHandleMode;
+                            let modes = [
+                                BezierHandleMode::Symmetric,
+                                BezierHandleMode::Asymmetric,
+                                BezierHandleMode::EqualLength,
+                                BezierHandleMode::Both,
+                                BezierHandleMode::LeftOnly,
+                                BezierHandleMode::RightOnly,
+                            ];
+                            
+                            ui.horizontal_wrapped(|ui| {
+                                for mode in modes {
+                                    let selected = kf.handle_mode == mode;
+                                    if ui.selectable_label(selected, mode.label()).clicked() {
+                                        kf.handle_mode = mode;
+                                        // Enforce mode constraints on existing handles
+                                        match mode {
+                                            BezierHandleMode::Symmetric => {
+                                                kf.handle_right = (-kf.handle_left.0, -kf.handle_left.1);
+                                            }
+                                            BezierHandleMode::EqualLength => {
+                                                kf.handle_right = (-kf.handle_left.0, -kf.handle_left.1);
+                                            }
+                                            _ => {}
+                                        }
+                                        entry_changed = true;
+                                    }
+                                }
+                            });
+                        }
+                        
+                        ui.add_space(8.0);
+                        if ui.button(RichText::new("🗑 Delete Keyframe").color(egui::Color32::from_rgb(230, 80, 80))).clicked() {
+                            delete_kf_target = Some((sel_track_lbl.clone(), sel_frame));
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     app.anim_timeline.nodes.insert(id, entry);
+    
+    if let Some((track, frame)) = delete_kf_target {
+        app.delete_keyframe(id, &track, frame);
+    } else if entry_changed {
+        app.apply_animation_for_frame(app.anim_current_frame);
+    }
 }

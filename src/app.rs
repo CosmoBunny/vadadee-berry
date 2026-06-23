@@ -77,12 +77,49 @@ impl Default for InterpolationMode {
     }
 }
 
+fn default_handle_left() -> (f64, f64) {
+    (-5.0, 0.0)
+}
+
+fn default_handle_right() -> (f64, f64) {
+    (5.0, 0.0)
+}
+
+fn default_handle_mode() -> crate::document::BezierHandleMode {
+    crate::document::BezierHandleMode::Both
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Keyframe {
     pub frame: usize,
     pub value: f64,
     #[serde(default)]
     pub interpolation: InterpolationMode,
+    #[serde(default = "default_handle_left")]
+    pub handle_left: (f64, f64),
+    #[serde(default = "default_handle_right")]
+    pub handle_right: (f64, f64),
+    #[serde(default = "default_handle_mode")]
+    pub handle_mode: crate::document::BezierHandleMode,
+}
+
+fn solve_u(x_target: f64, x1: f64, x2: f64, range: f64) -> f64 {
+    if range < 1e-9 {
+        return 0.0;
+    }
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..24 {
+        let u = (low + high) * 0.5;
+        let omt = 1.0 - u;
+        let x = 3.0 * omt * omt * u * x1 + 3.0 * omt * u * u * x2 + u * u * u * range;
+        if x < x_target {
+            low = u;
+        } else {
+            high = u;
+        }
+    }
+    (low + high) * 0.5
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -95,7 +132,14 @@ impl KeyframeTrack {
         if let Some(pos) = self.keyframes.iter().position(|kf| kf.frame == frame) {
             self.keyframes[pos].value = value;
         } else {
-            self.keyframes.push(Keyframe { frame, value, interpolation: InterpolationMode::Linear });
+            self.keyframes.push(Keyframe {
+                frame,
+                value,
+                interpolation: InterpolationMode::Linear,
+                handle_left: (-5.0, 0.0),
+                handle_right: (5.0, 0.0),
+                handle_mode: crate::document::BezierHandleMode::Both,
+            });
             self.keyframes.sort_by_key(|kf| kf.frame);
         }
     }
@@ -119,11 +163,27 @@ impl KeyframeTrack {
                 if range < 1e-9 {
                     return Some(kf0.value);
                 }
-                let mut t = (frame - kf0.frame) as f64 / range;
+                let t = (frame - kf0.frame) as f64 / range;
                 if kf0.interpolation == InterpolationMode::Bezier {
-                    t = t * t * (3.0 - 2.0 * t);
+                    let x_target = (frame - kf0.frame) as f64;
+                    let x1 = kf0.handle_right.0.clamp(0.0, range);
+                    let x2 = (range + kf1.handle_left.0).clamp(0.0, range);
+                    let u = solve_u(x_target, x1, x2, range);
+                    
+                    let omt = 1.0 - u;
+                    let y0 = kf0.value;
+                    let y1 = kf0.value + kf0.handle_right.1;
+                    let y2 = kf1.value + kf1.handle_left.1;
+                    let y3 = kf1.value;
+                    
+                    let val = omt * omt * omt * y0
+                        + 3.0 * omt * omt * u * y1
+                        + 3.0 * omt * u * u * y2
+                        + u * u * u * y3;
+                    return Some(val);
+                } else {
+                    return Some(kf0.value + t * (kf1.value - kf0.value));
                 }
-                return Some(kf0.value + t * (kf1.value - kf0.value));
             }
         }
         None
@@ -171,6 +231,24 @@ impl NodeAnimation {
             _ => None,
         }
     }
+
+    pub fn get_track(&self, label: &str) -> Option<&KeyframeTrack> {
+        match label {
+            "pos_x" => Some(&self.pos_x),
+            "pos_y" => Some(&self.pos_y),
+            "rotation" => Some(&self.rotation),
+            "opacity" => Some(&self.opacity),
+            "color_r" => Some(&self.color_r),
+            "color_g" => Some(&self.color_g),
+            "color_b" => Some(&self.color_b),
+            "color_a" => Some(&self.color_a),
+            _ if label.starts_with("geom_") => {
+                let idx: usize = label["geom_".len()..].parse().ok()?;
+                self.geom_tracks.get(idx)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -194,7 +272,8 @@ pub struct VadadeeBerryApp {
     pub anim_graph_editor_track: Option<(NodeId, String)>,
     pub anim_graph_editor_target_track: Option<(NodeId, String)>,
     pub anim_graph_editor_t: f32,
-    pub anim_graph_editor_dragged_kf: Option<usize>,
+    pub anim_graph_editor_dragged_kf: Option<(String, usize)>,
+    pub anim_graph_editor_dragged_handle: Option<(String, usize, bool)>, // (track_lbl, frame, is_left)
 
     pub project: ProjectFile,
     pub viewport: Viewport,
@@ -335,6 +414,7 @@ impl VadadeeBerryApp {
             anim_graph_editor_target_track: None,
             anim_graph_editor_t: 0.0,
             anim_graph_editor_dragged_kf: None,
+            anim_graph_editor_dragged_handle: None,
 
             project: Document::new_default_project(),
             viewport: Viewport::default(),
@@ -2223,7 +2303,9 @@ impl VadadeeBerryApp {
                 };
             } else if (i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) && !text_focused
             {
-                if self.tools.active == ToolKind::Node
+                if let Some((node_id, track_lbl, frame)) = self.anim_selected_keyframe.clone() {
+                    self.delete_keyframe(node_id, &track_lbl, frame);
+                } else if self.tools.active == ToolKind::Node
                     && !self.tools.select.selected_path_points.is_empty()
                     && self.remove_selected_path_points()
                 {
@@ -2369,6 +2451,133 @@ impl VadadeeBerryApp {
             } else {
                 "Select".into()
             };
+        }
+    }
+
+    pub fn delete_keyframe(&mut self, node_id: NodeId, track_lbl: &str, frame: usize) {
+        if let Some(anim) = self.anim_timeline.nodes.get_mut(&node_id) {
+            if let Some(track) = anim.get_track_mut(track_lbl) {
+                track.keyframes.retain(|kf| kf.frame != frame);
+                if let Some((sel_node_id, ref sel_track_lbl, sel_frame)) = self.anim_selected_keyframe {
+                    if sel_node_id == node_id && sel_track_lbl == track_lbl && sel_frame == frame {
+                        self.anim_selected_keyframe = None;
+                    }
+                }
+                self.apply_animation_for_frame(self.anim_current_frame);
+            }
+        }
+    }
+
+    pub fn get_node_geom_track_name(&self, id: NodeId, idx: usize) -> String {
+        let Some(node) = self.project.nodes.get(id) else {
+            return format!("Geom {}", idx);
+        };
+        let base_len = match &node.kind {
+            NodeKind::Rect { .. } => 3,
+            NodeKind::Ellipse { .. } => 2,
+            NodeKind::Polygon { .. } => 2,
+            NodeKind::Arc { .. } => 3,
+            NodeKind::Path { path } => path.anchor_positions().len() * 6,
+            NodeKind::BrushStroke { points } => points.len() * 3,
+            _ => 0,
+        };
+        if idx < base_len {
+            match &node.kind {
+                NodeKind::Rect { .. } => match idx {
+                    0 => "Width".to_string(),
+                    1 => "Height".to_string(),
+                    2 => "Corner Rad".to_string(),
+                    _ => format!("Geom {}", idx),
+                },
+                NodeKind::Ellipse { .. } => match idx {
+                    0 => "Radius X".to_string(),
+                    1 => "Radius Y".to_string(),
+                    _ => format!("Geom {}", idx),
+                },
+                NodeKind::Polygon { .. } => match idx {
+                    0 => "Radius".to_string(),
+                    1 => "Sides".to_string(),
+                    _ => format!("Geom {}", idx),
+                },
+                NodeKind::Arc { .. } => match idx {
+                    0 => "Radius".to_string(),
+                    1 => "Start Ang".to_string(),
+                    2 => "Sweep Ang".to_string(),
+                    _ => format!("Geom {}", idx),
+                },
+                NodeKind::Path { .. } => {
+                    let pt_idx = idx / 6;
+                    match idx % 6 {
+                        0 => format!("Pt {} X", pt_idx),
+                        1 => format!("Pt {} Y", pt_idx),
+                        2 => format!("Pt {} Out X", pt_idx),
+                        3 => format!("Pt {} Out Y", pt_idx),
+                        4 => format!("Pt {} In X", pt_idx),
+                        5 => format!("Pt {} In Y", pt_idx),
+                        _ => unreachable!(),
+                    }
+                }
+                NodeKind::BrushStroke { .. } => {
+                    let pt_idx = idx / 3;
+                    match idx % 3 {
+                        0 => format!("Stroke {} X", pt_idx),
+                        1 => format!("Stroke {} Y", pt_idx),
+                        _ => format!("Stroke {} W", pt_idx),
+                    }
+                }
+                _ => format!("Geom {}", idx),
+            }
+        } else {
+            let floats = node.get_geom_floats();
+            if idx < floats.len() {
+                let marker = floats[base_len];
+                if marker == 1.0 {
+                    let local = idx - base_len;
+                    match local {
+                        0 => "Fill Mode".to_string(),
+                        1 => "Grad Angle".to_string(),
+                        2 => "Grad X0".to_string(),
+                        3 => "Grad Y0".to_string(),
+                        4 => "Grad X1".to_string(),
+                        5 => "Grad Y1".to_string(),
+                        6 => "Grad Stops Count".to_string(),
+                        _ => {
+                            let stop_idx = (local - 7) / 5;
+                            match (local - 7) % 5 {
+                                0 => format!("Stop {} Pos", stop_idx),
+                                1 => format!("Stop {} R", stop_idx),
+                                2 => format!("Stop {} G", stop_idx),
+                                3 => format!("Stop {} B", stop_idx),
+                                4 => format!("Stop {} A", stop_idx),
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                } else if marker == 2.0 {
+                    let local = idx - base_len;
+                    match local {
+                        0 => "Fill Mode".to_string(),
+                        1 => "Grad Center X".to_string(),
+                        2 => "Grad Center Y".to_string(),
+                        3 => "Grad Stops Count".to_string(),
+                        _ => {
+                            let stop_idx = (local - 4) / 5;
+                            match (local - 4) % 5 {
+                                0 => format!("Stop {} Pos", stop_idx),
+                                1 => format!("Stop {} R", stop_idx),
+                                2 => format!("Stop {} G", stop_idx),
+                                3 => format!("Stop {} B", stop_idx),
+                                4 => format!("Stop {} A", stop_idx),
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                } else {
+                    format!("Geom {}", idx)
+                }
+            } else {
+                format!("Geom {}", idx)
+            }
         }
     }
 
@@ -6255,4 +6464,26 @@ fn generate_brush_outline(
 
     path.close_path();
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bezier_interpolation() {
+        let mut track = KeyframeTrack::default();
+        track.insert(0, 10.0);
+        track.insert(100, 110.0);
+
+        track.keyframes[0].interpolation = InterpolationMode::Bezier;
+        track.keyframes[0].handle_right = (25.0, 50.0);
+        track.keyframes[1].handle_left = (-25.0, -50.0);
+
+        assert!((track.interpolate(0).unwrap() - 10.0).abs() < 1e-5);
+        assert!((track.interpolate(100).unwrap() - 110.0).abs() < 1e-5);
+
+        let mid_val = track.interpolate(50).unwrap();
+        assert!((mid_val - 60.0).abs() < 1e-4);
+    }
 }
