@@ -46,10 +46,10 @@ impl BezierHandleMode {
         match self {
             Self::Symmetric => "Symmetric",
             Self::Asymmetric => "Asymmetric",
-            Self::EqualLength => "Equal length",
-            Self::LeftOnly => "Single Left (point_l)",
-            Self::RightOnly => "Single Right (point_r)",
-            Self::Both => "Both (Asymmetric)",
+            Self::EqualLength => "Equal Length",
+            Self::LeftOnly => "Left Only",
+            Self::RightOnly => "Right Only",
+            Self::Both => "Both",
         }
     }
 }

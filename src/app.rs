@@ -895,6 +895,7 @@ impl VadadeeBerryApp {
             *pr = r.max(1.0);
             *ps = sides.max(3);
             *rotation_rad = rotation_deg.to_radians();
+            after.transform.rotation_rad = *rotation_rad;
             after.name = format!("Polygon ({})", *ps);
         }
         self.history.push(
@@ -6193,10 +6194,15 @@ impl eframe::App for VadadeeBerryApp {
                         let mut changed_col = false;
                         let mut changed_geom = false;
                         
-                        let dx = pos.0 - last.pos.0;
-                        let dy = pos.1 - last.pos.1;
+                        let mut temp_node = node.clone();
+                        temp_node.set_rotation(last.rotation);
+                        let unrot_pos = temp_node.get_pos();
+                        
+                        let dx = unrot_pos.0 - last.pos.0;
+                        let dy = unrot_pos.1 - last.pos.1;
                         if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
                             changed_pos = true;
+                            temp_node.translate(-dx, -dy);
                         }
                         
                         if (rot - last.rotation).abs() > 1e-9 {
@@ -6213,14 +6219,47 @@ impl eframe::App for VadadeeBerryApp {
                             }
                         }
                         
-                        if geom.len() == last.geom_floats.len() {
-                            for i in 0..geom.len() {
-                                if (geom[i] - last.geom_floats[i]).abs() > 1e-6 {
-                                    changed_geom = true;
+                        let mut temp_geom = temp_node.get_geom_floats();
+                        if let Some(tiling) = self.project.document.tiling_effects.values().find(|e| e.source_id == *id) {
+                            temp_geom.push(tiling.gap_x);
+                            temp_geom.push(tiling.gap_y);
+                            temp_geom.push(tiling.count_x as f64);
+                            temp_geom.push(tiling.count_y as f64);
+                            temp_geom.push(tiling.offset_x);
+                            temp_geom.push(tiling.offset_y);
+                            temp_geom.push(tiling.row_rotation);
+                            temp_geom.push(tiling.col_rotation);
+                            temp_geom.push(tiling.row_scale);
+                            temp_geom.push(tiling.col_scale);
+                        }
+                        if let Some(circ) = self.project.document.circular_effects.values().find(|e| e.source_id == *id) {
+                            temp_geom.push(circ.origin_x);
+                            temp_geom.push(circ.origin_y);
+                            temp_geom.push(circ.radius);
+                            temp_geom.push(circ.copies as f64);
+                            temp_geom.push(circ.angle_offset);
+                            temp_geom.push(circ.base_x);
+                            temp_geom.push(circ.base_y);
+                        }
+                        if let Some(oop) = self.project.document.path_effects.values().find(|e| e.source_id == *id) {
+                            temp_geom.push(oop.gap);
+                            temp_geom.push(oop.count as f64);
+                            temp_geom.push(oop.start_offset);
+                        }
+                        
+                        let mut geom_really_changed = false;
+                        if temp_geom.len() == last.geom_floats.len() {
+                            for i in 0..temp_geom.len() {
+                                if (temp_geom[i] - last.geom_floats[i]).abs() > 1e-6 {
+                                    geom_really_changed = true;
                                     break;
                                 }
                             }
                         } else if !geom.is_empty() {
+                            geom_really_changed = true;
+                        }
+                        
+                        if geom_really_changed {
                             changed_geom = true;
                         }
                         
@@ -6485,5 +6524,47 @@ mod tests {
 
         let mid_val = track.interpolate(50).unwrap();
         assert!((mid_val - 60.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_pure_motion_geometry_equivalence() {
+        use crate::document::{NodeKind, PathData};
+        let path = PathData::from_anchor_data(
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            &[],
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            true,
+        );
+        
+        let mut node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "Test Path".to_string(),
+            kind: NodeKind::Path { path },
+            style: crate::document::NodeStyle::default(),
+            transform: crate::document::Transform2D::default(),
+            path_effect_links: Vec::new(),
+        };
+
+        let last_pos = node.get_pos();
+        let last_rotation = node.get_rotation();
+        let last_geom_floats = node.get_geom_floats();
+
+        node.translate(20.0, 30.0);
+        node.set_rotation(0.785);
+
+        let mut temp_node = node.clone();
+        temp_node.set_rotation(last_rotation);
+        let unrot_pos = temp_node.get_pos();
+        let dx_un = last_pos.0 - unrot_pos.0;
+        let dy_un = last_pos.1 - unrot_pos.1;
+        temp_node.translate(dx_un, dy_un);
+
+        let temp_geom = temp_node.get_geom_floats();
+        
+        assert_eq!(temp_geom.len(), last_geom_floats.len());
+        for i in 0..temp_geom.len() {
+            assert!((temp_geom[i] - last_geom_floats[i]).abs() < 1e-6, "Index {} differs: {} vs {}", i, temp_geom[i], last_geom_floats[i]);
+        }
     }
 }
