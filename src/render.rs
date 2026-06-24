@@ -1933,8 +1933,6 @@ pub fn draw_tiling_effects(
             let col = Color32::from_rgb(255, 165, 0);
             painter.line_segment([p0, p_col], Stroke::new(2.0, col));
             painter.line_segment([p0, p_row], Stroke::new(2.0, col));
-            painter.circle_filled(p0, 5.0, Color32::WHITE);
-            painter.circle_stroke(p0, 5.0, Stroke::new(1.5, col));
             painter.circle_filled(p_col, 4.0, Color32::WHITE);
             painter.circle_filled(p_row, 4.0, Color32::WHITE);
         }
@@ -2265,9 +2263,11 @@ pub fn draw_brush_preview(
         return;
     }
     let mut pts = points.to_vec();
-    pts[0].2 = 0.0;
-    if let Some(last) = pts.last_mut() {
-        last.2 = 0.0;
+    if brush_type != crate::tools::BrushType::Calligraphy {
+        pts[0].2 = 0.0;
+        if let Some(last) = pts.last_mut() {
+            last.2 = 0.0;
+        }
     }
     let n = pts.len();
     let mut left_pts = Vec::with_capacity(n);
@@ -2277,7 +2277,9 @@ pub fn draw_brush_preview(
         let (pos, _, w) = pts[i];
         let half_w = (w / 2.0) as f64;
 
-        let normal = if i == 0 {
+        let normal = if brush_type == crate::tools::BrushType::Calligraphy {
+            [0.7071067811865476, 0.7071067811865476]
+        } else if i == 0 {
             let next_pos = pts[1].0;
             let dx = next_pos[0] - pos[0];
             let dy = next_pos[1] - pos[1];

@@ -1,10 +1,12 @@
 mod node;
 mod path_effects;
 mod style;
+mod animation;
 
 pub use node::*;
 pub use path_effects::*;
 pub use style::*;
+pub use animation::*;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -158,10 +160,16 @@ impl NodeStore {
 pub struct ProjectFile {
     pub document: Document,
     pub nodes: NodeStore,
+    #[serde(default)]
+    pub anim_timeline: AnimationTimeline,
 }
 
 impl ProjectFile {
     pub fn new(document: Document, nodes: NodeStore) -> Self {
-        Self { document, nodes }
+        Self {
+            document,
+            nodes,
+            anim_timeline: AnimationTimeline::default(),
+        }
     }
 }

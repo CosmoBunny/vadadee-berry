@@ -1,6 +1,6 @@
 use undo::{Edit, Record};
 
-use crate::document::{Document, Node, NodeId, ProjectFile};
+use crate::document::{Document, Node, NodeId, ProjectFile, AnimationTimeline};
 
 #[derive(Debug, Clone)]
 pub enum ProjectEdit {
@@ -27,6 +27,10 @@ pub enum ProjectEdit {
     SetDocument {
         before: ProjectFile,
         after: ProjectFile,
+    },
+    PatchTimeline {
+        before: AnimationTimeline,
+        after: AnimationTimeline,
     },
 }
 
@@ -120,6 +124,9 @@ fn apply_forward(cmd: &ProjectEdit, project: &mut ProjectFile) {
         ProjectEdit::SetDocument { after, .. } => {
             *project = after.clone();
         }
+        ProjectEdit::PatchTimeline { after, .. } => {
+            project.anim_timeline = after.clone();
+        }
     }
 }
 
@@ -161,6 +168,9 @@ fn apply_inverse(cmd: &ProjectEdit, project: &mut ProjectFile) {
         }
         ProjectEdit::SetDocument { before, .. } => {
             *project = before.clone();
+        }
+        ProjectEdit::PatchTimeline { before, .. } => {
+            project.anim_timeline = before.clone();
         }
     }
 }

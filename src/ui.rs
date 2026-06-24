@@ -231,6 +231,7 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut app.viewport.show_grid, "Show grid");
                     ui.checkbox(&mut app.viewport.snap_grid, "Snap to grid");
+                    ui.checkbox(&mut app.snap_magnet, "Magnetic snap");
                     if ui.button("Zoom 100%").clicked() {
                         app.viewport.zoom = 1.0;
                     }
@@ -926,16 +927,10 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             changed |= ui.add(decimal_drag(&mut app.ui_tiling_cols).range(1..=20)).changed();
         });
         ui.horizontal(|ui| {
-            ui.label("Gap X");
+            ui.label("Col Gap");
             changed |= ui.add(decimal_drag(&mut app.ui_tiling_gap_x).speed(1.0)).changed();
-            ui.label("Y");
+            ui.label("Row Gap");
             changed |= ui.add(decimal_drag(&mut app.ui_tiling_gap_y).speed(1.0)).changed();
-        });
-        ui.horizontal(|ui| {
-            ui.label("Offset X");
-            changed |= ui.add(decimal_drag(&mut app.ui_tiling_offset_x).speed(1.0)).changed();
-            ui.label("Y");
-            changed |= ui.add(decimal_drag(&mut app.ui_tiling_offset_y).speed(1.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Row Rot °");
@@ -1907,10 +1902,12 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 .selected_text(match app.tools.brush.brush_type {
                     crate::tools::BrushType::Standard => "Standard",
                     crate::tools::BrushType::Pen => "Pen",
+                    crate::tools::BrushType::Calligraphy => "Calligraphy",
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut app.tools.brush.brush_type, crate::tools::BrushType::Standard, "Standard");
                     ui.selectable_value(&mut app.tools.brush.brush_type, crate::tools::BrushType::Pen, "Pen");
+                    ui.selectable_value(&mut app.tools.brush.brush_type, crate::tools::BrushType::Calligraphy, "Calligraphy");
                 });
             
             ui.add_space(4.0);
@@ -1932,6 +1929,22 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     app.tools.brush.size
                 };
                 draw_3d_pen_tip(ui, active_width, is_drawing);
+            }
+
+            if app.tools.brush.brush_type == crate::tools::BrushType::Calligraphy {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(RichText::new("Calligraphy Nib Preview").strong());
+                ui.add_space(4.0);
+                
+                let is_drawing = !app.tools.brush.points.is_empty();
+                let active_width = if is_drawing {
+                    app.tools.brush.points.last().map(|&(_, _, w)| w).unwrap_or(app.tools.brush.size)
+                } else {
+                    app.tools.brush.size
+                };
+                draw_3d_calligraphy_nib(ui, active_width, is_drawing);
             }
         });
         return;
@@ -2847,6 +2860,131 @@ fn draw_3d_pen_tip(ui: &mut egui::Ui, active_width: f32, is_drawing: bool) {
     ));
 }
 
+fn draw_3d_calligraphy_nib(ui: &mut egui::Ui, active_width: f32, is_drawing: bool) {
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 130.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    // Background card styling
+    painter.rect(
+        rect,
+        egui::CornerRadius::same(6),
+        colors::BG_PANEL,
+        egui::Stroke::new(1.0, colors::BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let cx = rect.center().x;
+    let paper_y = rect.top() + 90.0;
+    
+    // Lively pressure parameter
+    let pressure = if is_drawing {
+        (active_width / 100.0).clamp(0.05, 1.0)
+    } else {
+        0.15
+    };
+
+    // Calculate tip position and footprint size
+    let base_y = rect.top() + 15.0;
+    let tip_y = paper_y - 12.0 + (pressure * 16.0); // Tip sinks down with pressure
+    
+    // Draw background grid lines on the "paper" (vanishing point perspective)
+    let paper_color = colors::BORDER.gamma_multiply(0.3);
+    for offset in [-60.0, -30.0, 0.0, 30.0, 60.0] {
+        let vp_y = rect.top() + 35.0;
+        let x0 = cx + offset * 0.2;
+        let x1 = cx + offset * 1.5;
+        painter.line_segment(
+            [egui::pos2(x0, vp_y + 10.0), egui::pos2(x1, rect.bottom() - 5.0)],
+            egui::Stroke::new(1.0, paper_color),
+        );
+    }
+    // Horizontal perspective lines
+    for py in [90.0, 100.0, 110.0, 120.0] {
+        let y_coord = rect.top() + py;
+        let width_factor = (py - 35.0) / 55.0;
+        let x_span = 80.0 * width_factor;
+        painter.line_segment(
+            [egui::pos2(cx - x_span, y_coord), egui::pos2(cx + x_span, y_coord)],
+            egui::Stroke::new(1.0, paper_color),
+        );
+    }
+
+    // Draw the pen shaft tapering down to a chisel tip holder
+    let pen_shaft_w = 14.0;
+    let shaft_points = vec![
+        egui::pos2(cx - pen_shaft_w, base_y),
+        egui::pos2(cx + pen_shaft_w, base_y),
+        egui::pos2(cx + 8.0, tip_y - 15.0),
+        egui::pos2(cx - 8.0, tip_y - 15.0),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        shaft_points,
+        colors::BG_ELEVATED,
+        egui::Stroke::new(1.5, colors::BORDER),
+    ));
+
+    // Highlight on pen shaft for 3D look
+    painter.line_segment(
+        [egui::pos2(cx - pen_shaft_w * 0.3, base_y), egui::pos2(cx - 2.4, tip_y - 15.0)],
+        egui::Stroke::new(2.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
+    );
+
+    // Calligraphy metal nib: thin flat angled prism slanted at 45 degrees
+    let metal_color = egui::Color32::from_rgb(220, 200, 150); // Gold-like metallic
+    let slant_dx = 8.0 + pressure * 4.0;
+    let slant_dy = 4.0 + pressure * 2.0;
+    let tip_left = egui::pos2(cx - slant_dx, tip_y + slant_dy);
+    let tip_right = egui::pos2(cx + slant_dx, tip_y - slant_dy);
+    
+    // Top of the metal nib:
+    let top_left = egui::pos2(cx - 6.0, tip_y - 15.0);
+    let top_right = egui::pos2(cx + 6.0, tip_y - 15.0);
+
+    // Front face of the flat nib:
+    painter.add(egui::Shape::convex_polygon(
+        vec![top_left, top_right, tip_right, tip_left],
+        metal_color,
+        egui::Stroke::new(1.0, colors::BORDER),
+    ));
+
+    // Slit down the center of the nib
+    painter.line_segment(
+        [egui::pos2(cx, tip_y - 12.0), egui::pos2(cx, tip_y)],
+        egui::Stroke::new(1.0, colors::BORDER),
+    );
+    // Breather hole
+    painter.circle_filled(
+        egui::pos2(cx, tip_y - 12.0),
+        1.5,
+        colors::BG_PANEL,
+    );
+
+    // Translucent depth illusion: overlay a semi-transparent paper layer below paper_y
+    let paper_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 1.0, paper_y),
+        egui::pos2(rect.right() - 1.0, rect.bottom() - 1.0),
+    );
+    painter.rect_filled(
+        paper_rect,
+        egui::CornerRadius::ZERO,
+        colors::BG_PANEL.gamma_multiply(0.85),
+    );
+
+    // Draw the paper horizon line
+    painter.line_segment(
+        [egui::pos2(rect.left() + 5.0, paper_y), egui::pos2(rect.right() - 5.0, paper_y)],
+        egui::Stroke::new(1.5, colors::BORDER),
+    );
+
+    // Draw footprint/shadow of the slanted calligraphy nib on the paper:
+    let footprint_l = egui::pos2(cx - slant_dx, paper_y + slant_dy * 0.5);
+    let footprint_r = egui::pos2(cx + slant_dx, paper_y - slant_dy * 0.5);
+    painter.line_segment(
+        [footprint_l, footprint_r],
+        egui::Stroke::new(2.5 + pressure * 4.0, colors::ACCENT.gamma_multiply(0.7)),
+    );
+}
+
 struct TrackPlotInfo<'a> {
     label: &'static str,
     track: &'a mut crate::app::KeyframeTrack,
@@ -3227,11 +3365,18 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 ui.label(RichText::new(format!("Frame {}", app.anim_current_frame)).color(colors::TEXT));
 
                 let mut apply_anim_after = false;
+                let mut before_timeline = None;
                 if let Some((n_id, track_lbl, frame)) = app.anim_selected_keyframe.clone() {
+                    before_timeline = Some(app.project.anim_timeline.clone());
                     let mut interp_changed = None;
-                    if let Some(anim) = app.anim_timeline.nodes.get_mut(&n_id) {
+                    if let Some(anim) = app.project.anim_timeline.nodes.get_mut(&n_id) {
                         if let Some(track) = anim.get_track_mut(&track_lbl) {
-                            if let Some(kf) = track.keyframes.iter_mut().find(|k| k.frame == frame) {
+                            if let Some(idx) = track.keyframes.iter().position(|k| k.frame == frame) {
+                                let next_kf_val = track.keyframes.iter()
+                                    .find(|k| k.frame > frame)
+                                    .map(|k| (k.frame, k.value));
+                                
+                                let kf = &mut track.keyframes[idx];
                                 let mut selected_mode = kf.interpolation;
                                 ui.add_space(8.0);
                                 egui::ComboBox::from_id_salt("kf_interp_combo")
@@ -3249,6 +3394,16 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                     });
                                 if let Some(new_mode) = interp_changed {
                                     kf.interpolation = new_mode;
+                                    if new_mode == crate::app::InterpolationMode::Bezier {
+                                        if let Some((next_frame, next_value)) = next_kf_val {
+                                            kf.handle_right = (
+                                                (next_frame - kf.frame) as f64 * 0.5,
+                                                (next_value - kf.value) * 0.5
+                                            );
+                                        } else {
+                                            kf.handle_right = (5.0, 0.0);
+                                        }
+                                    }
                                     apply_anim_after = true;
                                 }
                                 ui.label(RichText::new(format!("Keyframe (Frame {}):", frame)).color(colors::TEXT_MUTED));
@@ -3257,7 +3412,17 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     }
                 }
                 if apply_anim_after {
-                    app.apply_animation_for_frame(app.anim_current_frame);
+                    if let Some(before) = before_timeline {
+                        let after_timeline = app.project.anim_timeline.clone();
+                        app.history.push(
+                            &mut app.project,
+                            crate::history::ProjectEdit::PatchTimeline {
+                                before,
+                                after: after_timeline,
+                            },
+                        );
+                        app.apply_animation_for_frame(app.anim_current_frame);
+                    }
                 }
             });
         });
@@ -3279,7 +3444,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             let mut temp_target_track = app.anim_graph_editor_target_track.clone();
             let geom_floats = app.get_node_geom_floats(node_id);
 
-            if let Some(anim) = app.anim_timeline.nodes.get_mut(&node_id) {
+            if let Some(anim) = app.project.anim_timeline.nodes.get_mut(&node_id) {
                 // Determine which tracks have keyframes
                 let has_pos = !anim.pos_x.keyframes.is_empty() || !anim.pos_y.keyframes.is_empty();
                 let has_rot = !anim.rotation.keyframes.is_empty();
@@ -3541,7 +3706,7 @@ fn floating_timeline_window(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect
     };
     let card_w = inset.width() - 2.0 * gap - width_reduction;
     let track_count = if let Some(node_id) = app.selection.first().copied() {
-        if let Some(anim) = app.anim_timeline.nodes.get(&node_id) {
+        if let Some(anim) = app.project.anim_timeline.nodes.get(&node_id) {
             let has_pos = !anim.pos_x.keyframes.is_empty() || !anim.pos_y.keyframes.is_empty();
             let has_rot = !anim.rotation.keyframes.is_empty();
             let has_op = !anim.opacity.keyframes.is_empty();
@@ -3594,6 +3759,22 @@ fn floating_timeline_window(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect
     });
 }
 
+fn draw_dotted_line(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, stroke: egui::Stroke) {
+    let dist = p1.distance(p2);
+    if dist < 1e-3 {
+        return;
+    }
+    let step = 6.0; // gap + dot length
+    let dir = (p2 - p1) / dist;
+    let mut current = 0.0;
+    while current < dist {
+        let start = p1 + dir * current;
+        let end = p1 + dir * (current + 3.0).min(dist);
+        painter.line_segment([start, end], stroke);
+        current += step;
+    }
+}
+
 fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
     let Some((node_id, track_lbl)) = app.anim_graph_editor_track.clone() else {
         return;
@@ -3641,9 +3822,14 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                 // Show interpolation mode selector inside graph editor header
                 if let Some((n_id, ref s_lbl, frame)) = app.anim_selected_keyframe.clone() {
                     if n_id == node_id {
-                        if let Some(anim) = app.anim_timeline.nodes.get_mut(&node_id) {
+                        if let Some(anim) = app.project.anim_timeline.nodes.get_mut(&node_id) {
                             if let Some(track) = anim.get_track_mut(&s_lbl) {
-                                if let Some(kf) = track.keyframes.iter_mut().find(|k| k.frame == frame) {
+                                if let Some(idx) = track.keyframes.iter().position(|k| k.frame == frame) {
+                                    let next_kf_val = track.keyframes.iter()
+                                        .find(|k| k.frame > frame)
+                                        .map(|k| (k.frame, k.value));
+                                    
+                                    let kf = &mut track.keyframes[idx];
                                     let mut selected_mode = kf.interpolation;
                                     ui.add_space(8.0);
                                     let combo = egui::ComboBox::from_id_salt("graph_kf_interp_combo")
@@ -3657,6 +3843,14 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                                             }
                                             if ui.selectable_value(&mut selected_mode, crate::app::InterpolationMode::Bezier, "Bezier/Smooth").clicked() {
                                                 kf.interpolation = crate::app::InterpolationMode::Bezier;
+                                                if let Some((next_frame, next_value)) = next_kf_val {
+                                                    kf.handle_right = (
+                                                        (next_frame - kf.frame) as f64 * 0.5,
+                                                        (next_value - kf.value) * 0.5
+                                                    );
+                                                } else {
+                                                    kf.handle_right = (5.0, 0.0);
+                                                }
                                             }
                                         });
                                     if combo.response.changed() {
@@ -3699,7 +3893,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             0.0
         };
 
-        let Some(anim) = app.anim_timeline.nodes.get(&node_id) else {
+        let Some(anim) = app.project.anim_timeline.nodes.get(&node_id) else {
             return;
         };
         
@@ -3913,6 +4107,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
         
         for (lbl, color, track, _) in &tracks_to_draw {
             let track_lbl_str = lbl.to_string();
+            let keyframes_len = track.keyframes.len();
             for (_i, kf) in track.keyframes.iter().enumerate() {
                 let center = to_screen(kf.frame as f64, kf.value);
                 
@@ -3941,48 +4136,29 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                 let stroke_w = if is_selected { 2.0 } else { 1.0 };
                 let radius = if is_selected { 6.0 } else { 4.5 };
                 
-                // Draw Bezier handles if selected and interpolation is Bezier
-                if is_selected && kf.interpolation == crate::app::InterpolationMode::Bezier {
-                    let draw_left = matches!(kf.handle_mode, crate::document::BezierHandleMode::LeftOnly | crate::document::BezierHandleMode::Both | crate::document::BezierHandleMode::Symmetric | crate::document::BezierHandleMode::Asymmetric | crate::document::BezierHandleMode::EqualLength);
-                    let draw_right = matches!(kf.handle_mode, crate::document::BezierHandleMode::RightOnly | crate::document::BezierHandleMode::Both | crate::document::BezierHandleMode::Symmetric | crate::document::BezierHandleMode::Asymmetric | crate::document::BezierHandleMode::EqualLength);
+                // Draw Bezier handle if interpolation is Bezier and we have a next keyframe
+                if kf.interpolation == crate::app::InterpolationMode::Bezier && _i + 1 < keyframes_len {
+                    let kf_next = &track.keyframes[_i + 1];
+                    let right_pt = to_screen(kf.frame as f64 + kf.handle_right.0, kf.value + kf.handle_right.1);
+                    let next_center = to_screen(kf_next.frame as f64, kf_next.value);
+                    
+                    // Draw white dotted lines connecting start endpoint to control point, and control point to end endpoint
+                    let dotted_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.6));
+                    draw_dotted_line(&painter, center, right_pt, dotted_stroke);
+                    draw_dotted_line(&painter, right_pt, next_center, dotted_stroke);
                     
                     let handle_color = egui::Color32::from_rgb(250, 200, 50); // yellow
-                    let line_stroke = egui::Stroke::new(1.0, colors::TEXT_MUTED.gamma_multiply(0.6));
+                    let is_h = mpos.map_or(false, |mp| mp.distance(right_pt) < 6.0);
+                    let is_d = app.anim_graph_editor_dragged_handle.as_ref().map_or(false, |(t, f, is_l)| {
+                        t == &track_lbl_str && *f == kf.frame && !*is_l
+                    });
                     
-                    if draw_left {
-                        let left_pt = to_screen(kf.frame as f64 + kf.handle_left.0, kf.value + kf.handle_left.1);
-                        painter.line_segment([center, left_pt], line_stroke);
-                        
-                        let is_h = mpos.map_or(false, |mp| mp.distance(left_pt) < 6.0);
-                        let is_d = app.anim_graph_editor_dragged_handle.as_ref().map_or(false, |(t, f, is_l)| {
-                            t == &track_lbl_str && *f == kf.frame && *is_l
-                        });
-                        
-                        let pt_color = if is_h || is_d { colors::ACCENT } else { handle_color };
-                        painter.circle_filled(left_pt, 4.0, pt_color);
-                        
-                        if is_h && ui.input(|i| i.pointer.any_pressed()) {
-                            app.anim_graph_editor_dragged_handle = Some((track_lbl_str.clone(), kf.frame, true));
-                            _clicked_any = true;
-                        }
-                    }
+                    let pt_color = if is_h || is_d { colors::ACCENT } else { handle_color };
+                    painter.circle_filled(right_pt, 4.0, pt_color);
                     
-                    if draw_right {
-                        let right_pt = to_screen(kf.frame as f64 + kf.handle_right.0, kf.value + kf.handle_right.1);
-                        painter.line_segment([center, right_pt], line_stroke);
-                        
-                        let is_h = mpos.map_or(false, |mp| mp.distance(right_pt) < 6.0);
-                        let is_d = app.anim_graph_editor_dragged_handle.as_ref().map_or(false, |(t, f, is_l)| {
-                            t == &track_lbl_str && *f == kf.frame && !*is_l
-                        });
-                        
-                        let pt_color = if is_h || is_d { colors::ACCENT } else { handle_color };
-                        painter.circle_filled(right_pt, 4.0, pt_color);
-                        
-                        if is_h && ui.input(|i| i.pointer.any_pressed()) {
-                            app.anim_graph_editor_dragged_handle = Some((track_lbl_str.clone(), kf.frame, false));
-                            _clicked_any = true;
-                        }
+                    if is_h && ui.input(|i| i.pointer.any_pressed()) {
+                        app.anim_graph_editor_dragged_handle = Some((track_lbl_str.clone(), kf.frame, false));
+                        _clicked_any = true;
                     }
                 }
                 
@@ -4016,7 +4192,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                     let target_frac_y = (rect.bottom() - padding - mpos.y) / (rect.height() - 2.0 * padding);
                     let target_val = val_min + (target_frac_y as f64) * (val_max - val_min);
                     
-                    if let Some(anim_mut) = app.anim_timeline.nodes.get_mut(&node_id) {
+                    if let Some(anim_mut) = app.project.anim_timeline.nodes.get_mut(&node_id) {
                         if let Some(track) = anim_mut.get_track_mut(&drag_lbl) {
                             if let Some(idx) = track.keyframes.iter().position(|k| k.frame == drag_frame) {
                                 let old_frame = track.keyframes[idx].frame;
@@ -4038,70 +4214,34 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                     app.apply_animation_for_frame(app.anim_current_frame);
                 }
             } else {
+                // Drag ended — commit to history
+                let snap = app.project.anim_timeline.clone();
+                app.history.push(
+                    &mut app.project,
+                    crate::history::ProjectEdit::PatchTimeline { before: snap.clone(), after: snap },
+                );
                 app.anim_graph_editor_dragged_kf = None;
             }
         }
         
         // Handle drag handle updates
-        if let Some((drag_lbl, drag_frame, is_left)) = app.anim_graph_editor_dragged_handle.clone() {
+        if let Some((drag_lbl, drag_frame, _is_left)) = app.anim_graph_editor_dragged_handle.clone() {
             if ui.input(|i| i.pointer.any_down()) {
                 if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
-                    if let Some(anim_mut) = app.anim_timeline.nodes.get_mut(&node_id) {
+                    if let Some(anim_mut) = app.project.anim_timeline.nodes.get_mut(&node_id) {
                         if let Some(track) = anim_mut.get_track_mut(&drag_lbl) {
                             if let Some(idx) = track.keyframes.iter().position(|k| k.frame == drag_frame) {
-                                let kf = &mut track.keyframes[idx];
-                                let (m_frame, m_val) = to_graph(mpos);
-                                
-                                let delta_frame = m_frame - kf.frame as f64;
-                                let delta_value = m_val - kf.value;
-                                
-                                // Update the dragged handle offset
-                                if is_left {
-                                    let df = delta_frame.min(0.0);
-                                    kf.handle_left = (df, delta_value);
+                                if idx + 1 < track.keyframes.len() {
+                                    let next_frame = track.keyframes[idx + 1].frame;
+                                    let kf = &mut track.keyframes[idx];
+                                    let (m_frame, m_val) = to_graph(mpos);
                                     
-                                    // Apply handle constraints based on mode
-                                    match kf.handle_mode {
-                                        crate::document::BezierHandleMode::Symmetric => {
-                                            kf.handle_right = (-df, -delta_value);
-                                        }
-                                        crate::document::BezierHandleMode::EqualLength => {
-                                            kf.handle_right = (-df, -delta_value);
-                                        }
-                                        crate::document::BezierHandleMode::Asymmetric => {
-                                            let r_len = (kf.handle_right.0 * kf.handle_right.0 + kf.handle_right.1 * kf.handle_right.1).sqrt();
-                                            let l_len = (df * df + delta_value * delta_value).sqrt();
-                                            if l_len > 1e-6 && r_len > 1e-6 {
-                                                let dir_x = -df / l_len;
-                                                let dir_y = -delta_value / l_len;
-                                                kf.handle_right = (dir_x * r_len, dir_y * r_len);
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                } else {
-                                    let df = delta_frame.max(0.0);
+                                    let delta_frame = m_frame - kf.frame as f64;
+                                    let delta_value = m_val - kf.value;
+                                    
+                                    let range = (next_frame - kf.frame) as f64;
+                                    let df = delta_frame.clamp(0.0, range);
                                     kf.handle_right = (df, delta_value);
-                                    
-                                    // Apply handle constraints based on mode
-                                    match kf.handle_mode {
-                                        crate::document::BezierHandleMode::Symmetric => {
-                                            kf.handle_left = (-df, -delta_value);
-                                        }
-                                        crate::document::BezierHandleMode::EqualLength => {
-                                            kf.handle_left = (-df, -delta_value);
-                                        }
-                                        crate::document::BezierHandleMode::Asymmetric => {
-                                            let l_len = (kf.handle_left.0 * kf.handle_left.0 + kf.handle_left.1 * kf.handle_left.1).sqrt();
-                                            let r_len = (df * df + delta_value * delta_value).sqrt();
-                                            if r_len > 1e-6 && l_len > 1e-6 {
-                                                let dir_x = -df / r_len;
-                                                let dir_y = -delta_value / r_len;
-                                                kf.handle_left = (dir_x * l_len, dir_y * l_len);
-                                            }
-                                        }
-                                        _ => {}
-                                    }
                                 }
                             }
                         }
@@ -4109,6 +4249,12 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                     app.apply_animation_for_frame(app.anim_current_frame);
                 }
             } else {
+                // Drag ended — commit to history
+                let snap = app.project.anim_timeline.clone();
+                app.history.push(
+                    &mut app.project,
+                    crate::history::ProjectEdit::PatchTimeline { before: snap.clone(), after: snap },
+                );
                 app.anim_graph_editor_dragged_handle = None;
             }
         }
@@ -4183,7 +4329,8 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     }
 
-    let mut entry = app.anim_timeline.nodes.entry(id).or_default().clone();
+    let before_timeline = app.project.anim_timeline.clone();
+    let mut entry = app.project.anim_timeline.nodes.entry(id).or_default().clone();
     let frame = app.anim_current_frame;
 
     let mut render_prop_row = |ui: &mut Ui, label: &str, track: &mut KeyframeTrack, default_val: f64, min: f64, max: f64, speed: f64| -> (bool, Option<f64>) {
@@ -4208,7 +4355,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ret = (true, None);
                 }
             } else {
-                ui.label(RichText::new(format!("{:.2} (interpolated)", val)).color(colors::TEXT_MUTED));
+                ui.label(RichText::new(format!("{:.2} (interp)", val)).color(colors::TEXT_MUTED));
                 if ui.button("+").on_hover_text("Add keyframe").clicked() {
                     track.insert(frame, val);
                     ret = (true, Some(val));
@@ -4250,9 +4397,14 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     let mut track_rot = entry.rotation.clone();
     let (changed_rot, val_rot) = render_prop_row(ui, "Rotation", &mut track_rot, curr_rot.to_degrees(), -360.0, 360.0, 1.0);
     if changed_rot {
-        entry.rotation = track_rot;
+        entry.rotation = track_rot.clone();
         entry_changed = true;
         if let Some(vrot) = val_rot {
+            app.convert_rect_to_path(id);
+            if let Some(new_entry) = app.project.anim_timeline.nodes.get(&id) {
+                entry = new_entry.clone();
+                entry.rotation = track_rot;
+            }
             if let Some(n) = app.project.nodes.get_mut(id) {
                 n.set_rotation(vrot.to_radians());
             }
@@ -4323,7 +4475,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 (a * 255.0) as u8,
             );
             ui.color_edit_button_srgba(&mut display_color);
-            ui.label(RichText::new(" (interpolated)").color(colors::TEXT_MUTED));
+            ui.label(RichText::new(" (interp)").color(colors::TEXT_MUTED));
             if ui.button("+").on_hover_text("Add color keyframe").clicked() {
                 entry.color_r.insert(frame, r as f64);
                 entry.color_g.insert(frame, g as f64);
@@ -4509,7 +4661,12 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 ui.add_space(4.0);
                 
                 if let Some(track) = entry.get_track_mut(&sel_track_lbl) {
-                    if let Some(kf) = track.keyframes.iter_mut().find(|k| k.frame == sel_frame) {
+                    if let Some(idx) = track.keyframes.iter().position(|k| k.frame == sel_frame) {
+                        let next_kf_val = track.keyframes.iter()
+                            .find(|k| k.frame > sel_frame)
+                            .map(|k| (k.frame, k.value));
+                        
+                        let kf = &mut track.keyframes[idx];
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(format!("Track: {}", sel_track_lbl)).color(colors::TEXT_MUTED));
                             ui.add_space(10.0);
@@ -4529,7 +4686,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         ui.horizontal(|ui| {
                             ui.label("Interpolation:");
                             let mut interp = kf.interpolation;
-                            let combo = egui::ComboBox::from_id_salt("act_kf_interp_combo")
+                            let _combo = egui::ComboBox::from_id_salt("act_kf_interp_combo")
                                 .selected_text(match interp {
                                     crate::app::InterpolationMode::Linear => "Linear",
                                     crate::app::InterpolationMode::Bezier => "Bezier/Smooth",
@@ -4541,45 +4698,18 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                     }
                                     if ui.selectable_value(&mut interp, crate::app::InterpolationMode::Bezier, "Bezier/Smooth").clicked() {
                                         kf.interpolation = crate::app::InterpolationMode::Bezier;
+                                        if let Some((next_frame, next_value)) = next_kf_val {
+                                            kf.handle_right = (
+                                                (next_frame - kf.frame) as f64 * 0.5,
+                                                (next_value - kf.value) * 0.5
+                                            );
+                                        } else {
+                                            kf.handle_right = (5.0, 0.0);
+                                        }
                                         entry_changed = true;
                                     }
                                 });
                         });
-                        
-                        if kf.interpolation == crate::app::InterpolationMode::Bezier {
-                            ui.add_space(6.0);
-                            ui.label(RichText::new("Bezier Handle Mode:").strong());
-                            
-                            use crate::document::BezierHandleMode;
-                            let modes = [
-                                BezierHandleMode::Symmetric,
-                                BezierHandleMode::Asymmetric,
-                                BezierHandleMode::EqualLength,
-                                BezierHandleMode::Both,
-                                BezierHandleMode::LeftOnly,
-                                BezierHandleMode::RightOnly,
-                            ];
-                            
-                            ui.horizontal_wrapped(|ui| {
-                                for mode in modes {
-                                    let selected = kf.handle_mode == mode;
-                                    if ui.selectable_label(selected, mode.label()).clicked() {
-                                        kf.handle_mode = mode;
-                                        // Enforce mode constraints on existing handles
-                                        match mode {
-                                            BezierHandleMode::Symmetric => {
-                                                kf.handle_right = (-kf.handle_left.0, -kf.handle_left.1);
-                                            }
-                                            BezierHandleMode::EqualLength => {
-                                                kf.handle_right = (-kf.handle_left.0, -kf.handle_left.1);
-                                            }
-                                            _ => {}
-                                        }
-                                        entry_changed = true;
-                                    }
-                                }
-                            });
-                        }
                         
                         ui.add_space(8.0);
                         if ui.button(RichText::new("🗑 Delete Keyframe").color(egui::Color32::from_rgb(230, 80, 80))).clicked() {
@@ -4591,11 +4721,16 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     }
 
-    app.anim_timeline.nodes.insert(id, entry);
+    app.project.anim_timeline.nodes.insert(id, entry);
     
     if let Some((track, frame)) = delete_kf_target {
         app.delete_keyframe(id, &track, frame);
     } else if entry_changed {
+        let after_timeline = app.project.anim_timeline.clone();
+        app.history.push(
+            &mut app.project,
+            crate::history::ProjectEdit::PatchTimeline { before: before_timeline, after: after_timeline },
+        );
         app.apply_animation_for_frame(app.anim_current_frame);
     }
 }

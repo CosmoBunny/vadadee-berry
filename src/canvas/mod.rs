@@ -47,7 +47,7 @@ impl Viewport {
         if !self.snap_grid {
             return doc;
         }
-        let g = self.grid_step as f64 / self.zoom as f64;
+        let g = self.grid_step as f64;
         if g <= 0.0 {
             return doc;
         }

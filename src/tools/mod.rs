@@ -69,6 +69,7 @@ pub enum BrushType {
     #[default]
     Standard,
     Pen,
+    Calligraphy,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +221,8 @@ pub struct SelectSession {
     pub select_rotation_mode: bool,
     pub rotate_center: Option<(f64, f64)>,
     pub rotate_start_angle: f64,
+    pub drag_start_doc: Option<(f64, f64)>,
+    pub clicked_already_selected: bool,
 }
 
 #[derive(Debug, Default)]

@@ -1675,8 +1675,23 @@ impl Node {
             NodeKind::Ellipse { cx, cy, rx, ry } => {
                 Rect::new(cx - rx, cy - ry, cx + rx, cy + ry)
             }
-            NodeKind::Polygon { cx, cy, r, .. } => {
-                Rect::new(cx - r, cy - r, cx + r, cy + r)
+            NodeKind::Polygon { cx, cy, r, sides, rotation_rad } => {
+                let verts = regular_polygon_vertices(*cx, *cy, *r, *sides, *rotation_rad);
+                if verts.is_empty() {
+                    Rect::new(cx - r, cy - r, cx + r, cy + r)
+                } else {
+                    let mut min_x = f64::MAX;
+                    let mut min_y = f64::MAX;
+                    let mut max_x = f64::MIN;
+                    let mut max_y = f64::MIN;
+                    for &(px, py) in &verts {
+                        min_x = min_x.min(px);
+                        min_y = min_y.min(py);
+                        max_x = max_x.max(px);
+                        max_y = max_y.max(py);
+                    }
+                    Rect::new(min_x, min_y, max_x, max_y)
+                }
             }
             NodeKind::Path { path } => path.to_bez().bounding_box(),
             NodeKind::Text { x, y, style } => text_bounds(*x, *y, style),

@@ -64,131 +64,7 @@ struct PasteProgress {
 }
 
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InterpolationMode {
-    Linear,
-    Bezier,
-}
-
-impl Default for InterpolationMode {
-    fn default() -> Self {
-        Self::Linear
-    }
-}
-
-fn default_handle_left() -> (f64, f64) {
-    (-5.0, 0.0)
-}
-
-fn default_handle_right() -> (f64, f64) {
-    (5.0, 0.0)
-}
-
-fn default_handle_mode() -> crate::document::BezierHandleMode {
-    crate::document::BezierHandleMode::Both
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Keyframe {
-    pub frame: usize,
-    pub value: f64,
-    #[serde(default)]
-    pub interpolation: InterpolationMode,
-    #[serde(default = "default_handle_left")]
-    pub handle_left: (f64, f64),
-    #[serde(default = "default_handle_right")]
-    pub handle_right: (f64, f64),
-    #[serde(default = "default_handle_mode")]
-    pub handle_mode: crate::document::BezierHandleMode,
-}
-
-fn solve_u(x_target: f64, x1: f64, x2: f64, range: f64) -> f64 {
-    if range < 1e-9 {
-        return 0.0;
-    }
-    let mut low = 0.0;
-    let mut high = 1.0;
-    for _ in 0..24 {
-        let u = (low + high) * 0.5;
-        let omt = 1.0 - u;
-        let x = 3.0 * omt * omt * u * x1 + 3.0 * omt * u * u * x2 + u * u * u * range;
-        if x < x_target {
-            low = u;
-        } else {
-            high = u;
-        }
-    }
-    (low + high) * 0.5
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct KeyframeTrack {
-    pub keyframes: Vec<Keyframe>,
-}
-
-impl KeyframeTrack {
-    pub fn insert(&mut self, frame: usize, value: f64) {
-        if let Some(pos) = self.keyframes.iter().position(|kf| kf.frame == frame) {
-            self.keyframes[pos].value = value;
-        } else {
-            self.keyframes.push(Keyframe {
-                frame,
-                value,
-                interpolation: InterpolationMode::Linear,
-                handle_left: (-5.0, 0.0),
-                handle_right: (5.0, 0.0),
-                handle_mode: crate::document::BezierHandleMode::Both,
-            });
-            self.keyframes.sort_by_key(|kf| kf.frame);
-        }
-    }
-
-    pub fn interpolate(&self, frame: usize) -> Option<f64> {
-        if self.keyframes.is_empty() {
-            return None;
-        }
-        if frame <= self.keyframes[0].frame {
-            return Some(self.keyframes[0].value);
-        }
-        let last_idx = self.keyframes.len() - 1;
-        if frame >= self.keyframes[last_idx].frame {
-            return Some(self.keyframes[last_idx].value);
-        }
-        for i in 0..last_idx {
-            let kf0 = &self.keyframes[i];
-            let kf1 = &self.keyframes[i+1];
-            if frame >= kf0.frame && frame <= kf1.frame {
-                let range = (kf1.frame - kf0.frame) as f64;
-                if range < 1e-9 {
-                    return Some(kf0.value);
-                }
-                let t = (frame - kf0.frame) as f64 / range;
-                if kf0.interpolation == InterpolationMode::Bezier {
-                    let x_target = (frame - kf0.frame) as f64;
-                    let x1 = kf0.handle_right.0.clamp(0.0, range);
-                    let x2 = (range + kf1.handle_left.0).clamp(0.0, range);
-                    let u = solve_u(x_target, x1, x2, range);
-                    
-                    let omt = 1.0 - u;
-                    let y0 = kf0.value;
-                    let y1 = kf0.value + kf0.handle_right.1;
-                    let y2 = kf1.value + kf1.handle_left.1;
-                    let y3 = kf1.value;
-                    
-                    let val = omt * omt * omt * y0
-                        + 3.0 * omt * omt * u * y1
-                        + 3.0 * omt * u * u * y2
-                        + u * u * u * y3;
-                    return Some(val);
-                } else {
-                    return Some(kf0.value + t * (kf1.value - kf0.value));
-                }
-            }
-        }
-        None
-    }
-}
+pub use crate::document::{InterpolationMode, Keyframe, KeyframeTrack, NodeAnimation, AnimationTimeline};
 
 #[derive(Debug, Clone)]
 pub struct AnimAppliedState {
@@ -197,66 +73,19 @@ pub struct AnimAppliedState {
     pub opacity: f32,
     pub color: [f32; 4],
     pub geom_floats: Vec<f64>,
+    pub fill: Fill,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct NodeAnimation {
-    pub pos_x: KeyframeTrack,
-    pub pos_y: KeyframeTrack,
-    pub rotation: KeyframeTrack,
-    pub opacity: KeyframeTrack,
-    pub color_r: KeyframeTrack,
-    pub color_g: KeyframeTrack,
-    pub color_b: KeyframeTrack,
-    pub color_a: KeyframeTrack,
-    #[serde(default)]
-    pub geom_tracks: Vec<KeyframeTrack>,
-}
-
-impl NodeAnimation {
-    pub fn get_track_mut(&mut self, label: &str) -> Option<&mut KeyframeTrack> {
-        match label {
-            "pos_x" => Some(&mut self.pos_x),
-            "pos_y" => Some(&mut self.pos_y),
-            "rotation" => Some(&mut self.rotation),
-            "opacity" => Some(&mut self.opacity),
-            "color_r" => Some(&mut self.color_r),
-            "color_g" => Some(&mut self.color_g),
-            "color_b" => Some(&mut self.color_b),
-            "color_a" => Some(&mut self.color_a),
-            _ if label.starts_with("geom_") => {
-                let idx: usize = label["geom_".len()..].parse().ok()?;
-                self.geom_tracks.get_mut(idx)
-            }
-            _ => None,
-        }
-    }
-
-    pub fn get_track(&self, label: &str) -> Option<&KeyframeTrack> {
-        match label {
-            "pos_x" => Some(&self.pos_x),
-            "pos_y" => Some(&self.pos_y),
-            "rotation" => Some(&self.rotation),
-            "opacity" => Some(&self.opacity),
-            "color_r" => Some(&self.color_r),
-            "color_g" => Some(&self.color_g),
-            "color_b" => Some(&self.color_b),
-            "color_a" => Some(&self.color_a),
-            _ if label.starts_with("geom_") => {
-                let idx: usize = label["geom_".len()..].parse().ok()?;
-                self.geom_tracks.get(idx)
-            }
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AnimationTimeline {
-    pub nodes: std::collections::HashMap<NodeId, NodeAnimation>,
+#[derive(Debug, Clone)]
+pub struct SnapGuide {
+    pub start: (f64, f64),
+    pub end: (f64, f64),
+    pub is_tangent: bool,
 }
 
 pub struct VadadeeBerryApp {
+    pub live_snap_guides: Vec<SnapGuide>,
+    pub snap_magnet: bool,
     pub anim_current_frame: usize,
     pub anim_is_playing: bool,
     pub anim_keyframing_mode: bool,
@@ -264,7 +93,6 @@ pub struct VadadeeBerryApp {
     pub anim_time_accumulator: f32,
     pub anim_last_seen_frame: usize,
     pub anim_last_applied_states: std::collections::HashMap<NodeId, AnimAppliedState>,
-    pub anim_timeline: AnimationTimeline,
     pub anim_timeline_scroll: f32,
     pub anim_edit_mode: bool,
     pub anim_dragged_keyframe: Option<(NodeId, String, usize)>,
@@ -398,6 +226,8 @@ impl VadadeeBerryApp {
         let fonts = FontRegistry::new();
         let default_font = fonts.default_family();
         Self {
+            live_snap_guides: Vec::new(),
+            snap_magnet: true,
             anim_current_frame: 0,
             anim_is_playing: false,
             anim_keyframing_mode: false,
@@ -405,7 +235,6 @@ impl VadadeeBerryApp {
             anim_time_accumulator: 0.0,
             anim_last_seen_frame: 0,
             anim_last_applied_states: std::collections::HashMap::new(),
-            anim_timeline: AnimationTimeline::default(),
             anim_timeline_scroll: 0.0,
             anim_edit_mode: false,
             anim_dragged_keyframe: None,
@@ -772,12 +601,13 @@ impl VadadeeBerryApp {
     }
 
     pub fn apply_fill_to_selection(&mut self) {
+        let new_fill = self.build_ui_fill();
         for id in self.selection.clone() {
             let Some(before) = self.project.nodes.get(id).cloned() else {
                 continue;
             };
             let mut after = before.clone();
-            after.style.fill = self.build_ui_fill();
+            after.style.fill = new_fill.clone();
             if let NodeKind::Path { path } = &mut after.kind {
                 if self.fill_enabled && !path.is_closed() && path.points.len() >= 3 {
                     path.set_closed(true);
@@ -787,6 +617,9 @@ impl VadadeeBerryApp {
                 &mut self.project,
                 ProjectEdit::PatchNode { id, before, after },
             );
+            if let Some(track) = self.project.anim_timeline.nodes.get_mut(&id) {
+                track.base_fill = Some(new_fill.clone());
+            }
         }
     }
 
@@ -1179,7 +1012,7 @@ impl VadadeeBerryApp {
 
     pub fn get_max_animation_frame(&self) -> usize {
         let mut max_f = 100;
-        for anim in self.anim_timeline.nodes.values() {
+        for anim in self.project.anim_timeline.nodes.values() {
             let tracks = [
                 &anim.pos_x, &anim.pos_y, &anim.rotation, &anim.opacity,
                 &anim.color_r, &anim.color_g, &anim.color_b, &anim.color_a
@@ -1194,7 +1027,7 @@ impl VadadeeBerryApp {
     }
 
     pub fn apply_animation_for_frame(&mut self, frame: usize) {
-        let updates: Vec<(NodeId, Option<f64>, Option<f64>, Option<f64>, Option<f32>, Option<[f32; 4]>, Option<Vec<f64>>)> = self.anim_timeline.nodes.iter()
+        let updates: Vec<(NodeId, Option<f64>, Option<f64>, Option<f64>, Option<f32>, Option<[f32; 4]>, Option<Vec<f64>>)> = self.project.anim_timeline.nodes.iter()
             .map(|(node_id, track)| {
                 let x = track.pos_x.interpolate(frame);
                 let y = track.pos_y.interpolate(frame);
@@ -1211,8 +1044,10 @@ impl VadadeeBerryApp {
                 };
                 let geom = if !track.geom_tracks.is_empty() {
                     let mut g_vals = Vec::new();
-                    for t in &track.geom_tracks {
-                        g_vals.push(t.interpolate(frame).unwrap_or(0.0));
+                    let current_geom = self.get_node_geom_floats(*node_id);
+                    for (idx, t) in track.geom_tracks.iter().enumerate() {
+                        let def_val = current_geom.get(idx).copied().unwrap_or(0.0);
+                        g_vals.push(t.interpolate(frame).unwrap_or(def_val));
                     }
                     Some(g_vals)
                 } else {
@@ -1244,7 +1079,39 @@ impl VadadeeBerryApp {
                 
                 // Apply color
                 if let Some(color) = target_color {
-                    node.set_color(color);
+                    let mut base_fill = self.project.anim_timeline.nodes.get(&node_id)
+                        .and_then(|track| track.base_fill.clone());
+                    
+                    if base_fill.is_none() {
+                        base_fill = Some(node.style.fill.clone());
+                        if let Some(track) = self.project.anim_timeline.nodes.get_mut(&node_id) {
+                            track.base_fill = base_fill.clone();
+                        }
+                    }
+
+                    if let Some(mut bf) = base_fill {
+                        match &mut bf {
+                            Fill::Solid(paint) => {
+                                paint.rgba = color;
+                                node.style.fill = Fill::Solid(*paint);
+                            }
+                            Fill::LinearGradient { stops, .. } |
+                            Fill::RadialGradient { stops, .. } => {
+                                for stop in stops {
+                                    stop.color.rgba = [
+                                        stop.color.rgba[0] * color[0],
+                                        stop.color.rgba[1] * color[1],
+                                        stop.color.rgba[2] * color[2],
+                                        stop.color.rgba[3] * color[3],
+                                    ];
+                                }
+                                node.style.fill = bf;
+                            }
+                            Fill::None => {}
+                        }
+                    } else {
+                        node.set_color(color);
+                    }
                 }
 
                 // Apply geometry
@@ -1380,6 +1247,78 @@ impl VadadeeBerryApp {
         }
         if has_oop {
             self.sync_on_path_ui_from_selection();
+        }
+    }
+
+    pub fn convert_rect_to_path(&mut self, id: NodeId) {
+        let Some(node) = self.project.nodes.get_mut(id) else {
+            return;
+        };
+        
+        let (x, y, w, h) = match &node.kind {
+            NodeKind::Rect { x, y, w, h, .. } => (*x, *y, *w, *h),
+            _ => return, // Not a rect
+        };
+        
+        // Convert the NodeKind to Path
+        let corners = [
+            (x, y),
+            (x + w, y),
+            (x + w, y + h),
+            (x, y + h),
+        ];
+        let path = crate::document::PathData::from_anchor_data(
+            &corners,
+            &[],
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            true,
+        );
+        node.kind = NodeKind::Path { path };
+        
+        // Now convert its timeline tracks in self.anim_timeline
+        if let Some(entry) = self.project.anim_timeline.nodes.get_mut(&id) {
+            // We need to convert geom_tracks from Rect (3 tracks) to Path (24 tracks)
+            let mut frames = std::collections::BTreeSet::new();
+            for t in &entry.geom_tracks {
+                for kf in &t.keyframes {
+                    frames.insert(kf.frame);
+                }
+            }
+            
+            // Create 24 empty tracks for Path geometry
+            let mut new_geom_tracks = vec![KeyframeTrack::default(); 24];
+            
+            // For each keyframe frame, calculate the 24 path geometry values from the interpolated rect values at that frame
+            for f in frames {
+                let w_val = entry.geom_tracks.get(0).and_then(|t| t.interpolate(f)).unwrap_or(w);
+                let h_val = entry.geom_tracks.get(1).and_then(|t| t.interpolate(f)).unwrap_or(h);
+                
+                let c = [
+                    (x, y),
+                    (x + w_val, y),
+                    (x + w_val, y + h_val),
+                    (x, y + h_val),
+                ];
+                
+                for i in 0..4 {
+                    let base = i * 6;
+                    new_geom_tracks[base].insert(f, c[i].0);
+                    new_geom_tracks[base + 1].insert(f, c[i].1);
+                    new_geom_tracks[base + 2].insert(f, 0.0);
+                    new_geom_tracks[base + 3].insert(f, 0.0);
+                    new_geom_tracks[base + 4].insert(f, 0.0);
+                    new_geom_tracks[base + 5].insert(f, 0.0);
+                }
+            }
+            
+            entry.geom_tracks = new_geom_tracks;
+        }
+        
+        // Also update anim_last_applied_states if it exists, to match the new geom_floats format/length
+        if let Some(last) = self.anim_last_applied_states.get_mut(&id) {
+            let gf = node.get_geom_floats();
+            last.geom_floats = gf;
         }
     }
 
@@ -2067,7 +2006,7 @@ impl VadadeeBerryApp {
     }
 
     fn object_clipboard_blocked(&self, ctx: &Context) -> bool {
-        self.on_page_text_edit.is_some() && ctx.wants_keyboard_input()
+        self.on_page_text_edit.is_some() || ctx.wants_keyboard_input()
     }
 
     /// Called early in chrome (right after menubar) so that state changes from
@@ -2456,7 +2395,9 @@ impl VadadeeBerryApp {
     }
 
     pub fn delete_keyframe(&mut self, node_id: NodeId, track_lbl: &str, frame: usize) {
-        if let Some(anim) = self.anim_timeline.nodes.get_mut(&node_id) {
+        let before_timeline = self.project.anim_timeline.clone();
+        let mut updated = false;
+        if let Some(anim) = self.project.anim_timeline.nodes.get_mut(&node_id) {
             if let Some(track) = anim.get_track_mut(track_lbl) {
                 track.keyframes.retain(|kf| kf.frame != frame);
                 if let Some((sel_node_id, ref sel_track_lbl, sel_frame)) = self.anim_selected_keyframe {
@@ -2465,7 +2406,15 @@ impl VadadeeBerryApp {
                     }
                 }
                 self.apply_animation_for_frame(self.anim_current_frame);
+                updated = true;
             }
+        }
+        if updated {
+            let after_timeline = self.project.anim_timeline.clone();
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchTimeline { before: before_timeline, after: after_timeline },
+            );
         }
     }
 
@@ -3045,6 +2994,23 @@ impl VadadeeBerryApp {
                 self.cursor_doc,
             );
 
+            for guide in &self.live_snap_guides {
+                let p1 = self.viewport.doc_to_screen(guide.start, origin);
+                let p2 = self.viewport.doc_to_screen(guide.end, origin);
+                let color = egui::Color32::from_rgb(255, 215, 0); // Yellow/Gold
+                if guide.is_tangent {
+                    painter.line_segment([p1, p2], egui::Stroke::new(2.5, color));
+                    let contact = (
+                        (guide.start.0 + guide.end.0) * 0.5,
+                        (guide.start.1 + guide.end.1) * 0.5,
+                    );
+                    let cp = self.viewport.doc_to_screen(contact, origin);
+                    painter.circle_filled(cp, 4.0, color);
+                } else {
+                    painter.line_segment([p1, p2], egui::Stroke::new(1.5, color));
+                }
+            }
+
             if self.tools.active == ToolKind::Brush && !self.tools.brush.points.is_empty() {
                  let stroke_color = match &self.build_brush_fill() {
                     Fill::Solid(p) => p.to_egui(),
@@ -3202,6 +3168,7 @@ impl VadadeeBerryApp {
             }
         }
         let pointer = response.interact_pointer_pos();
+        self.live_snap_guides.clear();
         let primary_down = response.is_pointer_button_down_on();
         let primary_pressed = response.ctx.input(|i| {
             i.pointer.button_pressed(egui::PointerButton::Primary)
@@ -4836,16 +4803,19 @@ impl VadadeeBerryApp {
                             {
                                 if self.tools.select.select_rotation_mode {
                                     if matches!(handle, tools::ResizeHandle::Nw | tools::ResizeHandle::Ne | tools::ResizeHandle::Se | tools::ResizeHandle::Sw) {
-                                        self.tools.select.drag_mode = Some(SelectDrag::Rotate);
-                                        let b = node.bounds();
-                                        let cx = (b.x0 + b.x1) * 0.5;
-                                        let cy = (b.y0 + b.y1) * 0.5;
-                                        self.tools.select.rotate_center = Some((cx, cy));
-                                        self.tools.select.rotate_start_angle = (doc.1 - cy).atan2(doc.0 - cx);
-                                        self.tools.select.drag_snapshot = vec![(id, node.clone())];
-                                        self.tools.select.last_doc = doc;
-                                        self.sync_inspector_from_selection();
-                                        return;
+                                        self.convert_rect_to_path(id);
+                                        if let Some(node) = self.project.nodes.get(id) {
+                                            self.tools.select.drag_mode = Some(SelectDrag::Rotate);
+                                            let b = node.bounds();
+                                            let cx = (b.x0 + b.x1) * 0.5;
+                                            let cy = (b.y0 + b.y1) * 0.5;
+                                            self.tools.select.rotate_center = Some((cx, cy));
+                                            self.tools.select.rotate_start_angle = (doc.1 - cy).atan2(doc.0 - cx);
+                                            self.tools.select.drag_snapshot = vec![(id, node.clone())];
+                                            self.tools.select.last_doc = doc;
+                                            self.sync_inspector_from_selection();
+                                            return;
+                                        }
                                     }
                                 } else {
                                     self.tools.select.drag_mode = Some(SelectDrag::Resize(handle));
@@ -4867,6 +4837,7 @@ impl VadadeeBerryApp {
                     let slop = 10.0 / (self.viewport.zoom as f64).max(0.1);
                     if let Some(pts) = self.get_tiling_gizmo_points(id) {
                         for (i, &(px, py)) in pts.iter().enumerate() {
+                            if i == 0 { continue; } // Skip offset handle
                             if (px - doc.0).hypot(py - doc.1) < slop {
                                 self.tools.select.drag_mode = Some(SelectDrag::TilingGizmo(i));
                                 self.tools.select.last_doc = doc;
@@ -4956,6 +4927,8 @@ impl VadadeeBerryApp {
             if let Some(id) = hit {
                 self.tools.select.marquee = None;
                 self.tools.select.clear_path_point_selection();
+                let already_selected = self.selection.contains(&id);
+                self.tools.select.clicked_already_selected = already_selected;
                 if shift {
                     if self.selection.contains(&id) {
                         self.selection.retain(|s| *s != id);
@@ -4968,16 +4941,22 @@ impl VadadeeBerryApp {
                 }
                 if !self.selection.is_empty() {
                     self.tools.select.drag_mode = Some(SelectDrag::Move);
-                    self.tools.select.drag_snapshot = self
-                        .selection
-                        .iter()
-                        .filter_map(|sid| {
-                            self.project
-                                .nodes
-                                .get(*sid)
-                                .map(|n| (*sid, n.clone()))
-                        })
-                        .collect();
+                    self.tools.select.drag_start_doc = Some(doc);
+                    let mut nodes_to_snapshot = Vec::new();
+                    for &sid in &self.selection {
+                        if let Some(node) = self.project.nodes.get(sid) {
+                            if let NodeKind::Group { children } = &node.kind {
+                                for &cid in children {
+                                    if let Some(child) = self.project.nodes.get(cid) {
+                                        nodes_to_snapshot.push((cid, child.clone()));
+                                    }
+                                }
+                            } else {
+                                nodes_to_snapshot.push((sid, node.clone()));
+                            }
+                        }
+                    }
+                    self.tools.select.drag_snapshot = nodes_to_snapshot;
                 }
             } else {
                 self.tools.select.drag_mode = None;
@@ -4996,27 +4975,18 @@ impl VadadeeBerryApp {
             } else if let Some(mode) = self.tools.select.drag_mode {
                 match mode {
                     SelectDrag::Move => {
-                        let dx = doc.0 - self.tools.select.last_doc.0;
-                        let dy = doc.1 - self.tools.select.last_doc.1;
-                        self.tools.select.last_doc = doc;
-                        for id in self.selection.clone() {
-                            let child_ids = self.project.nodes.get(id).and_then(|n| {
-                                if let NodeKind::Group { children } = &n.kind {
-                                    Some(children.clone())
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(kids) = child_ids {
-                                for cid in kids {
-                                    if let Some(child) = self.project.nodes.get_mut(cid) {
-                                        child.translate(dx, dy);
-                                    }
-                                }
-                            } else if let Some(node) = self.project.nodes.get_mut(id) {
-                                node.translate(dx, dy);
+                        let drag_start = self.tools.select.drag_start_doc.unwrap_or(self.tools.select.last_doc);
+                        let total_dx = doc.0 - drag_start.0;
+                        let total_dy = doc.1 - drag_start.1;
+                        let selection_ids = self.selection.clone();
+                        let (snapped_dx, snapped_dy) = self.apply_snapping((total_dx, total_dy), &selection_ids);
+                        for &(id, ref orig_node) in &self.tools.select.drag_snapshot {
+                            if let Some(node) = self.project.nodes.get_mut(id) {
+                                *node = orig_node.clone();
+                                node.translate(snapped_dx, snapped_dy);
                             }
                         }
+                        self.tools.select.last_doc = doc;
                     }
                     SelectDrag::Resize(handle) => {
                         if let Some(id) = self.selection.first().copied() {
@@ -5114,15 +5084,20 @@ impl VadadeeBerryApp {
                 self.sync_inspector_from_selection();
             } else if let Some(mode) = self.tools.select.drag_mode.take() {
                 if !matches!(mode, SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_)) {
-                    if matches!(mode, SelectDrag::Move) && self.selection.len() == 1 {
-                        if let Some(&(id, ref before)) = self.tools.select.drag_snapshot.first() {
-                            if let Some(node) = self.project.nodes.get(id) {
-                                let d_pos = node.get_pos();
-                                let b_pos = before.get_pos();
-                                let dist = (d_pos.0 - b_pos.0).hypot(d_pos.1 - b_pos.1);
-                                if dist < 2.0 / self.viewport.zoom as f64 {
-                                    self.tools.select.select_rotation_mode = !self.tools.select.select_rotation_mode;
+                    if matches!(mode, SelectDrag::Move) {
+                        let drag_start = self.tools.select.drag_start_doc.unwrap_or(self.tools.select.last_doc);
+                        let doc_dist = (doc.0 - drag_start.0).hypot(doc.1 - drag_start.1);
+                        let screen_dist = doc_dist * self.viewport.zoom as f64;
+                        if screen_dist < 2.0 {
+                            // Revert all moved nodes to their pre-drag states
+                            for &(id, ref orig_node) in &self.tools.select.drag_snapshot {
+                                if let Some(node) = self.project.nodes.get_mut(id) {
+                                    *node = orig_node.clone();
                                 }
+                            }
+                            // Toggle rotation mode only if it was already selected and it's a single selection
+                            if self.selection.len() == 1 && self.tools.select.clicked_already_selected {
+                                self.tools.select.select_rotation_mode = !self.tools.select.select_rotation_mode;
                             }
                         }
                     }
@@ -5134,6 +5109,367 @@ impl VadadeeBerryApp {
         }
     }
 
+    pub fn get_node_snap_points(&self, node: &Node) -> Vec<(f64, f64)> {
+        let mut pts = Vec::new();
+        let b = node.bounds();
+        let cx = (b.x0 + b.x1) * 0.5;
+        let cy = (b.y0 + b.y1) * 0.5;
+        pts.push((cx, cy));
+        pts.push((b.x0, b.y0));
+        pts.push((b.x1, b.y0));
+        pts.push((b.x0, b.y1));
+        pts.push((b.x1, b.y1));
+        
+        match &node.kind {
+            NodeKind::Polygon { cx, cy, r, sides, rotation_rad } => {
+                let verts = crate::document::regular_polygon_vertices(*cx, *cy, *r, *sides, *rotation_rad);
+                pts.extend(verts.clone());
+                let n = verts.len();
+                if n >= 3 {
+                    for i in 0..n {
+                        let v1 = verts[i];
+                        let v2 = verts[(i + 1) % n];
+                        pts.push(((v1.0 + v2.0) * 0.5, (v1.1 + v2.1) * 0.5));
+                    }
+                }
+            }
+            NodeKind::Rect { x, y, w, h, .. } => {
+                pts.push((x + w/2.0, *y));
+                pts.push((x + w/2.0, y + h));
+                pts.push((*x, y + h/2.0));
+                pts.push((x + w, y + h/2.0));
+                pts.push((x + w/2.0, y + h/2.0));
+            }
+            NodeKind::Ellipse { cx, cy, .. } => {
+                pts.push((*cx, *cy));
+            }
+            NodeKind::Arc { cx, cy, .. } => {
+                pts.push((*cx, *cy));
+            }
+            NodeKind::Path { path } => {
+                for p in &path.points {
+                    pts.push((p[0], p[1]));
+                }
+            }
+            _ => {}
+        }
+        pts
+    }
+
+    pub fn try_equal_spacing_snap(
+        &self,
+        proposed: (f64, f64),
+        target_pts: &[(f64, f64)],
+        threshold: f64,
+    ) -> Option<((f64, f64), Vec<SnapGuide>)> {
+        let n = target_pts.len();
+        for i in 0..n {
+            let a = target_pts[i];
+            for j in (i + 1)..n {
+                let b = target_pts[j];
+                
+                // Horizontal spacing (aligned on Y)
+                if (a.1 - b.1).abs() < 1.0 {
+                    let d = (a.0 - b.0).abs();
+                    if d > 5.0 {
+                        let left_x = a.0.min(b.0);
+                        let right_x = a.0.max(b.0);
+                        
+                        // Check right side
+                        let target_right = right_x + d;
+                        if (proposed.1 - a.1).abs() < threshold && (proposed.0 - target_right).abs() < threshold {
+                            let mut guides = Vec::new();
+                            guides.push(SnapGuide {
+                                start: (left_x, a.1),
+                                end: (right_x, a.1),
+                                is_tangent: false,
+                            });
+                            guides.push(SnapGuide {
+                                start: (right_x, a.1),
+                                end: (target_right, a.1),
+                                is_tangent: false,
+                            });
+                            return Some(((target_right, a.1), guides));
+                        }
+                        
+                        // Check left side
+                        let target_left = left_x - d;
+                        if (proposed.1 - a.1).abs() < threshold && (proposed.0 - target_left).abs() < threshold {
+                            let mut guides = Vec::new();
+                            guides.push(SnapGuide {
+                                start: (target_left, a.1),
+                                end: (left_x, a.1),
+                                is_tangent: false,
+                            });
+                            guides.push(SnapGuide {
+                                start: (left_x, a.1),
+                                end: (right_x, a.1),
+                                is_tangent: false,
+                            });
+                            return Some(((target_left, a.1), guides));
+                        }
+                    }
+                }
+                
+                // Vertical spacing (aligned on X)
+                if (a.0 - b.0).abs() < 1.0 {
+                    let d = (a.1 - b.1).abs();
+                    if d > 5.0 {
+                        let top_y = a.1.min(b.1);
+                        let bottom_y = a.1.max(b.1);
+                        
+                        // Check bottom side
+                        let target_bottom = bottom_y + d;
+                        if (proposed.0 - a.0).abs() < threshold && (proposed.1 - target_bottom).abs() < threshold {
+                            let mut guides = Vec::new();
+                            guides.push(SnapGuide {
+                                start: (a.0, top_y),
+                                end: (a.0, bottom_y),
+                                is_tangent: false,
+                            });
+                            guides.push(SnapGuide {
+                                start: (a.0, bottom_y),
+                                end: (a.0, target_bottom),
+                                is_tangent: false,
+                            });
+                            return Some(((a.0, target_bottom), guides));
+                        }
+                        
+                        // Check top side
+                        let target_top = top_y - d;
+                        if (proposed.0 - a.0).abs() < threshold && (proposed.1 - target_top).abs() < threshold {
+                            let mut guides = Vec::new();
+                            guides.push(SnapGuide {
+                                start: (a.0, target_top),
+                                end: (a.0, top_y),
+                                is_tangent: false,
+                            });
+                            guides.push(SnapGuide {
+                                start: (a.0, top_y),
+                                end: (a.0, bottom_y),
+                                is_tangent: false,
+                            });
+                            return Some(((a.0, target_top), guides));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn snap_cursor(&mut self, doc: (f64, f64)) -> (f64, f64) {
+        if !self.snap_magnet {
+            return doc;
+        }
+        let mut snapped = doc;
+        self.live_snap_guides.clear();
+        let threshold = (8.0 / self.viewport.zoom as f64).max(0.1);
+
+        let mut target_pts = Vec::new();
+        for (_, node) in &self.project.nodes.map {
+            target_pts.extend(self.get_node_snap_points(node));
+        }
+
+        // Try equal spacing snap first
+        if let Some((eq_snapped, eq_guides)) = self.try_equal_spacing_snap(doc, &target_pts, threshold) {
+            self.live_snap_guides = eq_guides;
+            return eq_snapped;
+        }
+
+        let mut best_dx = threshold;
+        let mut best_dy = threshold;
+        let mut snap_pt_x = None;
+        let mut snap_pt_y = None;
+
+        for &tpt in &target_pts {
+            let dx = tpt.0 - doc.0;
+            let dy = tpt.1 - doc.1;
+            if dx.abs() < best_dx.abs() {
+                best_dx = dx;
+                snap_pt_x = Some(tpt);
+            }
+            if dy.abs() < best_dy.abs() {
+                best_dy = dy;
+                snap_pt_y = Some(tpt);
+            }
+        }
+
+        if let Some(tpt) = snap_pt_x {
+            snapped.0 = tpt.0;
+            self.live_snap_guides.push(SnapGuide {
+                start: tpt,
+                end: (tpt.0, snapped.1),
+                is_tangent: false,
+            });
+        }
+        if let Some(tpt) = snap_pt_y {
+            snapped.1 = tpt.1;
+            self.live_snap_guides.push(SnapGuide {
+                start: tpt,
+                end: (snapped.0, tpt.1),
+                is_tangent: false,
+            });
+        }
+
+        snapped
+    }
+
+    pub fn apply_snapping(
+        &mut self,
+        proposed_translation: (f64, f64),
+        selection: &[NodeId],
+    ) -> (f64, f64) {
+        self.live_snap_guides.clear();
+        if !self.snap_magnet {
+            return proposed_translation;
+        }
+        
+        if self.tools.select.drag_snapshot.is_empty() {
+            return proposed_translation;
+        }
+
+        let threshold = (8.0 / self.viewport.zoom as f64).max(0.1);
+        let mut final_translation = proposed_translation;
+
+        // 1. Identify target nodes and their snap points / circles
+        let mut target_pts = Vec::new();
+        let mut target_circles = Vec::new();
+        for (id, node) in &self.project.nodes.map {
+            if selection.contains(id) {
+                continue;
+            }
+            let pts = self.get_node_snap_points(node);
+            target_pts.extend(pts);
+            
+            if node.is_circle() {
+                if let NodeKind::Ellipse { cx, cy, rx, .. } = &node.kind {
+                    target_circles.push(((*cx, *cy), *rx));
+                }
+            }
+        }
+
+        // 2. Identify candidate points and circles in the selection snapshot
+        let mut original_pts = Vec::new();
+        let mut dragged_circles = Vec::new();
+        for (_, orig_node) in &self.tools.select.drag_snapshot {
+            let pts = self.get_node_snap_points(orig_node);
+            original_pts.extend(pts);
+            
+            if orig_node.is_circle() {
+                if let NodeKind::Ellipse { cx, cy, rx, .. } = &orig_node.kind {
+                    dragged_circles.push(((*cx, *cy), *rx));
+                }
+            }
+        }
+
+        // Try equal spacing snap first
+        for &opt in &original_pts {
+            let ppt = (opt.0 + proposed_translation.0, opt.1 + proposed_translation.1);
+            if let Some((eq_snapped, eq_guides)) = self.try_equal_spacing_snap(ppt, &target_pts, threshold) {
+                let snap_dx = eq_snapped.0 - ppt.0;
+                let snap_dy = eq_snapped.1 - ppt.1;
+                self.live_snap_guides = eq_guides;
+                return (proposed_translation.0 + snap_dx, proposed_translation.1 + snap_dy);
+            }
+        }
+
+        // 3. Try tangent snapping first if we have dragged circle(s)
+        let mut tangent_snapped = false;
+        let mut snap_offset = (0.0, 0.0);
+        let mut best_dist_diff = threshold;
+        let mut best_tangent_snap = None;
+
+        for &(dc_orig, dr) in &dragged_circles {
+            let dc_prop = (dc_orig.0 + proposed_translation.0, dc_orig.1 + proposed_translation.1);
+            for &(tc, tr) in &target_circles {
+                let dist = (dc_prop.0 - tc.0).hypot(dc_prop.1 - tc.1);
+                let d_ideal = dr + tr;
+                let diff = (dist - d_ideal).abs();
+                if diff < best_dist_diff && dist > 0.01 {
+                    best_dist_diff = diff;
+                    let dir_x = (dc_prop.0 - tc.0) / dist;
+                    let dir_y = (dc_prop.1 - tc.1) / dist;
+                    let dc_snapped = (tc.0 + dir_x * d_ideal, tc.1 + dir_y * d_ideal);
+                    best_tangent_snap = Some((tc, dc_snapped, dc_prop));
+                }
+            }
+        }
+
+        if let Some((tc, dc_snapped, dc_prop)) = best_tangent_snap {
+            let snap_dx = dc_snapped.0 - dc_prop.0;
+            let snap_dy = dc_snapped.1 - dc_prop.1;
+            snap_offset = (snap_dx, snap_dy);
+            tangent_snapped = true;
+            self.live_snap_guides.push(SnapGuide {
+                start: tc,
+                end: dc_snapped,
+                is_tangent: true,
+            });
+        }
+
+        // 4. Try alignment snap
+        let mut snap_x = if tangent_snapped { snap_offset.0 } else { 0.0 };
+        let mut snap_y = if tangent_snapped { snap_offset.1 } else { 0.0 };
+
+        if !tangent_snapped {
+            let mut best_dx = threshold;
+            let mut best_dy = threshold;
+            let mut snap_pt_x = None;
+            let mut snap_pt_y = None;
+
+            for &opt in &original_pts {
+                let ppt = (opt.0 + proposed_translation.0, opt.1 + proposed_translation.1);
+                for &tpt in &target_pts {
+                    let dx = tpt.0 - ppt.0;
+                    let dy = tpt.1 - ppt.1;
+                    
+                    if dx.abs() < best_dx.abs() {
+                        best_dx = dx;
+                        snap_pt_x = Some((tpt, ppt));
+                    }
+                    if dy.abs() < best_dy.abs() {
+                        best_dy = dy;
+                        snap_pt_y = Some((tpt, ppt));
+                    }
+                }
+            }
+
+            if let Some((tpt, ppt)) = snap_pt_x {
+                snap_x = best_dx;
+                self.live_snap_guides.push(SnapGuide {
+                    start: tpt,
+                    end: (tpt.0, ppt.1),
+                    is_tangent: false,
+                });
+            }
+            if let Some((tpt, ppt)) = snap_pt_y {
+                snap_y = best_dy;
+                self.live_snap_guides.push(SnapGuide {
+                    start: tpt,
+                    end: (ppt.0, tpt.1),
+                    is_tangent: false,
+                });
+            }
+        }
+
+        final_translation.0 += snap_x;
+        final_translation.1 += snap_y;
+
+        // Correct guide lines end positions to match final snapped coordinate
+        for guide in &mut self.live_snap_guides {
+            if !guide.is_tangent {
+                if guide.start.0 == guide.end.0 {
+                    guide.end.1 += snap_y;
+                } else if guide.start.1 == guide.end.1 {
+                    guide.end.0 += snap_x;
+                }
+            }
+        }
+
+        final_translation
+    }
+
     fn styled_shape_node(&self, mut node: Node) -> Node {
         node.style.stroke = self.build_ui_stroke();
         node.style.fill = self.build_ui_fill();
@@ -5142,18 +5478,22 @@ impl VadadeeBerryApp {
 
     fn tool_drag_shape(&mut self, doc: (f64, f64), down: bool, released: bool) {
         if self.tools.drag_shape.is_none() && down {
+            let snapped_origin = self.snap_cursor(doc);
             self.tools.drag_shape = Some(DragNewShape {
-                origin_doc: doc,
-                current_doc: doc,
+                origin_doc: snapped_origin,
+                current_doc: snapped_origin,
                 kind: Some(self.tools.active),
             });
-        } else if let Some(drag) = &mut self.tools.drag_shape {
-            drag.current_doc = doc;
+        } else if self.tools.drag_shape.is_some() {
+            let snapped_current = self.snap_cursor(doc);
+            if let Some(drag) = &mut self.tools.drag_shape {
+                drag.current_doc = snapped_current;
+            }
             if released {
+                let drag = self.tools.drag_shape.take().unwrap();
                 let kind = drag.kind;
                 let origin = drag.origin_doc;
                 let current = drag.current_doc;
-                self.tools.drag_shape = None;
 
                 let Some(kind) = kind else {
                     return;
@@ -5727,8 +6067,10 @@ impl VadadeeBerryApp {
         if released {
             let mut pts = self.tools.brush.points.clone();
             if pts.len() >= 2 {
-                if let Some(last) = pts.last_mut() {
-                    last.2 = 0.0;
+                if self.tools.brush.brush_type != crate::tools::BrushType::Calligraphy {
+                    if let Some(last) = pts.last_mut() {
+                        last.2 = 0.0;
+                    }
                 }
                 
                 let mut node = if self.tools.brush.brush_type == crate::tools::BrushType::Pen {
@@ -6158,6 +6500,7 @@ impl eframe::App for VadadeeBerryApp {
                         opacity: node.get_opacity(),
                         color: node.get_color(),
                         geom_floats: gf,
+                        fill: node.style.fill.clone(),
                     });
                 }
             }
@@ -6172,6 +6515,7 @@ impl eframe::App for VadadeeBerryApp {
                         opacity: node.get_opacity(),
                         color: node.get_color(),
                         geom_floats: gf,
+                        fill: node.style.fill.clone(),
                     });
                 }
             }
@@ -6264,7 +6608,8 @@ impl eframe::App for VadadeeBerryApp {
                         }
                         
                         if changed_pos || changed_rot || changed_op || changed_col || changed_geom {
-                            let entry = self.anim_timeline.nodes.entry(*id).or_default();
+                            let before_timeline = self.project.anim_timeline.clone();
+                            let entry = self.project.anim_timeline.nodes.entry(*id).or_default();
                             
                             if changed_pos {
                                 if entry.pos_x.keyframes.is_empty() {
@@ -6312,6 +6657,12 @@ impl eframe::App for VadadeeBerryApp {
                                     entry.geom_tracks[i].insert(self.anim_current_frame, geom[i]);
                                 }
                             }
+
+                            let after_timeline = self.project.anim_timeline.clone();
+                            self.history.push(
+                                &mut self.project,
+                                ProjectEdit::PatchTimeline { before: before_timeline, after: after_timeline },
+                            );
                             
                             keyframes_updated = true;
                         }
@@ -6329,6 +6680,7 @@ impl eframe::App for VadadeeBerryApp {
                             opacity: node.get_opacity(),
                             color: node.get_color(),
                             geom_floats: gf,
+                            fill: node.style.fill.clone(),
                         });
                     }
                 }
@@ -6412,7 +6764,9 @@ fn generate_brush_outline(
         let (pos, _, w) = points[i];
         let half_w = (w / 2.0) as f64;
 
-        let normal = if i == 0 {
+        let normal = if brush_type == crate::tools::BrushType::Calligraphy {
+            [0.7071067811865476, 0.7071067811865476]
+        } else if i == 0 {
             let next_pos = points[1].0;
             let dx = next_pos[0] - pos[0];
             let dy = next_pos[1] - pos[1];
@@ -6516,8 +6870,7 @@ mod tests {
         track.insert(100, 110.0);
 
         track.keyframes[0].interpolation = InterpolationMode::Bezier;
-        track.keyframes[0].handle_right = (25.0, 50.0);
-        track.keyframes[1].handle_left = (-25.0, -50.0);
+        track.keyframes[0].handle_right = (50.0, 50.0);
 
         assert!((track.interpolate(0).unwrap() - 10.0).abs() < 1e-5);
         assert!((track.interpolate(100).unwrap() - 110.0).abs() < 1e-5);
@@ -6565,6 +6918,198 @@ mod tests {
         assert_eq!(temp_geom.len(), last_geom_floats.len());
         for i in 0..temp_geom.len() {
             assert!((temp_geom[i] - last_geom_floats[i]).abs() < 1e-6, "Index {} differs: {} vs {}", i, temp_geom[i], last_geom_floats[i]);
+        }
+    }
+
+    impl VadadeeBerryApp {
+        pub fn new_for_test() -> Self {
+            let fonts = FontRegistry::new();
+            let default_font = fonts.default_family();
+            Self {
+                live_snap_guides: Vec::new(),
+                snap_magnet: true,
+                anim_current_frame: 0,
+                anim_is_playing: false,
+                anim_keyframing_mode: false,
+                anim_show_timeline_window: false,
+                anim_time_accumulator: 0.0,
+                anim_last_seen_frame: 0,
+                anim_last_applied_states: std::collections::HashMap::new(),
+                anim_timeline_scroll: 0.0,
+                anim_edit_mode: false,
+                anim_dragged_keyframe: None,
+                anim_selected_keyframe: None,
+                anim_graph_editor_track: None,
+                anim_graph_editor_target_track: None,
+                anim_graph_editor_t: 0.0,
+                anim_graph_editor_dragged_kf: None,
+                anim_graph_editor_dragged_handle: None,
+
+                project: Document::new_default_project(),
+                viewport: Viewport::default(),
+                tools: ToolState {
+                    active: ToolKind::Select,
+                    ..Default::default()
+                },
+                selection: vec![],
+                history: History::default(),
+                ui_fill_stops: default_gradient_stops(),
+                ui_fill_stop_sel: 0,
+                ui_fill_edit_gradient_line: false,
+                ui_fill_kind: FillKind::Solid,
+                ui_gradient_angle: 90.0,
+                ui_fill_line_x0: 0.0,
+                ui_fill_line_y0: 0.5,
+                ui_fill_line_x1: 1.0,
+                ui_fill_line_y1: 0.5,
+                ui_radial_cx: 0.5,
+                ui_radial_cy: 0.5,
+                polygon_sides: 6,
+                ui_stroke_stops: vec![
+                    GradientStop::new(0.0, Paint::from_hex(0x1a1f2e, 1.0)),
+                    GradientStop::new(1.0, Paint::from_hex(0x1a1f2e, 1.0)),
+                ],
+                ui_stroke_stop_sel: 0,
+                ui_stroke_edit_gradient_line: false,
+                ui_stroke_line_join: crate::document::LineJoin::Miter,
+                ui_stroke_line_cap: crate::document::LineCap::Butt,
+                ui_stroke_kind: FillKind::Solid,
+                ui_stroke_angle: 0.0,
+                ui_stroke_line_x0: 0.0,
+                ui_stroke_line_y0: 0.5,
+                ui_stroke_line_x1: 1.0,
+                ui_stroke_line_y1: 0.5,
+                ui_stroke_radial_cx: 0.5,
+                ui_stroke_radial_cy: 0.5,
+                ui_stroke_width: 2.0,
+                ui_text_content: "Text".into(),
+                ui_text_font_size: 24.0,
+                ui_text_font_family: default_font,
+                fonts,
+                ui_text_bold: false,
+                ui_text_italic: false,
+                fill_enabled: true,
+                stroke_enabled: true,
+                status_message: "Idle".into(),
+                clipboard: Vec::new(),
+                action_tab_scroll_home: false,
+                on_page_text_edit: None,
+                on_page_text_focus_pending: false,
+                on_page_text_before: None,
+                on_page_text_newly_created: false,
+                image_textures: std::collections::HashMap::new(),
+                image_pixel_cache: std::collections::HashMap::new(),
+                cursor_doc: None,
+                action_bar_open: true,
+                action_bar_width: 300.0,
+                action_tab: ui::ActionTab::default(),
+                action_tab_order: ui::ActionTab::all_tabs(),
+                ui_on_path_mode: OnPathMode::GapDuplicate,
+                ui_on_path_gap: 48.0,
+                ui_on_path_count: 5,
+                ui_on_path_cyclic: true,
+                ui_on_path_rotate: true,
+                ui_on_path_loft_scale: 1.0,
+                ui_on_path_loft_opacity: 0.75,
+                ui_on_path_container_h: 280.0,
+                ui_tiling_rows: 3,
+                ui_tiling_cols: 3,
+                ui_tiling_offset_x: 0.0,
+                ui_tiling_offset_y: 0.0,
+                ui_tiling_row_rot: 0.0,
+                ui_tiling_col_rot: 0.0,
+                ui_tiling_row_scale: 0.0,
+                ui_tiling_col_scale: 0.0,
+                ui_tiling_gap_x: 48.0,
+                ui_tiling_gap_y: 48.0,
+                ui_circular_copies: 6,
+                ui_circular_angle_offset: 0.0,
+                ui_circular_origin_x: 0.0,
+                ui_circular_origin_y: 0.0,
+                ui_anim: {
+                    let mut anim = UiAnimation::new();
+                    anim.seed_status_board("Idle", 80.0, 56.0);
+                    anim
+                },
+                gradient_editor_focus: crate::gradient_ui::GradientEditorFocus::None,
+                gradient_flow_drag: None,
+                canvas_screen_rect: None,
+                canvas_origin: Pos2::ZERO,
+                pending_open_svg: false,
+                pending_save_project: false,
+                pending_export_svg: false,
+                eyedropper_holding: false,
+                eyedropper_releasing: false,
+                eyedropper_t: 0.0,
+                eyedropper_target_pos: None,
+                #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+                paste_hotkey_was_down: false,
+                paste_progress: None,
+                toolbar_expanded: false,
+                toolbar_drag_active: false,
+                text_editor_rect: None,
+                text_pan_restore: None,
+                text_pan_anim: None,
+                last_android_text: String::new(),
+                path_overlay_rect: None,
+            }
+        }
+    }
+
+    #[test]
+    fn test_gradient_color_animation() {
+        let mut app = VadadeeBerryApp::new_for_test();
+        let node_id = uuid::Uuid::new_v4();
+        
+        let initial_stops = vec![
+            GradientStop::new(0.0, Paint { rgba: [1.0, 0.0, 0.0, 1.0] }), // Red
+            GradientStop::new(1.0, Paint { rgba: [0.0, 0.0, 1.0, 1.0] }), // Blue
+        ];
+        
+        let fill = Fill::LinearGradient {
+            angle_deg: 90.0,
+            line_x0: 0.0,
+            line_y0: 0.0,
+            line_x1: 1.0,
+            line_y1: 1.0,
+            stops: initial_stops,
+        };
+        
+        let mut node = Node::rect(0.0, 0.0, 100.0, 100.0, fill);
+        node.id = node_id;
+        app.project.nodes.insert(node);
+        
+        // Add color animation tracks
+        let mut anim = NodeAnimation::default();
+        anim.color_r.insert(0, 1.0);
+        anim.color_r.insert(10, 0.5);
+        anim.color_g.insert(0, 1.0);
+        anim.color_g.insert(10, 0.5);
+        anim.color_b.insert(0, 1.0);
+        anim.color_b.insert(10, 0.5);
+        anim.color_a.insert(0, 1.0);
+        anim.color_a.insert(10, 1.0);
+        app.project.anim_timeline.nodes.insert(node_id, anim);
+        
+        // Run apply_animation_for_frame at frame 10
+        app.apply_animation_for_frame(10);
+        
+        // Verify the node's fill
+        let updated_node = app.project.nodes.get(node_id).unwrap();
+        match &updated_node.style.fill {
+            Fill::LinearGradient { stops, .. } => {
+                // Animated color target is [0.5, 0.5, 0.5, 1.0]
+                // Red stop: [1.0, 0.0, 0.0, 1.0] * [0.5, 0.5, 0.5, 1.0] = [0.5, 0.0, 0.0, 1.0]
+                assert!((stops[0].color.rgba[0] - 0.5).abs() < 1e-5);
+                assert!((stops[0].color.rgba[1] - 0.0).abs() < 1e-5);
+                assert!((stops[0].color.rgba[2] - 0.0).abs() < 1e-5);
+                
+                // Blue stop: [0.0, 0.0, 1.0, 1.0] * [0.5, 0.5, 0.5, 1.0] = [0.0, 0.0, 0.5, 1.0]
+                assert!((stops[1].color.rgba[0] - 0.0).abs() < 1e-5);
+                assert!((stops[1].color.rgba[1] - 0.0).abs() < 1e-5);
+                assert!((stops[1].color.rgba[2] - 0.5).abs() < 1e-5);
+            }
+            _ => panic!("Expected fill to be LinearGradient"),
         }
     }
 }
