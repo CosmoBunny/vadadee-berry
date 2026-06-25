@@ -102,6 +102,10 @@ pub struct VadadeeBerryApp {
     pub anim_graph_editor_t: f32,
     pub anim_graph_editor_dragged_kf: Option<(String, usize)>,
     pub anim_graph_editor_dragged_handle: Option<(String, usize, bool)>, // (track_lbl, frame, is_left)
+    /// When dragging a keyframe, record (track_lbl, frame, drag_start_pos) to detect real movement
+    pub anim_graph_kf_drag_start: Option<(String, usize, egui::Pos2)>,
+    /// Segment selected between two keyframe indices for bezier-add workflow: (track_lbl, left_frame, right_frame)
+    pub anim_graph_selected_segment: Option<(String, usize, usize)>,
 
     pub project: ProjectFile,
     pub viewport: Viewport,
@@ -244,6 +248,8 @@ impl VadadeeBerryApp {
             anim_graph_editor_t: 0.0,
             anim_graph_editor_dragged_kf: None,
             anim_graph_editor_dragged_handle: None,
+            anim_graph_kf_drag_start: None,
+            anim_graph_selected_segment: None,
 
             project: Document::new_default_project(),
             viewport: Viewport::default(),
@@ -6944,6 +6950,8 @@ mod tests {
                 anim_graph_editor_t: 0.0,
                 anim_graph_editor_dragged_kf: None,
                 anim_graph_editor_dragged_handle: None,
+                anim_graph_kf_drag_start: None,
+                anim_graph_selected_segment: None,
 
                 project: Document::new_default_project(),
                 viewport: Viewport::default(),

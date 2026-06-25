@@ -72,6 +72,14 @@ pub enum BrushType {
     Calligraphy,
 }
 
+/// Which input device mode controls brush behaviour
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrushInputMode {
+    #[default]
+    Mouse,
+    Stylus,
+}
+
 #[derive(Debug, Clone)]
 pub struct BrushSession {
     pub brush_type: BrushType,
@@ -90,6 +98,28 @@ pub struct BrushSession {
     pub radial_cx: f32,
     pub radial_cy: f32,
     pub fill_edit_gradient_line: bool,
+
+    // --- Input mode ---
+    pub input_mode: BrushInputMode,
+
+    // Mouse mode settings
+    pub mouse_pressure_sensitivity: f32,  // 0..2
+    pub mouse_speed_sensitivity: f32,     // 0..2
+    pub mouse_rotate_by_direction: bool,
+
+    // Stylus mode settings
+    pub stylus_tilt_angle: f32,           // degrees 0..90
+    pub stylus_pen_angle: f32,            // degrees 0..360
+    pub stylus_pressure: f32,             // 0..1
+
+    // Pen type settings
+    pub pen_roundness: f32,               // 0..1  (1 = fully round, 0 = flat)
+    pub pen_press_on_paper: f32,          // 0..1  (how hard the pen presses)
+
+    // Calligraphy type settings
+    pub calli_rotate_tip: bool,
+    pub calli_fountain_size: f32,         // nib width multiplier 0.1..3.0
+    pub calli_dynamic: bool,
 }
 
 impl Default for BrushSession {
@@ -114,9 +144,22 @@ impl Default for BrushSession {
             radial_cx: 0.5,
             radial_cy: 0.5,
             fill_edit_gradient_line: false,
+            input_mode: BrushInputMode::Mouse,
+            mouse_pressure_sensitivity: 1.0,
+            mouse_speed_sensitivity: 1.0,
+            mouse_rotate_by_direction: false,
+            stylus_tilt_angle: 0.0,
+            stylus_pen_angle: 0.0,
+            stylus_pressure: 1.0,
+            pen_roundness: 1.0,
+            pen_press_on_paper: 0.5,
+            calli_rotate_tip: false,
+            calli_fountain_size: 1.0,
+            calli_dynamic: false,
         }
     }
 }
+
 
 #[derive(Debug, Clone, Default)]
 pub struct DragNewShape {

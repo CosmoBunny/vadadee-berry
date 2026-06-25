@@ -1890,6 +1890,7 @@ fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
 fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     if app.tools.active == ToolKind::Brush {
+        // ── Main Brush Settings ─────────────────────────────────────────
         theme::constraint_block(ui, |ui| {
             ui.label(
                 RichText::new(format!("{} Brush settings", icons::BRUSH))
@@ -1897,7 +1898,7 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     .strong(),
             );
             ui.add_space(4.0);
-            
+
             egui::ComboBox::from_label("Type")
                 .selected_text(match app.tools.brush.brush_type {
                     crate::tools::BrushType::Standard => "Standard",
@@ -1909,44 +1910,135 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ui.selectable_value(&mut app.tools.brush.brush_type, crate::tools::BrushType::Pen, "Pen");
                     ui.selectable_value(&mut app.tools.brush.brush_type, crate::tools::BrushType::Calligraphy, "Calligraphy");
                 });
-            
+
             ui.add_space(4.0);
             ui.add(egui::Slider::new(&mut app.tools.brush.size, 1.0..=100.0).text("Size"));
             ui.add(egui::Slider::new(&mut app.tools.brush.smoothness, 0.0..=1.0).text("Smoothness"));
             ui.add(egui::Slider::new(&mut app.tools.brush.heavy, 0.0..=1.0).text("Heavybrush"));
+        });
 
-            if app.tools.brush.brush_type == crate::tools::BrushType::Pen {
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(RichText::new("Pen Tip 3D Preview").strong());
-                ui.add_space(4.0);
-                
-                let is_drawing = !app.tools.brush.points.is_empty();
-                let active_width = if is_drawing {
-                    app.tools.brush.points.last().map(|&(_, _, w)| w).unwrap_or(app.tools.brush.size)
-                } else {
-                    app.tools.brush.size
-                };
-                draw_3d_pen_tip(ui, active_width, is_drawing);
-            }
+        ui.add_space(6.0);
 
-            if app.tools.brush.brush_type == crate::tools::BrushType::Calligraphy {
-                ui.add_space(8.0);
-                ui.separator();
+        // ── Input Mode Panel ────────────────────────────────────────────
+        theme::constraint_block(ui, |ui| {
+            ui.label(
+                RichText::new("🖱 Input Mode")
+                    .font(nerd_font_id(13.0))
+                    .strong(),
+            );
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                let is_mouse = app.tools.brush.input_mode == crate::tools::BrushInputMode::Mouse;
+                let is_stylus = app.tools.brush.input_mode == crate::tools::BrushInputMode::Stylus;
+                if ui.selectable_label(is_mouse, "🖱 Mouse").clicked() {
+                    app.tools.brush.input_mode = crate::tools::BrushInputMode::Mouse;
+                }
                 ui.add_space(4.0);
-                ui.label(RichText::new("Calligraphy Nib Preview").strong());
-                ui.add_space(4.0);
-                
-                let is_drawing = !app.tools.brush.points.is_empty();
-                let active_width = if is_drawing {
-                    app.tools.brush.points.last().map(|&(_, _, w)| w).unwrap_or(app.tools.brush.size)
-                } else {
-                    app.tools.brush.size
-                };
-                draw_3d_calligraphy_nib(ui, active_width, is_drawing);
+                if ui.selectable_label(is_stylus, "✏ Stylus").clicked() {
+                    app.tools.brush.input_mode = crate::tools::BrushInputMode::Stylus;
+                }
+            });
+
+            ui.add_space(6.0);
+
+            match app.tools.brush.input_mode {
+                crate::tools::BrushInputMode::Mouse => {
+                    ui.label(RichText::new("Mouse sensitivity").color(colors::TEXT_MUTED));
+                    ui.add_space(2.0);
+                    ui.add(egui::Slider::new(&mut app.tools.brush.mouse_pressure_sensitivity, 0.0..=2.0)
+                        .text("Pressure sensitivity"));
+                    ui.add(egui::Slider::new(&mut app.tools.brush.mouse_speed_sensitivity, 0.0..=2.0)
+                        .text("Speed sensitivity"));
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut app.tools.brush.mouse_rotate_by_direction, "Rotate tip by direction");
+                }
+                crate::tools::BrushInputMode::Stylus => {
+                    ui.label(RichText::new("Stylus options").color(colors::TEXT_MUTED));
+                    ui.add_space(2.0);
+                    ui.add(egui::Slider::new(&mut app.tools.brush.stylus_tilt_angle, 0.0..=90.0)
+                        .suffix("°").text("Tilt angle"));
+                    let pen_angle_changed = ui.add(
+                        egui::Slider::new(&mut app.tools.brush.stylus_pen_angle, 0.0..=360.0)
+                            .suffix("°").text("Pen angle"),
+                    ).changed();
+                    ui.add(egui::Slider::new(&mut app.tools.brush.stylus_pressure, 0.0..=1.0)
+                        .text("Pressure"));
+                    ui.add_space(6.0);
+                    // 3D pen-angle preview
+                    ui.label(RichText::new("Pen angle 3D preview").strong());
+                    ui.add_space(2.0);
+                    draw_stylus_3d_preview(ui,
+                        app.tools.brush.stylus_pen_angle,
+                        app.tools.brush.stylus_tilt_angle,
+                        app.tools.brush.stylus_pressure);
+                    let _ = pen_angle_changed; // used to trigger repaint in future
+                }
             }
         });
+
+        ui.add_space(6.0);
+
+        // ── Brush-type Configure Container ──────────────────────────────
+        match app.tools.brush.brush_type {
+            crate::tools::BrushType::Standard => {}  // No extra container for Standard
+
+            crate::tools::BrushType::Pen => {
+                theme::constraint_block(ui, |ui| {
+                    ui.label(
+                        RichText::new("🖊 Pen Configuration")
+                            .font(nerd_font_id(13.0))
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    ui.add(egui::Slider::new(&mut app.tools.brush.pen_roundness, 0.0..=1.0)
+                        .text("Tip roundness"));
+                    ui.add(egui::Slider::new(&mut app.tools.brush.pen_press_on_paper, 0.0..=1.0)
+                        .text("Press on paper"));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Pen Tip 3D Preview").strong());
+                    ui.add_space(2.0);
+                    let is_drawing = !app.tools.brush.points.is_empty();
+                    let active_width = if is_drawing {
+                        app.tools.brush.points.last().map(|&(_, _, w)| w).unwrap_or(app.tools.brush.size)
+                    } else {
+                        app.tools.brush.size
+                    };
+                    draw_3d_pen_tip(ui, active_width, is_drawing);
+                });
+                ui.add_space(6.0);
+            }
+
+            crate::tools::BrushType::Calligraphy => {
+                theme::constraint_block(ui, |ui| {
+                    ui.label(
+                        RichText::new("🖋 Calligraphy Configuration")
+                            .font(nerd_font_id(13.0))
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut app.tools.brush.calli_rotate_tip, "Rotate tip by stroke direction");
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Nib geometry").color(colors::TEXT_MUTED));
+                    ui.add(egui::Slider::new(&mut app.tools.brush.calli_fountain_size, 0.1..=3.0)
+                        .text("Fountain nib size"));
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut app.tools.brush.calli_dynamic, "Dynamic nib (speed-reactive)");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Calligraphy Nib Preview").strong());
+                    ui.add_space(2.0);
+                    let is_drawing = !app.tools.brush.points.is_empty();
+                    let active_width = if is_drawing {
+                        app.tools.brush.points.last().map(|&(_, _, w)| w).unwrap_or(app.tools.brush.size)
+                    } else {
+                        app.tools.brush.size
+                    };
+                    draw_3d_calligraphy_nib(ui, active_width, is_drawing);
+                });
+                ui.add_space(6.0);
+            }
+        }
+
         return;
     }
 
@@ -2746,7 +2838,114 @@ fn decimal_drag<'a, Num: egui::emath::Numeric>(value: &'a mut Num) -> egui::Drag
     })
 }
 
+/// Render a real-time 3D stylus preview that reacts to pen_angle, tilt_angle, and pressure.
+///
+/// Mathematical model:
+///   - The pen is a cylinder of fixed length, held at `tilt_angle` from the paper surface (0° = flat, 90° = vertical).
+///   - `pen_angle` rotates the pen around the vertical axis (azimuth), so the shadow/contact point orbits.
+///   - Projection: orthographic with a 30° elevation view angle.
+///   - The tip contact point is offset from center using:
+///       dx = cos(azimuth) * cos(tilt_rad) * shaft_len
+///       dy = sin(azimuth) * cos(tilt_rad) * shaft_len   (in paper-plane)
+///       height at base = sin(tilt_rad) * shaft_len       (perspective foreshortening)
+///   - `pressure` squashes the footprint ellipse and shifts the tip down.
+fn draw_stylus_3d_preview(ui: &mut egui::Ui, pen_angle_deg: f32, tilt_angle_deg: f32, pressure: f32) {
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 150.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    painter.rect(
+        rect,
+        egui::CornerRadius::same(6),
+        colors::BG_PANEL,
+        egui::Stroke::new(1.0, colors::BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let cx = rect.center().x;
+    let paper_y = rect.bottom() - 28.0;
+
+    // --- parameters
+    let azimuth = pen_angle_deg.to_radians();
+    let tilt_rad = tilt_angle_deg.to_radians(); // 0 = flat on paper, π/2 = vertical
+    let shaft_len: f32 = 70.0; // visual shaft length in pixels
+
+    // tip sits on paper; base of pen is above-and-behind it
+    let tip_x = cx;
+    let tip_y = paper_y - pressure * 4.0; // slight sinking with pressure
+
+    // 3D displacement of pen body: elevation view at 30°
+    let proj_y_scale: f32 = 0.5_f32.to_radians().cos(); // foreshorten y
+    let dx = azimuth.cos() * tilt_rad.cos() * shaft_len;
+    let dy = azimuth.sin() * tilt_rad.cos() * shaft_len * proj_y_scale;
+    let dz = tilt_rad.sin() * shaft_len; // screen-up component
+
+    let base_x = tip_x - dx;
+    let base_y = tip_y - dz + dy * 0.3; // slight backward offset
+
+    // --- paper grid lines (subtle perspective)
+    let paper_color = colors::BORDER.gamma_multiply(0.25);
+    for i in 0..5i32 {
+        let ox = (i - 2) as f32 * 28.0;
+        painter.line_segment(
+            [egui::pos2(cx + ox - 60.0, paper_y + 12.0), egui::pos2(cx + ox + 60.0, paper_y + 12.0)],
+            egui::Stroke::new(1.0, paper_color),
+        );
+    }
+    painter.line_segment(
+        [egui::pos2(cx - 80.0, paper_y + 2.0), egui::pos2(cx + 80.0, paper_y + 2.0)],
+        egui::Stroke::new(1.5, colors::BORDER.gamma_multiply(0.5)),
+    );
+
+    // --- shadow ellipse under tip (contact footprint)
+    let shadow_rx = 4.0 + pressure * 3.0;
+    let shadow_ry = (2.0 + pressure * 1.5) * (1.0 - tilt_rad.sin() * 0.5);
+    let shadow_col = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 60);
+    // Draw shadow as a flattened circle using multiple concentric arcs approximation
+    for r_frac in [1.0f32, 0.7, 0.4] {
+        painter.circle_filled(
+            egui::pos2(tip_x, paper_y + 4.0 + shadow_ry * (1.0 - r_frac)),
+            shadow_rx * r_frac,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, (shadow_col.a() as f32 * r_frac * 0.5) as u8),
+        );
+    }
+
+    // --- pen shaft (thick line with gradient approximation via two lines)
+    let pen_col = egui::Color32::from_rgb(70, 130, 200);
+    let pen_col_hi = egui::Color32::from_rgb(130, 185, 240);
+    painter.line_segment(
+        [egui::pos2(base_x - 1.0, base_y), egui::pos2(tip_x - 1.0, tip_y)],
+        egui::Stroke::new(5.0, pen_col),
+    );
+    painter.line_segment(
+        [egui::pos2(base_x + 1.0, base_y), egui::pos2(tip_x + 1.0, tip_y)],
+        egui::Stroke::new(2.0, pen_col_hi),
+    );
+    // pen tip cone
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(tip_x, tip_y),
+            egui::pos2(tip_x + 4.0, tip_y + 6.0),
+            egui::pos2(tip_x - 4.0, tip_y + 6.0),
+        ],
+        egui::Color32::from_rgb(200, 170, 90),
+        egui::Stroke::NONE,
+    ));
+    // pen cap (eraser end)
+    painter.circle_filled(egui::pos2(base_x, base_y), 5.0, egui::Color32::from_rgb(220, 60, 60));
+
+    // --- angle info label
+    let font = egui::FontId::new(9.0, egui::FontFamily::Proportional);
+    painter.text(
+        egui::pos2(rect.left() + 6.0, rect.top() + 6.0),
+        egui::Align2::LEFT_TOP,
+        format!("Angle: {:.0}° | Tilt: {:.0}° | Pressure: {:.2}", pen_angle_deg, tilt_angle_deg, pressure),
+        font,
+        colors::TEXT_MUTED,
+    );
+}
+
 fn draw_3d_pen_tip(ui: &mut egui::Ui, active_width: f32, is_drawing: bool) {
+
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 130.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
@@ -4089,18 +4288,80 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             (frame, value)
         };
         
-        // Draw graph curves
-        for (_lbl, color, track, default_val) in &tracks_to_draw {
-            let mut curve_pts = Vec::new();
-            for f in 0..=100 {
+        // Draw graph curves and detect segment clicks
+        let mut clicked_segment: Option<(String, usize, usize, egui::Pos2)> = None; // (track_lbl, left_frame, right_frame, click_pos)
+        for (lbl, color, track, default_val) in &tracks_to_draw {
+            let track_lbl_str = lbl.to_string();
+            let mut curve_pts: Vec<(usize, egui::Pos2)> = Vec::new(); // (frame, screen_pos)
+            for f in 0..=100usize {
                 let val = track.interpolate(f).unwrap_or(*default_val);
-                curve_pts.push(to_screen(f as f64, val));
+                curve_pts.push((f, to_screen(f as f64, val)));
             }
+
+            // Check if pointer is near a segment (but not near a keyframe node)
+            let near_any_kf = ui.input(|i| i.pointer.hover_pos()).map_or(false, |mpos| {
+                track.keyframes.iter().any(|kf| to_screen(kf.frame as f64, kf.value).distance(mpos) < 10.0)
+            });
+
+            if !near_any_kf {
+                if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
+                    for w in curve_pts.windows(2) {
+                        let (fa, pa) = w[0];
+                        let (fb, pb) = w[1];
+                        let seg_len = pa.distance(pb);
+                        if seg_len < 0.5 { continue; }
+                        // Project mpos onto segment
+                        let t = ((mpos - pa).dot(pb - pa)) / (seg_len * seg_len);
+                        let t = t.clamp(0.0, 1.0);
+                        let proj = pa + (pb - pa) * t;
+                        if mpos.distance(proj) < 6.0 {
+                            // Segment hovered — highlight it
+                            painter.line_segment([pa, pb], egui::Stroke::new(3.5, color.linear_multiply(1.6)));
+                            if ui.input(|i| i.pointer.any_pressed()) {
+                                // Find left/right actual keyframes bracketing this segment
+                                let lf = track.keyframes.iter().filter(|k| k.frame <= fa).map(|k| k.frame).last();
+                                let rf = track.keyframes.iter().filter(|k| k.frame >= fb).map(|k| k.frame).next();
+                                if let (Some(lf), Some(rf)) = (lf, rf) {
+                                    clicked_segment = Some((track_lbl_str.clone(), lf, rf, mpos));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Redraw curves normally (the extra stroke above will layer on top)
             for window in curve_pts.windows(2) {
-                painter.line_segment([window[0], window[1]], egui::Stroke::new(1.5, *color));
+                painter.line_segment([window[0].1, window[1].1], egui::Stroke::new(1.5, *color));
             }
         }
-        
+
+        // Handle segment click → select segment for bezier-add
+        if let Some((seg_lbl, lf, rf, _)) = clicked_segment {
+            app.anim_graph_selected_segment = Some((seg_lbl, lf, rf));
+            app.anim_selected_keyframe = None;
+        }
+
+        // Draw selected-segment highlight
+        if let Some((ref seg_lbl, lf, rf)) = app.anim_graph_selected_segment.clone() {
+            for (lbl, color, track, default_val) in &tracks_to_draw {
+                if lbl.to_string() == *seg_lbl {
+                    let left_val = track.interpolate(lf).unwrap_or(*default_val);
+                    let right_val = track.interpolate(rf).unwrap_or(*default_val);
+                    let ps = to_screen(lf as f64, left_val);
+                    let pe = to_screen(rf as f64, right_val);
+                    painter.line_segment([ps, pe], egui::Stroke::new(3.0, colors::ACCENT.gamma_multiply(0.7)));
+                    // Midpoint indicator
+                    let mid_frame = (lf + rf) / 2;
+                    let mid_val = track.interpolate(mid_frame).unwrap_or((left_val + right_val) * 0.5);
+                    let pm = to_screen(mid_frame as f64, mid_val);
+                    painter.circle_filled(pm, 5.0, colors::ACCENT);
+                    painter.circle(pm, 5.0, egui::Color32::TRANSPARENT, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                }
+            }
+        }
+
         // Draw keyframe nodes and Bezier handles
         let mut _clicked_any = false;
         let mut next_dragged_kf = app.anim_graph_editor_dragged_kf.clone();
@@ -4142,12 +4403,11 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                     let right_pt = to_screen(kf.frame as f64 + kf.handle_right.0, kf.value + kf.handle_right.1);
                     let next_center = to_screen(kf_next.frame as f64, kf_next.value);
                     
-                    // Draw white dotted lines connecting start endpoint to control point, and control point to end endpoint
                     let dotted_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.6));
                     draw_dotted_line(&painter, center, right_pt, dotted_stroke);
                     draw_dotted_line(&painter, right_pt, next_center, dotted_stroke);
                     
-                    let handle_color = egui::Color32::from_rgb(250, 200, 50); // yellow
+                    let handle_color = egui::Color32::from_rgb(250, 200, 50);
                     let is_h = mpos.map_or(false, |mp| mp.distance(right_pt) < 6.0);
                     let is_d = app.anim_graph_editor_dragged_handle.as_ref().map_or(false, |(t, f, is_l)| {
                         t == &track_lbl_str && *f == kf.frame && !*is_l
@@ -4175,9 +4435,29 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                 }
                 
                 if is_hovered && ui.input(|i| i.pointer.any_pressed()) {
-                    next_dragged_kf = Some((track_lbl_str.clone(), kf.frame));
+                    // Record drag-start position to avoid creating duplicates on pure clicks
+                    if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
+                        app.anim_graph_kf_drag_start = Some((track_lbl_str.clone(), kf.frame, mpos));
+                    }
                     app.anim_selected_keyframe = Some((node_id, track_lbl_str.clone(), kf.frame));
+                    app.anim_graph_selected_segment = None;
                     _clicked_any = true;
+                }
+            }
+        }
+
+        // Only commit a drag if pointer has moved >3px from where we first pressed
+        if let Some((ref drag_lbl, drag_frame, start_pos)) = app.anim_graph_kf_drag_start.clone() {
+            if ui.input(|i| i.pointer.any_down()) {
+                let moved = ui.input(|i| i.pointer.hover_pos())
+                    .map_or(false, |mpos| mpos.distance(start_pos) > 3.0);
+                if moved {
+                    next_dragged_kf = Some((drag_lbl.clone(), drag_frame));
+                }
+            } else {
+                app.anim_graph_kf_drag_start = None;
+                if next_dragged_kf.is_none() {
+                    // Was just a click, not a drag — don't touch positions
                 }
             }
         }
@@ -4266,6 +4546,69 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             egui::Stroke::new(1.0, colors::ACCENT.gamma_multiply(0.4)),
         );
     });
+
+    // Segment-selected: show "Add Bezier Point" action bar
+    if let Some((ref seg_lbl, lf, rf)) = app.anim_graph_selected_segment.clone() {
+        let mid_frame = (lf + rf) / 2;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("Segment [{} – {}] selected", lf, rf))
+                    .color(colors::TEXT_MUTED)
+                    .italics(),
+            );
+            ui.add_space(8.0);
+            let add_btn = ui.add(
+                egui::Button::new(
+                    RichText::new("＋ Add Bezier Point")
+                        .color(egui::Color32::from_rgb(80, 200, 120))
+                )
+                .fill(colors::BG_DEEP),
+            );
+            if add_btn.clicked() {
+                let before_timeline = app.project.anim_timeline.clone();
+                if let Some(anim_mut) = app.project.anim_timeline.nodes.get_mut(&node_id) {
+                    if let Some(track) = anim_mut.get_track_mut(&seg_lbl) {
+                        // Only insert if midframe doesn't already exist
+                        if !track.keyframes.iter().any(|k| k.frame == mid_frame) {
+                            // Interpolated value at midpoint
+                            let mid_val = track.interpolate(mid_frame).unwrap_or_else(|| {
+                                let lv = track.keyframes.iter().find(|k| k.frame == lf).map(|k| k.value).unwrap_or(0.0);
+                                let rv = track.keyframes.iter().find(|k| k.frame == rf).map(|k| k.value).unwrap_or(0.0);
+                                (lv + rv) * 0.5
+                            });
+                            // Insert midpoint keyframe
+                            track.keyframes.push(crate::app::Keyframe {
+                                frame: mid_frame,
+                                value: mid_val,
+                                interpolation: crate::app::InterpolationMode::Bezier,
+                                handle_left: (0.0, 0.0),
+                                handle_right: ((rf - mid_frame) as f64 * 0.5, 0.0),
+                                handle_mode: crate::document::BezierHandleMode::Both,
+                            });
+                            track.keyframes.sort_by_key(|k| k.frame);
+
+                            // Convert left neighbour to bezier
+                            if let Some(lk) = track.keyframes.iter_mut().find(|k| k.frame == lf) {
+                                lk.interpolation = crate::app::InterpolationMode::Bezier;
+                                lk.handle_right = ((mid_frame - lf) as f64 * 0.5, (mid_val - lk.value) * 0.5);
+                            }
+                        }
+                    }
+                }
+                let after_timeline = app.project.anim_timeline.clone();
+                app.history.push(
+                    &mut app.project,
+                    crate::history::ProjectEdit::PatchTimeline { before: before_timeline, after: after_timeline },
+                );
+                app.anim_graph_selected_segment = None;
+                app.apply_animation_for_frame(app.anim_current_frame);
+            }
+            ui.add_space(4.0);
+            if ui.button(RichText::new("✕ Deselect").color(colors::TEXT_MUTED)).clicked() {
+                app.anim_graph_selected_segment = None;
+            }
+        });
+    }
 }
 
 fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
