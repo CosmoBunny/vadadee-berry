@@ -1614,7 +1614,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         if ui.button("+ New Layer").clicked() {
             app.add_layer("Layer");
         }
-        if ui.button("+ Import Video Layer").clicked() {
+        if ui.button("+ Video Layer").clicked() {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm"])
                 .pick_file()
@@ -1714,6 +1714,39 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             }
         });
     });
+    // List any Video Layers first as "Video Objects"
+    let video_layers: Vec<(uuid::Uuid, String)> = app.project.document.layers
+        .iter()
+        .filter(|l| l.kind == crate::document::LayerKind::Video)
+        .map(|l| (l.id, l.name.clone()))
+        .collect();
+    for (layer_id, layer_name) in video_layers {
+        let selected = app.selection.contains(&layer_id);
+        let label = RichText::new(format!("🎥 {}", layer_name)).font(nerd_font_id(13.0));
+        ui.horizontal(|ui| {
+            if ui.selectable_label(selected, label).clicked() {
+                app.set_selection(vec![layer_id]);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let delete_btn = ui.add(
+                    egui::Button::new(
+                        RichText::new("✖")
+                            .color(egui::Color32::from_rgb(255, 23, 68))
+                            .strong()
+                            .size(11.0)
+                    )
+                    .frame(false)
+                );
+                if delete_btn.clicked() {
+                    if let Some(pos) = app.project.document.layers.iter().position(|l| l.id == layer_id) {
+                        app.delete_layer(pos);
+                    }
+                }
+                delete_btn.on_hover_text("Delete video layer");
+            });
+        });
+    }
+
     let object_ids: Vec<_> = app
         .project
         .document
@@ -1751,6 +1784,64 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 }
 
 fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+    if app.selection.len() == 1 {
+        let id = app.selection[0];
+        if let Some(pos) = app.project.document.layers.iter().position(|l| l.id == id) {
+            let layer = &mut app.project.document.layers[pos];
+            theme::constraint_block(ui, |ui| {
+                ui.label(RichText::new("🎥 Color Controls").strong().color(colors::ACCENT));
+                ui.add_space(4.0);
+                
+                ui.horizontal(|ui| {
+                    ui.label("Hue:");
+                    ui.add(egui::Slider::new(&mut layer.hue, -180.0..=180.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Saturation:");
+                    ui.add(egui::Slider::new(&mut layer.saturation, 0.0..=2.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Brightness:");
+                    ui.add(egui::Slider::new(&mut layer.brightness, 0.0..=2.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Contrast:");
+                    ui.add(egui::Slider::new(&mut layer.contrast, 0.0..=2.0));
+                });
+            });
+            ui.add_space(6.0);
+            theme::constraint_block(ui, |ui| {
+                ui.label(RichText::new("🎵 Audio Equalizer").strong().color(colors::ACCENT));
+                ui.add_space(4.0);
+                
+                ui.horizontal(|ui| {
+                    ui.label("Bass:");
+                    ui.add(egui::Slider::new(&mut layer.eq_bass, -10.0..=10.0).suffix(" dB"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Middle:");
+                    ui.add(egui::Slider::new(&mut layer.eq_mid, -10.0..=10.0).suffix(" dB"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Treble:");
+                    ui.add(egui::Slider::new(&mut layer.eq_treble, -10.0..=10.0).suffix(" dB"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Volume:");
+                    ui.add(egui::Slider::new(&mut layer.volume, 0.0..=1.0));
+                });
+            });
+            
+            // Name editing
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.text_edit_singleline(&mut layer.name);
+            });
+            return;
+        }
+    }
+
     if app.tools.active == ToolKind::Brush {
         theme::constraint_block(ui, |ui| {
             ui.label(RichText::new("Brush Fill").strong());
@@ -2418,6 +2509,57 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         return;
     }
     let id = point_edit_id.unwrap_or(app.selection[0]);
+
+    // Check if the selected ID is a Layer (specifically Video layer, or any layer)
+    let is_layer = app.project.document.layers.iter().any(|l| l.id == id);
+    if is_layer {
+        if let Some(pos) = app.project.document.layers.iter().position(|l| l.id == id) {
+            let layer = &mut app.project.document.layers[pos];
+            theme::constraint_block(ui, |ui| {
+                ui.label(RichText::new(format!("🎥 Video Layer: {}", layer.name)).strong().color(colors::ACCENT));
+                ui.add_space(4.0);
+                
+                // Position X and Y
+                ui.horizontal(|ui| {
+                    ui.label("Position X");
+                    ui.add(egui::DragValue::new(&mut layer.x).speed(1.0));
+                    ui.label("Y");
+                    ui.add(egui::DragValue::new(&mut layer.y).speed(1.0));
+                });
+                
+                // Rotation
+                ui.horizontal(|ui| {
+                    ui.label("Rotation (°)");
+                    ui.add(egui::DragValue::new(&mut layer.rotation).speed(1.0).range(-360.0..=360.0));
+                });
+                
+                // Scale (Width / Height)
+                ui.horizontal(|ui| {
+                    ui.label("Width");
+                    let prev_w = layer.width;
+                    if ui.add(egui::DragValue::new(&mut layer.width).speed(1.0).range(1.0..=8192.0)).changed() {
+                        if layer.aspect_ratio_locked && prev_w > 0.0 {
+                            let ratio = layer.height / prev_w;
+                            layer.height = layer.width * ratio;
+                        }
+                    }
+                    ui.label("Height");
+                    let prev_h = layer.height;
+                    if ui.add(egui::DragValue::new(&mut layer.height).speed(1.0).range(1.0..=8192.0)).changed() {
+                        if layer.aspect_ratio_locked && prev_h > 0.0 {
+                            let ratio = layer.width / prev_h;
+                            layer.width = layer.height * ratio;
+                        }
+                    }
+                });
+                
+                // Aspect ratio lock toggle
+                ui.checkbox(&mut layer.aspect_ratio_locked, "Keep Aspect Ratio (No Squeeze)");
+            });
+            return;
+        }
+    }
+
     let Some(node) = app.project.nodes.get(id).cloned() else {
         return;
     };

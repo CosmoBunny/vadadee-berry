@@ -1753,16 +1753,36 @@ impl VadadeeBerryApp {
         
         // Find audio source from the first active video layer
         let mut audio_source: Option<String> = None;
+        let mut eq_bass = 0.0;
+        let mut eq_mid = 0.0;
+        let mut eq_treble = 0.0;
+        let mut volume = 1.0;
         for layer in &self.project.document.layers {
             if layer.visible && layer.is_renderer && layer.kind == crate::document::LayerKind::Video && !layer.video_path.is_empty() {
                 audio_source = Some(layer.video_path.clone());
+                eq_bass = layer.eq_bass;
+                eq_mid = layer.eq_mid;
+                eq_treble = layer.eq_treble;
+                volume = layer.volume;
                 break;
             }
         }
         
         self.video_export.status_msg = "Encoding video…".into();
         if let (Some(dir), Some(out)) = (frames_dir, output) {
-            let ok = Self::encode_video_from_frames(&dir, &out, fps, bitrate, format, backend, audio_source.as_deref());
+            let ok = Self::encode_video_from_frames(
+                &dir,
+                &out,
+                fps,
+                bitrate,
+                format,
+                backend,
+                audio_source.as_deref(),
+                eq_bass,
+                eq_mid,
+                eq_treble,
+                volume,
+            );
             if ok {
                 self.video_export.status_msg = format!("Saved {}", out.display());
                 self.status_message = format!("Video saved: {}", out.display());
@@ -1786,6 +1806,10 @@ impl VadadeeBerryApp {
         format: VideoFormat,
         backend: VideoBackend,
         audio_source: Option<&str>,
+        eq_bass: f32,
+        eq_mid: f32,
+        eq_treble: f32,
+        volume: f32,
     ) -> bool {
         use std::process::Command;
         let pattern = frames_dir.join("frame_%05d.png");
@@ -1804,8 +1828,16 @@ impl VadadeeBerryApp {
             .arg(pattern.to_str().unwrap_or("frame_%05d.png"));
             
         if let Some(audio_src) = audio_source {
-            cmd.arg("-i").arg(audio_src)
-               .arg("-map").arg("0:v")
+            cmd.arg("-i").arg(audio_src);
+            
+            // Parametric equalizer and volume filter
+            let af = format!(
+                "equalizer=f=100:width_type=h:w=200:g={:.1},equalizer=f=1000:width_type=h:w=1000:g={:.1},equalizer=f=8000:width_type=h:w=3000:g={:.1},volume={:.2}",
+                eq_bass, eq_mid, eq_treble, volume
+            );
+            cmd.arg("-af").arg(af);
+            
+            cmd.arg("-map").arg("0:v")
                .arg("-map").arg("1:a")
                .arg("-c:a").arg("aac")
                .arg("-shortest");
@@ -1853,7 +1885,12 @@ impl VadadeeBerryApp {
         let backend = self.video_export.backend;
         for layer in &self.project.document.layers {
             if layer.visible && layer.is_renderer && layer.kind == crate::document::LayerKind::Video && !layer.video_path.is_empty() {
-                if let Some(bytes) = extract_video_frame(&layer.video_path, f, fps, backend) {
+                if let Some(mut bytes) = extract_video_frame(&layer.video_path, f, fps, backend) {
+                    if layer.hue != 0.0 || layer.saturation != 1.0 || layer.brightness != 1.0 || layer.contrast != 1.0 {
+                        if let Some(adj) = adjust_frame_color(&bytes, layer.hue, layer.saturation, layer.brightness, layer.contrast) {
+                            bytes = adj;
+                        }
+                    }
                     video_frames.insert(layer.id, bytes);
                 }
             }
@@ -2219,7 +2256,47 @@ impl VadadeeBerryApp {
         self.selection = new_sel;
     }
 
+    pub fn delete_layer(&mut self, index: usize) {
+        if self.project.document.layers.len() <= 1 {
+            return;
+        }
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        after.layers.remove(index);
+        if after.active_layer_index >= after.layers.len() {
+            after.active_layer_index = after.layers.len() - 1;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+        self.selection.clear();
+    }
+
+    pub fn nudge_layer_order(&mut self, index: usize, delta: isize) {
+        let len = self.project.document.layers.len();
+        let target = (index as isize + delta).clamp(0, len as isize - 1) as usize;
+        if target == index {
+            return;
+        }
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let layer = after.layers.remove(index);
+        after.layers.insert(target, layer);
+        after.active_layer_index = target;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+    }
+
     pub fn nudge_z_order(&mut self, delta: isize) {
+        for id in self.selection.clone() {
+            if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == id) {
+                self.nudge_layer_order(pos, delta);
+                return;
+            }
+        }
         let idx = self.project.document.active_layer_index;
         let before = self
             .project
@@ -2944,11 +3021,25 @@ impl VadadeeBerryApp {
             }
         }
         
+        let mut hue = 0.0;
+        let mut saturation = 1.0;
+        let mut brightness = 1.0;
+        let mut contrast = 1.0;
+        if let Some(l) = self.project.document.layers.iter().find(|l| l.id == layer_id) {
+            hue = l.hue;
+            saturation = l.saturation;
+            brightness = l.brightness;
+            contrast = l.contrast;
+        }
+
         let fps = self.anim_fps as f32;
         let backend = self.video_export.backend;
         if let Some(bytes) = extract_video_frame(video_path, frame, fps, backend) {
             if let Ok(dyn_img) = image::load_from_memory(&bytes) {
-                let rgba = dyn_img.to_rgba8();
+                let mut rgba = dyn_img.to_rgba8();
+                if hue != 0.0 || saturation != 1.0 || brightness != 1.0 || contrast != 1.0 {
+                    apply_color_controls(&mut rgba, hue, saturation, brightness, contrast);
+                }
                 let (w, h) = rgba.dimensions();
                 let pixels = rgba.into_raw();
                 let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
@@ -3174,8 +3265,9 @@ impl VadadeeBerryApp {
                         if let Some(cache) = &self.video_frame_cache {
                             if cache.layer_id == layer.id && cache.frame == self.anim_current_frame {
                                 let mut opacity = 1.0;
-                                let mut dx = 0.0;
-                                let mut dy = 0.0;
+                                let mut dx = layer.x as f64;
+                                let mut dy = layer.y as f64;
+                                let mut rot = layer.rotation as f64;
                                 if let Some(track) = self.project.anim_timeline.nodes.get(&layer.id) {
                                     if let Some(o) = track.opacity.interpolate(self.anim_current_frame) {
                                         opacity = o as f32;
@@ -3186,20 +3278,66 @@ impl VadadeeBerryApp {
                                     if let Some(y) = track.pos_y.interpolate(self.anim_current_frame) {
                                         dy = y;
                                     }
+                                    if let Some(r) = track.rotation.interpolate(self.anim_current_frame) {
+                                        rot = r;
+                                    }
+                                }
+                                
+                                let tex_w = cache.texture.size()[0] as f32;
+                                let tex_h = cache.texture.size()[1] as f32;
+                                let aspect = if tex_h > 0.0 { tex_w / tex_h } else { 1.0 };
+                                
+                                let mut w = layer.width;
+                                let mut h = layer.height;
+                                if layer.aspect_ratio_locked {
+                                    if w / h > aspect {
+                                        w = h * aspect;
+                                    } else {
+                                        h = w / aspect;
+                                    }
                                 }
                                 
                                 let tl = self.viewport.doc_to_screen((dx, dy), origin);
                                 let br = self.viewport.doc_to_screen(
-                                    (dx + self.project.document.width, dy + self.project.document.height),
+                                    (dx + w as f64, dy + h as f64),
                                     origin
                                 );
                                 let rect = egui::Rect::from_min_max(tl, br);
-                                painter.image(
+                                let rot_rad = (rot as f32).to_radians();
+                                
+                                paint_rotated_image(
+                                    &painter,
                                     cache.texture.id(),
                                     rect,
-                                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-                                    egui::Color32::WHITE.gamma_multiply(opacity),
+                                    rot_rad,
+                                    opacity,
                                 );
+                                
+                                // Selection highlight outline
+                                if self.selection.contains(&layer.id) {
+                                    let mut points = [
+                                        rect.left_top(),
+                                        rect.right_top(),
+                                        rect.right_bottom(),
+                                        rect.left_bottom(),
+                                    ];
+                                    if rot_rad != 0.0 {
+                                        let center = rect.center();
+                                        let cos = rot_rad.cos();
+                                        let sin = rot_rad.sin();
+                                        for pt in &mut points {
+                                            let d = *pt - center;
+                                            let rx = d.x * cos - d.y * sin;
+                                            let ry = d.x * sin + d.y * cos;
+                                            *pt = center + egui::vec2(rx, ry);
+                                        }
+                                    }
+                                    let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 215));
+                                    painter.line_segment([points[0], points[1]], stroke);
+                                    painter.line_segment([points[1], points[2]], stroke);
+                                    painter.line_segment([points[2], points[3]], stroke);
+                                    painter.line_segment([points[3], points[0]], stroke);
+                                }
                             }
                         }
                     }
@@ -4734,7 +4872,20 @@ impl VadadeeBerryApp {
     }
 
     pub fn delete_nodes(&mut self, ids: &[NodeId]) {
-        if ids.is_empty() || !self.layer_editable() {
+        if ids.is_empty() {
+            return;
+        }
+        let mut layer_deleted = false;
+        for id in ids {
+            if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == *id) {
+                self.delete_layer(pos);
+                layer_deleted = true;
+            }
+        }
+        if layer_deleted {
+            return;
+        }
+        if !self.layer_editable() {
             return;
         }
         let layer_index = self.project.document.active_layer_index;
@@ -7607,4 +7758,113 @@ fn extract_video_frame(video_path: &str, frame_idx: usize, fps: f32, backend: Vi
     }
     None
 }
+
+fn apply_color_controls(img: &mut image::RgbaImage, hue: f32, sat: f32, bright: f32, contrast: f32) {
+    for pixel in img.pixels_mut() {
+        let [r, g, b, _a] = pixel.0;
+        
+        let mut rf = r as f32 / 255.0;
+        let mut gf = g as f32 / 255.0;
+        let mut bf = b as f32 / 255.0;
+        
+        // 1. Contrast
+        if contrast != 1.0 {
+            rf = (rf - 0.5) * contrast + 0.5;
+            gf = (gf - 0.5) * contrast + 0.5;
+            bf = (bf - 0.5) * contrast + 0.5;
+        }
+        
+        // 2. Brightness
+        if bright != 1.0 {
+            rf *= bright;
+            gf *= bright;
+            bf *= bright;
+        }
+        
+        // 3. Saturation (luminance-based grayscale interpolation)
+        if sat != 1.0 {
+            let lum = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
+            rf = lum + (rf - lum) * sat;
+            gf = lum + (gf - lum) * sat;
+            bf = lum + (bf - lum) * sat;
+        }
+        
+        pixel.0[0] = (rf * 255.0).clamp(0.0, 255.0) as u8;
+        pixel.0[1] = (gf * 255.0).clamp(0.0, 255.0) as u8;
+        pixel.0[2] = (bf * 255.0).clamp(0.0, 255.0) as u8;
+    }
+    
+    // 4. Hue rotation
+    if hue != 0.0 {
+        let mut dyn_img = image::DynamicImage::ImageRgba8(img.clone());
+        dyn_img = dyn_img.huerotate(hue as i32);
+        *img = dyn_img.to_rgba8();
+    }
+}
+
+fn adjust_frame_color(bytes: &[u8], hue: f32, sat: f32, bright: f32, contrast: f32) -> Option<Vec<u8>> {
+    if let Ok(mut dyn_img) = image::load_from_memory(bytes) {
+        let mut rgba = dyn_img.to_rgba8();
+        apply_color_controls(&mut rgba, hue, sat, bright, contrast);
+        let mut out_bytes = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut out_bytes);
+        if image::write_buffer_with_format(
+            &mut cursor,
+            &rgba,
+            rgba.width(),
+            rgba.height(),
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        ).is_ok() {
+            return Some(out_bytes);
+        }
+    }
+    None
+}
+
+fn paint_rotated_image(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    rect: egui::Rect,
+    rotation_rad: f32,
+    opacity: f32,
+) {
+    let mut mesh = egui::Mesh::with_texture(texture_id);
+    let color = egui::Color32::WHITE.gamma_multiply(opacity);
+    
+    // 4 corners of the rect
+    let mut points = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    
+    // Rotated around center
+    if rotation_rad != 0.0 {
+        let center = rect.center();
+        let cos = rotation_rad.cos();
+        let sin = rotation_rad.sin();
+        for pt in &mut points {
+            let d = *pt - center;
+            let rx = d.x * cos - d.y * sin;
+            let ry = d.x * sin + d.y * cos;
+            *pt = center + egui::vec2(rx, ry);
+        }
+    }
+    
+    // Add 4 vertices
+    mesh.vertices.push(egui::epaint::Vertex { pos: points[0], uv: egui::pos2(0.0, 0.0), color });
+    mesh.vertices.push(egui::epaint::Vertex { pos: points[1], uv: egui::pos2(1.0, 0.0), color });
+    mesh.vertices.push(egui::epaint::Vertex { pos: points[2], uv: egui::pos2(1.0, 1.0), color });
+    mesh.vertices.push(egui::epaint::Vertex { pos: points[3], uv: egui::pos2(0.0, 1.0), color });
+    
+    // Add 2 triangles
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    
+    painter.add(mesh);
+}
+
+
 

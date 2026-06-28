@@ -430,25 +430,61 @@ pub fn resize_bounds(
     let mut x1 = anchor.x1;
     let mut y1 = anchor.y1;
     let (px, py) = doc;
+    
+    let orig_w = anchor.width();
+    let orig_h = anchor.height();
+    
     match handle {
         ResizeHandle::Nw => {
-            x0 = px;
-            y0 = py;
+            if orig_w > 0.0 && orig_h > 0.0 {
+                let w = x1 - px;
+                let h = y1 - py;
+                let scale = ((w / orig_w) + (h / orig_h)) / 2.0;
+                x0 = x1 - orig_w * scale;
+                y0 = y1 - orig_h * scale;
+            } else {
+                x0 = px;
+                y0 = py;
+            }
         }
         ResizeHandle::N => y0 = py,
         ResizeHandle::Ne => {
-            x1 = px;
-            y0 = py;
+            if orig_w > 0.0 && orig_h > 0.0 {
+                let w = px - x0;
+                let h = y1 - py;
+                let scale = ((w / orig_w) + (h / orig_h)) / 2.0;
+                x1 = x0 + orig_w * scale;
+                y0 = y1 - orig_h * scale;
+            } else {
+                x1 = px;
+                y0 = py;
+            }
         }
         ResizeHandle::E => x1 = px,
         ResizeHandle::Se => {
-            x1 = px;
-            y1 = py;
+            if orig_w > 0.0 && orig_h > 0.0 {
+                let w = px - x0;
+                let h = py - y0;
+                let scale = ((w / orig_w) + (h / orig_h)) / 2.0;
+                x1 = x0 + orig_w * scale;
+                y1 = y0 + orig_h * scale;
+            } else {
+                x1 = px;
+                y1 = py;
+            }
         }
         ResizeHandle::S => y1 = py,
         ResizeHandle::Sw => {
-            x0 = px;
-            y1 = py;
+            if orig_w > 0.0 && orig_h > 0.0 {
+                let w = x1 - px;
+                let h = py - y0;
+                let scale = ((w / orig_w) + (h / orig_h)) / 2.0;
+                x0 = x1 - orig_w * scale;
+                y1 = y0 + orig_h * scale;
+            } else {
+                x0 = px;
+                y1 = py;
+            }
         }
         ResizeHandle::W => x0 = px,
     }

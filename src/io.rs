@@ -92,17 +92,13 @@ pub fn import_svg(path: &Path) -> Result<ProjectFile, IoError> {
         layer_nodes.push(id);
     }
 
-    document.layers.push(crate::document::Layer {
-        id: uuid::Uuid::new_v4(),
-        name: "Imported".into(),
-        visible: true,
-        locked: false,
-        nodes: layer_nodes,
-        kind: crate::document::LayerKind::Image,
-        video_path: String::new(),
-        volume: 1.0,
-        is_renderer: true,
-    });
+    document.layers.push(crate::document::Layer::new_image(
+        uuid::Uuid::new_v4(),
+        "Imported".into(),
+        true,
+        false,
+        layer_nodes,
+    ));
 
     Ok(ProjectFile::new(document, nodes))
 }
@@ -193,8 +189,9 @@ pub fn document_svg_string(
             crate::document::LayerKind::Video => {
                 if let Some(bytes) = video_frames.get(&layer.id) {
                     let mut opacity = 1.0;
-                    let mut dx = 0.0;
-                    let mut dy = 0.0;
+                    let mut dx = layer.x as f64;
+                    let mut dy = layer.y as f64;
+                    let mut rot = layer.rotation as f64;
                     if let Some(track) = project.anim_timeline.nodes.get(&layer.id) {
                         if let Some(o) = track.opacity.interpolate(current_frame) {
                             opacity = o;
@@ -205,10 +202,40 @@ pub fn document_svg_string(
                         if let Some(y) = track.pos_y.interpolate(current_frame) {
                             dy = y;
                         }
+                        if let Some(r) = track.rotation.interpolate(current_frame) {
+                            rot = r;
+                        }
                     }
+                    
+                    let mut aspect = 1.0;
+                    if let Ok(dyn_img) = image::load_from_memory(bytes) {
+                        if dyn_img.height() > 0 {
+                            aspect = dyn_img.width() as f32 / dyn_img.height() as f32;
+                        }
+                    }
+                    
+                    let mut w = layer.width;
+                    let mut h = layer.height;
+                    if layer.aspect_ratio_locked {
+                        if w / h > aspect {
+                            w = h * aspect;
+                        } else {
+                            h = w / aspect;
+                        }
+                    }
+                    
+                    let cx = dx + w as f64 / 2.0;
+                    let cy = dy + h as f64 / 2.0;
+                    
+                    let transform_attr = if rot != 0.0 {
+                        format!(" transform=\"rotate({}, {}, {})\"", rot, cx, cy)
+                    } else {
+                        String::new()
+                    };
+                    
                     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
                     svg.push_str(&format!(
-                        r#"<image href="data:image/png;base64,{b64}" x="{dx}" y="{dy}" width="{w}" height="{h}" opacity="{opacity}"/>"#,
+                        r#"<image href="data:image/png;base64,{b64}" x="{dx}" y="{dy}" width="{w}" height="{h}" opacity="{opacity}"{transform_attr}/>"#,
                     ));
                 }
             }

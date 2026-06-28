@@ -72,6 +72,109 @@ pub struct Layer {
     pub volume: f32,
     #[serde(default = "default_is_renderer")]
     pub is_renderer: bool,
+    
+    #[serde(default = "default_zero")]
+    pub x: f32,
+    #[serde(default = "default_zero")]
+    pub y: f32,
+    #[serde(default = "default_zero")]
+    pub rotation: f32,
+    #[serde(default = "default_width")]
+    pub width: f32,
+    #[serde(default = "default_height")]
+    pub height: f32,
+    #[serde(default = "default_true")]
+    pub aspect_ratio_locked: bool,
+    #[serde(default = "default_zero")]
+    pub hue: f32,
+    #[serde(default = "default_one")]
+    pub saturation: f32,
+    #[serde(default = "default_one")]
+    pub brightness: f32,
+    #[serde(default = "default_one")]
+    pub contrast: f32,
+    #[serde(default = "default_zero")]
+    pub eq_bass: f32,
+    #[serde(default = "default_zero")]
+    pub eq_mid: f32,
+    #[serde(default = "default_zero")]
+    pub eq_treble: f32,
+}
+
+fn default_zero() -> f32 {
+    0.0
+}
+
+fn default_one() -> f32 {
+    1.0
+}
+
+fn default_width() -> f32 {
+    A4_WIDTH_PX as f32
+}
+
+fn default_height() -> f32 {
+    A4_HEIGHT_PX as f32
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Layer {
+    pub fn new_image(id: Uuid, name: String, visible: bool, locked: bool, nodes: Vec<NodeId>) -> Self {
+        Self {
+            id,
+            name,
+            visible,
+            locked,
+            nodes,
+            kind: LayerKind::Image,
+            video_path: String::new(),
+            volume: 1.0,
+            is_renderer: true,
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            width: A4_WIDTH_PX as f32,
+            height: A4_HEIGHT_PX as f32,
+            aspect_ratio_locked: true,
+            hue: 0.0,
+            saturation: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            eq_bass: 0.0,
+            eq_mid: 0.0,
+            eq_treble: 0.0,
+        }
+    }
+
+    pub fn new_video(id: Uuid, name: String, video_path: String) -> Self {
+        Self {
+            id,
+            name,
+            visible: true,
+            locked: false,
+            nodes: vec![],
+            kind: LayerKind::Video,
+            video_path,
+            volume: 1.0,
+            is_renderer: true,
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            width: A4_WIDTH_PX as f32,
+            height: A4_HEIGHT_PX as f32,
+            aspect_ratio_locked: true,
+            hue: 0.0,
+            saturation: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            eq_bass: 0.0,
+            eq_mid: 0.0,
+            eq_treble: 0.0,
+        }
+    }
 }
 
 fn default_volume() -> f32 {
@@ -95,17 +198,7 @@ impl Document {
             width: A4_WIDTH_PX,
             height: A4_HEIGHT_PX,
             active_layer_index: 0,
-            layers: vec![Layer {
-                id: layer_id,
-                name: "Layer 1".into(),
-                visible: true,
-                locked: false,
-                nodes: vec![],
-                kind: LayerKind::Image,
-                video_path: String::new(),
-                volume: 1.0,
-                is_renderer: true,
-            }],
+            layers: vec![Layer::new_image(layer_id, "Layer 1".into(), true, false, vec![])],
             defs: IndexMap::new(),
             path_effects: IndexMap::new(),
             tiling_effects: IndexMap::new(),
@@ -162,33 +255,13 @@ impl Document {
     }
 
     pub fn add_layer(&mut self, name: impl Into<String>) -> usize {
-        let layer = Layer {
-            id: Uuid::new_v4(),
-            name: name.into(),
-            visible: true,
-            locked: false,
-            nodes: vec![],
-            kind: LayerKind::Image,
-            video_path: String::new(),
-            volume: 1.0,
-            is_renderer: true,
-        };
+        let layer = Layer::new_image(Uuid::new_v4(), name.into(), true, false, vec![]);
         self.layers.push(layer);
         self.layers.len() - 1
     }
 
     pub fn add_video_layer(&mut self, name: impl Into<String>, video_path: String) -> usize {
-        let layer = Layer {
-            id: Uuid::new_v4(),
-            name: name.into(),
-            visible: true,
-            locked: false,
-            nodes: vec![],
-            kind: LayerKind::Video,
-            video_path,
-            volume: 1.0,
-            is_renderer: true,
-        };
+        let layer = Layer::new_video(Uuid::new_v4(), name.into(), video_path);
         self.layers.push(layer);
         self.layers.len() - 1
     }
