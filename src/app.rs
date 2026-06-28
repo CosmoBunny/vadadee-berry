@@ -106,6 +106,8 @@ pub struct VadadeeBerryApp {
     pub anim_graph_kf_drag_start: Option<(String, usize, egui::Pos2)>,
     /// Segment selected between two keyframe indices for bezier-add workflow: (track_lbl, left_frame, right_frame)
     pub anim_graph_selected_segment: Option<(String, usize, usize)>,
+    pub anim_fps: u32,
+    pub video_frame_cache: Option<VideoFrameCache>,
 
     pub project: ProjectFile,
     pub viewport: Viewport,
@@ -214,6 +216,8 @@ pub struct VadadeeBerryApp {
     text_pan_anim: Option<TextPanAnim>,
     pub last_android_text: String,
     pub path_overlay_rect: Option<egui::Rect>,
+    /// Video render-to-file settings and live progress.
+    pub video_export: VideoExportState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -222,6 +226,104 @@ struct TextPanAnim {
     to: egui::Vec2,
     elapsed: f32,
     duration: f32,
+}
+
+#[derive(Clone)]
+pub struct VideoFrameCache {
+    pub layer_id: uuid::Uuid,
+    pub frame: usize,
+    pub texture: egui::TextureHandle,
+}
+
+
+/// Which backend to use for video encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoBackend {
+    #[default]
+    Ffmpeg,
+    Gstreamer,
+}
+
+impl VideoBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ffmpeg => "FFmpeg",
+            Self::Gstreamer => "GStreamer",
+        }
+    }
+}
+
+/// Container format for video export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoFormat {
+    #[default]
+    Mp4,
+    Mkv,
+    Webm,
+    Mov,
+}
+
+impl VideoFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mp4  => "MP4 (H.264)",
+            Self::Mkv  => "MKV (H.264)",
+            Self::Webm => "WebM (VP9)",
+            Self::Mov  => "MOV (ProRes)",
+        }
+    }
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Mp4  => "mp4",
+            Self::Mkv  => "mkv",
+            Self::Webm => "webm",
+            Self::Mov  => "mov",
+        }
+    }
+}
+
+/// All render-to-video settings plus live progress state.
+#[derive(Debug, Clone)]
+pub struct VideoExportState {
+    pub backend: VideoBackend,
+    pub fps: u32,
+    pub resolution_pct: u32,  // 25, 50, 75, 100, 150, 200
+    pub bitrate_kbps: u32,
+    pub format: VideoFormat,
+    /// 0.0 – 1.0 while rendering, None when idle.
+    pub progress: Option<f32>,
+    /// True while the progress dialog is shown, false when hidden.
+    pub progress_visible: bool,
+    /// True when a render is actually running.
+    pub rendering: bool,
+    /// Latest status message from the encoder.
+    pub status_msg: String,
+    pub frame_done: usize,
+    pub total_frames: usize,
+    pub restore_anim_frame: usize,
+    pub frames_dir: Option<std::path::PathBuf>,
+    pub output_path: Option<std::path::PathBuf>,
+}
+
+impl Default for VideoExportState {
+    fn default() -> Self {
+        Self {
+            backend: VideoBackend::Ffmpeg,
+            fps: 30,
+            resolution_pct: 100,
+            bitrate_kbps: 8000,
+            format: VideoFormat::Mp4,
+            progress: None,
+            progress_visible: false,
+            rendering: false,
+            status_msg: String::new(),
+            frame_done: 0,
+            total_frames: 0,
+            restore_anim_frame: 0,
+            frames_dir: None,
+            output_path: None,
+        }
+    }
 }
 
 impl VadadeeBerryApp {
@@ -250,6 +352,8 @@ impl VadadeeBerryApp {
             anim_graph_editor_dragged_handle: None,
             anim_graph_kf_drag_start: None,
             anim_graph_selected_segment: None,
+            anim_fps: 30,
+            video_frame_cache: None,
 
             project: Document::new_default_project(),
             viewport: Viewport::default(),
@@ -382,6 +486,7 @@ impl VadadeeBerryApp {
             text_pan_anim: None,
             last_android_text: String::new(),
             path_overlay_rect: None,
+            video_export: VideoExportState::default(),
         }
     }
 
@@ -1343,6 +1448,18 @@ impl VadadeeBerryApp {
         );
     }
 
+    pub fn add_video_layer(&mut self, name: &str, video_path: String) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let idx = after.add_video_layer(name, video_path);
+        after.active_layer_index = idx;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+    }
+
+
     pub fn set_active_layer(&mut self, index: usize) {
         if index >= self.project.document.layers.len() {
             return;
@@ -1575,6 +1692,204 @@ impl VadadeeBerryApp {
         {
             self.status_message = "Clipboard image copy not supported on Android".into();
         }
+    }
+
+    pub fn request_video_export(&mut self) {
+        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+        {
+            let ext = self.video_export.format.extension();
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name(format!("animation.{ext}"))
+                .add_filter("Video", &[ext])
+                .save_file()
+            {
+                self.begin_video_export(path);
+            }
+        }
+        #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+        {
+            self.status_message = "Video export is only available on desktop".into();
+        }
+    }
+
+    pub fn begin_video_export(&mut self, output: std::path::PathBuf) {
+        let max_frame = self.get_max_animation_frame().max(100);
+        let temp =
+            std::env::temp_dir().join(format!("vadadee_video_{}", uuid::Uuid::new_v4().as_simple()));
+        let _ = std::fs::create_dir_all(&temp);
+        self.video_export.restore_anim_frame = self.anim_current_frame;
+        self.video_export.frame_done = 0;
+        self.video_export.total_frames = max_frame + 1;
+        self.video_export.frames_dir = Some(temp);
+        self.video_export.output_path = Some(output);
+        self.video_export.rendering = true;
+        self.video_export.progress = Some(0.0);
+        self.video_export.progress_visible = true;
+        self.video_export.status_msg = format!(
+            "Rendering {} frames @ {}% resolution…",
+            self.video_export.total_frames, self.video_export.resolution_pct
+        );
+        self.status_message = "Video export started".into();
+    }
+
+    pub fn cancel_video_export(&mut self) {
+        self.video_export.rendering = false;
+        self.video_export.progress = None;
+        if let Some(dir) = self.video_export.frames_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        self.apply_animation_for_frame(self.video_export.restore_anim_frame);
+        self.video_export.status_msg = "Cancelled.".into();
+        self.status_message = "Video export cancelled".into();
+    }
+
+    fn finish_video_export(&mut self) {
+        let frames_dir = self.video_export.frames_dir.take();
+        let output = self.video_export.output_path.take();
+        let fps = self.video_export.fps;
+        let bitrate = self.video_export.bitrate_kbps;
+        let format = self.video_export.format;
+        let backend = self.video_export.backend;
+        
+        // Find audio source from the first active video layer
+        let mut audio_source: Option<String> = None;
+        for layer in &self.project.document.layers {
+            if layer.visible && layer.is_renderer && layer.kind == crate::document::LayerKind::Video && !layer.video_path.is_empty() {
+                audio_source = Some(layer.video_path.clone());
+                break;
+            }
+        }
+        
+        self.video_export.status_msg = "Encoding video…".into();
+        if let (Some(dir), Some(out)) = (frames_dir, output) {
+            let ok = Self::encode_video_from_frames(&dir, &out, fps, bitrate, format, backend, audio_source.as_deref());
+            if ok {
+                self.video_export.status_msg = format!("Saved {}", out.display());
+                self.status_message = format!("Video saved: {}", out.display());
+            } else {
+                self.video_export.status_msg =
+                    "Encoding failed — install ffmpeg (or gstreamer) and try again.".into();
+                self.status_message = self.video_export.status_msg.clone();
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        self.video_export.rendering = false;
+        self.video_export.progress = Some(1.0);
+        self.apply_animation_for_frame(self.video_export.restore_anim_frame);
+    }
+
+    fn encode_video_from_frames(
+        frames_dir: &std::path::Path,
+        output: &std::path::Path,
+        fps: u32,
+        bitrate_kbps: u32,
+        format: VideoFormat,
+        backend: VideoBackend,
+        audio_source: Option<&str>,
+    ) -> bool {
+        use std::process::Command;
+        let pattern = frames_dir.join("frame_%05d.png");
+        let fps_s = fps.to_string();
+        let bitrate = format!("{bitrate_kbps}k");
+        let vcodec = match format {
+            VideoFormat::Webm => "libvpx-vp9",
+            VideoFormat::Mov => "prores_ks",
+            _ => "libx264",
+        };
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-y")
+            .arg("-framerate")
+            .arg(&fps_s)
+            .arg("-i")
+            .arg(pattern.to_str().unwrap_or("frame_%05d.png"));
+            
+        if let Some(audio_src) = audio_source {
+            cmd.arg("-i").arg(audio_src)
+               .arg("-map").arg("0:v")
+               .arg("-map").arg("1:a")
+               .arg("-c:a").arg("aac")
+               .arg("-shortest");
+        }
+        
+        cmd.arg("-c:v")
+            .arg(vcodec)
+            .arg("-b:v")
+            .arg(&bitrate);
+        if format == VideoFormat::Mov {
+            cmd.arg("-profile:v").arg("3");
+        }
+        cmd.arg(output);
+        let ffmpeg = cmd.output();
+        if backend == VideoBackend::Gstreamer {
+            if let Ok(out) = Command::new("gst-launch-1.0").arg("--version").output() {
+                if out.status.success() {
+                    log::info!("GStreamer selected; using ffmpeg pipeline for encode");
+                }
+            }
+        }
+        match ffmpeg {
+            Ok(o) if o.status.success() => true,
+            _ => false,
+        }
+    }
+
+    pub fn tick_video_export(&mut self, ctx: &Context) {
+        if !self.video_export.rendering {
+            return;
+        }
+        let Some(frames_dir) = self.video_export.frames_dir.clone() else {
+            return;
+        };
+        let f = self.video_export.frame_done;
+        if f >= self.video_export.total_frames {
+            self.finish_video_export();
+            return;
+        }
+        self.apply_animation_for_frame(f);
+        
+        // Extract PNG frame bytes for all video layers at frame `f`
+        let mut video_frames = std::collections::HashMap::new();
+        let fps = self.anim_fps as f32;
+        let backend = self.video_export.backend;
+        for layer in &self.project.document.layers {
+            if layer.visible && layer.is_renderer && layer.kind == crate::document::LayerKind::Video && !layer.video_path.is_empty() {
+                if let Some(bytes) = extract_video_frame(&layer.video_path, f, fps, backend) {
+                    video_frames.insert(layer.id, bytes);
+                }
+            }
+        }
+        
+        let scale = (self.video_export.resolution_pct as f32 / 100.0).max(0.1);
+        let svg = io::document_svg_string(&self.project, f, &video_frames);
+        let Some((w, h, rgba)) = io::render_svg_to_rgba(&svg, scale) else {
+            self.video_export.status_msg = "Frame rasterize failed".into();
+            self.cancel_video_export();
+            return;
+        };
+        let path = frames_dir.join(format!("frame_{f:05}.png"));
+        if let Err(e) = Self::save_rgba_png(&path, w, h, &rgba) {
+            self.video_export.status_msg = format!("Write frame failed: {e}");
+            self.cancel_video_export();
+            return;
+        }
+        self.video_export.frame_done = f + 1;
+        self.video_export.progress = Some(
+            self.video_export.frame_done as f32 / self.video_export.total_frames.max(1) as f32,
+        );
+        self.video_export.status_msg = format!(
+            "Frame {}/{} ({} fps target)",
+            self.video_export.frame_done,
+            self.video_export.total_frames,
+            self.video_export.fps
+        );
+        ctx.request_repaint();
+    }
+
+    fn save_rgba_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
+        use image::{ImageBuffer, RgbaImage};
+        let img: RgbaImage = ImageBuffer::from_raw(w, h, rgba.to_vec())
+            .ok_or_else(|| "invalid RGBA buffer".to_string())?;
+        img.save(path).map_err(|e| e.to_string())
     }
 
     pub fn copy_selection(&mut self) {
@@ -1935,7 +2250,31 @@ impl VadadeeBerryApp {
         }
     }
 
+    /// Flip all selected nodes horizontally (if `horizontal`) or vertically.
+    pub fn flip_selection(&mut self, horizontal: bool) {
+        for &id in &self.selection.clone() {
+            let Some(before) = self.project.nodes.get(id).cloned() else {
+                continue;
+            };
+            let mut after = before.clone();
+            if horizontal {
+                after.flip_h();
+            } else {
+                after.flip_v();
+            }
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchNode {
+                    id,
+                    before,
+                    after,
+                },
+            );
+        }
+    }
+
     fn layer_editable(&self) -> bool {
+
         self.project
             .document
             .active_layer()
@@ -2597,6 +2936,37 @@ impl VadadeeBerryApp {
         }
     }
 
+    /// Load (or reload) texture for a video layer at the current frame.
+    fn ensure_video_layer_texture(&mut self, layer_id: uuid::Uuid, video_path: &str, frame: usize, ctx: &Context) {
+        if let Some(cache) = &self.video_frame_cache {
+            if cache.layer_id == layer_id && cache.frame == frame {
+                return;
+            }
+        }
+        
+        let fps = self.anim_fps as f32;
+        let backend = self.video_export.backend;
+        if let Some(bytes) = extract_video_frame(video_path, frame, fps, backend) {
+            if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                let rgba = dyn_img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let pixels = rgba.into_raw();
+                let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+                let handle = ctx.load_texture(
+                    format!("vadadee-berry-vid-layer-{}", layer_id.as_simple()),
+                    color_image,
+                    egui::TextureOptions::default(),
+                );
+                self.video_frame_cache = Some(VideoFrameCache {
+                    layer_id,
+                    frame,
+                    texture: handle,
+                });
+            }
+        }
+    }
+
+
     pub fn insert_image(&mut self, x: f64, y: f64, width: f64, height: f64, bytes: Vec<u8>) {
         let node = self.styled_shape_node(Node::image(x, y, width, height, bytes));
         self.insert_node(node);
@@ -2712,7 +3082,7 @@ impl VadadeeBerryApp {
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, theme::colors::CANVAS_BG);
             render::draw_grid(&painter, &self.viewport, origin, page);
-            render::draw_page_shadow(&painter, page);
+            render::draw_page_shadow(&painter, page, self.project.document.page_color_egui());
 
             let order = self.project.document.ordered_node_ids();
             let ctx = ui.ctx().clone();
@@ -2748,6 +3118,16 @@ impl VadadeeBerryApp {
                 }
             }
 
+            // Ensure textures for any Video layers at the current frame
+            let video_layers_to_ensure: Vec<(uuid::Uuid, String)> = self.project.document.layers
+                .iter()
+                .filter(|l| l.visible && l.kind == crate::document::LayerKind::Video && !l.video_path.is_empty())
+                .map(|l| (l.id, l.video_path.clone()))
+                .collect();
+            for (layer_id, video_path) in video_layers_to_ensure {
+                self.ensure_video_layer_texture(layer_id, &video_path, self.anim_current_frame, &ctx);
+            }
+
             let hidden_sources =
                 hidden_effect_sources(&self.project.document.path_effects);
             let mut hidden_sources = hidden_sources;
@@ -2761,18 +3141,70 @@ impl VadadeeBerryApp {
                 .filter(|e| e.mode == OnPathMode::Loft)
                 .map(|e| e.path_id)
                 .collect();
-            render::draw_nodes(
-                &painter,
-                &self.project.nodes,
-                &draw_order,
-                &self.viewport,
-                origin,
-                &self.selection,
-                &hidden_sources,
-                &loft_paths,
-                &self.fonts,
-                &self.image_textures,
-            );
+
+            // Draw layer by layer
+            for layer in &self.project.document.layers {
+                if !layer.visible {
+                    continue;
+                }
+                match layer.kind {
+                    crate::document::LayerKind::Image => {
+                        let layer_draw_order: Vec<NodeId> = draw_order
+                            .iter()
+                            .copied()
+                            .filter(|id| layer.nodes.contains(id))
+                            .collect();
+                        
+                        render::draw_nodes(
+                            &painter,
+                            &self.project.nodes,
+                            &layer_draw_order,
+                            &self.viewport,
+                            origin,
+                            self.project.document.width as f32,
+                            self.project.document.height as f32,
+                            &self.selection,
+                            &hidden_sources,
+                            &loft_paths,
+                            &self.fonts,
+                            &self.image_textures,
+                        );
+                    }
+                    crate::document::LayerKind::Video => {
+                        if let Some(cache) = &self.video_frame_cache {
+                            if cache.layer_id == layer.id && cache.frame == self.anim_current_frame {
+                                let mut opacity = 1.0;
+                                let mut dx = 0.0;
+                                let mut dy = 0.0;
+                                if let Some(track) = self.project.anim_timeline.nodes.get(&layer.id) {
+                                    if let Some(o) = track.opacity.interpolate(self.anim_current_frame) {
+                                        opacity = o as f32;
+                                    }
+                                    if let Some(x) = track.pos_x.interpolate(self.anim_current_frame) {
+                                        dx = x;
+                                    }
+                                    if let Some(y) = track.pos_y.interpolate(self.anim_current_frame) {
+                                        dy = y;
+                                    }
+                                }
+                                
+                                let tl = self.viewport.doc_to_screen((dx, dy), origin);
+                                let br = self.viewport.doc_to_screen(
+                                    (dx + self.project.document.width, dy + self.project.document.height),
+                                    origin
+                                );
+                                let rect = egui::Rect::from_min_max(tl, br);
+                                painter.image(
+                                    cache.texture.id(),
+                                    rect,
+                                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                                    egui::Color32::WHITE.gamma_multiply(opacity),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
 
             // Draw large selection outline for Tiling/Circular sources using effective bounds
             for &id in &self.selection {
@@ -6481,10 +6913,10 @@ impl eframe::App for VadadeeBerryApp {
         if self.anim_is_playing {
             let dt = ctx.input(|i| i.stable_dt);
             self.anim_time_accumulator += dt;
-            const FRAME_TIME: f32 = 1.0 / 30.0;
-            if self.anim_time_accumulator >= FRAME_TIME {
-                let steps = (self.anim_time_accumulator / FRAME_TIME) as usize;
-                self.anim_time_accumulator -= steps as f32 * FRAME_TIME;
+            let frame_time = 1.0 / (self.anim_fps as f32).max(1.0);
+            if self.anim_time_accumulator >= frame_time {
+                let steps = (self.anim_time_accumulator / frame_time) as usize;
+                self.anim_time_accumulator -= steps as f32 * frame_time;
                 let max_frame = self.get_max_animation_frame();
                 self.anim_current_frame = (self.anim_current_frame + steps) % (max_frame + 1);
                 frame_changed = true;
@@ -6510,7 +6942,7 @@ impl eframe::App for VadadeeBerryApp {
                     });
                 }
             }
-        } else if self.anim_keyframing_mode && !self.anim_is_playing {
+        } else if self.anim_keyframing_mode && !self.anim_is_playing && self.tools.select.drag_mode.is_some() {
             // Ensure reference state is populated
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
@@ -6744,6 +7176,7 @@ impl eframe::App for VadadeeBerryApp {
             ctx.request_repaint();
         }
         self.update_text_pan_animation(ctx);
+        self.tick_video_export(ctx);
         self.keyboard_shortcuts(ctx);
         self.canvas_wheel_zoom(ctx);
     }
@@ -6952,6 +7385,8 @@ mod tests {
                 anim_graph_editor_dragged_handle: None,
                 anim_graph_kf_drag_start: None,
                 anim_graph_selected_segment: None,
+                anim_fps: 30,
+                video_frame_cache: None,
 
                 project: Document::new_default_project(),
                 viewport: Viewport::default(),
@@ -7060,6 +7495,7 @@ mod tests {
                 text_pan_anim: None,
                 last_android_text: String::new(),
                 path_overlay_rect: None,
+            video_export: VideoExportState::default(),
             }
         }
     }
@@ -7121,3 +7557,54 @@ mod tests {
         }
     }
 }
+
+fn extract_video_frame(video_path: &str, frame_idx: usize, fps: f32, backend: VideoBackend) -> Option<Vec<u8>> {
+    use std::process::Command;
+    let time_sec = frame_idx as f32 / fps;
+    
+    // Attempt FFmpeg frame extraction first (seeking to time_sec is extremely fast and accurate)
+    let output = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-ss")
+        .arg(format!("{:.3}", time_sec))
+        .arg("-i")
+        .arg(video_path)
+        .arg("-vframes")
+        .arg("1")
+        .arg("-f")
+        .arg("image2pipe")
+        .arg("-vcodec")
+        .arg("png")
+        .arg("-")
+        .output();
+        
+    if let Ok(out) = output {
+        if out.status.success() && !out.stdout.is_empty() {
+            return Some(out.stdout);
+        }
+    }
+    
+    // Fallback to GStreamer if ffmpeg failed or not found:
+    let temp_png = std::env::temp_dir().join("vadadee_gst_temp.png");
+    let gst_out = Command::new("gst-launch-1.0")
+        .arg("filesrc")
+        .arg(format!("location={}", video_path))
+        .arg("!")
+        .arg("decodebin")
+        .arg("!")
+        .arg("videoconvert")
+        .arg("!")
+        .arg("pngenc")
+        .arg("!")
+        .arg("filesink")
+        .arg(format!("location={}", temp_png.to_string_lossy()))
+        .output();
+    if gst_out.is_ok() {
+        if let Ok(bytes) = std::fs::read(&temp_png) {
+            let _ = std::fs::remove_file(&temp_png);
+            return Some(bytes);
+        }
+    }
+    None
+}
+

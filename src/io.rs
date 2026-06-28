@@ -67,6 +67,7 @@ pub fn import_svg(path: &Path) -> Result<ProjectFile, IoError> {
         path_effects: Default::default(),
         tiling_effects: Default::default(),
         circular_effects: Default::default(),
+        page_color: [1.0, 1.0, 1.0, 1.0],
     };
     let mut nodes = NodeStore::default();
     let mut layer_nodes = Vec::new();
@@ -97,6 +98,10 @@ pub fn import_svg(path: &Path) -> Result<ProjectFile, IoError> {
         visible: true,
         locked: false,
         nodes: layer_nodes,
+        kind: crate::document::LayerKind::Image,
+        video_path: String::new(),
+        volume: 1.0,
+        is_renderer: true,
     });
 
     Ok(ProjectFile::new(document, nodes))
@@ -155,22 +160,83 @@ fn path_from_usvg(path: &usvg::Path) -> Option<Node> {
 }
 
 pub fn export_svg(path: &Path, project: &ProjectFile) -> Result<(), IoError> {
+    fs::write(path, document_svg_string(project, 0, &std::collections::HashMap::new())).map_err(|e| IoError::Msg(e.to_string()))
+}
+
+/// Full document SVG (for raster export / video frames).
+pub fn document_svg_string(
+    project: &ProjectFile,
+    current_frame: usize,
+    video_frames: &std::collections::HashMap<uuid::Uuid, Vec<u8>>,
+) -> String {
+    use base64::Engine;
     let w = project.document.width;
     let h = project.document.height;
+    let bg_color = project.document.page_color_svg();
     let mut svg = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
+<rect width="{w}" height="{h}" {bg_color}/>
 "#
     );
-    for id in project.document.ordered_node_ids() {
-        let Some(node) = project.nodes.get(id) else { continue };
-        svg.push_str(&node_to_svg_fragment(node));
+    for layer in &project.document.layers {
+        if !layer.visible || !layer.is_renderer {
+            continue;
+        }
+        match layer.kind {
+            crate::document::LayerKind::Image => {
+                for id in &layer.nodes {
+                    let Some(node) = project.nodes.get(*id) else { continue };
+                    svg.push_str(&node_to_svg_fragment(node, &project.nodes));
+                }
+            }
+            crate::document::LayerKind::Video => {
+                if let Some(bytes) = video_frames.get(&layer.id) {
+                    let mut opacity = 1.0;
+                    let mut dx = 0.0;
+                    let mut dy = 0.0;
+                    if let Some(track) = project.anim_timeline.nodes.get(&layer.id) {
+                        if let Some(o) = track.opacity.interpolate(current_frame) {
+                            opacity = o;
+                        }
+                        if let Some(x) = track.pos_x.interpolate(current_frame) {
+                            dx = x;
+                        }
+                        if let Some(y) = track.pos_y.interpolate(current_frame) {
+                            dy = y;
+                        }
+                    }
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    svg.push_str(&format!(
+                        r#"<image href="data:image/png;base64,{b64}" x="{dx}" y="{dy}" width="{w}" height="{h}" opacity="{opacity}"/>"#,
+                    ));
+                }
+            }
+        }
     }
     svg.push_str("</svg>\n");
-    fs::write(path, svg).map_err(|e| IoError::Msg(e.to_string()))
+    svg
 }
 
-fn node_to_svg_fragment(node: &Node) -> String {
+/// Rasterize a single node into a tight SVG view box (transparent background).
+pub fn node_svg_for_bounds(node: &Node, bounds: kurbo::Rect, nodes: &crate::document::NodeStore) -> String {
+    let w = bounds.width().max(1.0);
+    let h = bounds.height().max(1.0);
+    let x0 = bounds.x0;
+    let y0 = bounds.y0;
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
+<g transform="translate({},{})">{}</g>
+</svg>
+"#,
+        -x0,
+        -y0,
+        node_to_svg_fragment(node, nodes)
+    )
+}
+
+pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> String {
     let fill_grad_id = format!("fill-{}", node.id.as_simple());
     let stroke_grad_id = format!("stroke-{}", node.id.as_simple());
     let (fill, fill_defs) = fill_svg(&node.style.fill, &fill_grad_id);
@@ -181,6 +247,7 @@ fn node_to_svg_fragment(node: &Node) -> String {
     };
     let defs = format!("{fill_defs}{stroke_defs}");
     let op = node.style.opacity;
+    let blend = node.style.blend_mode.svg_value();
     let body = match &node.kind {
         NodeKind::Rect { x, y, w, h, rx } => format!(
             r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" {fill} {stroke} opacity="{op}"/>"#,
@@ -222,13 +289,24 @@ fn node_to_svg_fragment(node: &Node) -> String {
                 style.font_size
             )
         }
-        NodeKind::Group { .. } => String::new(),
-        NodeKind::Image { .. } => String::new(),
+        NodeKind::Group { children } => {
+            let mut inner = String::new();
+            for cid in children {
+                if let Some(child) = nodes.get(*cid) {
+                    inner.push_str(&node_to_svg_fragment(child, nodes));
+                }
+            }
+            format!(r#"<g>{inner}</g>"#)
+        }
+        NodeKind::Image { x, y, width, height, bytes } => {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            format!(
+                r#"<image x="{x}" y="{y}" width="{width}" height="{height}" href="data:image/png;base64,{b64}" opacity="{op}"/>"#
+            )
+        }
         NodeKind::Arc { cx, cy, radius, start_angle_rad, sweep_angle_rad, join } => {
-            // Approximate via the same bez builder and path d if available, else empty for export.
             let bez = crate::document::build_arc_bez(*cx, *cy, *radius, *start_angle_rad, *sweep_angle_rad, *join);
-            // If there's a path_to_svg_d helper visible, but to keep simple output a path using to_path approx or skip detailed.
-            // For now emit a crude path using the kurbo elements (very basic d).
             let d = bez.to_svg();
             format!(r#"<path d="{d}" {fill} {stroke} opacity="{op}"/>"#)
         }
@@ -243,8 +321,9 @@ fn node_to_svg_fragment(node: &Node) -> String {
             svg
         }
     };
-    format!("{defs}{body}")
+    format!(r#"<g style="mix-blend-mode:{blend}">{defs}{body}</g>"#)
 }
+
 
 fn stops_svg(stops: &[crate::document::GradientStop]) -> String {
     stops
@@ -423,7 +502,7 @@ pub fn export_selected_svg_string(project: &ProjectFile, selection: &[NodeId], b
     );
     for id in selection {
         let Some(node) = project.nodes.get(*id) else { continue };
-        svg.push_str(&node_to_svg_fragment(node));
+        svg.push_str(&node_to_svg_fragment(node, &project.nodes));
     }
     svg.push_str("</g>\n</svg>\n");
     svg

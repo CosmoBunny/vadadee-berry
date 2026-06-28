@@ -1,6 +1,7 @@
 #![warn(clippy::all, rust_2018_idioms)]
 
 pub mod animation;
+pub mod blend;
 pub mod app;
 pub mod canvas;
 pub mod document;

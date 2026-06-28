@@ -67,10 +67,10 @@ pub fn draw_grid(painter: &Painter, viewport: &Viewport, _origin: Pos2, page: Re
     }
 }
 
-pub fn draw_page_shadow(painter: &Painter, page: Rect) {
+pub fn draw_page_shadow(painter: &Painter, page: Rect, page_color: Color32) {
     let shadow = page.expand(6.0);
     painter.rect_filled(shadow, 4.0, Color32::from_black_alpha(80));
-    painter.rect_filled(page, 0.0, Color32::WHITE);
+    painter.rect_filled(page, 0.0, page_color);
     painter.rect_stroke(page, 0.0, Stroke::new(1.0, Color32::from_gray(120)), egui::StrokeKind::Inside);
 }
 
@@ -1835,12 +1835,31 @@ pub fn draw_nodes(
     order: &[NodeId],
     viewport: &Viewport,
     origin: Pos2,
+    page_w: f32,
+    page_h: f32,
     selection: &[NodeId],
     hidden: &HashSet<NodeId>,
     loft_paths: &HashSet<NodeId>,
     fonts: &crate::fonts::FontRegistry,
     image_textures: &std::collections::HashMap<NodeId, egui::TextureHandle>,
 ) {
+    if crate::blend::document_needs_blend_composite(nodes, order, hidden) {
+        draw_nodes_with_blend(
+            painter,
+            nodes,
+            order,
+            viewport,
+            origin,
+            page_w,
+            page_h,
+            selection,
+            hidden,
+            loft_paths,
+            fonts,
+            image_textures,
+        );
+        return;
+    }
     for id in order {
         if hidden.contains(id) {
             continue;
@@ -1879,6 +1898,106 @@ pub fn draw_nodes(
         let sel = selection.contains(id);
         draw_node(painter, &node, viewport, origin, sel, fonts, image_textures);
     }
+}
+
+fn draw_nodes_with_blend(
+    painter: &Painter,
+    nodes: &NodeStore,
+    order: &[NodeId],
+    viewport: &Viewport,
+    origin: Pos2,
+    page_w: f32,
+    page_h: f32,
+    selection: &[NodeId],
+    hidden: &HashSet<NodeId>,
+    loft_paths: &HashSet<NodeId>,
+    fonts: &crate::fonts::FontRegistry,
+    image_textures: &std::collections::HashMap<NodeId, egui::TextureHandle>,
+) {
+    let doc_w = page_w as f64;
+    let doc_h = page_h as f64;
+    let tl = viewport.doc_to_screen((0.0, 0.0), origin);
+    let br = viewport.doc_to_screen((doc_w, doc_h), origin);
+    let page_rect = Rect::from_min_max(tl, br);
+    let pw = page_rect.width().ceil().max(1.0) as u32;
+    let ph = page_rect.height().ceil().max(1.0) as u32;
+    let mut layer = vec![255u8; (pw * ph * 4) as usize];
+    let scale = viewport.zoom;
+
+    let mut draw_one = |node: &Node, sel: bool| {
+        if matches!(node.kind, NodeKind::Group { .. }) {
+            return;
+        }
+        let b = node.bounds();
+        if b.width() < 0.5 || b.height() < 0.5 {
+            return;
+        }
+        let svg = crate::io::node_svg_for_bounds(node, b, nodes);
+        let Some((nw, nh, rgba)) = crate::io::render_svg_to_rgba(&svg, scale) else {
+            draw_node(painter, node, viewport, origin, sel, fonts, image_textures);
+            return;
+        };
+        let node_tl = viewport.doc_to_screen((b.x0, b.y0), origin);
+        let ox = (node_tl.x - page_rect.left()).round() as i32;
+        let oy = (node_tl.y - page_rect.top()).round() as i32;
+        crate::blend::composite_stamp(
+            &mut layer,
+            pw,
+            ph,
+            &rgba,
+            nw,
+            nh,
+            ox,
+            oy,
+            node.style.blend_mode,
+            node.style.opacity,
+        );
+    };
+
+    for id in order {
+        if hidden.contains(id) {
+            continue;
+        }
+        let Some(raw_node) = nodes.get(*id) else {
+            continue;
+        };
+        let node = if loft_paths.contains(id) {
+            let mut n = raw_node.clone();
+            if matches!(n.kind, NodeKind::Path { .. }) {
+                if !selection.contains(id) {
+                    n.style.stroke.width = 0.0;
+                }
+                n.style.fill = Fill::None;
+            }
+            n
+        } else {
+            raw_node.clone()
+        };
+        if let NodeKind::Group { children } = &node.kind {
+            let sel = selection.contains(id);
+            for cid in children {
+                if let Some(child) = nodes.get(*cid) {
+                    draw_one(child, sel);
+                }
+            }
+            continue;
+        }
+        let sel = selection.contains(id);
+        draw_one(&node, sel);
+    }
+
+    let image = egui::ColorImage::from_rgba_premultiplied([pw as usize, ph as usize], &layer);
+    let tex = painter.ctx().load_texture(
+        "blend_page_composite",
+        image,
+        egui::TextureOptions::LINEAR,
+    );
+    painter.image(
+        tex.id(),
+        page_rect,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
 
 pub fn draw_tiling_effects(

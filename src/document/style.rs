@@ -421,11 +421,93 @@ impl Default for Stroke {
     }
 }
 
+/// CSS / SVG mix-blend-mode equivalents
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+    Addition,
+    Subtract,
+}
+
+impl BlendMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal      => "Normal",
+            Self::Multiply    => "Multiply",
+            Self::Screen      => "Screen",
+            Self::Overlay     => "Overlay",
+            Self::Darken      => "Darken",
+            Self::Lighten     => "Lighten",
+            Self::ColorDodge  => "Color Dodge",
+            Self::ColorBurn   => "Color Burn",
+            Self::HardLight   => "Hard Light",
+            Self::SoftLight   => "Soft Light",
+            Self::Difference  => "Difference",
+            Self::Exclusion   => "Exclusion",
+            Self::Hue         => "Hue",
+            Self::Saturation  => "Saturation",
+            Self::Color       => "Color",
+            Self::Luminosity  => "Luminosity",
+            Self::Addition    => "Addition",
+            Self::Subtract    => "Subtract",
+        }
+    }
+
+    pub fn all() -> &'static [BlendMode] {
+        use BlendMode::*;
+        &[Normal, Multiply, Screen, Overlay, Darken, Lighten,
+          ColorDodge, ColorBurn, HardLight, SoftLight, Difference,
+          Exclusion, Hue, Saturation, Color, Luminosity, Addition, Subtract]
+    }
+
+    /// Returns the SVG/CSS string (used when exporting)
+    pub fn svg_value(self) -> &'static str {
+        match self {
+            Self::Normal      => "normal",
+            Self::Multiply    => "multiply",
+            Self::Screen      => "screen",
+            Self::Overlay     => "overlay",
+            Self::Darken      => "darken",
+            Self::Lighten     => "lighten",
+            Self::ColorDodge  => "color-dodge",
+            Self::ColorBurn   => "color-burn",
+            Self::HardLight   => "hard-light",
+            Self::SoftLight   => "soft-light",
+            Self::Difference  => "difference",
+            Self::Exclusion   => "exclusion",
+            Self::Hue         => "hue",
+            Self::Saturation  => "saturation",
+            Self::Color       => "color",
+            Self::Luminosity  => "luminosity",
+            Self::Addition    => "plus-lighter",
+            Self::Subtract    => "plus-darker",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeStyle {
     pub fill: Fill,
     pub stroke: Stroke,
     pub opacity: f32,
+    #[serde(default)]
+    pub blend_mode: BlendMode,
 }
 
 impl Default for NodeStyle {
@@ -434,6 +516,7 @@ impl Default for NodeStyle {
             fill: Fill::default(),
             stroke: Stroke::default(),
             opacity: 1.0,
+            blend_mode: BlendMode::Normal,
         }
     }
 }

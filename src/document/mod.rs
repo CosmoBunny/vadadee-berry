@@ -36,6 +36,24 @@ pub struct Document {
     /// CircularClone effects (separate from ObjectOnPath), keyed by effect id.
     #[serde(default)]
     pub circular_effects: IndexMap<Uuid, CircularCloneEffect>,
+    #[serde(default = "default_page_color")]
+    pub page_color: [f32; 4],
+}
+
+fn default_page_color() -> [f32; 4] {
+    [1.0, 1.0, 1.0, 1.0]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LayerKind {
+    Image,
+    Video,
+}
+
+impl Default for LayerKind {
+    fn default() -> Self {
+        Self::Image
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +63,25 @@ pub struct Layer {
     pub visible: bool,
     pub locked: bool,
     pub nodes: Vec<NodeId>,
+    
+    #[serde(default)]
+    pub kind: LayerKind,
+    #[serde(default)]
+    pub video_path: String,
+    #[serde(default = "default_volume")]
+    pub volume: f32,
+    #[serde(default = "default_is_renderer")]
+    pub is_renderer: bool,
 }
+
+fn default_volume() -> f32 {
+    1.0
+}
+
+fn default_is_renderer() -> bool {
+    true
+}
+
 
 impl Document {
     pub fn new_default_project() -> ProjectFile {
@@ -65,14 +101,37 @@ impl Document {
                 visible: true,
                 locked: false,
                 nodes: vec![],
+                kind: LayerKind::Image,
+                video_path: String::new(),
+                volume: 1.0,
+                is_renderer: true,
             }],
             defs: IndexMap::new(),
             path_effects: IndexMap::new(),
             tiling_effects: IndexMap::new(),
             circular_effects: IndexMap::new(),
+            page_color: default_page_color(),
         };
         ProjectFile::new(document, NodeStore::default())
     }
+
+    pub fn page_color_egui(&self) -> egui::Color32 {
+        egui::Color32::from_rgba_unmultiplied(
+            (self.page_color[0] * 255.0) as u8,
+            (self.page_color[1] * 255.0) as u8,
+            (self.page_color[2] * 255.0) as u8,
+            (self.page_color[3] * 255.0) as u8,
+        )
+    }
+
+    pub fn page_color_svg(&self) -> String {
+        let r = (self.page_color[0] * 255.0) as u8;
+        let g = (self.page_color[1] * 255.0) as u8;
+        let b = (self.page_color[2] * 255.0) as u8;
+        let a = self.page_color[3];
+        format!(r#"fill="rgb({},{},{})" fill-opacity="{:.2}""#, r, g, b, a)
+    }
+
 
     pub fn active_layer_mut(&mut self) -> Option<&mut Layer> {
         self.layers.get_mut(self.active_layer_index)
@@ -109,10 +168,31 @@ impl Document {
             visible: true,
             locked: false,
             nodes: vec![],
+            kind: LayerKind::Image,
+            video_path: String::new(),
+            volume: 1.0,
+            is_renderer: true,
         };
         self.layers.push(layer);
         self.layers.len() - 1
     }
+
+    pub fn add_video_layer(&mut self, name: impl Into<String>, video_path: String) -> usize {
+        let layer = Layer {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            visible: true,
+            locked: false,
+            nodes: vec![],
+            kind: LayerKind::Video,
+            video_path,
+            volume: 1.0,
+            is_renderer: true,
+        };
+        self.layers.push(layer);
+        self.layers.len() - 1
+    }
+
 
     pub fn move_node_in_active_layer(&mut self, id: NodeId, delta: isize) -> bool {
         let Some(layer) = self.layers.get_mut(self.active_layer_index) else {

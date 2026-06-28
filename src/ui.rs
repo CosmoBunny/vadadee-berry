@@ -110,6 +110,7 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     app.ui_anim.advance_action_bar_slide(ui.ctx());
     app.ui_anim.advance_timeline_slide(ui.ctx());
     app.ui_anim.tick(ui.ctx());
+    video_export_progress_window(app, ui.ctx());
     status_bar(app, ui);
 
     let canvas_alpha = app.ui_anim.canvas_alpha();
@@ -227,6 +228,17 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         app.nudge_z_order(-1);
                         ui.close();
                     }
+                    ui.separator();
+                    ui.menu_button("Flip", |ui| {
+                        if ui.button("⟺  Flip Horizontal").clicked() {
+                            app.flip_selection(true);
+                            ui.close();
+                        }
+                        if ui.button("⟻  Flip Vertical").clicked() {
+                            app.flip_selection(false);
+                            ui.close();
+                        }
+                    });
                 });
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut app.viewport.show_grid, "Show grid");
@@ -1288,6 +1300,163 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     if ui.button("Import Image…").clicked() {
         app.request_import_image();
     }
+
+    ui.add_space(8.0);
+    ui.separator();
+
+    // ── Render to Video ──────────────────────────────────────────────
+    theme::constraint_block(ui, |ui| {
+        ui.label(
+            RichText::new("🎬 Render to Video")
+                .font(nerd_font_id(13.0))
+                .strong(),
+        );
+        ui.add_space(4.0);
+
+        // Animated objects note
+        ui.label(
+            RichText::new("Objects with keyframes will be animated.")
+                .color(colors::TEXT_MUTED)
+                .italics(),
+        );
+        ui.add_space(6.0);
+
+        // Backend
+        ui.horizontal(|ui| {
+            ui.label("Backend");
+            egui::ComboBox::from_id_salt("video_backend_combo")
+                .selected_text(app.video_export.backend.label())
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut app.video_export.backend,
+                        crate::app::VideoBackend::Ffmpeg,
+                        "FFmpeg",
+                    );
+                    ui.selectable_value(
+                        &mut app.video_export.backend,
+                        crate::app::VideoBackend::Gstreamer,
+                        "GStreamer",
+                    );
+                });
+        });
+
+        // Frame rate
+        ui.horizontal(|ui| {
+            ui.label("Frame rate");
+            let mut fps = app.video_export.fps;
+            egui::ComboBox::from_id_salt("video_fps_combo")
+                .selected_text(format!("{} fps", fps))
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    for &f in &[24u32, 25, 30, 50, 60] {
+                        ui.selectable_value(&mut fps, f, format!("{} fps", f));
+                    }
+                });
+            app.video_export.fps = fps;
+        });
+
+        // Resolution
+        ui.horizontal(|ui| {
+            ui.label("Resolution");
+            let mut res = app.video_export.resolution_pct;
+            egui::ComboBox::from_id_salt("video_res_combo")
+                .selected_text(format!("{}%", res))
+                .width(80.0)
+                .show_ui(ui, |ui| {
+                    for &r in &[25u32, 50, 75, 100, 150, 200] {
+                        ui.selectable_value(&mut res, r, format!("{}%", r));
+                    }
+                });
+            app.video_export.resolution_pct = res;
+        });
+
+        // Bitrate
+        ui.horizontal(|ui| {
+            ui.label("Bitrate");
+            let mut kb = app.video_export.bitrate_kbps;
+            ui.add(egui::DragValue::new(&mut kb).range(500..=80000).suffix(" kbps").speed(100.0));
+            app.video_export.bitrate_kbps = kb;
+        });
+
+        // Format
+        ui.horizontal(|ui| {
+            ui.label("Format");
+            egui::ComboBox::from_id_salt("video_fmt_combo")
+                .selected_text(app.video_export.format.label())
+                .width(130.0)
+                .show_ui(ui, |ui| {
+                    for &fmt in &[
+                        crate::app::VideoFormat::Mp4,
+                        crate::app::VideoFormat::Mkv,
+                        crate::app::VideoFormat::Webm,
+                        crate::app::VideoFormat::Mov,
+                    ] {
+                        ui.selectable_value(&mut app.video_export.format, fmt, fmt.label());
+                    }
+                });
+        });
+
+        ui.add_space(6.0);
+
+        // Export button
+        let btn_text = if app.video_export.rendering {
+            "⏳ Rendering…"
+        } else {
+            "▶ Export Video"
+        };
+        let export_btn = ui.add_enabled(
+            !app.video_export.rendering,
+            egui::Button::new(
+                RichText::new(btn_text)
+                    .color(egui::Color32::from_rgb(80, 200, 120)),
+            )
+            .fill(colors::BG_DEEP)
+            .min_size(egui::vec2(ui.available_width() - 8.0, 28.0)),
+        );
+        if export_btn.clicked() {
+            app.request_video_export();
+        }
+    });
+}
+
+fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
+    if !app.video_export.progress_visible {
+        return;
+    }
+    let Some(prog) = app.video_export.progress else {
+        return;
+    };
+    egui::Window::new("Render to Video")
+        .id(egui::Id::new("video_progress_dlg"))
+        .collapsible(false)
+        .resizable(false)
+        .default_width(340.0)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(&app.video_export.status_msg)
+                    .color(colors::TEXT_MUTED)
+                    .italics(),
+            );
+            ui.add_space(8.0);
+            let pb = egui::ProgressBar::new(prog)
+                .show_percentage()
+                .animate(app.video_export.rendering)
+                .desired_width(ui.available_width());
+            ui.add(pb);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if app.video_export.rendering {
+                    if ui.button("Cancel").clicked() {
+                        app.cancel_video_export();
+                        app.video_export.progress_visible = false;
+                    }
+                }
+                if ui.button("Hide").clicked() {
+                    app.video_export.progress_visible = false;
+                }
+            });
+        });
 }
 
 fn status_bar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
@@ -1337,6 +1506,18 @@ fn status_bar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(6.0);
+                    if app.video_export.rendering || app.video_export.progress.is_some() {
+                        let show_vid = ui.button(
+                            RichText::new("󰕧")
+                                .font(icons::nerd_font_id(12.0))
+                                .color(colors::ACCENT),
+                        );
+                        if show_vid.clicked() {
+                            app.video_export.progress_visible = true;
+                        }
+                        show_vid.on_hover_text("Show video export progress");
+                        ui.add_space(4.0);
+                    }
                     // timeline toggle
                     let timeline_btn_icon = if app.anim_show_timeline_window { "" } else { "" };
                     let timeline_btn_tooltip = if app.anim_show_timeline_window { "Hide timeline" } else { "Show timeline" };
@@ -1419,18 +1600,38 @@ fn page_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             app.set_page_size(w as f64, h as f64);
         }
     });
+    ui.horizontal(|ui| {
+        ui.label("Page Color");
+        let mut col = app.project.document.page_color;
+        if ui.color_edit_button_rgba_unmultiplied(&mut col).changed() {
+            app.project.document.page_color = col;
+        }
+    });
 }
 
 fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
-    if ui.button("+ New layer").clicked() {
-        app.add_layer("Layer");
-    }
+    ui.horizontal(|ui| {
+        if ui.button("+ New Layer").clicked() {
+            app.add_layer("Layer");
+        }
+        if ui.button("+ Import Video Layer").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm"])
+                .pick_file()
+            {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                app.add_video_layer(&name, path.to_string_lossy().into_owned());
+            }
+        }
+    });
+    ui.add_space(4.0);
+    
     let layer_count = app.project.document.layers.len();
     for i in 0..layer_count {
         let active = app.project.document.active_layer_index == i;
-        let (name, visible, locked) = {
+        let (name, visible, locked, is_video) = {
             let l = &app.project.document.layers[i];
-            (l.name.clone(), l.visible, l.locked)
+            (l.name.clone(), l.visible, l.locked, l.kind == crate::document::LayerKind::Video)
         };
         ui.horizontal(|ui| {
             if ui.selectable_label(active, "●").clicked() {
@@ -1445,12 +1646,58 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 app.set_layer_locked(i, lck);
             }
             let mut edit_name = name;
+            let icon = if is_video { "🎥 " } else { "🖼 " };
+            ui.label(icon);
             if ui.text_edit_singleline(&mut edit_name).changed() {
                 app.rename_layer(i, edit_name);
             }
         });
     }
+
+    // Active Layer settings (Renderer/Non-renderer and Video details)
+    if let Some(l) = app.project.document.active_layer_mut() {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+        theme::constraint_block(ui, |ui| {
+            ui.label(RichText::new("Layer Properties").strong());
+            ui.add_space(4.0);
+
+            ui.checkbox(&mut l.is_renderer, "Export Renderer Layer").on_hover_text("If unchecked, this layer will not render during export");
+
+            ui.horizontal(|ui| {
+                ui.label("Type:");
+                let mut is_vid = l.kind == crate::document::LayerKind::Video;
+                if ui.selectable_label(!is_vid, "🖼 Image").clicked() {
+                    l.kind = crate::document::LayerKind::Image;
+                }
+                if ui.selectable_label(is_vid, "🎥 Video").clicked() {
+                    l.kind = crate::document::LayerKind::Video;
+                }
+            });
+
+            if l.kind == crate::document::LayerKind::Video {
+                ui.horizontal(|ui| {
+                    ui.label("Path:");
+                    ui.text_edit_singleline(&mut l.video_path);
+                    if ui.button("Browse...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm"])
+                            .pick_file()
+                        {
+                            l.video_path = path.to_string_lossy().into_owned();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Volume:");
+                    ui.add(egui::Slider::new(&mut l.volume, 0.0..=1.0));
+                });
+            }
+        });
+    }
 }
+
 
 fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
@@ -1625,6 +1872,44 @@ fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             app.set_selection_opacity(op);
         }
     });
+
+    // ── Blend Mode ────────────────────────────────────────────────────
+    {
+        let current_blend = app.selection.first()
+            .and_then(|&id| app.project.nodes.get(id))
+            .map(|n| n.style.blend_mode)
+            .unwrap_or_default();
+        let mut selected = current_blend;
+        ui.horizontal(|ui| {
+            ui.label("Blend Mode");
+            egui::ComboBox::from_id_salt("blend_mode_combo")
+                .selected_text(selected.label())
+                .width(140.0)
+                .show_ui(ui, |ui| {
+                    for &mode in crate::document::BlendMode::all() {
+                        ui.selectable_value(&mut selected, mode, mode.label());
+                    }
+                });
+        });
+        if selected != current_blend {
+            for &id in &app.selection.clone() {
+                let Some(before) = app.project.nodes.get(id).cloned() else {
+                    continue;
+                };
+                let mut after = before.clone();
+                after.style.blend_mode = selected;
+                app.history.push(
+                    &mut app.project,
+                    crate::history::ProjectEdit::PatchNode {
+                        id,
+                        before,
+                        after,
+                    },
+                );
+            }
+        }
+    }
+
     theme::constraint_block(ui, |ui| {
         ui.label(RichText::new("Fill").strong());
         let mut fill_changed = false;
@@ -1888,6 +2173,23 @@ fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     }
 }
 
+fn brush_numeric_row(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    speed: f32,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        changed = ui
+            .add(egui::DragValue::new(value).range(range).speed(speed))
+            .changed();
+    });
+    changed
+}
+
 fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     if app.tools.active == ToolKind::Brush {
         // ── Main Brush Settings ─────────────────────────────────────────
@@ -1912,9 +2214,9 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 });
 
             ui.add_space(4.0);
-            ui.add(egui::Slider::new(&mut app.tools.brush.size, 1.0..=100.0).text("Size"));
-            ui.add(egui::Slider::new(&mut app.tools.brush.smoothness, 0.0..=1.0).text("Smoothness"));
-            ui.add(egui::Slider::new(&mut app.tools.brush.heavy, 0.0..=1.0).text("Heavybrush"));
+            brush_numeric_row(ui, "Size", &mut app.tools.brush.size, 1.0..=100.0, 0.4);
+            brush_numeric_row(ui, "Smoothness", &mut app.tools.brush.smoothness, 0.0..=1.0, 0.01);
+            brush_numeric_row(ui, "Heavybrush", &mut app.tools.brush.heavy, 0.0..=1.0, 0.01);
         });
 
         ui.add_space(6.0);
@@ -1946,24 +2248,47 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 crate::tools::BrushInputMode::Mouse => {
                     ui.label(RichText::new("Mouse sensitivity").color(colors::TEXT_MUTED));
                     ui.add_space(2.0);
-                    ui.add(egui::Slider::new(&mut app.tools.brush.mouse_pressure_sensitivity, 0.0..=2.0)
-                        .text("Pressure sensitivity"));
-                    ui.add(egui::Slider::new(&mut app.tools.brush.mouse_speed_sensitivity, 0.0..=2.0)
-                        .text("Speed sensitivity"));
+                    brush_numeric_row(
+                        ui,
+                        "Pressure sensitivity",
+                        &mut app.tools.brush.mouse_pressure_sensitivity,
+                        0.0..=2.0,
+                        0.02,
+                    );
+                    brush_numeric_row(
+                        ui,
+                        "Speed sensitivity",
+                        &mut app.tools.brush.mouse_speed_sensitivity,
+                        0.0..=2.0,
+                        0.02,
+                    );
                     ui.add_space(4.0);
                     ui.checkbox(&mut app.tools.brush.mouse_rotate_by_direction, "Rotate tip by direction");
                 }
                 crate::tools::BrushInputMode::Stylus => {
                     ui.label(RichText::new("Stylus options").color(colors::TEXT_MUTED));
                     ui.add_space(2.0);
-                    ui.add(egui::Slider::new(&mut app.tools.brush.stylus_tilt_angle, 0.0..=90.0)
-                        .suffix("°").text("Tilt angle"));
-                    let pen_angle_changed = ui.add(
-                        egui::Slider::new(&mut app.tools.brush.stylus_pen_angle, 0.0..=360.0)
-                            .suffix("°").text("Pen angle"),
-                    ).changed();
-                    ui.add(egui::Slider::new(&mut app.tools.brush.stylus_pressure, 0.0..=1.0)
-                        .text("Pressure"));
+                    brush_numeric_row(
+                        ui,
+                        "Tilt angle (°)",
+                        &mut app.tools.brush.stylus_tilt_angle,
+                        0.0..=90.0,
+                        0.5,
+                    );
+                    let pen_angle_changed = brush_numeric_row(
+                        ui,
+                        "Pen angle (°)",
+                        &mut app.tools.brush.stylus_pen_angle,
+                        0.0..=360.0,
+                        1.0,
+                    );
+                    brush_numeric_row(
+                        ui,
+                        "Pressure",
+                        &mut app.tools.brush.stylus_pressure,
+                        0.0..=1.0,
+                        0.01,
+                    );
                     ui.add_space(6.0);
                     // 3D pen-angle preview
                     ui.label(RichText::new("Pen angle 3D preview").strong());
@@ -1991,10 +2316,14 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             .strong(),
                     );
                     ui.add_space(4.0);
-                    ui.add(egui::Slider::new(&mut app.tools.brush.pen_roundness, 0.0..=1.0)
-                        .text("Tip roundness"));
-                    ui.add(egui::Slider::new(&mut app.tools.brush.pen_press_on_paper, 0.0..=1.0)
-                        .text("Press on paper"));
+                    brush_numeric_row(ui, "Tip roundness", &mut app.tools.brush.pen_roundness, 0.0..=1.0, 0.01);
+                    brush_numeric_row(
+                        ui,
+                        "Press on paper",
+                        &mut app.tools.brush.pen_press_on_paper,
+                        0.0..=1.0,
+                        0.01,
+                    );
                     ui.add_space(6.0);
                     ui.label(RichText::new("Pen Tip 3D Preview").strong());
                     ui.add_space(2.0);
@@ -2020,8 +2349,13 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ui.checkbox(&mut app.tools.brush.calli_rotate_tip, "Rotate tip by stroke direction");
                     ui.add_space(4.0);
                     ui.label(RichText::new("Nib geometry").color(colors::TEXT_MUTED));
-                    ui.add(egui::Slider::new(&mut app.tools.brush.calli_fountain_size, 0.1..=3.0)
-                        .text("Fountain nib size"));
+                    brush_numeric_row(
+                        ui,
+                        "Fountain nib size",
+                        &mut app.tools.brush.calli_fountain_size,
+                        0.1..=3.0,
+                        0.02,
+                    );
                     ui.add_space(4.0);
                     ui.checkbox(&mut app.tools.brush.calli_dynamic, "Dynamic nib (speed-reactive)");
                     ui.add_space(6.0);
@@ -3276,6 +3610,12 @@ fn draw_timeline_track(
                 for kf in &plot.track.keyframes {
                     val_min = val_min.min(kf.value);
                     val_max = val_max.max(kf.value);
+                    if kf.interpolation == crate::app::InterpolationMode::Bezier {
+                        val_min = val_min.min(kf.value + kf.handle_right.1);
+                        val_max = val_max.max(kf.value + kf.handle_right.1);
+                        val_min = val_min.min(kf.value + kf.handle_left.1);
+                        val_max = val_max.max(kf.value + kf.handle_left.1);
+                    }
                 }
             }
         }
@@ -3287,6 +3627,10 @@ fn draw_timeline_track(
                 val_min = 0.0;
                 val_max = 100.0;
             }
+        } else {
+            let span = val_max - val_min;
+            val_min -= span * 0.25;
+            val_max += span * 0.25;
         }
         
         // Keyframe dragging/shifting in edit mode
@@ -3563,6 +3907,14 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 
                 ui.label(RichText::new(format!("Frame {}", app.anim_current_frame)).color(colors::TEXT));
 
+                ui.add_space(8.0);
+                let mut fps = app.anim_fps;
+                if ui.add(egui::DragValue::new(&mut fps).range(1..=120).suffix(" fps")).changed() {
+                    app.anim_fps = fps;
+                }
+                ui.label(RichText::new("Speed:").color(colors::TEXT_MUTED));
+                ui.add_space(8.0);
+
                 let mut apply_anim_after = false;
                 let mut before_timeline = None;
                 if let Some((n_id, track_lbl, frame)) = app.anim_selected_keyframe.clone() {
@@ -3630,9 +3982,96 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         ui.separator();
         ui.add_space(6.0);
 
-        let selected_node_id = app.selection.first().copied();
         let mut curr_frame = app.anim_current_frame;
         let mut scroll = app.anim_timeline_scroll;
+
+        // --- HORIZONTAL TIMELINE SCROLL & RULER ---
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Scroll:").color(colors::TEXT_MUTED));
+            ui.add(egui::Slider::new(&mut scroll, 0.0..=500.0).show_value(false));
+            ui.add_space(8.0);
+            
+            // Frame number indicator
+            ui.label(RichText::new(format!("Current: Frame {}", curr_frame)).color(colors::TEXT));
+        });
+        ui.add_space(4.0);
+        
+        // Draw progress ruler bar (aligned with tracks)
+        let ruler_width = ui.available_width() - 8.0;
+        let ruler_height = 24.0;
+        ui.horizontal(|ui| {
+            ui.add_space(64.0); // Perfect alignment with tracks
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2((ruler_width - 64.0).max(10.0), ruler_height),
+                egui::Sense::click_and_drag()
+            );
+            
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 2.0, colors::BG_DEEP.gamma_multiply(0.5));
+            painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, colors::BORDER.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+            
+            let start_frame = scroll;
+            let visible_frames = 100.0;
+            let end_frame = start_frame + visible_frames;
+            
+            let grid_start = ((start_frame / 10.0).floor() * 10.0) as i32;
+            let grid_end = (end_frame / 10.0).ceil() as i32 * 10;
+            
+            // Draw ticks & numbers
+            for f in grid_start..=grid_end {
+                if f >= 0 {
+                    let frac = (f as f32 - start_frame) / visible_frames;
+                    if frac >= 0.0 && frac <= 1.0 {
+                        let x = rect.left() + frac * rect.width();
+                        let is_major = f % 10 == 0;
+                        let tick_h = if is_major { 10.0 } else { 5.0 };
+                        painter.line_segment(
+                            [egui::pos2(x, rect.top()), egui::pos2(x, rect.top() + tick_h)],
+                            egui::Stroke::new(1.0, colors::TEXT_MUTED.gamma_multiply(0.7)),
+                        );
+                        if is_major {
+                            painter.text(
+                                egui::pos2(x, rect.top() + 10.0),
+                                egui::Align2::CENTER_TOP,
+                                f.to_string(),
+                                egui::FontId::new(9.0, egui::FontFamily::Proportional),
+                                colors::TEXT_MUTED,
+                            );
+                        }
+                    }
+                }
+            }
+            
+            // Handle scrubbing/clicking to change frame
+            if response.clicked() || response.dragged() {
+                if let Some(mpos) = response.interact_pointer_pos() {
+                    let frac = ((mpos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                    let target_frame = (start_frame + frac * visible_frames).round() as usize;
+                    curr_frame = target_frame;
+                    app.apply_animation_for_frame(curr_frame);
+                }
+            }
+            
+            // Draw current frame playhead indicator
+            let current_frac = (curr_frame as f32 - start_frame) / visible_frames;
+            if current_frac >= 0.0 && current_frac <= 1.0 {
+                let px = rect.left() + current_frac * rect.width();
+                let size = 6.0;
+                let pts = vec![
+                    egui::pos2(px - size, rect.top()),
+                    egui::pos2(px + size, rect.top()),
+                    egui::pos2(px, rect.top() + size * 1.5),
+                ];
+                painter.add(egui::Shape::convex_polygon(pts, colors::ACCENT, egui::Stroke::NONE));
+                painter.line_segment(
+                    [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
+                    egui::Stroke::new(1.5, colors::ACCENT),
+                );
+            }
+        });
+        ui.add_space(6.0);
+
+        let selected_node_id = app.selection.first().copied();
         let edit_mode = app.anim_edit_mode;
         
         let mut dragged = app.anim_dragged_keyframe.clone();
@@ -4222,6 +4661,12 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             for kf in &track.keyframes {
                 val_min = val_min.min(kf.value);
                 val_max = val_max.max(kf.value);
+                if kf.interpolation == crate::app::InterpolationMode::Bezier {
+                    val_min = val_min.min(kf.value + kf.handle_right.1);
+                    val_max = val_max.max(kf.value + kf.handle_right.1);
+                    val_min = val_min.min(kf.value + kf.handle_left.1);
+                    val_max = val_max.max(kf.value + kf.handle_left.1);
+                }
                 has_keyframes = true;
             }
             if track.keyframes.is_empty() {
@@ -4242,8 +4687,8 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             val_max += 1.0;
         } else {
             let span = val_max - val_min;
-            val_min -= span * 0.15;
-            val_max += span * 0.15;
+            val_min -= span * 0.25;
+            val_max += span * 0.25;
         }
         
         // Draw grid
@@ -4547,9 +4992,8 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
         );
     });
 
-    // Segment-selected: show "Add Bezier Point" action bar
+    // Segment-selected: apply bezier on the span between two keyframes (no extra keyframe).
     if let Some((ref seg_lbl, lf, rf)) = app.anim_graph_selected_segment.clone() {
-        let mid_frame = (lf + rf) / 2;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("Segment [{} – {}] selected", lf, rf))
@@ -4559,7 +5003,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             ui.add_space(8.0);
             let add_btn = ui.add(
                 egui::Button::new(
-                    RichText::new("＋ Add Bezier Point")
+                    RichText::new("+ Apply Bezier")
                         .color(egui::Color32::from_rgb(80, 200, 120))
                 )
                 .fill(colors::BG_DEEP),
@@ -4568,30 +5012,25 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                 let before_timeline = app.project.anim_timeline.clone();
                 if let Some(anim_mut) = app.project.anim_timeline.nodes.get_mut(&node_id) {
                     if let Some(track) = anim_mut.get_track_mut(&seg_lbl) {
-                        // Only insert if midframe doesn't already exist
-                        if !track.keyframes.iter().any(|k| k.frame == mid_frame) {
-                            // Interpolated value at midpoint
-                            let mid_val = track.interpolate(mid_frame).unwrap_or_else(|| {
-                                let lv = track.keyframes.iter().find(|k| k.frame == lf).map(|k| k.value).unwrap_or(0.0);
-                                let rv = track.keyframes.iter().find(|k| k.frame == rf).map(|k| k.value).unwrap_or(0.0);
-                                (lv + rv) * 0.5
-                            });
-                            // Insert midpoint keyframe
-                            track.keyframes.push(crate::app::Keyframe {
-                                frame: mid_frame,
-                                value: mid_val,
-                                interpolation: crate::app::InterpolationMode::Bezier,
-                                handle_left: (0.0, 0.0),
-                                handle_right: ((rf - mid_frame) as f64 * 0.5, 0.0),
-                                handle_mode: crate::document::BezierHandleMode::Both,
-                            });
-                            track.keyframes.sort_by_key(|k| k.frame);
-
-                            // Convert left neighbour to bezier
-                            if let Some(lk) = track.keyframes.iter_mut().find(|k| k.frame == lf) {
-                                lk.interpolation = crate::app::InterpolationMode::Bezier;
-                                lk.handle_right = ((mid_frame - lf) as f64 * 0.5, (mid_val - lk.value) * 0.5);
-                            }
+                        let left_val = track
+                            .keyframes
+                            .iter()
+                            .find(|k| k.frame == lf)
+                            .map(|k| k.value)
+                            .unwrap_or(0.0);
+                        let right_val = track
+                            .keyframes
+                            .iter()
+                            .find(|k| k.frame == rf)
+                            .map(|k| k.value)
+                            .unwrap_or(left_val);
+                        let range = (rf - lf) as f64;
+                        if let Some(lk) = track.keyframes.iter_mut().find(|k| k.frame == lf) {
+                            lk.interpolation = crate::app::InterpolationMode::Bezier;
+                            lk.handle_right = (
+                                (range * 0.33).clamp(1.0, range.max(1.0)),
+                                (right_val - left_val) * 0.33,
+                            );
                         }
                     }
                 }
@@ -4604,7 +5043,13 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                 app.apply_animation_for_frame(app.anim_current_frame);
             }
             ui.add_space(4.0);
-            if ui.button(RichText::new("✕ Deselect").color(colors::TEXT_MUTED)).clicked() {
+            if ui
+                .button(
+                    RichText::new("x Deselect")
+                        .color(colors::TEXT_MUTED),
+                )
+                .clicked()
+            {
                 app.anim_graph_selected_segment = None;
             }
         });

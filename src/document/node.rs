@@ -785,6 +785,46 @@ impl PathData {
         let _ = &mut rev;
     }
 
+    /// Mirror geometry across a vertical axis at `cx` (flip horizontal).
+    pub fn mirror_horizontal(&mut self, cx: f64) {
+        let anchors: Vec<(f64, f64)> = self
+            .anchor_positions()
+            .into_iter()
+            .map(|(x, y)| (2.0 * cx - x, y))
+            .collect();
+        let mut out = HashMap::new();
+        let mut inn = HashMap::new();
+        for (k, v) in &self.handle_out_offset {
+            out.insert(*k, [-v[0], v[1]]);
+        }
+        for (k, v) in &self.handle_in_offset {
+            inn.insert(*k, [-v[0], v[1]]);
+        }
+        self.handle_out_offset = out;
+        self.handle_in_offset = inn;
+        self.rebuild_with_smooth_anchors(&anchors);
+    }
+
+    /// Mirror geometry across a horizontal axis at `cy` (flip vertical).
+    pub fn mirror_vertical(&mut self, cy: f64) {
+        let anchors: Vec<(f64, f64)> = self
+            .anchor_positions()
+            .into_iter()
+            .map(|(x, y)| (x, 2.0 * cy - y))
+            .collect();
+        let mut out = HashMap::new();
+        let mut inn = HashMap::new();
+        for (k, v) in &self.handle_out_offset {
+            out.insert(*k, [v[0], -v[1]]);
+        }
+        for (k, v) in &self.handle_in_offset {
+            inn.insert(*k, [v[0], -v[1]]);
+        }
+        self.handle_out_offset = out;
+        self.handle_in_offset = inn;
+        self.rebuild_with_smooth_anchors(&anchors);
+    }
+
     /// Remove anchors by index; returns false if fewer than the minimum would remain.
     pub fn remove_anchors(&mut self, indices: &[usize]) -> bool {
         let anchors = self.anchor_positions();
@@ -2106,6 +2146,56 @@ impl Node {
         n.id = Uuid::new_v4();
         n.name = format!("{} copy", self.name);
         n
+    }
+
+    /// Flip the node horizontally (mirror across vertical centre axis).
+    pub fn flip_h(&mut self) {
+        let b = self.bounds();
+        let cx = (b.x0 + b.x1) * 0.5;
+        match &mut self.kind {
+            NodeKind::Path { path } => {
+                path.mirror_horizontal(cx);
+            }
+            NodeKind::BrushStroke { points } => {
+                for pt in points.iter_mut() {
+                    pt.0[0] = 2.0 * cx - pt.0[0];
+                }
+                points.reverse();
+            }
+            NodeKind::Image { x, width, .. } => {
+                *x = 2.0 * cx - *x - *width;
+            }
+            // Ellipse/Polygon/Rect/Arc are symmetric — flip is a no-op for shape
+            // but we still need to adjust position for Rect
+            NodeKind::Rect { x, w, .. } => {
+                *x = 2.0 * cx - *x - *w;
+            }
+            _ => {}
+        }
+    }
+
+    /// Flip the node vertically (mirror across horizontal centre axis).
+    pub fn flip_v(&mut self) {
+        let b = self.bounds();
+        let cy = (b.y0 + b.y1) * 0.5;
+        match &mut self.kind {
+            NodeKind::Path { path } => {
+                path.mirror_vertical(cy);
+            }
+            NodeKind::BrushStroke { points } => {
+                for pt in points.iter_mut() {
+                    pt.0[1] = 2.0 * cy - pt.0[1];
+                }
+                points.reverse();
+            }
+            NodeKind::Image { y, height, .. } => {
+                *y = 2.0 * cy - *y - *height;
+            }
+            NodeKind::Rect { y, h, .. } => {
+                *y = 2.0 * cy - *y - *h;
+            }
+            _ => {}
+        }
     }
 
     pub fn node_points(&self) -> Vec<(f64, f64)> {
