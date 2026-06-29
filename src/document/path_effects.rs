@@ -102,6 +102,31 @@ impl Default for CircularCloneEffect {
     }
 }
 
+/// A Clip Mask effect: the `source_id` object is rendered clipped to the shape of `mask_id`.
+/// The mask shape is the (approximate) axis-aligned bounding box of `mask_id` during viewport
+/// rendering, while SVG export uses a proper `<clipPath>` element.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClipMaskEffect {
+    pub id: Uuid,
+    /// The object being clipped / shown through the mask.
+    pub source_id: NodeId,
+    /// The node whose geometry defines the clip region.
+    pub mask_id: NodeId,
+    /// When true, the mask node itself is hidden from normal rendering.
+    pub hide_mask: bool,
+}
+
+impl Default for ClipMaskEffect {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            source_id: Uuid::nil(),
+            mask_id: Uuid::nil(),
+            hide_mask: true,
+        }
+    }
+}
+
 impl Default for ObjectOnPathEffect {
     fn default() -> Self {
         Self {

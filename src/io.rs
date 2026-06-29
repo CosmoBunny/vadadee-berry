@@ -67,6 +67,7 @@ pub fn import_svg(path: &Path) -> Result<ProjectFile, IoError> {
         path_effects: Default::default(),
         tiling_effects: Default::default(),
         circular_effects: Default::default(),
+        clip_masks: Default::default(),
         page_color: [1.0, 1.0, 1.0, 1.0],
     };
     let mut nodes = NodeStore::default();
@@ -169,11 +170,39 @@ pub fn document_svg_string(
     let w = project.document.width;
     let h = project.document.height;
     let bg_color = project.document.page_color_svg();
+
+    let mut clip_defs = String::new();
+    let mut clip_map = std::collections::HashMap::new();
+    let mut mask_set = std::collections::HashSet::new();
+    for cm in project.document.clip_masks.values() {
+        clip_map.insert(cm.source_id, cm.clone());
+        if cm.hide_mask {
+            mask_set.insert(cm.mask_id);
+        }
+        if let Some(mask_node) = project.nodes.get(cm.mask_id) {
+            let shape_svg = node_to_svg_fragment(mask_node, &project.nodes);
+            clip_defs.push_str(&format!(
+                r#"  <clipPath id="clip-{}">
+    {}
+  </clipPath>
+"#,
+                cm.id.as_simple(),
+                shape_svg
+            ));
+        }
+    }
+
+    let mut defs_str = String::new();
+    if !clip_defs.is_empty() {
+        defs_str = format!("<defs>\n{}</defs>\n", clip_defs);
+    }
+
     let mut svg = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
-<rect width="{w}" height="{h}" {bg_color}/>
-"#
+{}<rect width="{w}" height="{h}" {bg_color}/>
+"#,
+        defs_str
     );
     for layer in &project.document.layers {
         if !layer.visible || !layer.is_renderer {
@@ -182,8 +211,20 @@ pub fn document_svg_string(
         match layer.kind {
             crate::document::LayerKind::Image => {
                 for id in &layer.nodes {
+                    if mask_set.contains(id) {
+                        continue;
+                    }
                     let Some(node) = project.nodes.get(*id) else { continue };
-                    svg.push_str(&node_to_svg_fragment(node, &project.nodes));
+                    let node_svg = node_to_svg_fragment(node, &project.nodes);
+                    if let Some(cm) = clip_map.get(id) {
+                        svg.push_str(&format!(
+                            r#"<g clip-path="url(#clip-{})">{}</g>"#,
+                            cm.id.as_simple(),
+                            node_svg
+                        ));
+                    } else {
+                        svg.push_str(&node_svg);
+                    }
                 }
             }
             crate::document::LayerKind::Video => {
@@ -239,6 +280,7 @@ pub fn document_svg_string(
                     ));
                 }
             }
+            crate::document::LayerKind::Audio => {}
         }
     }
     svg.push_str("</svg>\n");

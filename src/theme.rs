@@ -189,8 +189,12 @@ pub fn show_overlay_area(
     rect: Rect,
     alpha: f32,
     add_contents: impl FnOnce(&mut egui::Ui),
-) {
-    show_overlay_area_inner(ctx, id, rect, alpha, true, true, add_contents);
+) -> Option<Rect> {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.004 {
+        return None;
+    }
+    Some(show_overlay_area_inner(ctx, id, rect, alpha, true, true, add_contents))
 }
 
 /// Action bar: frame + contents share one opacity; no interaction when faded out.
@@ -200,13 +204,13 @@ pub fn show_action_bar_area(
     rect: Rect,
     alpha: f32,
     add_contents: impl FnOnce(&mut egui::Ui),
-) {
+) -> Option<Rect> {
     let alpha = alpha.clamp(0.0, 1.0);
     if alpha <= 0.004 {
-        return;
+        return None;
     }
     // Must slide fully off-screen; default Area constrain keeps the right edge glued to content_rect.
-    show_overlay_area_inner(ctx, id, rect, alpha, alpha > 0.35, false, add_contents);
+    Some(show_overlay_area_inner(ctx, id, rect, alpha, alpha > 0.35, false, add_contents))
 }
 
 fn show_overlay_area_inner(
@@ -217,9 +221,9 @@ fn show_overlay_area_inner(
     interactable: bool,
     constrain_to_content: bool,
     add_contents: impl FnOnce(&mut egui::Ui),
-) {
+) -> Rect {
     if rect.width() < 8.0 || rect.height() < 8.0 {
-        return;
+        return rect;
     }
     let alpha = alpha.clamp(0.0, 1.0);
     let mut area = egui::Area::new(egui::Id::new(id))
@@ -231,7 +235,7 @@ fn show_overlay_area_inner(
     if !constrain_to_content {
         area = area.constrain(false);
     }
-    area.show(ctx, |ui| {
+    let response = area.show(ctx, |ui| {
             ui.set_width(rect.width());
             ui.set_height(rect.height());
             floating_card_frame(alpha).show(ui, |ui| {
@@ -241,6 +245,7 @@ fn show_overlay_area_inner(
                 add_contents(ui);
             });
         });
+    response.response.rect
 }
 
 pub fn overlay_work_rect(work: Rect) -> Rect {

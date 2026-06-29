@@ -46,6 +46,8 @@ kramaframe = { path = "../kramaframe" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 geo = "0.29"
 base64 = "0.22"
+libloading = "0.8"
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-mp3", "symphonia-isomp4", "symphonia-wav", "symphonia-aac"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "wayland", "x11"] }

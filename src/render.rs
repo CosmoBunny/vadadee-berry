@@ -3152,3 +3152,104 @@ mod lyon_path_tests {
             .expect("closed polyline stroke should tessellate");
     }
 }
+
+/// Draw Clip Mask effects: render `source_id` clipped to `mask_id`'s bounding box.
+pub fn draw_clip_mask_effects(
+    painter: &Painter,
+    nodes: &NodeStore,
+    clip_masks: &indexmap::IndexMap<uuid::Uuid, crate::document::ClipMaskEffect>,
+    viewport: &Viewport,
+    origin: Pos2,
+    fonts: &crate::fonts::FontRegistry,
+    image_textures: &std::collections::HashMap<NodeId, egui::TextureHandle>,
+    selection: &[NodeId],
+) {
+    for cm in clip_masks.values() {
+        let Some(mask_node) = nodes.get(cm.mask_id) else { continue };
+        let Some(source_node) = nodes.get(cm.source_id) else { continue };
+
+        // Compute mask bounding box in screen coords using node's own bounding box
+        let mask_bounds = mask_node.bounds();
+        let tl = viewport.doc_to_screen((mask_bounds.x0, mask_bounds.y0), origin);
+        let br = viewport.doc_to_screen((mask_bounds.x1, mask_bounds.y1), origin);
+        let clip_rect = egui::Rect::from_min_max(tl, br);
+
+        // Draw source node clipped to mask region
+        if let Some(tex) = image_textures.get(&cm.id) {
+            painter.image(
+                tex.id(),
+                clip_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            let clipped_painter = painter.with_clip_rect(clip_rect);
+            draw_node(&clipped_painter, source_node, viewport, origin, false, fonts, image_textures);
+        }
+
+        // Draw dashed outline of the actual mask shape contour
+        let bez = mask_node.bez_path();
+        let (screen_pts, _) = polyline_from_bez(&bez, viewport, origin, true);
+        
+        let is_selected = selection.contains(&cm.source_id) || selection.contains(&cm.mask_id);
+        let color = if is_selected {
+            Color32::from_rgb(180, 100, 255)
+        } else {
+            Color32::from_rgba_unmultiplied(180, 100, 255, 100)
+        };
+        let width = if is_selected { 1.5 } else { 1.0 };
+        draw_dashed_polyline(painter, &screen_pts, true, 6.0, 4.0, egui::Stroke::new(width, color));
+    }
+}
+
+/// Draw a dashed polyline.
+fn draw_dashed_polyline(
+    painter: &Painter,
+    pts: &[Pos2],
+    closed: bool,
+    dash: f32,
+    gap: f32,
+    stroke: egui::Stroke,
+) {
+    if pts.len() < 2 {
+        return;
+    }
+    let mut draw_state = true;
+    let mut remaining = dash;
+    let mut current_pt = pts[0];
+    let end_idx = if closed { pts.len() } else { pts.len() - 1 };
+
+    for idx in 0..end_idx {
+        let next_pt = pts[(idx + 1) % pts.len()];
+        let d = next_pt - current_pt;
+        let mut len = d.length();
+        if len < 1e-4 {
+            continue;
+        }
+        let dir = d / len;
+
+        while len > 0.0 {
+            if len <= remaining {
+                if draw_state {
+                    painter.line_segment([current_pt, next_pt], stroke);
+                }
+                remaining -= len;
+                if remaining <= 0.0 {
+                    draw_state = !draw_state;
+                    remaining = if draw_state { dash } else { gap };
+                }
+                break;
+            } else {
+                let step_pt = current_pt + dir * remaining;
+                if draw_state {
+                    painter.line_segment([current_pt, step_pt], stroke);
+                }
+                current_pt = step_pt;
+                len -= remaining;
+                draw_state = !draw_state;
+                remaining = if draw_state { dash } else { gap };
+            }
+        }
+        current_pt = next_pt;
+    }
+}

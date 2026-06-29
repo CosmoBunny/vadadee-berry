@@ -60,6 +60,12 @@ pub struct UiAnimation {
     timeline_to: f32,
     timeline_elapsed: f32,
     pub timeline_running: bool,
+    prev_show_video_editor: bool,
+    pub video_editor_t: f32,
+    video_editor_from: f32,
+    video_editor_to: f32,
+    video_editor_elapsed: f32,
+    pub video_editor_running: bool,
 }
 
 impl Default for UiAnimation {
@@ -185,6 +191,12 @@ impl UiAnimation {
             timeline_to: 0.0,
             timeline_elapsed: 0.0,
             timeline_running: false,
+            prev_show_video_editor: false,
+            video_editor_t: 0.0,
+            video_editor_from: 0.0,
+            video_editor_to: 0.0,
+            video_editor_elapsed: 0.0,
+            video_editor_running: false,
         };
         anim.play_intro();
         anim
@@ -264,6 +276,47 @@ impl UiAnimation {
         self.timeline_t = target;
     }
 
+    fn begin_video_editor_slide(&mut self, to: f32) {
+        self.video_editor_from = self.video_editor_t;
+        self.video_editor_to = to.clamp(0.0, 1.0);
+        self.video_editor_elapsed = 0.0;
+        self.video_editor_running = true;
+    }
+
+    pub fn advance_video_editor_slide(&mut self, ctx: &Context) {
+        if !self.video_editor_running {
+            return;
+        }
+        let raw_dt = ctx.input(|i| i.unstable_dt).max(0.0);
+        let steps = ((raw_dt / ACTION_BAR_MAX_DT).ceil() as u32)
+            .clamp(1, ACTION_BAR_MAX_STEPS_PER_FRAME);
+        for _ in 0..steps {
+            self.video_editor_elapsed += ACTION_BAR_MAX_DT;
+            self.apply_video_editor_pose();
+            if !self.video_editor_running {
+                break;
+            }
+        }
+    }
+
+    fn apply_video_editor_pose(&mut self) {
+        let u = (self.video_editor_elapsed / ACTION_BAR_SLIDE_SECS).min(1.0);
+        self.video_editor_t =
+            self.video_editor_from + (self.video_editor_to - self.video_editor_from) * u;
+        if u >= 1.0 {
+            self.video_editor_t = self.video_editor_to;
+            self.video_editor_running = false;
+        }
+    }
+
+    fn settle_video_editor_pose(&mut self, show_video_editor: bool) {
+        if self.video_editor_running {
+            return;
+        }
+        let target = if show_video_editor { 1.0 } else { 0.0 };
+        self.video_editor_t = target;
+    }
+
     fn begin_action_bar_slide(&mut self, to: f32) {
         self.action_bar_from = self.action_bar_t;
         self.action_bar_to = to.clamp(0.0, 1.0);
@@ -310,6 +363,7 @@ impl UiAnimation {
         &mut self,
         action_bar_open: bool,
         show_timeline: bool,
+        show_video_editor: bool,
         active_tool: ToolKind,
         action_tab: ActionTab,
         status_message: &str,
@@ -329,6 +383,12 @@ impl UiAnimation {
             self.prev_show_timeline = show_timeline;
         } else {
             self.settle_timeline_pose(show_timeline);
+        }
+        if show_video_editor != self.prev_show_video_editor {
+            self.begin_video_editor_slide(if show_video_editor { 1.0 } else { 0.0 });
+            self.prev_show_video_editor = show_video_editor;
+        } else {
+            self.settle_video_editor_pose(show_video_editor);
         }
         if active_tool != self.prev_tool {
             let label = active_tool.label();
@@ -356,14 +416,24 @@ impl UiAnimation {
             self.prev_action_tab = action_tab;
         }
         if status_message != self.prev_status_message {
-            self.status_msg_outgoing = self.prev_status_message.clone();
-            self.status_msg_incoming = status_message.to_owned();
-            self.status_msg_width_out = self.status_msg_width_settled;
-            self.status_msg_width_in = status_message_width;
-            self.status_slide_distance = self.status_msg_width_out.max(status_message_width) + 40.0;
-            self.engine.restart_progress("status_sign", ID);
-            self.status_msg_target_in = true;
-            self.prev_status_message = status_message.to_owned();
+            let is_anim_frame_update = (status_message.starts_with("Playing animation") && self.prev_status_message.starts_with("Playing animation"))
+                || (status_message.starts_with("Recording keyframes") && self.prev_status_message.starts_with("Recording keyframes"));
+
+            if is_anim_frame_update {
+                self.status_msg_incoming = status_message.to_owned();
+                self.status_msg_width_in = status_message_width;
+                self.status_msg_width_settled = status_message_width;
+                self.prev_status_message = status_message.to_owned();
+            } else {
+                self.status_msg_outgoing = self.prev_status_message.clone();
+                self.status_msg_incoming = status_message.to_owned();
+                self.status_msg_width_out = self.status_msg_width_settled;
+                self.status_msg_width_in = status_message_width;
+                self.status_slide_distance = self.status_msg_width_out.max(status_message_width) + 40.0;
+                self.engine.restart_progress("status_sign", ID);
+                self.status_msg_target_in = true;
+                self.prev_status_message = status_message.to_owned();
+            }
         }
         if coords_text != self.prev_coords_text {
             let is_reverse = if self.coords_target_in {
@@ -454,7 +524,7 @@ impl UiAnimation {
     /// True while a visible transition still needs another frame. Avoid calling
     /// `request_repaint` when this is false so the GPU can idle.
     pub fn needs_repaint(&self) -> bool {
-        if self.action_bar_running || self.timeline_running {
+        if self.action_bar_running || self.timeline_running || self.video_editor_running {
             return true;
         }
         const TRACKS: &[&str] = &[

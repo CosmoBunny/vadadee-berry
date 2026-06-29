@@ -90,10 +90,12 @@ pub struct VadadeeBerryApp {
     pub anim_is_playing: bool,
     pub anim_keyframing_mode: bool,
     pub anim_show_timeline_window: bool,
+    pub show_video_editor_window: Option<uuid::Uuid>,
     pub anim_time_accumulator: f32,
     pub anim_last_seen_frame: usize,
     pub anim_last_applied_states: std::collections::HashMap<NodeId, AnimAppliedState>,
     pub anim_timeline_scroll: f32,
+    pub anim_timeline_follow: bool,
     pub anim_edit_mode: bool,
     pub anim_dragged_keyframe: Option<(NodeId, String, usize)>,
     pub anim_selected_keyframe: Option<(NodeId, String, usize)>,
@@ -107,7 +109,18 @@ pub struct VadadeeBerryApp {
     /// Segment selected between two keyframe indices for bezier-add workflow: (track_lbl, left_frame, right_frame)
     pub anim_graph_selected_segment: Option<(String, usize, usize)>,
     pub anim_fps: u32,
+    /// Legacy single-frame cache (kept for backward compat with rendering code that reads it).
     pub video_frame_cache: Option<VideoFrameCache>,
+    /// Per-layer async decode state. Replaces the single video_frame_cache for multi-video.
+    pub video_layers: std::collections::HashMap<uuid::Uuid, VideoLayerState>,
+    pub clip_mask_signatures: std::collections::HashMap<uuid::Uuid, String>,
+    /// Keeps the default output device stream alive while audio plays.
+    pub audio_device: Option<rodio::MixerDeviceSink>,
+    pub audio_players: std::collections::HashMap<uuid::Uuid, rodio::Player>,
+    /// Do not retry rodio open/decode for these layers until playback stops.
+    audio_layers_skip: std::collections::HashSet<uuid::Uuid>,
+    /// MP4/MOV/… → one-shot ffmpeg PCM wav for rodio.
+    audio_extract_cache: std::collections::HashMap<String, std::path::PathBuf>,
 
     pub project: ProjectFile,
     pub viewport: Viewport,
@@ -172,6 +185,8 @@ pub struct VadadeeBerryApp {
     pub ui_on_path_loft_opacity: f32,
     /// Measured height of the Object on Path panel (drives expand animation).
     pub ui_on_path_container_h: f32,
+    pub timeline_container_h: f32,
+    pub video_editor_container_h: f32,
     // Tiling params (2D)
     pub ui_tiling_rows: usize,
     pub ui_tiling_cols: usize,
@@ -233,6 +248,36 @@ pub struct VideoFrameCache {
     pub layer_id: uuid::Uuid,
     pub frame: usize,
     pub texture: egui::TextureHandle,
+}
+
+pub enum VideoCommand {
+    GetFrame {
+        timeline_frame: usize,
+        source_frame: usize,
+        fps: f32,
+        path: String,
+        sequential: bool,
+    },
+    StopStream,
+    Stop,
+}
+
+/// Per-layer video decode state for async background decoding.
+pub struct VideoLayerState {
+    /// Currently displayed texture for this layer.
+    pub texture: Option<egui::TextureHandle>,
+    /// Frame index of the displayed texture.
+    pub cached_frame: Option<usize>,
+    /// Sender for commands to the decode thread.
+    pub tx_cmd: std::sync::mpsc::Sender<VideoCommand>,
+    /// Receiver for completed frame decodes.
+    pub rx_frame: std::sync::mpsc::Receiver<(usize, u32, u32, Vec<u8>)>,
+    /// The frame we currently requested from the background thread.
+    pub requested_frame: Option<usize>,
+    /// Whether ffmpeg is currently running a sequential decode stream.
+    pub stream_active: bool,
+    /// Last request timestamp in seconds (from egui time) to throttle scrubbing requests.
+    pub last_req_time: Option<f64>,
 }
 
 
@@ -338,10 +383,12 @@ impl VadadeeBerryApp {
             anim_is_playing: false,
             anim_keyframing_mode: false,
             anim_show_timeline_window: false,
+            show_video_editor_window: None,
             anim_time_accumulator: 0.0,
             anim_last_seen_frame: 0,
             anim_last_applied_states: std::collections::HashMap::new(),
             anim_timeline_scroll: 0.0,
+            anim_timeline_follow: true,
             anim_edit_mode: false,
             anim_dragged_keyframe: None,
             anim_selected_keyframe: None,
@@ -352,8 +399,14 @@ impl VadadeeBerryApp {
             anim_graph_editor_dragged_handle: None,
             anim_graph_kf_drag_start: None,
             anim_graph_selected_segment: None,
-            anim_fps: 30,
+            anim_fps: 60,
             video_frame_cache: None,
+            video_layers: std::collections::HashMap::new(),
+            clip_mask_signatures: std::collections::HashMap::new(),
+            audio_device: rodio::DeviceSinkBuilder::open_default_sink().ok(),
+            audio_players: std::collections::HashMap::new(),
+            audio_layers_skip: std::collections::HashSet::new(),
+            audio_extract_cache: std::collections::HashMap::new(),
 
             project: Document::new_default_project(),
             viewport: Viewport::default(),
@@ -446,6 +499,8 @@ impl VadadeeBerryApp {
             ui_on_path_loft_scale: 1.0,
             ui_on_path_loft_opacity: 0.75,
             ui_on_path_container_h: 280.0,
+            timeline_container_h: 56.0,
+            video_editor_container_h: 130.0,
             ui_tiling_rows: 3,
             ui_tiling_cols: 3,
             ui_tiling_offset_x: 0.0,
@@ -1134,6 +1189,15 @@ impl VadadeeBerryApp {
                 }
             }
         }
+
+        let fps = self.anim_fps as f32;
+        for l in &self.project.document.layers {
+            if (l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio) && !l.video_path.is_empty() {
+                let end_frame = ((l.video_timeline_start + l.video_play_length) * fps) as usize;
+                max_f = max_f.max(end_frame);
+            }
+        }
+
         max_f
     }
 
@@ -1228,6 +1292,16 @@ impl VadadeeBerryApp {
                 // Apply geometry
                 if let Some(geom) = target_geom {
                     self.set_node_geom_floats(node_id, &geom);
+                }
+            } else if let Some(layer) = self.project.document.layers.iter_mut().find(|l| l.id == node_id && (l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio)) {
+                if let Some(x) = target_x {
+                    layer.x = x as f32;
+                }
+                if let Some(y) = target_y {
+                    layer.y = y as f32;
+                }
+                if let Some(rot) = target_rot {
+                    layer.rotation = rot as f32;
                 }
             }
         }
@@ -1452,6 +1526,17 @@ impl VadadeeBerryApp {
         let before = snapshot_document(&self.project.document);
         let mut after = before.clone();
         let idx = after.add_video_layer(name, video_path);
+        after.active_layer_index = idx;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+    }
+
+    pub fn add_audio_layer(&mut self, name: &str, audio_path: String) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let idx = after.add_audio_layer(name, audio_path);
         after.active_layer_index = idx;
         self.history.push(
             &mut self.project,
@@ -1757,6 +1842,8 @@ impl VadadeeBerryApp {
         let mut eq_mid = 0.0;
         let mut eq_treble = 0.0;
         let mut volume = 1.0;
+        let mut audio_start_offset = 0.0;
+        let mut audio_timeline_delay = 0.0;
         for layer in &self.project.document.layers {
             if layer.visible && layer.is_renderer && layer.kind == crate::document::LayerKind::Video && !layer.video_path.is_empty() {
                 audio_source = Some(layer.video_path.clone());
@@ -1764,6 +1851,8 @@ impl VadadeeBerryApp {
                 eq_mid = layer.eq_mid;
                 eq_treble = layer.eq_treble;
                 volume = layer.volume;
+                audio_start_offset = layer.video_start_offset;
+                audio_timeline_delay = layer.video_timeline_start;
                 break;
             }
         }
@@ -1782,6 +1871,8 @@ impl VadadeeBerryApp {
                 eq_mid,
                 eq_treble,
                 volume,
+                audio_start_offset,
+                audio_timeline_delay,
             );
             if ok {
                 self.video_export.status_msg = format!("Saved {}", out.display());
@@ -1810,6 +1901,8 @@ impl VadadeeBerryApp {
         eq_mid: f32,
         eq_treble: f32,
         volume: f32,
+        audio_start_offset: f32,
+        audio_timeline_delay: f32,
     ) -> bool {
         use std::process::Command;
         let pattern = frames_dir.join("frame_%05d.png");
@@ -1820,6 +1913,22 @@ impl VadadeeBerryApp {
             VideoFormat::Mov => "prores_ks",
             _ => "libx264",
         };
+        
+        if crate::video_decode::is_libav_available() {
+            log::info!("libav backend active for encoding");
+            match crate::video_decode::encode_video_libav(frames_dir, output, fps, bitrate_kbps, vcodec) {
+                Ok(_) => {
+                    log::info!("Successfully encoded video via shared library");
+                    if audio_source.is_none() {
+                        return true;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("libav encode failed, falling back to process: {}", e);
+                }
+            }
+        }
+
         let mut cmd = Command::new("ffmpeg");
         cmd.arg("-y")
             .arg("-framerate")
@@ -1828,13 +1937,23 @@ impl VadadeeBerryApp {
             .arg(pattern.to_str().unwrap_or("frame_%05d.png"));
             
         if let Some(audio_src) = audio_source {
+            if audio_start_offset > 0.0 {
+                cmd.arg("-ss").arg(format!("{:.3}", audio_start_offset));
+            }
             cmd.arg("-i").arg(audio_src);
             
-            // Parametric equalizer and volume filter
-            let af = format!(
-                "equalizer=f=100:width_type=h:w=200:g={:.1},equalizer=f=1000:width_type=h:w=1000:g={:.1},equalizer=f=8000:width_type=h:w=3000:g={:.1},volume={:.2}",
-                eq_bass, eq_mid, eq_treble, volume
-            );
+            // Parametric equalizer, volume and delay filters
+            let mut af_filters = vec![
+                format!("equalizer=f=100:width_type=h:w=200:g={:.1}", eq_bass),
+                format!("equalizer=f=1000:width_type=h:w=1000:g={:.1}", eq_mid),
+                format!("equalizer=f=8000:width_type=h:w=3000:g={:.1}", eq_treble),
+                format!("volume={:.2}", volume),
+            ];
+            if audio_timeline_delay > 0.0 {
+                let ms = (audio_timeline_delay * 1000.0) as i32;
+                af_filters.push(format!("adelay={ms}|{ms}"));
+            }
+            let af = af_filters.join(",");
             cmd.arg("-af").arg(af);
             
             cmd.arg("-map").arg("0:v")
@@ -1885,7 +2004,10 @@ impl VadadeeBerryApp {
         let backend = self.video_export.backend;
         for layer in &self.project.document.layers {
             if layer.visible && layer.is_renderer && layer.kind == crate::document::LayerKind::Video && !layer.video_path.is_empty() {
-                if let Some(mut bytes) = extract_video_frame(&layer.video_path, f, fps, backend) {
+                let elapsed_time = ((f as f32 / fps) - layer.video_timeline_start).max(0.0).min(layer.video_play_length);
+                let source_time = layer.video_start_offset + elapsed_time;
+                let source_frame_idx = (source_time * fps) as usize;
+                if let Some(mut bytes) = extract_video_frame(&layer.video_path, source_frame_idx, fps, backend) {
                     if layer.hue != 0.0 || layer.saturation != 1.0 || layer.brightness != 1.0 || layer.contrast != 1.0 {
                         if let Some(adj) = adjust_frame_color(&bytes, layer.hue, layer.saturation, layer.brightness, layer.contrast) {
                             bytes = adj;
@@ -2681,6 +2803,9 @@ impl VadadeeBerryApp {
                 // Play/pause on Space
                 if i.key_pressed(Key::Space) {
                     self.anim_is_playing = !self.anim_is_playing;
+                    if !self.anim_is_playing {
+                        self.stop_all_video_streams();
+                    }
                     let _ = i.consume_key(egui::Modifiers::NONE, Key::Space);
                 }
                 
@@ -2688,6 +2813,7 @@ impl VadadeeBerryApp {
                 if cmd && i.key_pressed(Key::ArrowLeft) {
                     self.anim_current_frame = 0;
                     self.anim_is_playing = false;
+                    self.stop_all_video_streams();
                     let _ = i.consume_key(egui::Modifiers::CTRL, Key::ArrowLeft);
                     let _ = i.consume_key(egui::Modifiers::COMMAND, Key::ArrowLeft);
                 }
@@ -2958,7 +3084,33 @@ impl VadadeeBerryApp {
     }
 
     fn delete_selection(&mut self) {
-        if self.selection.is_empty() || !self.layer_editable() {
+        if self.selection.is_empty() {
+            return;
+        }
+        let mut layer_positions: Vec<usize> = self
+            .selection
+            .iter()
+            .filter_map(|id| {
+                self.project
+                    .document
+                    .layers
+                    .iter()
+                    .position(|l| l.id == *id)
+            })
+            .collect();
+        layer_positions.sort_unstable_by(|a, b| b.cmp(a));
+        let mut layer_deleted = false;
+        for pos in layer_positions {
+            self.delete_layer(pos);
+            layer_deleted = true;
+        }
+        if layer_deleted {
+            self.selection.clear();
+            self.sync_inspector_from_selection();
+            return;
+        }
+
+        if !self.layer_editable() {
             return;
         }
         let layer_index = self.project.document.active_layer_index;
@@ -3013,49 +3165,279 @@ impl VadadeeBerryApp {
         }
     }
 
-    /// Load (or reload) texture for a video layer at the current frame.
-    fn ensure_video_layer_texture(&mut self, layer_id: uuid::Uuid, video_path: &str, frame: usize, ctx: &Context) {
-        if let Some(cache) = &self.video_frame_cache {
-            if cache.layer_id == layer_id && cache.frame == frame {
-                return;
+fn run_video_decode_thread(
+    rx_cmd: std::sync::mpsc::Receiver<VideoCommand>,
+    tx_frame: std::sync::mpsc::Sender<(usize, u32, u32, Vec<u8>)>,
+) {
+    let mut current_path: Option<String> = None;
+    let mut next_expected_frame = 0;
+    
+    // Libav dynamic loader state
+    let mut libav_stream: Option<crate::video_decode::VideoStream> = None;
+    
+    // Fallback process-based state
+    let mut ffmpeg_child: Option<std::process::Child> = None;
+    let mut ffmpeg_stdout: Option<std::process::ChildStdout> = None;
+    let mut width = 0;
+    let mut height = 0;
+    let mut frame_bytes_len = 0;
+
+    while let Ok(cmd) = rx_cmd.recv() {
+        // Drain channel to get the latest command (avoids queue backlog & lag)
+        let mut latest_cmd = cmd;
+        while let Ok(next_cmd) = rx_cmd.try_recv() {
+            if matches!(next_cmd, VideoCommand::Stop) {
+                latest_cmd = next_cmd;
+                break;
             }
-        }
-        
-        let mut hue = 0.0;
-        let mut saturation = 1.0;
-        let mut brightness = 1.0;
-        let mut contrast = 1.0;
-        if let Some(l) = self.project.document.layers.iter().find(|l| l.id == layer_id) {
-            hue = l.hue;
-            saturation = l.saturation;
-            brightness = l.brightness;
-            contrast = l.contrast;
+            latest_cmd = next_cmd;
         }
 
-        let fps = self.anim_fps as f32;
-        let backend = self.video_export.backend;
-        if let Some(bytes) = extract_video_frame(video_path, frame, fps, backend) {
-            if let Ok(dyn_img) = image::load_from_memory(&bytes) {
-                let mut rgba = dyn_img.to_rgba8();
-                if hue != 0.0 || saturation != 1.0 || brightness != 1.0 || contrast != 1.0 {
-                    apply_color_controls(&mut rgba, hue, saturation, brightness, contrast);
+        match latest_cmd {
+            VideoCommand::Stop => {
+                if let Some(mut child) = ffmpeg_child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
                 }
-                let (w, h) = rgba.dimensions();
-                let pixels = rgba.into_raw();
-                let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
-                let handle = ctx.load_texture(
-                    format!("vadadee-berry-vid-layer-{}", layer_id.as_simple()),
-                    color_image,
-                    egui::TextureOptions::default(),
-                );
-                self.video_frame_cache = Some(VideoFrameCache {
-                    layer_id,
-                    frame,
-                    texture: handle,
-                });
+                break;
+            }
+            VideoCommand::StopStream => {
+                if let Some(mut child) = ffmpeg_child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    ffmpeg_stdout = None;
+                }
+                libav_stream = None;
+            }
+            VideoCommand::GetFrame { timeline_frame, source_frame, fps, path, sequential } => {
+                let path_changed = current_path.as_ref() != Some(&path);
+                if path_changed {
+                    current_path = Some(path.clone());
+                    libav_stream = None; // Reset stream on file switch
+                }
+                
+                // Try libav backend first
+                if crate::video_decode::is_libav_available() {
+                    // Make sure we stop/kill any leftover command fallback processes
+                    if let Some(mut child) = ffmpeg_child.take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        ffmpeg_stdout = None;
+                    }
+                    
+                    if libav_stream.is_none() {
+                        libav_stream = crate::video_decode::VideoStream::open(&path);
+                    }
+                    
+                    if let Some(ref mut stream) = libav_stream {
+                        if let Some((w, h, rgba)) = stream.get_frame(source_frame, fps) {
+                            let _ = tx_frame.send((timeline_frame, w, h, rgba));
+                            next_expected_frame = source_frame + 1;
+                            continue;
+                        }
+                    }
+                }
+                
+                // Fallback to ffmpeg process pipeline
+                let seek_needed = !sequential 
+                    || source_frame != next_expected_frame 
+                    || path_changed 
+                    || ffmpeg_child.is_none();
+
+                if seek_needed {
+                    if let Some(mut child) = ffmpeg_child.take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        ffmpeg_stdout = None;
+                    }
+
+                    if path_changed || width == 0 || height == 0 {
+                        width = 0;
+                        height = 0;
+
+                        if let Some((w, h, _)) = crate::video_decode::decode_frame(&path, 0, fps) {
+                            width = w;
+                            height = h;
+                        }
+                    }
+
+                    if width > 0 && height > 0 {
+                        frame_bytes_len = (width * height * 4) as usize;
+                        let time_sec = source_frame as f32 / fps;
+                        
+                        use std::process::Command;
+                        let mut cmd_builder = Command::new("ffmpeg");
+                        cmd_builder.arg("-y");
+                        cmd_builder.arg("-noautorotate");
+                        cmd_builder.arg("-ss").arg(format!("{:.3}", time_sec));
+                        cmd_builder.arg("-i").arg(&path);
+                        
+                        if !sequential {
+                            cmd_builder.arg("-vframes").arg("1");
+                        }
+                        
+                        cmd_builder.args([
+                            "-f", "rawvideo",
+                            "-pix_fmt", "rgba",
+                            "pipe:1"
+                        ]);
+                        
+                        cmd_builder.stdout(std::process::Stdio::piped());
+                        cmd_builder.stderr(std::process::Stdio::null());
+                        
+                        if let Ok(mut child) = cmd_builder.spawn() {
+                            if let Some(stdout) = child.stdout.take() {
+                                ffmpeg_stdout = Some(stdout);
+                                ffmpeg_child = Some(child);
+                            }
+                        }
+                    }
+                }
+
+                let mut decoded = false;
+                if let Some(ref mut stdout) = ffmpeg_stdout {
+                    use std::io::Read;
+                    let mut buf = vec![0u8; frame_bytes_len];
+                    if stdout.read_exact(&mut buf).is_ok() {
+                        let _ = tx_frame.send((timeline_frame, width, height, buf));
+                        next_expected_frame = source_frame + 1;
+                        decoded = true;
+                    }
+                }
+
+                if !decoded {
+                    if let Some((_, w, h, rgba)) = extract_video_frame_raw(&path, source_frame, fps) {
+                        let _ = tx_frame.send((timeline_frame, w, h, rgba));
+                        next_expected_frame = source_frame + 1;
+                    }
+                }
             }
         }
     }
+    
+    // Explicit thread exit cleanup to prevent orphaned ffmpeg background processes
+    if let Some(mut child) = ffmpeg_child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+    pub fn stop_all_video_streams(&mut self) {
+        for state in self.video_layers.values_mut() {
+            if state.stream_active {
+                let _ = state.tx_cmd.send(VideoCommand::StopStream);
+                state.stream_active = false;
+                state.requested_frame = None;
+            }
+        }
+    }
+
+    /// Load (or reload) texture for a video layer at the current frame.
+    /// Tick the per-layer video decode system. Call once per frame.
+    /// - Collects any completed background decodes and uploads textures.
+    /// - Kicks off a new background decode if the current frame differs from cached.
+    /// - Never blocks the UI thread.
+    fn tick_video_layers(&mut self, ctx: &Context) {
+        let fps = self.anim_fps as f32;
+        let current_frame = self.anim_current_frame;
+
+        // Collect layer metadata without borrowing self.video_layers yet
+        let layers_info: Vec<(uuid::Uuid, String, f32, f32, f32, f32, f32, f32, f32)> = self.project.document.layers
+            .iter()
+            .filter(|l| l.visible && l.kind == crate::document::LayerKind::Video && !l.video_path.is_empty())
+            .map(|l| (l.id, l.video_path.clone(), l.hue, l.saturation, l.brightness, l.contrast, l.video_start_offset, l.video_play_length, l.video_timeline_start))
+            .collect();
+
+        // Clean up deleted/inactive video layers to terminate their channels and background processes
+        let active_ids: std::collections::HashSet<uuid::Uuid> = layers_info.iter().map(|info| info.0).collect();
+        self.video_layers.retain(|id, _| active_ids.contains(id));
+
+        for (layer_id, video_path, hue, sat, bright, contrast, start_offset, play_length, timeline_start) in &layers_info {
+            let state = self.video_layers.entry(*layer_id).or_insert_with(|| {
+                let (tx_cmd, rx_cmd) = std::sync::mpsc::channel();
+                let (tx_frame, rx_frame) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    Self::run_video_decode_thread(rx_cmd, tx_frame);
+                });
+                VideoLayerState {
+                    texture: None,
+                    cached_frame: None,
+                    tx_cmd,
+                    rx_frame,
+                    requested_frame: None,
+                    stream_active: false,
+                    last_req_time: None,
+                }
+            });
+
+            let mut latest_frame = None;
+            while let Ok(data) = state.rx_frame.try_recv() {
+                latest_frame = Some(data);
+            }
+
+            if let Some((decoded_frame, w, h, mut rgba)) = latest_frame {
+                if *hue != 0.0 || *sat != 1.0 || *bright != 1.0 || *contrast != 1.0 {
+                    let mut img = image::RgbaImage::from_raw(w, h, rgba).unwrap_or_default();
+                    apply_color_controls(&mut img, *hue, *sat, *bright, *contrast);
+                    rgba = img.into_raw();
+                }
+                let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                let handle = ctx.load_texture(
+                    format!("vadadee-vid-{}-{}", layer_id.as_simple(), decoded_frame),
+                    color_image,
+                    egui::TextureOptions::default(),
+                );
+                
+                self.video_frame_cache = Some(VideoFrameCache {
+                    layer_id: *layer_id,
+                    frame: decoded_frame,
+                    texture: handle.clone(),
+                });
+                state.texture = Some(handle);
+                state.cached_frame = Some(decoded_frame);
+                state.requested_frame = None;
+                ctx.request_repaint();
+            }
+
+            // Cleanly terminate the sequential stream if the animation has been paused
+            if !self.anim_is_playing && state.stream_active {
+                let _ = state.tx_cmd.send(VideoCommand::StopStream);
+                state.stream_active = false;
+            }
+
+            let elapsed_time = ((current_frame as f32 / fps) - timeline_start).max(0.0).min(*play_length);
+            let source_time = start_offset + elapsed_time;
+            let source_frame_idx = (source_time * fps) as usize;
+
+            let already_cached = state.cached_frame == Some(current_frame);
+            let already_requested = state.requested_frame == Some(current_frame);
+            
+            let now = ctx.input(|i| i.time);
+            let throttle = if self.anim_is_playing {
+                false
+            } else {
+                if let Some(last) = state.last_req_time {
+                    (now - last) < 0.080 // limit to ~12.5 fps when scrubbing
+                } else {
+                    false
+                }
+            };
+
+            if !already_cached && !already_requested && !throttle {
+                let _ = state.tx_cmd.send(VideoCommand::GetFrame {
+                    timeline_frame: current_frame,
+                    source_frame: source_frame_idx,
+                    fps,
+                    path: video_path.clone(),
+                    sequential: self.anim_is_playing,
+                });
+                state.requested_frame = Some(current_frame);
+                state.stream_active = self.anim_is_playing;
+                state.last_req_time = Some(now);
+            }
+        }
+    }
+
 
 
     pub fn insert_image(&mut self, x: f64, y: f64, width: f64, height: f64, bytes: Vec<u8>) {
@@ -3209,15 +3591,8 @@ impl VadadeeBerryApp {
                 }
             }
 
-            // Ensure textures for any Video layers at the current frame
-            let video_layers_to_ensure: Vec<(uuid::Uuid, String)> = self.project.document.layers
-                .iter()
-                .filter(|l| l.visible && l.kind == crate::document::LayerKind::Video && !l.video_path.is_empty())
-                .map(|l| (l.id, l.video_path.clone()))
-                .collect();
-            for (layer_id, video_path) in video_layers_to_ensure {
-                self.ensure_video_layer_texture(layer_id, &video_path, self.anim_current_frame, &ctx);
-            }
+            // Async video decode: non-blocking poll + kick off background decode if needed
+            self.tick_video_layers(&ctx);
 
             let hidden_sources =
                 hidden_effect_sources(&self.project.document.path_effects);
@@ -3227,6 +3602,13 @@ impl VadadeeBerryApp {
             }
             for e in self.project.document.circular_effects.values() {
                 if e.hide_source { hidden_sources.insert(e.source_id); }
+            }
+            // Hide clip mask source (rendered clipped) and mask (used as clip region)
+            for cm in self.project.document.clip_masks.values() {
+                hidden_sources.insert(cm.source_id);
+                if cm.hide_mask {
+                    hidden_sources.insert(cm.mask_id);
+                }
             }
             let loft_paths: std::collections::HashSet<NodeId> = self.project.document.path_effects.values()
                 .filter(|e| e.mode == OnPathMode::Loft)
@@ -3262,85 +3644,94 @@ impl VadadeeBerryApp {
                         );
                     }
                     crate::document::LayerKind::Video => {
-                        if let Some(cache) = &self.video_frame_cache {
-                            if cache.layer_id == layer.id && cache.frame == self.anim_current_frame {
-                                let mut opacity = 1.0;
-                                let mut dx = layer.x as f64;
-                                let mut dy = layer.y as f64;
-                                let mut rot = layer.rotation as f64;
-                                if let Some(track) = self.project.anim_timeline.nodes.get(&layer.id) {
-                                    if let Some(o) = track.opacity.interpolate(self.anim_current_frame) {
-                                        opacity = o as f32;
-                                    }
-                                    if let Some(x) = track.pos_x.interpolate(self.anim_current_frame) {
-                                        dx = x;
-                                    }
-                                    if let Some(y) = track.pos_y.interpolate(self.anim_current_frame) {
-                                        dy = y;
-                                    }
-                                    if let Some(r) = track.rotation.interpolate(self.anim_current_frame) {
-                                        rot = r;
+                        // Use per-layer texture from async decode system
+                        let tex = self.video_layers.get(&layer.id)
+                            .and_then(|s| s.texture.as_ref())
+                            .cloned()
+                            // Fallback to legacy single cache for the first render before async kicks in
+                            .or_else(|| {
+                                self.video_frame_cache.as_ref()
+                                    .filter(|c| c.layer_id == layer.id)
+                                    .map(|c| c.texture.clone())
+                            });
+                        if let Some(texture) = tex {
+                            let mut opacity = 1.0;
+                            let mut dx = layer.x as f64;
+                            let mut dy = layer.y as f64;
+                            let mut rot = layer.rotation as f64;
+                            if let Some(track) = self.project.anim_timeline.nodes.get(&layer.id) {
+                                if let Some(o) = track.opacity.interpolate(self.anim_current_frame) {
+                                    opacity = o as f32;
+                                }
+                                if let Some(x) = track.pos_x.interpolate(self.anim_current_frame) {
+                                    dx = x;
+                                }
+                                if let Some(y) = track.pos_y.interpolate(self.anim_current_frame) {
+                                    dy = y;
+                                }
+                                if let Some(r) = track.rotation.interpolate(self.anim_current_frame) {
+                                    rot = r;
+                                }
+                            }
+                            
+                            let tex_w = texture.size()[0] as f32;
+                            let tex_h = texture.size()[1] as f32;
+                            let aspect = if tex_h > 0.0 { tex_w / tex_h } else { 1.0 };
+                            
+                            let mut w = layer.width;
+                            let mut h = layer.height;
+                            if layer.aspect_ratio_locked {
+                                if w / h > aspect {
+                                    w = h * aspect;
+                                } else {
+                                    h = w / aspect;
+                                }
+                            }
+                            
+                            let tl = self.viewport.doc_to_screen((dx, dy), origin);
+                            let br = self.viewport.doc_to_screen(
+                                (dx + w as f64, dy + h as f64),
+                                origin
+                            );
+                            let rect = egui::Rect::from_min_max(tl, br);
+                            let rot_rad = (rot as f32).to_radians();
+                            
+                            paint_rotated_image(
+                                &painter,
+                                texture.id(),
+                                rect,
+                                rot_rad,
+                                opacity,
+                            );
+                            
+                            // Selection highlight outline
+                            if self.selection.contains(&layer.id) {
+                                let mut points = [
+                                    rect.left_top(),
+                                    rect.right_top(),
+                                    rect.right_bottom(),
+                                    rect.left_bottom(),
+                                ];
+                                if rot_rad != 0.0 {
+                                    let center = rect.center();
+                                    let cos = rot_rad.cos();
+                                    let sin = rot_rad.sin();
+                                    for pt in &mut points {
+                                        let d = *pt - center;
+                                        let rx = d.x * cos - d.y * sin;
+                                        let ry = d.x * sin + d.y * cos;
+                                        *pt = center + egui::vec2(rx, ry);
                                     }
                                 }
-                                
-                                let tex_w = cache.texture.size()[0] as f32;
-                                let tex_h = cache.texture.size()[1] as f32;
-                                let aspect = if tex_h > 0.0 { tex_w / tex_h } else { 1.0 };
-                                
-                                let mut w = layer.width;
-                                let mut h = layer.height;
-                                if layer.aspect_ratio_locked {
-                                    if w / h > aspect {
-                                        w = h * aspect;
-                                    } else {
-                                        h = w / aspect;
-                                    }
-                                }
-                                
-                                let tl = self.viewport.doc_to_screen((dx, dy), origin);
-                                let br = self.viewport.doc_to_screen(
-                                    (dx + w as f64, dy + h as f64),
-                                    origin
-                                );
-                                let rect = egui::Rect::from_min_max(tl, br);
-                                let rot_rad = (rot as f32).to_radians();
-                                
-                                paint_rotated_image(
-                                    &painter,
-                                    cache.texture.id(),
-                                    rect,
-                                    rot_rad,
-                                    opacity,
-                                );
-                                
-                                // Selection highlight outline
-                                if self.selection.contains(&layer.id) {
-                                    let mut points = [
-                                        rect.left_top(),
-                                        rect.right_top(),
-                                        rect.right_bottom(),
-                                        rect.left_bottom(),
-                                    ];
-                                    if rot_rad != 0.0 {
-                                        let center = rect.center();
-                                        let cos = rot_rad.cos();
-                                        let sin = rot_rad.sin();
-                                        for pt in &mut points {
-                                            let d = *pt - center;
-                                            let rx = d.x * cos - d.y * sin;
-                                            let ry = d.x * sin + d.y * cos;
-                                            *pt = center + egui::vec2(rx, ry);
-                                        }
-                                    }
-                                    let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 215));
-                                    painter.line_segment([points[0], points[1]], stroke);
-                                    painter.line_segment([points[1], points[2]], stroke);
-                                    painter.line_segment([points[2], points[3]], stroke);
-                                    painter.line_segment([points[3], points[0]], stroke);
-                                }
+                                let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 215));
+                                painter.line_segment([points[0], points[1]], stroke);
+                                painter.line_segment([points[1], points[2]], stroke);
+                                painter.line_segment([points[2], points[3]], stroke);
+                                painter.line_segment([points[3], points[0]], stroke);
                             }
                         }
                     }
+                    crate::document::LayerKind::Audio => {}
                 }
             }
 
@@ -3391,7 +3782,16 @@ impl VadadeeBerryApp {
                 &self.image_textures,
                 &self.selection,
             );
-
+            render::draw_clip_mask_effects(
+                &painter,
+                &self.project.nodes,
+                &self.project.document.clip_masks,
+                &self.viewport,
+                origin,
+                &self.fonts,
+                &self.image_textures,
+                &self.selection,
+            );
             if self.tools.active == ToolKind::Select && self.tools.select.marquee.is_none() {
                 if self.selection.len() == 1 {
                     if let Some(id) = self.selection.first() {
@@ -3808,7 +4208,7 @@ impl VadadeeBerryApp {
                 pos,
                 origin,
                 doc,
-                shift,
+                shift || ctrl,
                 primary_pressed,
                 primary_down,
                 primary_released,
@@ -3903,6 +4303,148 @@ impl VadadeeBerryApp {
         self.tools.select.node_edit_target = None;
         self.tools.select.node_drag_origin = None;
         self.tools.select.node_drag_active = false;
+    }
+
+    fn update_clip_mask_textures(&mut self, ctx: &egui::Context) {
+        let mut active_clip_ids = std::collections::HashSet::new();
+        
+        // Temporarily clone clip masks to avoid borrow checker issues with self
+        let clip_masks: Vec<crate::document::ClipMaskEffect> = self.project.document.clip_masks.values().cloned().collect();
+        
+        for cm in &clip_masks {
+            active_clip_ids.insert(cm.id);
+            let Some(mask_node) = self.project.nodes.get(cm.mask_id) else { continue };
+            let Some(source_node) = self.project.nodes.get(cm.source_id) else { continue };
+            
+            let sig = format!("{:?}_{:?}", mask_node, source_node);
+            let needs_update = self.clip_mask_signatures.get(&cm.id) != Some(&sig);
+            
+            if needs_update {
+                // Generate SVG fragment for mask and source
+                let mask_svg = io::node_to_svg_fragment(mask_node, &self.project.nodes);
+                let source_svg = io::node_to_svg_fragment(source_node, &self.project.nodes);
+                
+                let mask_bounds = mask_node.bounds();
+                let w = mask_bounds.width().max(1.0);
+                let h = mask_bounds.height().max(1.0);
+                
+                // Let's use a scale of 2.0 to keep it sharp
+                let scale = 2.0f32;
+                let pixel_w = (w * scale as f64).round().max(1.0) as u32;
+                let pixel_h = (h * scale as f64).round().max(1.0) as u32;
+                
+                let svg_data = format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{} {} {} {}" width="{}" height="{}">
+                      <defs>
+                        <clipPath id="clip">
+                          {}
+                        </clipPath>
+                      </defs>
+                      <g clip-path="url(#clip)">
+                        {}
+                      </g>
+                    </svg>"#,
+                    mask_bounds.x0, mask_bounds.y0, w, h,
+                    w, h,
+                    mask_svg,
+                    source_svg
+                );
+                
+                let opt = usvg::Options::default();
+                if let Ok(tree) = usvg::Tree::from_str(&svg_data, &opt) {
+                    if let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(pixel_w, pixel_h) {
+                        resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+                        let rgba = pixmap.take();
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                            [pixel_w as usize, pixel_h as usize],
+                            &rgba,
+                        );
+                        let handle = ctx.load_texture(
+                            format!("clip-mask-{}", cm.id.as_simple()),
+                            color_image,
+                            egui::TextureOptions::default(),
+                        );
+                        self.image_textures.insert(cm.id, handle);
+                        self.clip_mask_signatures.insert(cm.id, sig);
+                    }
+                }
+            }
+        }
+        
+        // Retain only active clip masks
+        self.clip_mask_signatures.retain(|id, _| active_clip_ids.contains(id));
+    }
+
+    pub fn sync_audio_playback(&mut self) {
+        use rodio::Source;
+
+        if !self.anim_is_playing {
+            self.audio_players.clear();
+            self.audio_layers_skip.clear();
+            return;
+        }
+
+        let playhead_time = self.anim_current_frame as f32 / self.anim_fps as f32;
+        let mut active_layer_ids = std::collections::HashSet::new();
+
+        let Some(device) = self.audio_device.as_ref() else {
+            return;
+        };
+        let mixer = device.mixer();
+
+        for layer in &self.project.document.layers {
+            if layer.visible
+                && (layer.kind == crate::document::LayerKind::Video || layer.kind == crate::document::LayerKind::Audio)
+                && !layer.video_path.is_empty()
+            {
+                let start = layer.video_timeline_start;
+                let duration = layer.video_play_length;
+                if playhead_time >= start && playhead_time < start + duration {
+                    active_layer_ids.insert(layer.id);
+
+                    if self.audio_layers_skip.contains(&layer.id) {
+                        continue;
+                    }
+
+                    if !self.audio_players.contains_key(&layer.id) {
+                        let audio_path = resolve_audio_path_for_rodio(&layer.video_path, &mut self.audio_extract_cache)
+                            .unwrap_or_else(|| std::path::PathBuf::from(&layer.video_path));
+                        let Ok(file) = std::fs::File::open(&audio_path) else {
+                            self.audio_layers_skip.insert(layer.id);
+                            continue;
+                        };
+                        let buf_reader = std::io::BufReader::new(file);
+                        if let Ok(mut source) = rodio::Decoder::try_from(buf_reader) {
+                            let sample_rate = source.sample_rate().get();
+                            let channels = source.channels().get();
+                            let relative_time =
+                                (playhead_time - start) + layer.video_start_offset;
+                            if relative_time > 0.0 {
+                                let samples_to_skip = (relative_time
+                                    * sample_rate as f32
+                                    * channels as f32)
+                                    as usize;
+                                for _ in 0..samples_to_skip {
+                                    source.next();
+                                }
+                            }
+
+                            let player = rodio::Player::connect_new(mixer);
+                            player.set_volume(layer.volume);
+                            player.append(source);
+                            self.audio_players.insert(layer.id, player);
+                        } else {
+                            self.audio_layers_skip.insert(layer.id);
+                        }
+                    } else if let Some(player) = self.audio_players.get(&layer.id) {
+                        player.set_volume(layer.volume);
+                    }
+                }
+            }
+        }
+
+        self.audio_players
+            .retain(|id, _| active_layer_ids.contains(id));
     }
 
     pub fn set_path_handle_mode(&mut self, id: NodeId, anchor_idx: usize, mode: BezierHandleMode) {
@@ -4578,6 +5120,80 @@ impl VadadeeBerryApp {
         if !removed { return; }
         self.history.push(&mut self.project, ProjectEdit::PatchDocument { before: before_doc, after: after_doc });
         self.status_message = "Removed CircularClone effect(s)".into();
+    }
+
+    /// Returns true if any selected node is the source_id or mask_id of a clip mask effect.
+    pub fn selection_has_clip_mask(&self) -> bool {
+        self.selection.iter().any(|&id| {
+            self.project.document.clip_masks.values().any(|cm| cm.source_id == id || cm.mask_id == id)
+        })
+    }
+
+    /// Apply a clip mask: first selected non-path object becomes source_id, first path becomes mask_id.
+    pub fn apply_clip_mask(&mut self) {
+        let paths: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| matches!(&n.kind, NodeKind::Path { .. }))
+        }).copied().collect();
+        let objects: Vec<NodeId> = self.selection.iter().filter(|&&id| {
+            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+        }).copied().collect();
+        let (source_id, mask_id) = match (objects.first(), paths.first()) {
+            (Some(&s), Some(&m)) => (s, m),
+            // If both are paths, use first as source and second as mask
+            _ => {
+                let sel = &self.selection;
+                if sel.len() >= 2 { (sel[0], sel[1]) } else { return; }
+            }
+        };
+        // Avoid duplicates
+        if self.project.document.clip_masks.values().any(|cm| cm.source_id == source_id && cm.mask_id == mask_id) {
+            return;
+        }
+        let before_doc = snapshot_document(&self.project.document);
+        let mut after_doc = before_doc.clone();
+        let effect = crate::document::ClipMaskEffect {
+            id: uuid::Uuid::new_v4(),
+            source_id,
+            mask_id,
+            hide_mask: true,
+        };
+        after_doc.clip_masks.insert(effect.id, effect);
+        self.history.push(&mut self.project, ProjectEdit::PatchDocument { before: before_doc, after: after_doc });
+        self.status_message = "Clip Mask applied".into();
+    }
+
+    /// Remove all clip mask effects that involve any selected node.
+    pub fn remove_clip_mask(&mut self) {
+        let sel = self.selection.clone();
+        let before_doc = snapshot_document(&self.project.document);
+        let mut after_doc = before_doc.clone();
+        let mut removed = false;
+        let keys: Vec<uuid::Uuid> = after_doc.clip_masks.iter().filter(|(_, cm)| {
+            sel.contains(&cm.source_id) || sel.contains(&cm.mask_id)
+        }).map(|(k, _)| *k).collect();
+        for k in keys {
+            after_doc.clip_masks.swap_remove(&k);
+            removed = true;
+        }
+        if !removed { return; }
+        self.history.push(&mut self.project, ProjectEdit::PatchDocument { before: before_doc, after: after_doc });
+        self.status_message = "Clip Mask removed".into();
+    }
+
+    /// Swap source_id and mask_id in the clip mask that involves the current selection.
+    pub fn swap_clip_mask_source(&mut self) {
+        let sel = &self.selection;
+        let effect_id = self.project.document.clip_masks.iter().find(|(_, cm)| {
+            sel.contains(&cm.source_id) || sel.contains(&cm.mask_id)
+        }).map(|(k, _)| *k);
+        let Some(eid) = effect_id else { return };
+        let before_doc = snapshot_document(&self.project.document);
+        let mut after_doc = before_doc.clone();
+        if let Some(cm) = after_doc.clip_masks.get_mut(&eid) {
+            std::mem::swap(&mut cm.source_id, &mut cm.mask_id);
+        }
+        self.history.push(&mut self.project, ProjectEdit::PatchDocument { before: before_doc, after: after_doc });
+        self.status_message = "Clip Mask swapped".into();
     }
 
     pub fn bake_tiling(&mut self) {
@@ -5376,6 +5992,82 @@ impl VadadeeBerryApp {
         }
 
         if pressed {
+            // Resize handles for selected Video Layer
+            if self.selection.len() == 1 {
+                if let Some(id) = self.selection.first().copied() {
+                    let mut layer_doc_rect = None;
+                    if let Some(l) = self.project.document.layers.iter().find(|l| l.id == id) {
+                        if l.kind == crate::document::LayerKind::Video {
+                            let mut dx = l.x as f64;
+                            let mut dy = l.y as f64;
+                            if let Some(track) = self.project.anim_timeline.nodes.get(&l.id) {
+                                if let Some(x) = track.pos_x.interpolate(self.anim_current_frame) {
+                                    dx = x;
+                                }
+                                if let Some(y) = track.pos_y.interpolate(self.anim_current_frame) {
+                                    dy = y;
+                                }
+                            }
+                             let aspect = self.video_layers.get(&l.id)
+                                .and_then(|s| s.texture.as_ref())
+                                .map(|tex| {
+                                    let tex_w = tex.size()[0] as f32;
+                                    let tex_h = tex.size()[1] as f32;
+                                    if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                })
+                                .or_else(|| {
+                                    self.video_frame_cache.as_ref()
+                                        .filter(|c| c.layer_id == l.id)
+                                        .map(|c| {
+                                            let tex_w = c.texture.size()[0] as f32;
+                                            let tex_h = c.texture.size()[1] as f32;
+                                            if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                        })
+                                })
+                                .unwrap_or(1.0);
+                            let mut w = l.width as f64;
+                            let mut h = l.height as f64;
+                            if l.aspect_ratio_locked {
+                                if w / h > aspect {
+                                    w = h * aspect;
+                                } else {
+                                    h = w / aspect;
+                                }
+                            }
+                            layer_doc_rect = Some(kurbo::Rect::new(dx, dy, dx + w, dy + h));
+                        }
+                    }
+                    if let Some(r) = layer_doc_rect {
+                        let tl = self.viewport.doc_to_screen((r.x0, r.y0), origin);
+                        let br = self.viewport.doc_to_screen((r.x1, r.y1), origin);
+                        let sr = egui::Rect::from_min_max(tl, br);
+                        if let Some(handle) = render::hit_resize_handle(sr, screen, self.viewport.zoom) {
+                            if self.tools.select.select_rotation_mode {
+                                if matches!(handle, tools::ResizeHandle::Nw | tools::ResizeHandle::Ne | tools::ResizeHandle::Se | tools::ResizeHandle::Sw) {
+                                    self.tools.select.drag_mode = Some(SelectDrag::Rotate);
+                                    let cx = (r.x0 + r.x1) * 0.5;
+                                    let cy = (r.y0 + r.y1) * 0.5;
+                                    self.tools.select.rotate_center = Some((cx, cy));
+                                    self.tools.select.rotate_start_angle = (doc.1 - cy).atan2(doc.0 - cx);
+                                    if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == id) {
+                                        self.tools.select.rotate_start_layer_rotation = self.project.document.layers[pos].rotation;
+                                    }
+                                    self.tools.select.last_doc = doc;
+                                    self.sync_inspector_from_selection();
+                                    return;
+                                }
+                            } else {
+                                self.tools.select.drag_mode = Some(SelectDrag::Resize(handle));
+                                self.tools.select.resize_anchor = r;
+                                self.tools.select.last_doc = doc;
+                                self.sync_inspector_from_selection();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Resize / Rotate handles take priority over move (must run on pointer-down, not click-up).
             if self.selection.len() == 1 {
                 if let Some(id) = self.selection.first().copied() {
@@ -5463,6 +6155,90 @@ impl VadadeeBerryApp {
                 self.tools.select.set_path_segment(id, from, to);
                 self.tools.active = ToolKind::Node;
                 ui::promote_action_tab(self, ui::ActionTab::Geometry);
+                self.sync_inspector_from_selection();
+                return;
+            }
+
+            // Hit check visible Video Layers first
+            let mut hit_layer_id = None;
+            let mut hit_layer_rect = None;
+            for layer in self.project.document.layers.iter().rev() {
+                if layer.visible && layer.kind == crate::document::LayerKind::Video {
+                    let mut dx = layer.x as f64;
+                    let mut dy = layer.y as f64;
+                    let mut rot = layer.rotation as f64;
+                    if let Some(track) = self.project.anim_timeline.nodes.get(&layer.id) {
+                        if let Some(x) = track.pos_x.interpolate(self.anim_current_frame) {
+                            dx = x;
+                        }
+                        if let Some(y) = track.pos_y.interpolate(self.anim_current_frame) {
+                            dy = y;
+                        }
+                        if let Some(r) = track.rotation.interpolate(self.anim_current_frame) {
+                            rot = r;
+                        }
+                    }
+                    let aspect = self.video_layers.get(&layer.id)
+                        .and_then(|s| s.texture.as_ref())
+                        .map(|tex| {
+                            let tex_w = tex.size()[0] as f32;
+                            let tex_h = tex.size()[1] as f32;
+                            if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                        })
+                        .or_else(|| {
+                            self.video_frame_cache.as_ref()
+                                .filter(|c| c.layer_id == layer.id)
+                                .map(|c| {
+                                    let tex_w = c.texture.size()[0] as f32;
+                                    let tex_h = c.texture.size()[1] as f32;
+                                    if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                })
+                        })
+                        .unwrap_or(1.0);
+                    let mut w = layer.width as f64;
+                    let mut h = layer.height as f64;
+                    if layer.aspect_ratio_locked {
+                        if w / h > aspect {
+                            w = h * aspect;
+                        } else {
+                            h = w / aspect;
+                        }
+                    }
+                    let cx = dx + w / 2.0;
+                    let cy = dy + h / 2.0;
+                    let px = doc.0 - cx;
+                    let py = doc.1 - cy;
+                    let rot_rad = (rot as f32).to_radians();
+                    let cos = (-rot_rad).cos() as f64;
+                    let sin = (-rot_rad).sin() as f64;
+                    let local_x = px * cos - py * sin;
+                    let local_y = px * sin + py * cos;
+                    if local_x >= -w/2.0 && local_x <= w/2.0 && local_y >= -h/2.0 && local_y <= h/2.0 {
+                        hit_layer_id = Some(layer.id);
+                        hit_layer_rect = Some(kurbo::Rect::new(dx, dy, dx + w, dy + h));
+                        break;
+                    }
+                }
+            }
+            if let Some(id) = hit_layer_id {
+                self.tools.select.marquee = None;
+                self.tools.select.clear_path_point_selection();
+                if shift {
+                    if self.selection.contains(&id) {
+                        self.selection.retain(|s| *s != id);
+                    } else {
+                        self.selection.push(id);
+                    }
+                } else if !self.selection.contains(&id) {
+                    self.selection = vec![id];
+                    self.tools.select.select_rotation_mode = false;
+                }
+                if !self.selection.is_empty() {
+                    self.tools.select.drag_mode = Some(SelectDrag::Move);
+                    self.tools.select.drag_start_doc = Some(doc);
+                    self.tools.select.resize_anchor = hit_layer_rect.unwrap();
+                }
+                self.tools.select.last_doc = doc;
                 self.sync_inspector_from_selection();
                 return;
             }
@@ -5569,6 +6345,16 @@ impl VadadeeBerryApp {
                         let total_dy = doc.1 - drag_start.1;
                         let selection_ids = self.selection.clone();
                         let (snapped_dx, snapped_dy) = self.apply_snapping((total_dx, total_dy), &selection_ids);
+                        
+                        // Move Video Layers in selection
+                        for &sid in &selection_ids {
+                            if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == sid) {
+                                let layer = &mut self.project.document.layers[pos];
+                                layer.x = (self.tools.select.resize_anchor.x0 + snapped_dx) as f32;
+                                layer.y = (self.tools.select.resize_anchor.y0 + snapped_dy) as f32;
+                            }
+                        }
+                        
                         for &(id, ref orig_node) in &self.tools.select.drag_snapshot {
                             if let Some(node) = self.project.nodes.get_mut(id) {
                                 *node = orig_node.clone();
@@ -5581,7 +6367,13 @@ impl VadadeeBerryApp {
                         if let Some(id) = self.selection.first().copied() {
                             let new_bounds =
                                 tools::resize_bounds(self.tools.select.resize_anchor, handle, doc);
-                            if let Some(node) = self.project.nodes.get_mut(id) {
+                            if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == id) {
+                                let layer = &mut self.project.document.layers[pos];
+                                layer.x = new_bounds.x0 as f32;
+                                layer.y = new_bounds.y0 as f32;
+                                layer.width = new_bounds.width() as f32;
+                                layer.height = new_bounds.height() as f32;
+                            } else if let Some(node) = self.project.nodes.get_mut(id) {
                                 node.set_bounds(new_bounds);
                             }
                         }
@@ -5616,17 +6408,26 @@ impl VadadeeBerryApp {
                         }
                     }
                     SelectDrag::Rotate => {
-                        if let Some(&(id, ref original_node)) = self.tools.select.drag_snapshot.first() {
+                        if let Some(id) = self.selection.first().copied() {
                             if let Some(center) = self.tools.select.rotate_center {
                                 let dx = doc.0 - center.0;
                                 let dy = doc.1 - center.1;
                                 let current_angle = dy.atan2(dx);
                                 let delta_angle = current_angle - self.tools.select.rotate_start_angle;
-                                let mut node = original_node.clone();
-                                let original_rot = original_node.get_rotation();
-                                node.set_rotation(original_rot + delta_angle);
-                                if let Some(n) = self.project.nodes.get_mut(id) {
-                                    *n = node;
+                                
+                                if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == id) {
+                                    let layer = &mut self.project.document.layers[pos];
+                                    let new_rot = self.tools.select.rotate_start_layer_rotation + delta_angle.to_degrees() as f32;
+                                    layer.rotation = new_rot;
+                                } else if let Some(&(drag_id, ref original_node)) = self.tools.select.drag_snapshot.first() {
+                                    if drag_id == id {
+                                        let mut node = original_node.clone();
+                                        let original_rot = original_node.get_rotation();
+                                        node.set_rotation(original_rot + delta_angle);
+                                        if let Some(n) = self.project.nodes.get_mut(id) {
+                                            *n = node;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -7035,6 +7836,7 @@ impl VadadeeBerryApp {
 
 impl eframe::App for VadadeeBerryApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.update_clip_mask_textures(ctx);
         // Graph editor transition animation tick
         let dt = ctx.input(|i| i.stable_dt);
         let target_t = if self.anim_graph_editor_track.is_some() && self.anim_graph_editor_target_track.is_none() {
@@ -7105,6 +7907,15 @@ impl eframe::App for VadadeeBerryApp {
                         color: node.get_color(),
                         geom_floats: gf,
                         fill: node.style.fill.clone(),
+                    });
+                } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::Video) {
+                    self.anim_last_applied_states.entry(*id).or_insert_with(|| AnimAppliedState {
+                        pos: (layer.x as f64, layer.y as f64),
+                        rotation: layer.rotation as f64,
+                        opacity: 1.0,
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        geom_floats: vec![],
+                        fill: Fill::default(),
                     });
                 }
             }
@@ -7256,6 +8067,53 @@ impl eframe::App for VadadeeBerryApp {
                             keyframes_updated = true;
                         }
                     }
+                } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::Video) {
+                    let pos = (layer.x as f64, layer.y as f64);
+                    let rot = layer.rotation as f64;
+                    let last_state = self.anim_last_applied_states.get(id);
+                    if let Some(last) = last_state {
+                        let mut changed_pos = false;
+                        let mut changed_rot = false;
+                        
+                        let dx = pos.0 - last.pos.0;
+                        let dy = pos.1 - last.pos.1;
+                        if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
+                            changed_pos = true;
+                        }
+                        if (rot - last.rotation).abs() > 1e-9 {
+                            changed_rot = true;
+                        }
+                        
+                        if changed_pos || changed_rot {
+                            let before_timeline = self.project.anim_timeline.clone();
+                            let entry = self.project.anim_timeline.nodes.entry(*id).or_default();
+                            if changed_pos {
+                                if entry.pos_x.keyframes.is_empty() {
+                                    entry.pos_x.insert(0, last.pos.0);
+                                }
+                                if entry.pos_y.keyframes.is_empty() {
+                                    entry.pos_y.insert(0, last.pos.1);
+                                }
+                                entry.pos_x.insert(self.anim_current_frame, pos.0);
+                                entry.pos_y.insert(self.anim_current_frame, pos.1);
+                            }
+                            if changed_rot {
+                                if entry.rotation.keyframes.is_empty() {
+                                    entry.rotation.insert(0, last.rotation);
+                                }
+                                entry.rotation.insert(self.anim_current_frame, rot);
+                            }
+                            let after_timeline = self.project.anim_timeline.clone();
+                            self.history.push(
+                                &mut self.project,
+                                ProjectEdit::PatchTimeline {
+                                    before: before_timeline,
+                                    after: after_timeline,
+                                },
+                            );
+                            keyframes_updated = true;
+                        }
+                    }
                 }
             }
             if keyframes_updated {
@@ -7270,6 +8128,15 @@ impl eframe::App for VadadeeBerryApp {
                             color: node.get_color(),
                             geom_floats: gf,
                             fill: node.style.fill.clone(),
+                        });
+                    } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::Video) {
+                        self.anim_last_applied_states.insert(*id, AnimAppliedState {
+                            pos: (layer.x as f64, layer.y as f64),
+                            rotation: layer.rotation as f64,
+                            opacity: 1.0,
+                            color: [1.0, 1.0, 1.0, 1.0],
+                            geom_floats: vec![],
+                            fill: Fill::default(),
                         });
                     }
                 }
@@ -7330,6 +8197,7 @@ impl eframe::App for VadadeeBerryApp {
         self.tick_video_export(ctx);
         self.keyboard_shortcuts(ctx);
         self.canvas_wheel_zoom(ctx);
+        self.sync_audio_playback();
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
@@ -7522,10 +8390,12 @@ mod tests {
                 anim_is_playing: false,
                 anim_keyframing_mode: false,
                 anim_show_timeline_window: false,
+                show_video_editor_window: None,
                 anim_time_accumulator: 0.0,
                 anim_last_seen_frame: 0,
                 anim_last_applied_states: std::collections::HashMap::new(),
                 anim_timeline_scroll: 0.0,
+                anim_timeline_follow: true,
                 anim_edit_mode: false,
                 anim_dragged_keyframe: None,
                 anim_selected_keyframe: None,
@@ -7536,8 +8406,14 @@ mod tests {
                 anim_graph_editor_dragged_handle: None,
                 anim_graph_kf_drag_start: None,
                 anim_graph_selected_segment: None,
-                anim_fps: 30,
+                anim_fps: 60,
                 video_frame_cache: None,
+                video_layers: std::collections::HashMap::new(),
+                clip_mask_signatures: std::collections::HashMap::new(),
+                audio_device: None,
+                audio_players: std::collections::HashMap::new(),
+                audio_layers_skip: std::collections::HashSet::new(),
+                audio_extract_cache: std::collections::HashMap::new(),
 
                 project: Document::new_default_project(),
                 viewport: Viewport::default(),
@@ -7606,6 +8482,8 @@ mod tests {
                 ui_on_path_loft_scale: 1.0,
                 ui_on_path_loft_opacity: 0.75,
                 ui_on_path_container_h: 280.0,
+                timeline_container_h: 56.0,
+                video_editor_container_h: 130.0,
                 ui_tiling_rows: 3,
                 ui_tiling_cols: 3,
                 ui_tiling_offset_x: 0.0,
@@ -7709,6 +8587,76 @@ mod tests {
     }
 }
 
+fn is_video_container_ext(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mpeg" | "mpg" | "3gp"
+    )
+}
+
+/// Rodio/symphonia cannot stream most MP4 containers; extract PCM wav once via ffmpeg.
+fn resolve_audio_path_for_rodio(
+    video_path: &str,
+    cache: &mut std::collections::HashMap<String, std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if !is_video_container_ext(video_path) {
+        return Some(std::path::PathBuf::from(video_path));
+    }
+    if let Some(cached) = cache.get(video_path) {
+        if cached.exists() {
+            return Some(cached.clone());
+        }
+    }
+    #[cfg(any(target_os = "android", target_arch = "wasm32"))]
+    {
+        let _ = cache;
+        return None;
+    }
+    #[cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))]
+    {
+        use std::hash::{Hash, Hasher};
+        use std::process::Command;
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        video_path.hash(&mut hasher);
+        let out = std::env::temp_dir().join(format!("vadadee_audio_{:016x}.wav", hasher.finish()));
+
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                video_path,
+                "-vn",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+            ])
+            .arg(&out)
+            .status()
+            .ok()
+            .is_some_and(|s| s.success())
+            && out.exists();
+
+        if ok {
+            cache.insert(video_path.to_string(), out.clone());
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
 fn extract_video_frame(video_path: &str, frame_idx: usize, fps: f32, backend: VideoBackend) -> Option<Vec<u8>> {
     use std::process::Command;
     let time_sec = frame_idx as f32 / fps;
@@ -7716,6 +8664,7 @@ fn extract_video_frame(video_path: &str, frame_idx: usize, fps: f32, backend: Vi
     // Attempt FFmpeg frame extraction first (seeking to time_sec is extremely fast and accurate)
     let output = Command::new("ffmpeg")
         .arg("-y")
+        .arg("-noautorotate")
         .arg("-ss")
         .arg(format!("{:.3}", time_sec))
         .arg("-i")
@@ -7757,6 +8706,16 @@ fn extract_video_frame(video_path: &str, frame_idx: usize, fps: f32, backend: Vi
         }
     }
     None
+}
+
+/// Fast async frame extractor using the best available backend:
+/// - libav (libavformat/libavcodec/libswscale dlopen'd at runtime) when available
+/// - ffmpeg process spawn as fallback
+///
+/// Returns (frame_idx, width, height, rgba_bytes). Used by background threads.
+fn extract_video_frame_raw(video_path: &str, frame_idx: usize, fps: f32) -> Option<(usize, u32, u32, Vec<u8>)> {
+    crate::video_decode::decode_frame(video_path, frame_idx, fps)
+        .map(|(w, h, rgba)| (frame_idx, w, h, rgba))
 }
 
 fn apply_color_controls(img: &mut image::RgbaImage, hue: f32, sat: f32, bright: f32, contrast: f32) {

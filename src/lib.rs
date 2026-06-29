@@ -15,6 +15,7 @@ pub mod text_glyph;
 pub mod theme;
 pub mod tools;
 pub mod ui;
+pub mod video_decode;
 
 use app::VadadeeBerryApp;
 
@@ -53,6 +54,8 @@ fn init_logging() {
     {
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .filter_module("egui_winit::clipboard", log::LevelFilter::Off)
+            .filter_module("symphonia_format_isomp4", log::LevelFilter::Off)
+            .filter_module("symphonia_bundle", log::LevelFilter::Off)
             .try_init();
     }
 }

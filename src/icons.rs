@@ -35,6 +35,8 @@ pub const ARC: &str = "";
 pub const ACTION_HIDE: &str = "";
 pub const ACTION_SHOW: &str = "󰞓";
 pub const CLOSE: &str = "";
+pub const VIDEO: &str = "";
+pub const AUDIO: &str = "";
 
 pub fn nerd_font_id(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name(FONT_NAME.into()))

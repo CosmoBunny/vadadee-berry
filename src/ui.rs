@@ -99,6 +99,7 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     app.ui_anim.sync(
         app.action_bar_open,
         app.anim_show_timeline_window,
+        app.show_video_editor_window.is_some(),
         app.tools.active,
         app.action_tab,
         &action_text,
@@ -109,6 +110,7 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     );
     app.ui_anim.advance_action_bar_slide(ui.ctx());
     app.ui_anim.advance_timeline_slide(ui.ctx());
+    app.ui_anim.advance_video_editor_slide(ui.ctx());
     app.ui_anim.tick(ui.ctx());
     video_export_progress_window(app, ui.ctx());
     status_bar(app, ui);
@@ -124,6 +126,7 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             floating_toolbar(app, &ctx, work);
             floating_action_bar(app, &ctx, work);
             floating_timeline_window(app, &ctx, work);
+            floating_video_editor(app, &ctx, work);
         });
 
     let ctx = ui.ctx();
@@ -884,6 +887,22 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     }
 
+    // Offer clip mask when 2+ nodes are selected and no clip mask is active yet
+    if app.selection.len() >= 2 && !app.selection_has_clip_mask() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("Clip Mask: ")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            if ui.button("✂ Apply Clip Mask").clicked() {
+                app.apply_clip_mask();
+                ui.ctx().request_repaint();
+            }
+        });
+        ui.add_space(4.0);
+    }
+
     if on_path_container {
         let expand = app.ui_anim.on_path_container_expand();
         let alpha = app.ui_anim.on_path_container_alpha();
@@ -1003,12 +1022,35 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     }
 
+    // Clip Mask active panel (when selection involves a clip mask)
+    if app.selection_has_clip_mask() {
+        ui.separator();
+        ui.label(RichText::new("✂ Clip Mask").strong());
+        ui.label(
+            RichText::new("Source is rendered clipped to the mask shape.")
+                .small()
+                .color(colors::TEXT_MUTED),
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("⇄ Swap source / mask").clicked() {
+                app.swap_clip_mask_source();
+                ui.ctx().request_repaint();
+            }
+            if ui.button("✖ Remove").clicked() {
+                app.remove_clip_mask();
+                ui.ctx().request_repaint();
+            }
+        });
+        ui.add_space(4.0);
+    }
+
     if path_ids.is_empty() && app.object_on_path_panel_context().is_none() {
         // Show Tiling and CircularClone apply when only facial objects (e.g. Circle) selected, and not yet enabled
         let facial_objects: Vec<_> = app.selection.iter().filter(|&&id| {
             app.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. } | NodeKind::Group { .. }))
         }).cloned().collect();
         let has_t_or_c = app.selection_has_tiling_effect() || app.selection_has_circular_effect();
+        let has_cm = app.selection_has_clip_mask();
         if !facial_objects.is_empty() && !has_t_or_c {
             ui.label(RichText::new("Path Magic (separate traits)").strong());
             ui.horizontal_wrapped(|ui| {
@@ -1021,7 +1063,7 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             });
             ui.add_space(8.0);
         }
-        if !has_t_or_c {
+        if !has_t_or_c && !has_cm {
             ui.label(
                 RichText::new("Select path(s) or one path + object(s).")
                     .color(colors::TEXT_MUTED),
@@ -1459,6 +1501,485 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
         });
 }
 
+fn floating_video_editor(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
+    let open_t = app.ui_anim.video_editor_t;
+    let animating = app.ui_anim.video_editor_running;
+    if app.show_video_editor_window.is_none() && !animating && open_t <= 0.001 {
+        return;
+    }
+
+    let active_video_id_from_index = {
+        let active_idx = app.project.document.active_layer_index;
+        if active_idx < app.project.document.layers.len() {
+            let l = &app.project.document.layers[active_idx];
+            if l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio {
+                Some(l.id)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some(vid_id) = active_video_id_from_index {
+        if app.show_video_editor_window.is_some() {
+            app.show_video_editor_window = Some(vid_id);
+        }
+    }
+
+    let Some(layer_id) = app.show_video_editor_window.or(active_video_id_from_index).or_else(|| {
+        app.selection.first().copied().and_then(|sel_id| {
+            app.project.document.layers.iter().find(|l| l.id == sel_id && (l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio)).map(|l| l.id)
+        })
+    }).or_else(|| {
+        app.project.document.layers.iter().find(|l| l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio).map(|l| l.id)
+    }) else {
+        return;
+    };
+    
+    let mut layer_pos = None;
+    for (i, l) in app.project.document.layers.iter().enumerate() {
+        if l.id == layer_id {
+            layer_pos = Some(i);
+            break;
+        }
+    }
+    
+    let Some(pos) = layer_pos else {
+        return;
+    };
+
+    let inset = theme::overlay_work_rect(work);
+    let gap = theme::chrome_gap() as f32;
+    let action_bar_open_amount = app.ui_anim.action_bar_open_t();
+    let action_bar_visible_width = app.action_bar_width * action_bar_open_amount;
+    let width_reduction = if action_bar_open_amount > 0.001 {
+        action_bar_visible_width + gap
+    } else {
+        0.0
+    };
+    let card_w = inset.width() - 2.0 * gap - width_reduction;
+    
+    let expected_h = 130.0;
+    let card_h = app.video_editor_container_h.clamp(expected_h, 450.0);
+    let left = inset.left() + gap;
+    let screen_y = ctx.content_rect().max.y;
+    let open_top = screen_y - 38.0 - card_h;
+    let travel = card_h + 38.0 + gap;
+    let top = open_top + (1.0 - open_t) * travel;
+    
+    let rect = Rect::from_min_size(egui::pos2(left, top), egui::vec2(card_w, card_h));
+    let opacity = egui::emath::easing::cubic_out(open_t);
+    
+    if let Some(actual_rect) = theme::show_action_bar_area(ctx, "floating_video_editor", rect, opacity, |ui| {
+        video_editor_interior(app, ui, pos);
+    }) {
+        app.video_editor_container_h = actual_rect.height();
+    }
+}
+
+fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_pos: usize) {
+    let fps = app.anim_fps as f32;
+    let max_frames = app.get_max_animation_frame() as f32;
+    
+    let mut curr_frame = app.anim_current_frame;
+    let mut scroll = app.anim_timeline_scroll;
+
+    // Auto-follow playhead: scroll so the playhead stays in the middle 70% of the timeline viewport
+    if app.anim_timeline_follow {
+        let left_boundary = scroll + 15.0;
+        let right_boundary = scroll + 85.0;
+        let current = curr_frame as f32;
+        if current < left_boundary {
+            scroll = (current - 15.0).max(0.0);
+        } else if current > right_boundary {
+            scroll = (current - 85.0).max(0.0);
+        }
+    }
+
+    let mut apply_anim_for_frame = None;
+    let mut close_editor = false;
+
+    // Filter all video and audio layers
+    let timeline_layers: Vec<(usize, uuid::Uuid, String, crate::document::LayerKind)> = app.project.document.layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio)
+        .map(|(pos, l)| (pos, l.id, l.name.clone(), l.kind))
+        .collect();
+
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new("🎬 VIDEO TIMELINE EDITOR").strong().color(colors::ACCENT));
+            ui.add_space(16.0);
+            ui.checkbox(&mut app.anim_timeline_follow, "Follow Playhead");
+            
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(RichText::new(icons::CLOSE).font(nerd_font_id(12.0))).clicked() {
+                    close_editor = true;
+                }
+            });
+        });
+        ui.add_space(2.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        let left_col_w = 120.0;
+        let track_w = (ui.available_width() - left_col_w - 12.0).max(50.0);
+        let ruler_h = 20.0;
+
+        // Draw top playhead ruler aligned with the timeline tracks
+        ui.horizontal(|ui| {
+            // spacer for left column alignment
+            ui.allocate_rect(egui::Rect::from_min_size(ui.next_widget_position(), egui::vec2(left_col_w, ruler_h)), egui::Sense::hover());
+            let (ruler_resp, ruler_painter) = ui.allocate_painter(egui::vec2(track_w, ruler_h), egui::Sense::click_and_drag());
+            let ruler_rect = ruler_resp.rect;
+
+            ruler_painter.rect(
+                ruler_rect,
+                egui::CornerRadius::same(2),
+                egui::Color32::from_rgb(30, 32, 40),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 53, 65)),
+                egui::StrokeKind::Inside,
+            );
+
+            let start_frame = scroll;
+            let visible_frames = 100.0;
+            let end_frame = start_frame + visible_frames;
+            let start_sec = start_frame / fps;
+            let visible_sec = visible_frames / fps;
+            let end_sec = end_frame / fps;
+
+            let start_sec_grid = (start_sec.floor() as i32).max(0);
+            let end_sec_grid = end_sec.ceil() as i32;
+
+            for i in start_sec_grid..=end_sec_grid {
+                let pct = (i as f32 - start_sec) / visible_sec;
+                if pct >= 0.0 && pct <= 1.0 {
+                    let x = ruler_rect.left() + pct * ruler_rect.width();
+                    ruler_painter.line_segment(
+                        [egui::pos2(x, ruler_rect.top()), egui::pos2(x, ruler_rect.bottom())],
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 63, 75)),
+                    );
+                    if i % 2 == 0 || end_sec_grid - start_sec_grid < 10 {
+                        ruler_painter.text(
+                            egui::pos2(x + 2.0, ruler_rect.top() + 6.0),
+                            egui::Align2::LEFT_CENTER,
+                            format!("{i}s"),
+                            egui::FontId::proportional(8.0),
+                            egui::Color32::from_rgb(150, 155, 170),
+                        );
+                    }
+                }
+            }
+
+            // Draw orange playhead line on the ruler
+            let playhead_frac = (curr_frame as f32 - start_frame) / visible_frames;
+            if playhead_frac >= 0.0 && playhead_frac <= 1.0 {
+                let playhead_x = ruler_rect.left() + playhead_frac * ruler_rect.width();
+                ruler_painter.line_segment(
+                    [egui::pos2(playhead_x, ruler_rect.top() - 2.0), egui::pos2(playhead_x, ruler_rect.bottom() + 2.0)],
+                    egui::Stroke::new(1.8, egui::Color32::from_rgb(255, 165, 0)),
+                );
+            }
+
+            if ruler_resp.dragged() || ruler_resp.clicked() {
+                if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let frac = ((mpos.x - ruler_rect.left()) / ruler_rect.width()).clamp(0.0, 1.0);
+                    let target_frame = (start_frame + frac * visible_frames).round() as usize;
+                    curr_frame = target_frame.min(max_frames as usize);
+                    apply_anim_for_frame = Some(curr_frame);
+                }
+            }
+        });
+        ui.add_space(2.0);
+
+        // Helper to truncate long name
+        let truncate_name = |name: &str| -> String {
+            if name.chars().count() > 15 {
+                let mut res: String = name.chars().take(12).collect();
+                res.push_str("...");
+                res
+            } else {
+                name.to_owned()
+            }
+        };
+
+        let start_frame = scroll;
+        let visible_frames = 100.0;
+        let visible_sec = visible_frames / fps;
+        let start_sec = start_frame / fps;
+        let end_sec = (start_frame + visible_frames) / fps;
+        let start_sec_grid = (start_sec.floor() as i32).max(0);
+        let end_sec_grid = end_sec.ceil() as i32;
+
+        let mut scroll_area = egui::ScrollArea::vertical();
+        if timeline_layers.len() > 5 {
+            scroll_area = scroll_area.max_height(5.0 * 36.0);
+        }
+
+        let mut dragged_layer_id_and_delta = None;
+        let mut scroll_delta_timeline = 0.0;
+        let mut scroll_follow_disable = false;
+
+        scroll_area.show(ui, |ui| {
+            for (idx, layer_id, layer_name, layer_kind) in &timeline_layers {
+                ui.horizontal(|ui| {
+                    let is_selected_layer = app.project.document.active_layer_index == *idx;
+                    let display_name = truncate_name(layer_name);
+                    let icon = match layer_kind {
+                        crate::document::LayerKind::Video => icons::VIDEO,
+                        crate::document::LayerKind::Audio => icons::AUDIO,
+                        _ => "🖼",
+                    };
+                    let label = RichText::new(format!("{} {}", icon, display_name)).font(nerd_font_id(11.0));
+                    let label_resp = ui.add_sized(
+                        egui::vec2(left_col_w, 32.0),
+                        egui::SelectableLabel::new(is_selected_layer, label)
+                    );
+                    if label_resp.clicked() {
+                        app.set_active_layer(*idx);
+                    }
+
+                    let (track_resp, track_painter) = ui.allocate_painter(egui::vec2(track_w, 32.0), egui::Sense::drag());
+                    let track_rect = track_resp.rect;
+
+                    track_painter.rect(
+                        track_rect,
+                        egui::CornerRadius::same(4),
+                        if is_selected_layer {
+                            egui::Color32::from_rgb(35, 38, 48)
+                        } else {
+                            egui::Color32::from_rgb(25, 27, 34)
+                        },
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 48, 58)),
+                        egui::StrokeKind::Inside,
+                    );
+
+                    for i in start_sec_grid..=end_sec_grid {
+                        let pct = (i as f32 - start_sec) / visible_sec;
+                        if pct >= 0.0 && pct <= 1.0 {
+                            let x = track_rect.left() + pct * track_rect.width();
+                            track_painter.line_segment(
+                                [egui::pos2(x, track_rect.top()), egui::pos2(x, track_rect.bottom())],
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 37, 45)),
+                            );
+                        }
+                    }
+
+                    let l = &app.project.document.layers[*idx];
+                    let clip_start_frame = l.video_timeline_start * fps;
+                    let clip_end_frame = (l.video_timeline_start + l.video_play_length) * fps;
+
+                    let clip_start_x = track_rect.left() + ((clip_start_frame - start_frame) / visible_frames) * track_rect.width();
+                    let clip_end_x = track_rect.left() + ((clip_end_frame - start_frame) / visible_frames) * track_rect.width();
+
+                    let clip_rect = Rect::from_min_max(
+                        egui::pos2(clip_start_x, track_rect.top() + 4.0),
+                        egui::pos2(clip_end_x.max(clip_start_x + 10.0), track_rect.bottom() - 4.0),
+                    );
+
+                    let clip_painter = track_painter.with_clip_rect(track_rect);
+
+                    if clip_rect.max.x > track_rect.min.x && clip_rect.min.x < track_rect.max.x {
+                        let mouse_pos = ui.input(|i| i.pointer.hover_pos());
+                        let is_hovered = mouse_pos.map_or(false, |mp| clip_rect.contains(mp) && track_rect.contains(mp));
+                        let is_down = ui.input(|i| i.pointer.any_down());
+
+                        if *layer_kind == crate::document::LayerKind::Video {
+                            // Split video layer into two sub-bars: Video (top, blue) and Audio (bottom, green)
+                            let v_rect = Rect::from_min_max(
+                                egui::pos2(clip_rect.min.x, clip_rect.min.y),
+                                egui::pos2(clip_rect.max.x, clip_rect.min.y + 10.0),
+                            );
+                            let a_rect = Rect::from_min_max(
+                                egui::pos2(clip_rect.min.x, clip_rect.min.y + 14.0),
+                                egui::pos2(clip_rect.max.x, clip_rect.max.y),
+                            );
+
+                            let fill_v_color = if is_hovered && is_down {
+                                egui::Color32::from_rgba_unmultiplied(36, 105, 217, 240)
+                            } else if is_hovered {
+                                egui::Color32::from_rgba_unmultiplied(66, 135, 247, 210)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(46, 115, 227, 180)
+                            };
+
+                            let fill_a_color = if is_hovered && is_down {
+                                egui::Color32::from_rgba_unmultiplied(26, 184, 93, 240)
+                            } else if is_hovered {
+                                egui::Color32::from_rgba_unmultiplied(66, 224, 133, 210)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(46, 204, 113, 180)
+                            };
+
+                            clip_painter.rect(
+                                v_rect,
+                                egui::CornerRadius::same(2),
+                                fill_v_color,
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 160, 255)),
+                                egui::StrokeKind::Inside,
+                            );
+
+                            clip_painter.rect(
+                                a_rect,
+                                egui::CornerRadius::same(2),
+                                fill_a_color,
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 255, 160)),
+                                egui::StrokeKind::Inside,
+                            );
+                        } else {
+                            // Audio-only track, single solid green bar
+                            let fill_color = if is_hovered && is_down {
+                                egui::Color32::from_rgba_unmultiplied(26, 184, 93, 240)
+                            } else if is_hovered {
+                                egui::Color32::from_rgba_unmultiplied(66, 224, 133, 210)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(46, 204, 113, 180)
+                            };
+
+                            clip_painter.rect(
+                                clip_rect,
+                                egui::CornerRadius::same(4),
+                                fill_color,
+                                egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 255, 160)),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+
+                        let clip_name = if l.name.chars().count() > 15 {
+                            format!("{}...", l.name.chars().take(13).collect::<String>())
+                        } else {
+                            l.name.clone()
+                        };
+                        clip_painter.text(
+                            clip_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{} ({:.1}s - {:.1}s)", clip_name, l.video_timeline_start, l.video_timeline_start + l.video_play_length),
+                            egui::FontId::proportional(9.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+
+                    if track_resp.dragged() {
+                        if let Some(press_origin) = ui.input(|i| i.pointer.press_origin()) {
+                            if clip_rect.contains(press_origin) {
+                                let delta_sec = (track_resp.drag_delta().x / track_rect.width()) * visible_sec;
+                                dragged_layer_id_and_delta = Some((*layer_id, delta_sec));
+                            } else {
+                                let drag_delta = track_resp.drag_delta().x;
+                                scroll_delta_timeline = drag_delta / track_rect.width() * visible_frames;
+                                scroll_follow_disable = true;
+                            }
+                        }
+                    }
+
+                    let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+                    let wheel_delta = if scroll_delta.x != 0.0 { scroll_delta.x } else { scroll_delta.y };
+                    if wheel_delta != 0.0 && track_resp.hovered() {
+                        scroll_delta_timeline = wheel_delta * 0.1;
+                        scroll_follow_disable = true;
+                    }
+
+                    let playhead_frac = (curr_frame as f32 - start_frame) / visible_frames;
+                    if playhead_frac >= 0.0 && playhead_frac <= 1.0 {
+                        let playhead_x = track_rect.left() + playhead_frac * track_rect.width();
+                        track_painter.line_segment(
+                            [egui::pos2(playhead_x, track_rect.top()), egui::pos2(playhead_x, track_rect.bottom())],
+                            egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 165, 0)),
+                        );
+                    }
+                });
+            }
+        });
+
+        if let Some((id, delta)) = dragged_layer_id_and_delta {
+            if let Some(l) = app.project.document.layers.iter_mut().find(|l| l.id == id) {
+                l.video_timeline_start = (l.video_timeline_start + delta).max(0.0);
+            }
+        }
+        if scroll_delta_timeline != 0.0 {
+            if scroll_follow_disable {
+                app.anim_timeline_follow = false;
+            }
+            scroll = (scroll - scroll_delta_timeline).max(0.0);
+        }
+
+        // Active Track Details
+        if let Some(layer) = app.project.document.active_layer_mut() {
+            if layer.kind == crate::document::LayerKind::Video || layer.kind == crate::document::LayerKind::Audio {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let display_active_name = if layer.name.chars().count() > 18 {
+                        let mut res: String = layer.name.chars().take(15).collect();
+                        res.push_str("...");
+                        res
+                    } else {
+                        layer.name.clone()
+                    };
+                    ui.label(RichText::new(format!("Active Track Details: {}", display_active_name)).strong().color(colors::ACCENT));
+                    ui.add_space(16.0);
+
+                    ui.label("Volume:");
+                    let mut vol_percent = (layer.volume * 100.0) as i32;
+                    if ui.add(egui::Slider::new(&mut vol_percent, 0..=100).suffix("%")).changed() {
+                        layer.volume = vol_percent as f32 / 100.0;
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.label("Trim Start:");
+                    ui.add(egui::DragValue::new(&mut layer.video_start_offset)
+                        .speed(0.1)
+                        .range(0.0..=3600.0)
+                        .suffix("s"));
+
+                    ui.add_space(8.0);
+
+                    ui.label("Play Duration:");
+                    let mut play_len = layer.video_play_length;
+                    if ui.add(egui::DragValue::new(&mut play_len)
+                        .speed(0.1)
+                        .range(0.1..=3600.0)
+                        .suffix("s")).changed() {
+                        layer.video_play_length = play_len;
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.label("Bass:");
+                    ui.add(egui::DragValue::new(&mut layer.eq_bass).speed(0.1).range(-12.0..=12.0).suffix("dB"));
+                    ui.label("Mid:");
+                    ui.add(egui::DragValue::new(&mut layer.eq_mid).speed(0.1).range(-12.0..=12.0).suffix("dB"));
+                    ui.label("Treble:");
+                    ui.add(egui::DragValue::new(&mut layer.eq_treble).speed(0.1).range(-12.0..=12.0).suffix("dB"));
+                });
+            }
+        }
+    });
+
+    if close_editor {
+        app.show_video_editor_window = None;
+    }
+    if curr_frame != app.anim_current_frame {
+        app.anim_current_frame = curr_frame;
+    }
+    if scroll != app.anim_timeline_scroll {
+        app.anim_timeline_scroll = scroll;
+    }
+    if let Some(frame) = apply_anim_for_frame {
+        app.apply_animation_for_frame(frame);
+    }
+}
+
 fn status_bar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     let alpha = app.ui_anim.status_alpha();
     let tool_slide_out = app.ui_anim.status_tool_slide_out(120.0);
@@ -1521,13 +2042,49 @@ fn status_bar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     // timeline toggle
                     let timeline_btn_icon = if app.anim_show_timeline_window { "" } else { "" };
                     let timeline_btn_tooltip = if app.anim_show_timeline_window { "Hide timeline" } else { "Show timeline" };
-                    let btn_timeline = ui.button(RichText::new(timeline_btn_icon).font(nerd_font_id(12.0)));
+                    let mut text = RichText::new(timeline_btn_icon).font(nerd_font_id(12.0));
+                    if app.anim_show_timeline_window {
+                        text = text.color(colors::ACCENT);
+                    }
+                    let btn_timeline = ui.button(text);
                     if btn_timeline.clicked() {
                         app.anim_show_timeline_window = !app.anim_show_timeline_window;
+                        if app.anim_show_timeline_window {
+                            app.show_video_editor_window = None;
+                        }
                     }
                     btn_timeline.on_hover_text(timeline_btn_tooltip);
 
                     ui.add_space(4.0);
+
+                    // video editor toggle (placed near animation timeline)
+                    let active_video_id = app.selection.first().copied().and_then(|sel_id| {
+                        app.project.document.layers.iter().find(|l| l.id == sel_id && (l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio)).map(|l| l.id)
+                    }).or_else(|| {
+                        app.project.document.layers.iter().find(|l| l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio).map(|l| l.id)
+                    });
+
+                    if let Some(video_layer_id) = active_video_id {
+                        let is_video_editor_open = app.show_video_editor_window.is_some();
+                        let video_btn_icon = "🎬";
+                        let video_btn_tooltip = if is_video_editor_open { "Hide video editor" } else { "Show video editor" };
+                        
+                        let mut text = RichText::new(video_btn_icon);
+                        if is_video_editor_open {
+                            text = text.color(colors::ACCENT);
+                        }
+                        let btn_video_editor = ui.button(text);
+                        if btn_video_editor.clicked() {
+                            if is_video_editor_open {
+                                app.show_video_editor_window = None;
+                            } else {
+                                app.show_video_editor_window = Some(video_layer_id);
+                                app.anim_show_timeline_window = false;
+                            }
+                        }
+                        btn_video_editor.on_hover_text(video_btn_tooltip);
+                        ui.add_space(4.0);
+                    }
 
                     // playback controls
                     let play_icon = if app.anim_is_playing { "" } else { "" };
@@ -1542,6 +2099,9 @@ fn status_bar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     let btn_play = ui.button(RichText::new(play_icon).font(nerd_font_id(12.0)));
                     if btn_play.clicked() {
                         app.anim_is_playing = !app.anim_is_playing;
+                        if !app.anim_is_playing {
+                            app.stop_all_video_streams();
+                        }
                     }
                     btn_play.on_hover_text(play_tooltip);
 
@@ -1555,6 +2115,7 @@ fn status_bar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     if btn_rewind.clicked() {
                         app.anim_current_frame = 0;
                         app.anim_is_playing = false;
+                        app.stop_all_video_streams();
                     }
                     btn_rewind.on_hover_text("Back to start");
 
@@ -1614,24 +2175,39 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         if ui.button("+ New Layer").clicked() {
             app.add_layer("Layer");
         }
-        if ui.button("+ Video Layer").clicked() {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm"])
-                .pick_file()
-            {
-                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                app.add_video_layer(&name, path.to_string_lossy().into_owned());
-            }
-        }
     });
+    #[cfg(not(target_os = "android"))]
+    {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            if ui.button("+ Video Layer").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm"])
+                    .pick_file()
+                {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    app.add_video_layer(&name, path.to_string_lossy().into_owned());
+                }
+            }
+            if ui.button("+ Audio Layer").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Audio", &["mp3", "wav", "aac", "m4a", "flac", "ogg", "mp4"])
+                    .pick_file()
+                {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    app.add_audio_layer(&name, path.to_string_lossy().into_owned());
+                }
+            }
+        });
+    }
     ui.add_space(4.0);
     
     let layer_count = app.project.document.layers.len();
     for i in 0..layer_count {
         let active = app.project.document.active_layer_index == i;
-        let (name, visible, locked, is_video) = {
+        let (name, visible, locked, kind) = {
             let l = &app.project.document.layers[i];
-            (l.name.clone(), l.visible, l.locked, l.kind == crate::document::LayerKind::Video)
+            (l.name.clone(), l.visible, l.locked, l.kind)
         };
         ui.horizontal(|ui| {
             if ui.selectable_label(active, "●").clicked() {
@@ -1646,15 +2222,19 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 app.set_layer_locked(i, lck);
             }
             let mut edit_name = name;
-            let icon = if is_video { "🎥 " } else { "🖼 " };
-            ui.label(icon);
+            let icon = match kind {
+                crate::document::LayerKind::Video => icons::VIDEO,
+                crate::document::LayerKind::Audio => icons::AUDIO,
+                crate::document::LayerKind::Image => "🖼",
+            };
+            ui.label(RichText::new(icon).font(nerd_font_id(13.0)));
             if ui.text_edit_singleline(&mut edit_name).changed() {
                 app.rename_layer(i, edit_name);
             }
         });
     }
 
-    // Active Layer settings (Renderer/Non-renderer and Video details)
+    // Active Layer settings (Renderer/Non-renderer and Video/Audio details)
     if let Some(l) = app.project.document.active_layer_mut() {
         ui.add_space(8.0);
         ui.separator();
@@ -1663,32 +2243,40 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             ui.label(RichText::new("Layer Properties").strong());
             ui.add_space(4.0);
 
-            ui.checkbox(&mut l.is_renderer, "Export Renderer Layer").on_hover_text("If unchecked, this layer will not render during export");
+            ui.checkbox(&mut l.is_renderer, "Export Renderer Layer").on_hover_text("If unchecked, this layer will not render/play during export");
 
             ui.horizontal(|ui| {
                 ui.label("Type:");
-                let mut is_vid = l.kind == crate::document::LayerKind::Video;
-                if ui.selectable_label(!is_vid, "🖼 Image").clicked() {
+                if ui.selectable_label(l.kind == crate::document::LayerKind::Image, "🖼 Image").clicked() {
                     l.kind = crate::document::LayerKind::Image;
                 }
-                if ui.selectable_label(is_vid, "🎥 Video").clicked() {
+                let vid_lbl = RichText::new(format!("{} Video", icons::VIDEO)).font(nerd_font_id(12.0));
+                if ui.selectable_label(l.kind == crate::document::LayerKind::Video, vid_lbl).clicked() {
                     l.kind = crate::document::LayerKind::Video;
+                }
+                let aud_lbl = RichText::new(format!("{} Audio", icons::AUDIO)).font(nerd_font_id(12.0));
+                if ui.selectable_label(l.kind == crate::document::LayerKind::Audio, aud_lbl).clicked() {
+                    l.kind = crate::document::LayerKind::Audio;
                 }
             });
 
-            if l.kind == crate::document::LayerKind::Video {
+            if l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio {
                 ui.horizontal(|ui| {
                     ui.label("Path:");
-                    ui.text_edit_singleline(&mut l.video_path);
+                    #[cfg(not(target_os = "android"))]
                     if ui.button("Browse...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm"])
-                            .pick_file()
-                        {
+                        let mut dlg = rfd::FileDialog::new();
+                        if l.kind == crate::document::LayerKind::Video {
+                            dlg = dlg.add_filter("Video", &["mp4", "mkv", "avi", "mov", "webm"]);
+                        } else {
+                            dlg = dlg.add_filter("Audio", &["mp3", "wav", "aac", "m4a", "flac", "ogg", "mp4"]);
+                        }
+                        if let Some(path) = dlg.pick_file() {
                             l.video_path = path.to_string_lossy().into_owned();
                         }
                     }
                 });
+                ui.add(egui::TextEdit::singleline(&mut l.video_path).desired_width(ui.available_width()));
                 ui.horizontal(|ui| {
                     ui.label("Volume:");
                     ui.add(egui::Slider::new(&mut l.volume, 0.0..=1.0));
@@ -1714,72 +2302,121 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             }
         });
     });
-    // List any Video Layers first as "Video Objects"
-    let video_layers: Vec<(uuid::Uuid, String)> = app.project.document.layers
+    // Helper to truncate long names to prevent UI overflow
+    let truncate_name = |name: &str| -> String {
+        if name.chars().count() > 18 {
+            let mut res: String = name.chars().take(15).collect();
+            res.push_str("...");
+            res
+        } else {
+            name.to_owned()
+        }
+    };
+
+    let layers_info = app.project.document.layers
         .iter()
-        .filter(|l| l.kind == crate::document::LayerKind::Video)
-        .map(|l| (l.id, l.name.clone()))
-        .collect();
-    for (layer_id, layer_name) in video_layers {
-        let selected = app.selection.contains(&layer_id);
-        let label = RichText::new(format!("🎥 {}", layer_name)).font(nerd_font_id(13.0));
-        ui.horizontal(|ui| {
-            if ui.selectable_label(selected, label).clicked() {
-                app.set_selection(vec![layer_id]);
+        .map(|l| (l.id, l.name.clone(), l.kind, l.nodes.clone()))
+        .collect::<Vec<_>>();
+    let active_layer_id = app.project.document.active_layer().map(|l| l.id);
+
+    // List all layers and active layer nodes in rendering order (top-most first)
+    for (layer_id, layer_name, layer_kind, layer_nodes) in layers_info.into_iter().rev() {
+        match layer_kind {
+            crate::document::LayerKind::Video => {
+                let selected = app.selection.contains(&layer_id);
+                let display_name = truncate_name(&layer_name);
+                let label = RichText::new(format!("{} {}", icons::VIDEO, display_name)).font(nerd_font_id(13.0));
+                ui.horizontal(|ui| {
+                    let resp = ui.selectable_label(selected, label);
+                    if resp.clicked() {
+                        app.set_selection(vec![layer_id]);
+                    }
+                    resp.on_hover_text(&layer_name);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let delete_btn = ui.add(
+                            egui::Button::new(
+                                RichText::new("✖")
+                                    .color(egui::Color32::from_rgb(255, 23, 68))
+                                    .strong()
+                                    .size(11.0)
+                            )
+                            .frame(false)
+                        );
+                        if delete_btn.clicked() {
+                            if let Some(pos) = app.project.document.layers.iter().position(|l| l.id == layer_id) {
+                                app.delete_layer(pos);
+                            }
+                        }
+                        delete_btn.on_hover_text("Delete video layer");
+                    });
+                });
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let delete_btn = ui.add(
-                    egui::Button::new(
-                        RichText::new("✖")
-                            .color(egui::Color32::from_rgb(255, 23, 68))
-                            .strong()
-                            .size(11.0)
-                    )
-                    .frame(false)
-                );
-                if delete_btn.clicked() {
-                    if let Some(pos) = app.project.document.layers.iter().position(|l| l.id == layer_id) {
-                        app.delete_layer(pos);
+            crate::document::LayerKind::Audio => {
+                let selected = app.selection.contains(&layer_id);
+                let display_name = truncate_name(&layer_name);
+                let label = RichText::new(format!("{} {}", icons::AUDIO, display_name)).font(nerd_font_id(13.0));
+                ui.horizontal(|ui| {
+                    let resp = ui.selectable_label(selected, label);
+                    if resp.clicked() {
+                        app.set_selection(vec![layer_id]);
+                    }
+                    resp.on_hover_text(&layer_name);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let delete_btn = ui.add(
+                            egui::Button::new(
+                                RichText::new("✖")
+                                    .color(egui::Color32::from_rgb(255, 23, 68))
+                                    .strong()
+                                    .size(11.0)
+                            )
+                            .frame(false)
+                        );
+                        if delete_btn.clicked() {
+                            if let Some(pos) = app.project.document.layers.iter().position(|l| l.id == layer_id) {
+                                app.delete_layer(pos);
+                            }
+                        }
+                        delete_btn.on_hover_text("Delete audio layer");
+                    });
+                });
+            }
+            crate::document::LayerKind::Image => {
+                if active_layer_id.is_some_and(|id| id == layer_id) {
+                    for id in layer_nodes.iter().rev() {
+                        let Some(node) = app.project.nodes.get(*id) else {
+                            continue;
+                        };
+                        let selected = app.selection.contains(id);
+                        let icon = node_icon(&node.kind);
+                        let node_name = node.name.clone();
+                        let display_name = truncate_name(&node_name);
+                        let label = RichText::new(format!("{icon} {}", display_name)).font(nerd_font_id(13.0));
+                        ui.horizontal(|ui| {
+                            let resp = ui.selectable_label(selected, label);
+                            if resp.clicked() {
+                                app.set_selection(vec![*id]);
+                            }
+                            resp.on_hover_text(&node_name);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let delete_btn = ui.add(
+                                    egui::Button::new(
+                                        RichText::new("✖")
+                                            .color(egui::Color32::from_rgb(255, 23, 68))
+                                            .strong()
+                                            .size(11.0)
+                                    )
+                                    .frame(false)
+                                );
+                                if delete_btn.clicked() {
+                                    app.delete_nodes(&[*id]);
+                                }
+                                delete_btn.on_hover_text("Delete object");
+                            });
+                        });
                     }
                 }
-                delete_btn.on_hover_text("Delete video layer");
-            });
-        });
-    }
-
-    let object_ids: Vec<_> = app
-        .project
-        .document
-        .active_layer()
-        .map(|l| l.nodes.clone())
-        .unwrap_or_default();
-    for id in object_ids.iter().rev() {
-        let Some(node) = app.project.nodes.get(*id) else {
-            continue;
-        };
-        let selected = app.selection.contains(id);
-        let icon = node_icon(&node.kind);
-        let label = RichText::new(format!("{icon} {}", node.name)).font(nerd_font_id(13.0));
-        ui.horizontal(|ui| {
-            if ui.selectable_label(selected, label).clicked() {
-                app.set_selection(vec![*id]);
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let delete_btn = ui.add(
-                    egui::Button::new(
-                        RichText::new("✖")
-                            .color(egui::Color32::from_rgb(255, 23, 68))
-                            .strong()
-                            .size(11.0)
-                    )
-                    .frame(false)
-                );
-                if delete_btn.clicked() {
-                    app.delete_nodes(&[*id]);
-                }
-                delete_btn.on_hover_text("Delete object");
-            });
-        });
+        }
     }
 }
 
@@ -2515,8 +3152,14 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     if is_layer {
         if let Some(pos) = app.project.document.layers.iter().position(|l| l.id == id) {
             let layer = &mut app.project.document.layers[pos];
+            let display_name = if layer.name.chars().count() > 16 {
+                format!("{}...", layer.name.chars().take(14).collect::<String>())
+            } else {
+                layer.name.clone()
+            };
             theme::constraint_block(ui, |ui| {
-                ui.label(RichText::new(format!("🎥 Video Layer: {}", layer.name)).strong().color(colors::ACCENT));
+                let lbl = ui.label(RichText::new(format!("🎥 Video: {}", display_name)).strong().color(colors::ACCENT));
+                lbl.on_hover_text(&layer.name);
                 ui.add_space(4.0);
                 
                 // Position X and Y
@@ -3674,6 +4317,7 @@ fn draw_timeline_track(
     plots: &mut [TrackPlotInfo<'_>],
     current_frame: &mut usize,
     timeline_scroll: &mut f32,
+    timeline_follow: &mut bool,
     edit_mode: bool,
     dragged_keyframe: &mut Option<(crate::document::NodeId, String, usize)>,
     selected_keyframe: &mut Option<(crate::document::NodeId, String, usize)>,
@@ -3948,10 +4592,12 @@ fn draw_timeline_track(
             );
         }
         
-        // Mouse wheel scroll to pan timeline (horizontal scroll only!)
+        // Mouse wheel scroll to pan timeline (maps horizontal and vertical wheel scrolling to timeline scroll)
         let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-        if scroll_delta.x != 0.0 && response.hovered() {
-            *timeline_scroll = (*timeline_scroll - scroll_delta.x * 0.1).max(0.0);
+        let wheel_delta = if scroll_delta.x != 0.0 { scroll_delta.x } else { scroll_delta.y };
+        if wheel_delta != 0.0 && response.hovered() {
+            *timeline_scroll = (*timeline_scroll - wheel_delta * 0.1).max(0.0);
+            *timeline_follow = false;
         }
         
         // Find if a specific plot's keyframe is hovered
@@ -4003,17 +4649,21 @@ fn draw_timeline_track(
 
         // Drag interaction
         if dragged_keyframe.is_some() {
-            // Dragging keyframe: do not scrub playhead
+            // Dragging keyframe: do not scrub playhead or pan
+        } else if response.dragged_by(egui::PointerButton::Secondary)
+            || response.dragged_by(egui::PointerButton::Middle)
+            || (response.dragged_by(egui::PointerButton::Primary) && ui.input(|i| i.modifiers.shift))
+        {
+            let delta_x = ui.input(|i| i.pointer.delta().x);
+            let frames_pan = delta_x / rect.width() * visible_frames;
+            *timeline_scroll = (*timeline_scroll - frames_pan).max(0.0);
+            *timeline_follow = false;
         } else if response.dragged_by(egui::PointerButton::Primary) || response.clicked_by(egui::PointerButton::Primary) {
             if let Some(mouse_pos) = response.interact_pointer_pos() {
                 let relative_x = mouse_pos.x - rect.left();
                 let raw_frame = start_frame + (relative_x / rect.width() * visible_frames);
                 *current_frame = raw_frame.round().max(0.0) as usize;
             }
-        } else if response.dragged_by(egui::PointerButton::Secondary) {
-            let delta_x = ui.input(|i| i.pointer.delta().x);
-            let frames_pan = delta_x / rect.width() * visible_frames;
-            *timeline_scroll = (*timeline_scroll - frames_pan).max(0.0);
         }
     });
 }
@@ -4127,14 +4777,24 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         let mut curr_frame = app.anim_current_frame;
         let mut scroll = app.anim_timeline_scroll;
 
+        // Auto-follow playhead: scroll so the playhead stays in the middle 70% of the timeline viewport
+        if app.anim_timeline_follow {
+            let left_boundary = scroll + 15.0;
+            let right_boundary = scroll + 85.0;
+            let current = curr_frame as f32;
+            if current < left_boundary {
+                scroll = (current - 15.0).max(0.0);
+            } else if current > right_boundary {
+                scroll = (current - 85.0).max(0.0);
+            }
+        }
+
         // --- HORIZONTAL TIMELINE SCROLL & RULER ---
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Scroll:").color(colors::TEXT_MUTED));
-            ui.add(egui::Slider::new(&mut scroll, 0.0..=500.0).show_value(false));
-            ui.add_space(8.0);
-            
-            // Frame number indicator
-            ui.label(RichText::new(format!("Current: Frame {}", curr_frame)).color(colors::TEXT));
+            // Frame number indicator (slider removed as scroll is done via drag/grab and wheel)
+            ui.label(RichText::new(format!("Current Frame: {}", curr_frame)).strong().color(colors::TEXT));
+            ui.add_space(16.0);
+            ui.checkbox(&mut app.anim_timeline_follow, "Follow Playhead");
         });
         ui.add_space(4.0);
         
@@ -4184,8 +4844,21 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 }
             }
             
-            // Handle scrubbing/clicking to change frame
-            if response.clicked() || response.dragged() {
+            // Mouse wheel scroll to pan timeline (maps horizontal and vertical wheel scrolling to timeline scroll)
+            let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+            let wheel_delta = if scroll_delta.x != 0.0 { scroll_delta.x } else { scroll_delta.y };
+            if wheel_delta != 0.0 && response.hovered() {
+                scroll = (scroll - wheel_delta * 0.1).max(0.0);
+            }
+
+            // Handle scrubbing/clicking/dragging to change frame or pan
+            if response.dragged_by(egui::PointerButton::Secondary)
+                || response.dragged_by(egui::PointerButton::Middle)
+                || (response.dragged_by(egui::PointerButton::Primary) && ui.input(|i| i.modifiers.shift))
+            {
+                let delta_x = ui.input(|i| i.pointer.delta().x);
+                scroll = (scroll - (delta_x / rect.width() * visible_frames)).max(0.0);
+            } else if response.clicked_by(egui::PointerButton::Primary) || response.dragged_by(egui::PointerButton::Primary) {
                 if let Some(mpos) = response.interact_pointer_pos() {
                     let frac = ((mpos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
                     let target_frame = (start_frame + frac * visible_frames).round() as usize;
@@ -4234,11 +4907,8 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     || !anim.color_b.keyframes.is_empty() 
                     || !anim.color_a.keyframes.is_empty();
                 
-                ScrollArea::vertical()
-                    .id_salt("timeline_tracks_scroll")
-                    .max_height(80.0)
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 6.0;
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
                         
                         if has_pos {
                             let mut plots = vec![
@@ -4262,6 +4932,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut plots,
                                 &mut curr_frame,
                                 &mut scroll,
+                                &mut app.anim_timeline_follow,
                                 edit_mode,
                                 &mut dragged,
                                 &mut temp_selected_kf,
@@ -4286,6 +4957,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut plots,
                                 &mut curr_frame,
                                 &mut scroll,
+                                &mut app.anim_timeline_follow,
                                 edit_mode,
                                 &mut dragged,
                                 &mut temp_selected_kf,
@@ -4310,6 +4982,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut plots,
                                 &mut curr_frame,
                                 &mut scroll,
+                                &mut app.anim_timeline_follow,
                                 edit_mode,
                                 &mut dragged,
                                 &mut temp_selected_kf,
@@ -4346,6 +5019,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut plots,
                                 &mut curr_frame,
                                 &mut scroll,
+                                &mut app.anim_timeline_follow,
                                 edit_mode,
                                 &mut dragged,
                                 &mut temp_selected_kf,
@@ -4442,6 +5116,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                     &mut plots,
                                     &mut curr_frame,
                                     &mut scroll,
+                                    &mut app.anim_timeline_follow,
                                     edit_mode,
                                     &mut dragged,
                                     &mut temp_selected_kf,
@@ -4508,15 +5183,20 @@ fn floating_timeline_window(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect
         0
     };
 
-    let card_h = match track_count {
-        0 => 56.0,
-        1 => 92.0,
-        _ => 130.0,
+    let expected_h = if track_count == 0 {
+        56.0
+    } else {
+        56.0 + (track_count as f32 * 36.0)
     };
+    let mut card_h = app.timeline_container_h;
+    if (card_h - expected_h).abs() > 120.0 {
+        card_h = expected_h;
+    }
     
     let left = inset.left() + gap;
-    let open_top = inset.bottom() - card_h - gap - 30.0;
-    let travel = card_h + gap + 30.0;
+    let screen_y = ctx.content_rect().max.y;
+    let open_top = screen_y - 38.0 - card_h;
+    let travel = card_h + 38.0 + gap;
     let top = open_top + (1.0 - open_t) * travel;
     
     let rect = Rect::from_min_size(egui::pos2(left, top), egui::vec2(card_w, card_h));
@@ -4534,9 +5214,11 @@ fn floating_timeline_window(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect
         });
     }
 
-    theme::show_action_bar_area(ctx, "floating_timeline", rect, opacity, |ui| {
+    if let Some(actual_rect) = theme::show_action_bar_area(ctx, "floating_timeline", rect, opacity, |ui| {
         timeline_interior(app, ui);
-    });
+    }) {
+        app.timeline_container_h = actual_rect.height();
+    }
 }
 
 fn draw_dotted_line(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, stroke: egui::Stroke) {

@@ -36,6 +36,9 @@ pub struct Document {
     /// CircularClone effects (separate from ObjectOnPath), keyed by effect id.
     #[serde(default)]
     pub circular_effects: IndexMap<Uuid, CircularCloneEffect>,
+    /// Clip Mask effects: source node rendered clipped to mask node's shape.
+    #[serde(default)]
+    pub clip_masks: IndexMap<Uuid, ClipMaskEffect>,
     #[serde(default = "default_page_color")]
     pub page_color: [f32; 4],
 }
@@ -48,6 +51,7 @@ fn default_page_color() -> [f32; 4] {
 pub enum LayerKind {
     Image,
     Video,
+    Audio,
 }
 
 impl Default for LayerKind {
@@ -99,6 +103,16 @@ pub struct Layer {
     pub eq_mid: f32,
     #[serde(default = "default_zero")]
     pub eq_treble: f32,
+    #[serde(default = "default_zero")]
+    pub video_start_offset: f32,
+    #[serde(default = "default_max_duration")]
+    pub video_play_length: f32,
+    #[serde(default = "default_zero")]
+    pub video_timeline_start: f32,
+}
+
+fn default_max_duration() -> f32 {
+    3600.0
 }
 
 fn default_zero() -> f32 {
@@ -146,6 +160,9 @@ impl Layer {
             eq_bass: 0.0,
             eq_mid: 0.0,
             eq_treble: 0.0,
+            video_start_offset: 0.0,
+            video_play_length: 3600.0,
+            video_timeline_start: 0.0,
         }
     }
 
@@ -173,6 +190,39 @@ impl Layer {
             eq_bass: 0.0,
             eq_mid: 0.0,
             eq_treble: 0.0,
+            video_start_offset: 0.0,
+            video_play_length: 3600.0,
+            video_timeline_start: 0.0,
+        }
+    }
+
+    pub fn new_audio(id: Uuid, name: String, audio_path: String) -> Self {
+        Self {
+            id,
+            name,
+            visible: true,
+            locked: false,
+            nodes: vec![],
+            kind: LayerKind::Audio,
+            video_path: audio_path,
+            volume: 1.0,
+            is_renderer: true,
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            width: A4_WIDTH_PX as f32,
+            height: A4_HEIGHT_PX as f32,
+            aspect_ratio_locked: true,
+            hue: 0.0,
+            saturation: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            eq_bass: 0.0,
+            eq_mid: 0.0,
+            eq_treble: 0.0,
+            video_start_offset: 0.0,
+            video_play_length: 3600.0,
+            video_timeline_start: 0.0,
         }
     }
 }
@@ -203,6 +253,7 @@ impl Document {
             path_effects: IndexMap::new(),
             tiling_effects: IndexMap::new(),
             circular_effects: IndexMap::new(),
+            clip_masks: IndexMap::new(),
             page_color: default_page_color(),
         };
         ProjectFile::new(document, NodeStore::default())
@@ -262,6 +313,12 @@ impl Document {
 
     pub fn add_video_layer(&mut self, name: impl Into<String>, video_path: String) -> usize {
         let layer = Layer::new_video(Uuid::new_v4(), name.into(), video_path);
+        self.layers.push(layer);
+        self.layers.len() - 1
+    }
+
+    pub fn add_audio_layer(&mut self, name: impl Into<String>, audio_path: String) -> usize {
+        let layer = Layer::new_audio(Uuid::new_v4(), name.into(), audio_path);
         self.layers.push(layer);
         self.layers.len() - 1
     }
