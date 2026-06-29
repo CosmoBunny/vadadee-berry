@@ -18,6 +18,12 @@ use crate::render;
 use crate::theme;
 use crate::tools::{self, DragNewShape, MarqueeSelect, SelectDrag, ToolKind, ToolState};
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum AudioExtractStatus {
+    Extracting,
+    Ready(std::path::PathBuf),
+    Failed,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GradientFlowTarget {
     Fill,
@@ -120,7 +126,7 @@ pub struct VadadeeBerryApp {
     /// Do not retry rodio open/decode for these layers until playback stops.
     audio_layers_skip: std::collections::HashSet<uuid::Uuid>,
     /// MP4/MOV/… → one-shot ffmpeg PCM wav for rodio.
-    audio_extract_cache: std::collections::HashMap<String, std::path::PathBuf>,
+    pub audio_extract_status: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
 
     pub project: ProjectFile,
     pub viewport: Viewport,
@@ -406,7 +412,7 @@ impl VadadeeBerryApp {
             audio_device: rodio::DeviceSinkBuilder::open_default_sink().ok(),
             audio_players: std::collections::HashMap::new(),
             audio_layers_skip: std::collections::HashSet::new(),
-            audio_extract_cache: std::collections::HashMap::new(),
+            audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
             project: Document::new_default_project(),
             viewport: Viewport::default(),
@@ -3809,6 +3815,49 @@ fn run_video_decode_thread(
                                 sr.max.y += 8.0;
                             }
                             render::draw_transform_handles(&painter, sr, self.tools.select.select_rotation_mode);
+                        } else if let Some(l) = self.project.document.layers.iter().find(|l| l.id == *id) {
+                            if l.kind == crate::document::LayerKind::Video {
+                                let mut dx = l.x as f64;
+                                let mut dy = l.y as f64;
+                                if let Some(track) = self.project.anim_timeline.nodes.get(&l.id) {
+                                    if let Some(x) = track.pos_x.interpolate(self.anim_current_frame) {
+                                        dx = x;
+                                    }
+                                    if let Some(y) = track.pos_y.interpolate(self.anim_current_frame) {
+                                        dy = y;
+                                    }
+                                }
+                                let aspect = self.video_layers.get(&l.id)
+                                    .and_then(|s| s.texture.as_ref())
+                                    .map(|tex| {
+                                        let tex_w = tex.size()[0] as f32;
+                                        let tex_h = tex.size()[1] as f32;
+                                        if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                    })
+                                    .or_else(|| {
+                                        self.video_frame_cache.as_ref()
+                                            .filter(|c| c.layer_id == l.id)
+                                            .map(|c| {
+                                                let tex_w = c.texture.size()[0] as f32;
+                                                let tex_h = c.texture.size()[1] as f32;
+                                                if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                            })
+                                    })
+                                    .unwrap_or(1.0);
+                                let mut w = l.width as f64;
+                                let mut h = l.height as f64;
+                                if l.aspect_ratio_locked {
+                                    if w / h > aspect {
+                                        w = h * aspect;
+                                    } else {
+                                        h = w / aspect;
+                                    }
+                                }
+                                let tl = self.viewport.doc_to_screen((dx, dy), origin);
+                                let br = self.viewport.doc_to_screen((dx + w, dy + h), origin);
+                                let sr = egui::Rect::from_min_max(tl, br);
+                                render::draw_transform_handles(&painter, sr, self.tools.select.select_rotation_mode);
+                            }
                         }
                     }
                 } else if self.selection.len() > 1 {
@@ -4407,34 +4456,34 @@ fn run_video_decode_thread(
                     }
 
                     if !self.audio_players.contains_key(&layer.id) {
-                        let audio_path = resolve_audio_path_for_rodio(&layer.video_path, &mut self.audio_extract_cache)
-                            .unwrap_or_else(|| std::path::PathBuf::from(&layer.video_path));
-                        let Ok(file) = std::fs::File::open(&audio_path) else {
-                            self.audio_layers_skip.insert(layer.id);
-                            continue;
-                        };
-                        let buf_reader = std::io::BufReader::new(file);
-                        if let Ok(mut source) = rodio::Decoder::try_from(buf_reader) {
-                            let sample_rate = source.sample_rate().get();
-                            let channels = source.channels().get();
-                            let relative_time =
-                                (playhead_time - start) + layer.video_start_offset;
-                            if relative_time > 0.0 {
-                                let samples_to_skip = (relative_time
-                                    * sample_rate as f32
-                                    * channels as f32)
-                                    as usize;
-                                for _ in 0..samples_to_skip {
-                                    source.next();
+                        if let Some(audio_path) = resolve_audio_path_for_rodio(&layer.video_path, &self.audio_extract_status) {
+                            let Ok(file) = std::fs::File::open(&audio_path) else {
+                                self.audio_layers_skip.insert(layer.id);
+                                continue;
+                            };
+                            let buf_reader = std::io::BufReader::new(file);
+                            if let Ok(mut source) = rodio::Decoder::try_from(buf_reader) {
+                                let sample_rate = source.sample_rate().get();
+                                let channels = source.channels().get();
+                                let relative_time =
+                                    (playhead_time - start) + layer.video_start_offset;
+                                if relative_time > 0.0 {
+                                    let samples_to_skip = (relative_time
+                                        * sample_rate as f32
+                                        * channels as f32)
+                                        as usize;
+                                    for _ in 0..samples_to_skip {
+                                        source.next();
+                                    }
                                 }
-                            }
 
-                            let player = rodio::Player::connect_new(mixer);
-                            player.set_volume(layer.volume);
-                            player.append(source);
-                            self.audio_players.insert(layer.id, player);
-                        } else {
-                            self.audio_layers_skip.insert(layer.id);
+                                let player = rodio::Player::connect_new(mixer);
+                                player.set_volume(layer.volume);
+                                player.append(source);
+                                self.audio_players.insert(layer.id, player);
+                            } else {
+                                self.audio_layers_skip.insert(layer.id);
+                            }
                         }
                     } else if let Some(player) = self.audio_players.get(&layer.id) {
                         player.set_volume(layer.volume);
@@ -8410,10 +8459,10 @@ mod tests {
                 video_frame_cache: None,
                 video_layers: std::collections::HashMap::new(),
                 clip_mask_signatures: std::collections::HashMap::new(),
-                audio_device: None,
+                audio_device: rodio::DeviceSinkBuilder::open_default_sink().ok(),
                 audio_players: std::collections::HashMap::new(),
                 audio_layers_skip: std::collections::HashSet::new(),
-                audio_extract_cache: std::collections::HashMap::new(),
+                audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
                 project: Document::new_default_project(),
                 viewport: Viewport::default(),
@@ -8599,62 +8648,74 @@ fn is_video_container_ext(path: &str) -> bool {
     )
 }
 
-/// Rodio/symphonia cannot stream most MP4 containers; extract PCM wav once via ffmpeg.
+/// Rodio/symphonia cannot stream most MP4 containers; extract PCM wav once via ffmpeg asynchronously in background.
 fn resolve_audio_path_for_rodio(
     video_path: &str,
-    cache: &mut std::collections::HashMap<String, std::path::PathBuf>,
+    status_map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
 ) -> Option<std::path::PathBuf> {
     if !is_video_container_ext(video_path) {
         return Some(std::path::PathBuf::from(video_path));
     }
-    if let Some(cached) = cache.get(video_path) {
-        if cached.exists() {
-            return Some(cached.clone());
+    
+    let mut map = status_map.lock().unwrap();
+    match map.get(video_path) {
+        Some(AudioExtractStatus::Ready(pb)) => {
+            if pb.exists() {
+                return Some(pb.clone());
+            }
+        }
+        Some(AudioExtractStatus::Extracting) => {
+            return None;
+        }
+        Some(AudioExtractStatus::Failed) => {
+            return None;
+        }
+        None => {
+            map.insert(video_path.to_string(), AudioExtractStatus::Extracting);
+            
+            let path_clone = video_path.to_string();
+            let map_clone = status_map.clone();
+            
+            std::thread::spawn(move || {
+                use std::hash::{Hash, Hasher};
+                use std::process::Command;
+
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                path_clone.hash(&mut hasher);
+                let out = std::env::temp_dir().join(format!("vadadee_audio_{:016x}.wav", hasher.finish()));
+
+                let ok = Command::new("ffmpeg")
+                    .args([
+                        "-nostdin",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-i",
+                        &path_clone,
+                        "-vn",
+                        "-acodec",
+                        "pcm_s16le",
+                        "-ar",
+                        "44100",
+                        "-ac",
+                        "2",
+                    ])
+                    .arg(&out)
+                    .status()
+                    .ok()
+                    .is_some_and(|s| s.success())
+                    && out.exists();
+
+                let mut m = map_clone.lock().unwrap();
+                if ok {
+                    m.insert(path_clone, AudioExtractStatus::Ready(out));
+                } else {
+                    m.insert(path_clone, AudioExtractStatus::Failed);
+                }
+            });
         }
     }
-    #[cfg(any(target_os = "android", target_arch = "wasm32"))]
-    {
-        let _ = cache;
-        return None;
-    }
-    #[cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))]
-    {
-        use std::hash::{Hash, Hasher};
-        use std::process::Command;
-
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        video_path.hash(&mut hasher);
-        let out = std::env::temp_dir().join(format!("vadadee_audio_{:016x}.wav", hasher.finish()));
-
-        let ok = Command::new("ffmpeg")
-            .args([
-                "-nostdin",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                video_path,
-                "-vn",
-                "-acodec",
-                "pcm_s16le",
-                "-ar",
-                "44100",
-                "-ac",
-                "2",
-            ])
-            .arg(&out)
-            .status()
-            .ok()
-            .is_some_and(|s| s.success())
-            && out.exists();
-
-        if ok {
-            cache.insert(video_path.to_string(), out.clone());
-            Some(out)
-        } else {
-            None
-        }
-    }
+    None
 }
 
 fn extract_video_frame(video_path: &str, frame_idx: usize, fps: f32, backend: VideoBackend) -> Option<Vec<u8>> {

@@ -2146,10 +2146,46 @@ fn page_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     });
     ui.horizontal(|ui| {
-        ui.label("Preset");
-        if ui.button("A4").clicked() {
-            app.set_page_size(A4_WIDTH_PX, A4_HEIGHT_PX);
+        ui.label("Preset:");
+        let mut selected_preset_name = "Custom".to_owned();
+        let w = app.project.document.width;
+        let h = app.project.document.height;
+        let presets = [
+            ("A0 (P)", 3179.0, 4494.0),
+            ("A0 (L)", 4494.0, 3179.0),
+            ("A1 (P)", 2245.0, 3179.0),
+            ("A1 (L)", 3179.0, 2245.0),
+            ("A2 (P)", 1587.0, 2245.0),
+            ("A2 (L)", 2245.0, 1587.0),
+            ("A3 (P)", 1123.0, 1587.0),
+            ("A3 (L)", 1587.0, 1123.0),
+            ("A4 (P)", 794.0, 1123.0),
+            ("A4 (L)", 1123.0, 794.0),
+            ("A5 (P)", 559.0, 794.0),
+            ("A5 (L)", 794.0, 559.0),
+            ("720p (H)", 1280.0, 720.0),
+            ("720p (V)", 720.0, 1280.0),
+            ("1080p (H)", 1920.0, 1080.0),
+            ("1080p (V)", 1080.0, 1920.0),
+            ("4K (H)", 3840.0, 2160.0),
+            ("4K (V)", 2160.0, 3840.0),
+        ];
+        for (name, pw, ph) in &presets {
+            if (w - *pw).abs() < 1.0 && (h - *ph).abs() < 1.0 {
+                selected_preset_name = name.to_string();
+                break;
+            }
         }
+        egui::ComboBox::from_id_salt("page_preset_combo")
+            .selected_text(&selected_preset_name)
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for (name, pw, ph) in presets {
+                    if ui.selectable_label(selected_preset_name == name, name).clicked() {
+                        app.set_page_size(pw, ph);
+                    }
+                }
+            });
     });
     ui.horizontal(|ui| {
         ui.label("Size");
@@ -2247,17 +2283,21 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
             ui.horizontal(|ui| {
                 ui.label("Type:");
-                if ui.selectable_label(l.kind == crate::document::LayerKind::Image, "🖼 Image").clicked() {
-                    l.kind = crate::document::LayerKind::Image;
-                }
-                let vid_lbl = RichText::new(format!("{} Video", icons::VIDEO)).font(nerd_font_id(12.0));
-                if ui.selectable_label(l.kind == crate::document::LayerKind::Video, vid_lbl).clicked() {
-                    l.kind = crate::document::LayerKind::Video;
-                }
-                let aud_lbl = RichText::new(format!("{} Audio", icons::AUDIO)).font(nerd_font_id(12.0));
-                if ui.selectable_label(l.kind == crate::document::LayerKind::Audio, aud_lbl).clicked() {
-                    l.kind = crate::document::LayerKind::Audio;
-                }
+                let current_label = match l.kind {
+                    crate::document::LayerKind::Image => "🖼 Image".to_owned(),
+                    crate::document::LayerKind::Video => format!("{} Video", icons::VIDEO),
+                    crate::document::LayerKind::Audio => format!("{} Audio", icons::AUDIO),
+                };
+                egui::ComboBox::from_id_salt("layer_kind_combo")
+                    .selected_text(RichText::new(current_label).font(nerd_font_id(12.0)))
+                    .width(100.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut l.kind, crate::document::LayerKind::Image, RichText::new("🖼 Image").font(nerd_font_id(12.0)));
+                        let vid_lbl = RichText::new(format!("{} Video", icons::VIDEO)).font(nerd_font_id(12.0));
+                        ui.selectable_value(&mut l.kind, crate::document::LayerKind::Video, vid_lbl);
+                        let aud_lbl = RichText::new(format!("{} Audio", icons::AUDIO)).font(nerd_font_id(12.0));
+                        ui.selectable_value(&mut l.kind, crate::document::LayerKind::Audio, aud_lbl);
+                    });
             });
 
             if l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio {
