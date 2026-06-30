@@ -596,3 +596,249 @@ pub fn render_svg_to_rgba(svg_data: &str, scale: f32) -> Option<(u32, u32, Vec<u
     
     Some((pixel_w, pixel_h, pixmap.take()))
 }
+
+pub fn render_svg_to_rgba_even(svg_data: &str, scale: f32) -> Option<(u32, u32, Vec<u8>)> {
+    let opt = usvg::Options::default();
+    let tree = usvg::Tree::from_str(svg_data, &opt).ok()?;
+
+    let pixmap_size = tree.size().to_int_size();
+    let mut pixel_w = (pixmap_size.width() as f32 * scale).round() as u32;
+    let mut pixel_h = (pixmap_size.height() as f32 * scale).round() as u32;
+    
+    if pixel_w % 2 != 0 {
+        pixel_w = pixel_w.saturating_sub(1);
+    }
+    if pixel_h % 2 != 0 {
+        pixel_h = pixel_h.saturating_sub(1);
+    }
+    
+    if pixel_w == 0 || pixel_h == 0 {
+        return None;
+    }
+    
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(pixel_w, pixel_h)?;
+    
+    let scale_x = pixel_w as f32 / pixmap_size.width() as f32;
+    let scale_y = pixel_h as f32 / pixmap_size.height() as f32;
+    
+    let transform = resvg::tiny_skia::Transform::from_scale(scale_x, scale_y);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    
+    Some((pixel_w, pixel_h, pixmap.take()))
+}
+
+fn layer_anim_transform(
+    layer: &crate::document::Layer,
+    project: &ProjectFile,
+    current_frame: usize,
+) -> (f64, f64, f64, f32) {
+    let mut dx = layer.x as f64;
+    let mut dy = layer.y as f64;
+    let mut rot = layer.rotation as f64;
+    let mut opacity = 1.0f32;
+    if let Some(track) = project.anim_timeline.nodes.get(&layer.id) {
+        if let Some(o) = track.opacity.interpolate(current_frame) {
+            opacity = o as f32;
+        }
+        if let Some(x) = track.pos_x.interpolate(current_frame) {
+            dx = x;
+        }
+        if let Some(y) = track.pos_y.interpolate(current_frame) {
+            dy = y;
+        }
+        if let Some(r) = track.rotation.interpolate(current_frame) {
+            rot = r;
+        }
+    }
+    (dx, dy, rot, opacity)
+}
+
+fn video_layer_dest_size(layer: &crate::document::Layer, frame_w: u32, frame_h: u32) -> (f32, f32) {
+    let aspect = if frame_h > 0 {
+        frame_w as f32 / frame_h as f32
+    } else {
+        1.0
+    };
+    let mut w = layer.width;
+    let mut h = layer.height;
+    if layer.aspect_ratio_locked {
+        if w / h > aspect {
+            w = h * aspect;
+        } else {
+            h = w / aspect;
+        }
+    }
+    (w, h)
+}
+
+fn clip_defs_and_maps(
+    project: &ProjectFile,
+) -> (
+    String,
+    std::collections::HashMap<uuid::Uuid, crate::document::ClipMaskEffect>,
+    std::collections::HashSet<uuid::Uuid>,
+) {
+    let mut clip_defs = String::new();
+    let mut clip_map = std::collections::HashMap::new();
+    let mut mask_set = std::collections::HashSet::new();
+    for cm in project.document.clip_masks.values() {
+        clip_map.insert(cm.source_id, cm.clone());
+        if cm.hide_mask {
+            mask_set.insert(cm.mask_id);
+        }
+        if let Some(mask_node) = project.nodes.get(cm.mask_id) {
+            let shape_svg = node_to_svg_fragment(mask_node, &project.nodes);
+            clip_defs.push_str(&format!(
+                r#"  <clipPath id="clip-{}">
+    {}
+  </clipPath>
+"#,
+                cm.id.as_simple(),
+                shape_svg
+            ));
+        }
+    }
+    let defs_str = if clip_defs.is_empty() {
+        String::new()
+    } else {
+        format!("<defs>\n{}</defs>\n", clip_defs)
+    };
+    (defs_str, clip_map, mask_set)
+}
+
+fn append_image_layer_nodes_to_svg(
+    svg: &mut String,
+    layer: &crate::document::Layer,
+    project: &ProjectFile,
+    clip_map: &std::collections::HashMap<uuid::Uuid, crate::document::ClipMaskEffect>,
+    mask_set: &std::collections::HashSet<uuid::Uuid>,
+) {
+    for id in &layer.nodes {
+        if mask_set.contains(id) {
+            continue;
+        }
+        let Some(node) = project.nodes.get(*id) else {
+            continue;
+        };
+        let node_svg = node_to_svg_fragment(node, &project.nodes);
+        if let Some(cm) = clip_map.get(id) {
+            svg.push_str(&format!(
+                r#"<g clip-path="url(#clip-{})">{}</g>"#,
+                cm.id.as_simple(),
+                node_svg
+            ));
+        } else {
+            svg.push_str(&node_svg);
+        }
+    }
+}
+
+fn document_svg_single_image_layer(
+    project: &ProjectFile,
+    layer: &crate::document::Layer,
+    defs_str: &str,
+    clip_map: &std::collections::HashMap<uuid::Uuid, crate::document::ClipMaskEffect>,
+    mask_set: &std::collections::HashSet<uuid::Uuid>,
+) -> String {
+    let w = project.document.width;
+    let h = project.document.height;
+    let mut svg = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
+{defs_str}"#,
+    );
+    append_image_layer_nodes_to_svg(&mut svg, layer, project, clip_map, mask_set);
+    svg.push_str("</svg>\n");
+    svg
+}
+
+/// Raster export frame following document layer stack order (bottom → top).
+pub fn composite_export_frame(
+    project: &ProjectFile,
+    current_frame: usize,
+    video_frames: &std::collections::HashMap<uuid::Uuid, (u32, u32, Vec<u8>)>,
+    scale: f32,
+) -> Option<(u32, u32, Vec<u8>)> {
+    use resvg::tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
+
+    let doc_w = project.document.width;
+    let doc_h = project.document.height;
+    let mut pixel_w = (doc_w as f32 * scale).round() as u32;
+    let mut pixel_h = (doc_h as f32 * scale).round() as u32;
+    if pixel_w % 2 != 0 {
+        pixel_w = pixel_w.saturating_sub(1);
+    }
+    if pixel_h % 2 != 0 {
+        pixel_h = pixel_h.saturating_sub(1);
+    }
+    if pixel_w == 0 || pixel_h == 0 {
+        return None;
+    }
+
+    let mut pixmap = Pixmap::new(pixel_w, pixel_h)?;
+    let pc = project.document.page_color;
+    let bg = Color::from_rgba(
+        pc[0].clamp(0.0, 1.0),
+        pc[1].clamp(0.0, 1.0),
+        pc[2].clamp(0.0, 1.0),
+        pc[3].clamp(0.0, 1.0),
+    )
+    .unwrap_or(Color::WHITE);
+    pixmap.fill(bg);
+
+    let (defs_str, clip_map, mask_set) = clip_defs_and_maps(project);
+    let scale_x = pixel_w as f32 / doc_w as f32;
+    let scale_y = pixel_h as f32 / doc_h as f32;
+    let svg_scale = Transform::from_scale(scale_x, scale_y);
+    let opt = usvg::Options::default();
+
+    for layer in &project.document.layers {
+        if !layer.visible || !layer.is_renderer {
+            continue;
+        }
+        match layer.kind {
+            crate::document::LayerKind::Video => {
+                let Some((fw, fh, rgba)) = video_frames.get(&layer.id) else {
+                    continue;
+                };
+                let Some(src) = Pixmap::from_vec(
+                    rgba.clone(),
+                    resvg::tiny_skia::IntSize::from_wh(*fw, *fh)?,
+                ) else {
+                    continue;
+                };
+                let (dx, dy, rot, opacity) =
+                    layer_anim_transform(layer, project, current_frame);
+                let (dw, dh) = video_layer_dest_size(layer, *fw, *fh);
+                let x = (dx as f32) * scale;
+                let y = (dy as f32) * scale;
+                let w = dw * scale;
+                let h = dh * scale;
+                let sx = w / *fw as f32;
+                let sy = h / *fh as f32;
+                let transform = if rot != 0.0 {
+                    Transform::from_translate(x, y).pre_concat(
+                        Transform::from_translate(w / 2.0, h / 2.0)
+                            .pre_rotate(rot as f32)
+                            .pre_translate(-w / 2.0, -h / 2.0)
+                            .pre_scale(sx, sy),
+                    )
+                } else {
+                    Transform::from_translate(x, y).pre_scale(sx, sy)
+                };
+                let mut paint = PixmapPaint::default();
+                paint.opacity = opacity;
+                pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
+            }
+            crate::document::LayerKind::Image => {
+                let svg = document_svg_single_image_layer(project, layer, &defs_str, &clip_map, &mask_set);
+                if let Ok(tree) = usvg::Tree::from_str(&svg, &opt) {
+                    resvg::render(&tree, svg_scale, &mut pixmap.as_mut());
+                }
+            }
+            crate::document::LayerKind::Audio => {}
+        }
+    }
+
+    Some((pixel_w, pixel_h, pixmap.take()))
+}

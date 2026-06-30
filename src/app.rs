@@ -20,7 +20,8 @@ use crate::tools::{self, DragNewShape, MarqueeSelect, SelectDrag, ToolKind, Tool
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioExtractStatus {
-    Extracting,
+    /// Left-to-right fill uses `progress` (0..1).
+    Extracting { progress: f32 },
     Ready(std::path::PathBuf),
     Failed,
 }
@@ -123,10 +124,17 @@ pub struct VadadeeBerryApp {
     /// Keeps the default output device stream alive while audio plays.
     pub audio_device: Option<rodio::MixerDeviceSink>,
     pub audio_players: std::collections::HashMap<uuid::Uuid, rodio::Player>,
+    /// File offset (seconds) at which each player's sample buffer starts.
+    audio_player_buffer_offset: std::collections::HashMap<uuid::Uuid, f32>,
     /// Do not retry rodio open/decode for these layers until playback stops.
     audio_layers_skip: std::collections::HashSet<uuid::Uuid>,
-    /// MP4/MOV/… → one-shot ffmpeg PCM wav for rodio.
+    /// MP4/MOV/… → one-shot symphonia PCM wav for rodio.
     pub audio_extract_status: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
+    /// Decoded PCM for extracted WAVs (avoids re-reading disk on seek).
+    pub audio_pcm_cache: crate::audio_extract::AudioPcmCache,
+    /// Background audio decode → main thread attaches rodio players.
+    audio_prepare_rx:
+        std::collections::HashMap<uuid::Uuid, std::sync::mpsc::Receiver<Option<crate::audio_extract::AudioPrepareResult>>>,
 
     pub project: ProjectFile,
     pub viewport: Viewport,
@@ -280,7 +288,7 @@ pub struct VideoLayerState {
     pub rx_frame: std::sync::mpsc::Receiver<(usize, u32, u32, Vec<u8>)>,
     /// The frame we currently requested from the background thread.
     pub requested_frame: Option<usize>,
-    /// Whether ffmpeg is currently running a sequential decode stream.
+    /// Whether libav sequential decode is active for this layer.
     pub stream_active: bool,
     /// Last request timestamp in seconds (from egui time) to throttle scrubbing requests.
     pub last_req_time: Option<f64>,
@@ -300,6 +308,23 @@ impl VideoBackend {
         match self {
             Self::Ffmpeg => "FFmpeg",
             Self::Gstreamer => "GStreamer",
+        }
+    }
+}
+
+/// CPU usage profile while encoding video (libav encoder thread count / preset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ExportPowerLevel {
+    #[default]
+    PowerSaving,
+    FullPower,
+}
+
+impl ExportPowerLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PowerSaving => "Power saving",
+            Self::FullPower => "Full power",
         }
     }
 }
@@ -334,7 +359,7 @@ impl VideoFormat {
 }
 
 /// All render-to-video settings plus live progress state.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VideoExportState {
     pub backend: VideoBackend,
     pub fps: u32,
@@ -354,6 +379,10 @@ pub struct VideoExportState {
     pub restore_anim_frame: usize,
     pub frames_dir: Option<std::path::PathBuf>,
     pub output_path: Option<std::path::PathBuf>,
+    pub power_level: ExportPowerLevel,
+    pub export_start_time: Option<std::time::Instant>,
+    export_rx: Option<std::sync::mpsc::Receiver<crate::export_worker::ExportWorkerEvent>>,
+    export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for VideoExportState {
@@ -373,6 +402,10 @@ impl Default for VideoExportState {
             restore_anim_frame: 0,
             frames_dir: None,
             output_path: None,
+            power_level: ExportPowerLevel::default(),
+            export_start_time: None,
+            export_rx: None,
+            export_cancel: None,
         }
     }
 }
@@ -411,8 +444,11 @@ impl VadadeeBerryApp {
             clip_mask_signatures: std::collections::HashMap::new(),
             audio_device: rodio::DeviceSinkBuilder::open_default_sink().ok(),
             audio_players: std::collections::HashMap::new(),
+            audio_player_buffer_offset: std::collections::HashMap::new(),
             audio_layers_skip: std::collections::HashSet::new(),
             audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            audio_prepare_rx: std::collections::HashMap::new(),
 
             project: Document::new_default_project(),
             viewport: Viewport::default(),
@@ -1531,11 +1567,17 @@ impl VadadeeBerryApp {
     pub fn add_video_layer(&mut self, name: &str, video_path: String) {
         let before = snapshot_document(&self.project.document);
         let mut after = before.clone();
+        let path_for_extract = video_path.clone();
         let idx = after.add_video_layer(name, video_path);
         after.active_layer_index = idx;
         self.history.push(
             &mut self.project,
             ProjectEdit::PatchDocument { before, after },
+        );
+        spawn_video_audio_extract(
+            &path_for_extract,
+            &self.audio_extract_status,
+            &self.audio_pcm_cache,
         );
     }
 
@@ -1808,253 +1850,113 @@ impl VadadeeBerryApp {
         let temp =
             std::env::temp_dir().join(format!("vadadee_video_{}", uuid::Uuid::new_v4().as_simple()));
         let _ = std::fs::create_dir_all(&temp);
-        self.video_export.restore_anim_frame = self.anim_current_frame;
+        let restore = self.anim_current_frame;
+        let total_frames = max_frame + 1;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let job = crate::export_worker::ExportJobConfig {
+            output_path: output,
+            work_dir: temp.clone(),
+            fps: self.video_export.fps,
+            resolution_pct: self.video_export.resolution_pct,
+            bitrate_kbps: self.video_export.bitrate_kbps,
+            format: self.video_export.format,
+            power: self.video_export.power_level,
+            total_frames,
+            restore_anim_frame: restore,
+        };
+
+        crate::export_worker::spawn_export_worker(
+            self.project.clone(),
+            job,
+            cancel.clone(),
+            tx,
+        );
+
+        self.video_export.restore_anim_frame = restore;
         self.video_export.frame_done = 0;
-        self.video_export.total_frames = max_frame + 1;
+        self.video_export.total_frames = total_frames;
         self.video_export.frames_dir = Some(temp);
-        self.video_export.output_path = Some(output);
         self.video_export.rendering = true;
         self.video_export.progress = Some(0.0);
         self.video_export.progress_visible = true;
+        self.video_export.export_start_time = Some(std::time::Instant::now());
+        self.video_export.export_rx = Some(rx);
+        self.video_export.export_cancel = Some(cancel);
         self.video_export.status_msg = format!(
-            "Rendering {} frames @ {}% resolution…",
-            self.video_export.total_frames, self.video_export.resolution_pct
+            "Rendering {} frames @ {} fps, {}% resolution…",
+            total_frames, self.video_export.fps, self.video_export.resolution_pct
         );
-        self.status_message = "Video export started".into();
+        self.status_message = "Video export started (background)".into();
     }
 
     pub fn cancel_video_export(&mut self) {
+        if let Some(cancel) = &self.video_export.export_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.video_export.status_msg = "Cancelling…".into();
+        self.status_message = "Cancelling video export…".into();
+    }
+
+    fn finish_video_export_ui(&mut self, cancelled: bool) {
         self.video_export.rendering = false;
         self.video_export.progress = None;
+        self.video_export.export_rx = None;
+        self.video_export.export_cancel = None;
+        self.video_export.export_start_time = None;
         if let Some(dir) = self.video_export.frames_dir.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
         self.apply_animation_for_frame(self.video_export.restore_anim_frame);
-        self.video_export.status_msg = "Cancelled.".into();
-        self.status_message = "Video export cancelled".into();
-    }
-
-    fn finish_video_export(&mut self) {
-        let frames_dir = self.video_export.frames_dir.take();
-        let output = self.video_export.output_path.take();
-        let fps = self.video_export.fps;
-        let bitrate = self.video_export.bitrate_kbps;
-        let format = self.video_export.format;
-        let backend = self.video_export.backend;
-        
-        // Find audio source from the first active video layer
-        let mut audio_source: Option<String> = None;
-        let mut eq_bass = 0.0;
-        let mut eq_mid = 0.0;
-        let mut eq_treble = 0.0;
-        let mut volume = 1.0;
-        let mut audio_start_offset = 0.0;
-        let mut audio_timeline_delay = 0.0;
-        for layer in &self.project.document.layers {
-            if layer.visible && layer.is_renderer && layer.kind == crate::document::LayerKind::Video && !layer.video_path.is_empty() {
-                audio_source = Some(layer.video_path.clone());
-                eq_bass = layer.eq_bass;
-                eq_mid = layer.eq_mid;
-                eq_treble = layer.eq_treble;
-                volume = layer.volume;
-                audio_start_offset = layer.video_start_offset;
-                audio_timeline_delay = layer.video_timeline_start;
-                break;
-            }
-        }
-        
-        self.video_export.status_msg = "Encoding video…".into();
-        if let (Some(dir), Some(out)) = (frames_dir, output) {
-            let ok = Self::encode_video_from_frames(
-                &dir,
-                &out,
-                fps,
-                bitrate,
-                format,
-                backend,
-                audio_source.as_deref(),
-                eq_bass,
-                eq_mid,
-                eq_treble,
-                volume,
-                audio_start_offset,
-                audio_timeline_delay,
-            );
-            if ok {
-                self.video_export.status_msg = format!("Saved {}", out.display());
-                self.status_message = format!("Video saved: {}", out.display());
-            } else {
-                self.video_export.status_msg =
-                    "Encoding failed — install ffmpeg (or gstreamer) and try again.".into();
-                self.status_message = self.video_export.status_msg.clone();
-            }
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-        self.video_export.rendering = false;
-        self.video_export.progress = Some(1.0);
-        self.apply_animation_for_frame(self.video_export.restore_anim_frame);
-    }
-
-    fn encode_video_from_frames(
-        frames_dir: &std::path::Path,
-        output: &std::path::Path,
-        fps: u32,
-        bitrate_kbps: u32,
-        format: VideoFormat,
-        backend: VideoBackend,
-        audio_source: Option<&str>,
-        eq_bass: f32,
-        eq_mid: f32,
-        eq_treble: f32,
-        volume: f32,
-        audio_start_offset: f32,
-        audio_timeline_delay: f32,
-    ) -> bool {
-        use std::process::Command;
-        let pattern = frames_dir.join("frame_%05d.png");
-        let fps_s = fps.to_string();
-        let bitrate = format!("{bitrate_kbps}k");
-        let vcodec = match format {
-            VideoFormat::Webm => "libvpx-vp9",
-            VideoFormat::Mov => "prores_ks",
-            _ => "libx264",
-        };
-        
-        if crate::video_decode::is_libav_available() {
-            log::info!("libav backend active for encoding");
-            match crate::video_decode::encode_video_libav(frames_dir, output, fps, bitrate_kbps, vcodec) {
-                Ok(_) => {
-                    log::info!("Successfully encoded video via shared library");
-                    if audio_source.is_none() {
-                        return true;
-                    }
-                }
-                Err(e) => {
-                    log::warn!("libav encode failed, falling back to process: {}", e);
-                }
-            }
-        }
-
-        let mut cmd = Command::new("ffmpeg");
-        cmd.arg("-y")
-            .arg("-framerate")
-            .arg(&fps_s)
-            .arg("-i")
-            .arg(pattern.to_str().unwrap_or("frame_%05d.png"));
-            
-        if let Some(audio_src) = audio_source {
-            if audio_start_offset > 0.0 {
-                cmd.arg("-ss").arg(format!("{:.3}", audio_start_offset));
-            }
-            cmd.arg("-i").arg(audio_src);
-            
-            // Parametric equalizer, volume and delay filters
-            let mut af_filters = vec![
-                format!("equalizer=f=100:width_type=h:w=200:g={:.1}", eq_bass),
-                format!("equalizer=f=1000:width_type=h:w=1000:g={:.1}", eq_mid),
-                format!("equalizer=f=8000:width_type=h:w=3000:g={:.1}", eq_treble),
-                format!("volume={:.2}", volume),
-            ];
-            if audio_timeline_delay > 0.0 {
-                let ms = (audio_timeline_delay * 1000.0) as i32;
-                af_filters.push(format!("adelay={ms}|{ms}"));
-            }
-            let af = af_filters.join(",");
-            cmd.arg("-af").arg(af);
-            
-            cmd.arg("-map").arg("0:v")
-               .arg("-map").arg("1:a")
-               .arg("-c:a").arg("aac")
-               .arg("-shortest");
-        }
-        
-        cmd.arg("-c:v")
-            .arg(vcodec)
-            .arg("-b:v")
-            .arg(&bitrate);
-        if format == VideoFormat::Mov {
-            cmd.arg("-profile:v").arg("3");
-        }
-        cmd.arg(output);
-        let ffmpeg = cmd.output();
-        if backend == VideoBackend::Gstreamer {
-            if let Ok(out) = Command::new("gst-launch-1.0").arg("--version").output() {
-                if out.status.success() {
-                    log::info!("GStreamer selected; using ffmpeg pipeline for encode");
-                }
-            }
-        }
-        match ffmpeg {
-            Ok(o) if o.status.success() => true,
-            _ => false,
+        if cancelled {
+            self.video_export.status_msg = "Cancelled.".into();
+            self.status_message = "Video export cancelled".into();
         }
     }
 
-    pub fn tick_video_export(&mut self, ctx: &Context) {
+    pub fn poll_video_export(&mut self, ctx: &Context) {
         if !self.video_export.rendering {
             return;
         }
-        let Some(frames_dir) = self.video_export.frames_dir.clone() else {
+        let Some(rx) = &self.video_export.export_rx else {
             return;
         };
-        let f = self.video_export.frame_done;
-        if f >= self.video_export.total_frames {
-            self.finish_video_export();
-            return;
-        }
-        self.apply_animation_for_frame(f);
-        
-        // Extract PNG frame bytes for all video layers at frame `f`
-        let mut video_frames = std::collections::HashMap::new();
-        let fps = self.anim_fps as f32;
-        let backend = self.video_export.backend;
-        for layer in &self.project.document.layers {
-            if layer.visible && layer.is_renderer && layer.kind == crate::document::LayerKind::Video && !layer.video_path.is_empty() {
-                let elapsed_time = ((f as f32 / fps) - layer.video_timeline_start).max(0.0).min(layer.video_play_length);
-                let source_time = layer.video_start_offset + elapsed_time;
-                let source_frame_idx = (source_time * fps) as usize;
-                if let Some(mut bytes) = extract_video_frame(&layer.video_path, source_frame_idx, fps, backend) {
-                    if layer.hue != 0.0 || layer.saturation != 1.0 || layer.brightness != 1.0 || layer.contrast != 1.0 {
-                        if let Some(adj) = adjust_frame_color(&bytes, layer.hue, layer.saturation, layer.brightness, layer.contrast) {
-                            bytes = adj;
-                        }
-                    }
-                    video_frames.insert(layer.id, bytes);
+        let mut done: Option<(bool, String)> = None;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                crate::export_worker::ExportWorkerEvent::Progress {
+                    frame_done,
+                    total,
+                    message,
+                } => {
+                    self.video_export.frame_done = frame_done;
+                    self.video_export.total_frames = total;
+                    self.video_export.progress =
+                        Some(frame_done as f32 / total.max(1) as f32);
+                    self.video_export.status_msg = message;
+                }
+                crate::export_worker::ExportWorkerEvent::Finished { success, message } => {
+                    done = Some((success, message));
                 }
             }
         }
-        
-        let scale = (self.video_export.resolution_pct as f32 / 100.0).max(0.1);
-        let svg = io::document_svg_string(&self.project, f, &video_frames);
-        let Some((w, h, rgba)) = io::render_svg_to_rgba(&svg, scale) else {
-            self.video_export.status_msg = "Frame rasterize failed".into();
-            self.cancel_video_export();
-            return;
-        };
-        let path = frames_dir.join(format!("frame_{f:05}.png"));
-        if let Err(e) = Self::save_rgba_png(&path, w, h, &rgba) {
-            self.video_export.status_msg = format!("Write frame failed: {e}");
-            self.cancel_video_export();
-            return;
+        if let Some((success, message)) = done {
+            let cancelled = !success && message.contains("Cancelled");
+            if success {
+                self.video_export.progress = Some(1.0);
+                self.video_export.status_msg = message.clone();
+                self.status_message = message.clone();
+            } else if !cancelled {
+                self.video_export.status_msg = message.clone();
+                self.status_message = message;
+            }
+            self.finish_video_export_ui(cancelled);
         }
-        self.video_export.frame_done = f + 1;
-        self.video_export.progress = Some(
-            self.video_export.frame_done as f32 / self.video_export.total_frames.max(1) as f32,
-        );
-        self.video_export.status_msg = format!(
-            "Frame {}/{} ({} fps target)",
-            self.video_export.frame_done,
-            self.video_export.total_frames,
-            self.video_export.fps
-        );
-        ctx.request_repaint();
-    }
-
-    fn save_rgba_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
-        use image::{ImageBuffer, RgbaImage};
-        let img: RgbaImage = ImageBuffer::from_raw(w, h, rgba.to_vec())
-            .ok_or_else(|| "invalid RGBA buffer".to_string())?;
-        img.save(path).map_err(|e| e.to_string())
+        if self.video_export.rendering {
+            ctx.request_repaint();
+        }
     }
 
     pub fn copy_selection(&mut self) {
@@ -2418,41 +2320,96 @@ impl VadadeeBerryApp {
         );
     }
 
+    /// Layer index that owns the first selected image-layer node, if any.
+    fn image_layer_index_for_selection(&self) -> Option<usize> {
+        for id in &self.selection {
+            if self.project.nodes.get(*id).is_none() {
+                continue;
+            }
+            for (i, layer) in self.project.document.layers.iter().enumerate() {
+                if layer.kind == crate::document::LayerKind::Image && layer.nodes.contains(id) {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    fn nudge_nodes_within_layer(&mut self, layer_index: usize, delta: isize) -> bool {
+        let before = self
+            .project
+            .document
+            .layers
+            .get(layer_index)
+            .map(|l| l.nodes.clone())
+            .unwrap_or_default();
+        let mut after = before.clone();
+        let mut changed = false;
+        for id in self.selection.clone() {
+            if let Some(pos) = after.iter().position(|n| *n == id) {
+                let new_pos =
+                    (pos as isize + delta).clamp(0, after.len() as isize - 1) as usize;
+                if new_pos != pos {
+                    let item = after.remove(pos);
+                    after.insert(new_pos, item);
+                    changed = true;
+                }
+            }
+        }
+        if changed && after != before {
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::ReorderNodes {
+                    layer_index,
+                    before,
+                    after,
+                },
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Raise / lower selection in the stack (vs video/audio layers) or within an image layer.
+    /// Kind of the sole selected layer, if selection is exactly one layer id.
+    pub fn selected_layer_kind(&self) -> Option<crate::document::LayerKind> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let id = self.selection[0];
+        self.project
+            .document
+            .layers
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| l.kind)
+    }
+
     pub fn nudge_z_order(&mut self, delta: isize) {
+        let len = self.project.document.layers.len();
+        if len == 0 {
+            return;
+        }
+
         for id in self.selection.clone() {
             if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == id) {
                 self.nudge_layer_order(pos, delta);
                 return;
             }
         }
-        let idx = self.project.document.active_layer_index;
-        let before = self
-            .project
-            .document
-            .layers
-            .get(idx)
-            .map(|l| l.nodes.clone())
-            .unwrap_or_default();
-        let mut after = before.clone();
-        for id in self.selection.clone() {
-            if let Some(pos) = after.iter().position(|n| *n == id) {
-                let new_pos = (pos as isize + delta).clamp(0, after.len() as isize - 1) as usize;
-                if new_pos != pos {
-                    let item = after.remove(pos);
-                    after.insert(new_pos, item);
-                }
+
+        if let Some(layer_idx) = self.image_layer_index_for_selection() {
+            let target = (layer_idx as isize + delta).clamp(0, len as isize - 1) as usize;
+            if target != layer_idx {
+                self.nudge_layer_order(layer_idx, delta);
+                return;
             }
+            let _ = self.nudge_nodes_within_layer(layer_idx, delta);
+            return;
         }
-        if after != before {
-            self.history.push(
-                &mut self.project,
-                ProjectEdit::ReorderNodes {
-                    layer_index: idx,
-                    before,
-                    after,
-                },
-            );
-        }
+
+        let idx = self.project.document.active_layer_index;
+        let _ = self.nudge_nodes_within_layer(idx, delta);
     }
 
     /// Flip all selected nodes horizontally (if `horizontal`) or vertically.
@@ -3176,20 +3133,9 @@ fn run_video_decode_thread(
     tx_frame: std::sync::mpsc::Sender<(usize, u32, u32, Vec<u8>)>,
 ) {
     let mut current_path: Option<String> = None;
-    let mut next_expected_frame = 0;
-    
-    // Libav dynamic loader state
     let mut libav_stream: Option<crate::video_decode::VideoStream> = None;
-    
-    // Fallback process-based state
-    let mut ffmpeg_child: Option<std::process::Child> = None;
-    let mut ffmpeg_stdout: Option<std::process::ChildStdout> = None;
-    let mut width = 0;
-    let mut height = 0;
-    let mut frame_bytes_len = 0;
 
     while let Ok(cmd) = rx_cmd.recv() {
-        // Drain channel to get the latest command (avoids queue backlog & lag)
         let mut latest_cmd = cmd;
         while let Ok(next_cmd) = rx_cmd.try_recv() {
             if matches!(next_cmd, VideoCommand::Stop) {
@@ -3200,131 +3146,44 @@ fn run_video_decode_thread(
         }
 
         match latest_cmd {
-            VideoCommand::Stop => {
-                if let Some(mut child) = ffmpeg_child.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                break;
-            }
+            VideoCommand::Stop => break,
             VideoCommand::StopStream => {
-                if let Some(mut child) = ffmpeg_child.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    ffmpeg_stdout = None;
-                }
                 libav_stream = None;
             }
-            VideoCommand::GetFrame { timeline_frame, source_frame, fps, path, sequential } => {
+            VideoCommand::GetFrame {
+                timeline_frame,
+                source_frame,
+                fps,
+                path,
+                sequential: _,
+            } => {
+                if !crate::video_decode::is_libav_available() {
+                    continue;
+                }
                 let path_changed = current_path.as_ref() != Some(&path);
                 if path_changed {
                     current_path = Some(path.clone());
-                    libav_stream = None; // Reset stream on file switch
+                    libav_stream = None;
                 }
-                
-                // Try libav backend first
-                if crate::video_decode::is_libav_available() {
-                    // Make sure we stop/kill any leftover command fallback processes
-                    if let Some(mut child) = ffmpeg_child.take() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        ffmpeg_stdout = None;
-                    }
-                    
-                    if libav_stream.is_none() {
-                        libav_stream = crate::video_decode::VideoStream::open(&path);
-                    }
-                    
-                    if let Some(ref mut stream) = libav_stream {
-                        if let Some((w, h, rgba)) = stream.get_frame(source_frame, fps) {
-                            let _ = tx_frame.send((timeline_frame, w, h, rgba));
-                            next_expected_frame = source_frame + 1;
-                            continue;
-                        }
-                    }
+                if libav_stream.is_none() {
+                    libav_stream = crate::video_decode::VideoStream::open(&path);
                 }
-                
-                // Fallback to ffmpeg process pipeline
-                let seek_needed = !sequential 
-                    || source_frame != next_expected_frame 
-                    || path_changed 
-                    || ffmpeg_child.is_none();
-
-                if seek_needed {
-                    if let Some(mut child) = ffmpeg_child.take() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        ffmpeg_stdout = None;
-                    }
-
-                    if path_changed || width == 0 || height == 0 {
-                        width = 0;
-                        height = 0;
-
-                        if let Some((w, h, _)) = crate::video_decode::decode_frame(&path, 0, fps) {
-                            width = w;
-                            height = h;
-                        }
-                    }
-
-                    if width > 0 && height > 0 {
-                        frame_bytes_len = (width * height * 4) as usize;
-                        let time_sec = source_frame as f32 / fps;
-                        
-                        use std::process::Command;
-                        let mut cmd_builder = Command::new("ffmpeg");
-                        cmd_builder.arg("-y");
-                        cmd_builder.arg("-noautorotate");
-                        cmd_builder.arg("-ss").arg(format!("{:.3}", time_sec));
-                        cmd_builder.arg("-i").arg(&path);
-                        
-                        if !sequential {
-                            cmd_builder.arg("-vframes").arg("1");
-                        }
-                        
-                        cmd_builder.args([
-                            "-f", "rawvideo",
-                            "-pix_fmt", "rgba",
-                            "pipe:1"
-                        ]);
-                        
-                        cmd_builder.stdout(std::process::Stdio::piped());
-                        cmd_builder.stderr(std::process::Stdio::null());
-                        
-                        if let Ok(mut child) = cmd_builder.spawn() {
-                            if let Some(stdout) = child.stdout.take() {
-                                ffmpeg_stdout = Some(stdout);
-                                ffmpeg_child = Some(child);
-                            }
-                        }
-                    }
-                }
-
-                let mut decoded = false;
-                if let Some(ref mut stdout) = ffmpeg_stdout {
-                    use std::io::Read;
-                    let mut buf = vec![0u8; frame_bytes_len];
-                    if stdout.read_exact(&mut buf).is_ok() {
-                        let _ = tx_frame.send((timeline_frame, width, height, buf));
-                        next_expected_frame = source_frame + 1;
-                        decoded = true;
-                    }
-                }
-
-                if !decoded {
-                    if let Some((_, w, h, rgba)) = extract_video_frame_raw(&path, source_frame, fps) {
-                        let _ = tx_frame.send((timeline_frame, w, h, rgba));
-                        next_expected_frame = source_frame + 1;
-                    }
+                let decoded = if let Some(ref mut stream) = libav_stream {
+                    stream
+                        .get_frame(source_frame, fps)
+                        .map(|(w, h, rgba)| (w, h, rgba))
+                } else {
+                    None
+                };
+                if let Some((w, h, rgba)) = decoded {
+                    let _ = tx_frame.send((timeline_frame, w, h, rgba));
+                } else if let Some((w, h, rgba)) =
+                    crate::video_decode::decode_frame(&path, source_frame, fps)
+                {
+                    let _ = tx_frame.send((timeline_frame, w, h, rgba));
                 }
             }
         }
-    }
-    
-    // Explicit thread exit cleanup to prevent orphaned ffmpeg background processes
-    if let Some(mut child) = ffmpeg_child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
     }
 }
 
@@ -3621,7 +3480,7 @@ fn run_video_decode_thread(
                 .map(|e| e.path_id)
                 .collect();
 
-            // Draw layer by layer
+            // Draw layer by layer (stack order = document.layers, bottom → top)
             for layer in &self.project.document.layers {
                 if !layer.visible {
                     continue;
@@ -4426,20 +4285,84 @@ fn run_video_decode_thread(
 
     pub fn sync_audio_playback(&mut self) {
         use rodio::Source;
+        use std::num::{NonZeroU16, NonZeroU32};
 
         if !self.anim_is_playing {
             self.audio_players.clear();
+            self.audio_player_buffer_offset.clear();
             self.audio_layers_skip.clear();
+            self.audio_prepare_rx.clear();
             return;
         }
 
         let playhead_time = self.anim_current_frame as f32 / self.anim_fps as f32;
         let mut active_layer_ids = std::collections::HashSet::new();
+        for layer in &self.project.document.layers {
+            if layer.visible
+                && (layer.kind == crate::document::LayerKind::Video
+                    || layer.kind == crate::document::LayerKind::Audio)
+                && !layer.video_path.is_empty()
+            {
+                let start = layer.video_timeline_start;
+                let duration = layer.video_play_length;
+                if playhead_time >= start && playhead_time < start + duration {
+                    active_layer_ids.insert(layer.id);
+                }
+            }
+        }
 
         let Some(device) = self.audio_device.as_ref() else {
             return;
         };
         let mixer = device.mixer();
+
+        let mut prepared: Vec<(uuid::Uuid, crate::audio_extract::AudioPrepareResult)> =
+            Vec::new();
+        let mut prepare_failed: Vec<uuid::Uuid> = Vec::new();
+        self.audio_prepare_rx.retain(|layer_id, rx| {
+            match rx.try_recv() {
+                Ok(Some(p)) => {
+                    prepared.push((*layer_id, p));
+                    false
+                }
+                Ok(None) => {
+                    prepare_failed.push(*layer_id);
+                    false
+                }
+                Err(_) => active_layer_ids.contains(layer_id),
+            }
+        });
+        for id in prepare_failed {
+            self.audio_layers_skip.insert(id);
+            self.audio_player_buffer_offset.remove(&id);
+        }
+        for (layer_id, p) in prepared {
+            if p.samples.is_empty() {
+                self.audio_layers_skip.insert(layer_id);
+                self.audio_player_buffer_offset.remove(&layer_id);
+                continue;
+            }
+            if let (Some(ch), Some(rate)) =
+                (NonZeroU16::new(p.channels), NonZeroU32::new(p.sample_rate))
+            {
+                let source = rodio::buffer::SamplesBuffer::new(ch, rate, p.samples);
+                let player = rodio::Player::connect_new(mixer);
+                if let Some(layer) = self
+                    .project
+                    .document
+                    .layers
+                    .iter()
+                    .find(|l| l.id == layer_id)
+                {
+                    player.set_volume(layer.volume);
+                }
+                player.append(source);
+                self.audio_players.insert(layer_id, player);
+            } else {
+                self.audio_layers_skip.insert(layer_id);
+                self.audio_player_buffer_offset.remove(&layer_id);
+            }
+        }
 
         for layer in &self.project.document.layers {
             if layer.visible
@@ -4449,50 +4372,79 @@ fn run_video_decode_thread(
                 let start = layer.video_timeline_start;
                 let duration = layer.video_play_length;
                 if playhead_time >= start && playhead_time < start + duration {
-                    active_layer_ids.insert(layer.id);
-
                     if self.audio_layers_skip.contains(&layer.id) {
-                        continue;
+                        if resolve_audio_path_for_rodio(
+                            &layer.video_path,
+                            &self.audio_extract_status,
+                            &self.audio_pcm_cache,
+                        )
+                        .is_some()
+                        {
+                            self.audio_layers_skip.remove(&layer.id);
+                        } else {
+                            continue;
+                        }
                     }
 
-                    if !self.audio_players.contains_key(&layer.id) {
-                        if let Some(audio_path) = resolve_audio_path_for_rodio(&layer.video_path, &self.audio_extract_status) {
-                            let Ok(file) = std::fs::File::open(&audio_path) else {
-                                self.audio_layers_skip.insert(layer.id);
-                                continue;
-                            };
-                            let buf_reader = std::io::BufReader::new(file);
-                            if let Ok(mut source) = rodio::Decoder::try_from(buf_reader) {
-                                let sample_rate = source.sample_rate().get();
-                                let channels = source.channels().get();
-                                let relative_time =
-                                    (playhead_time - start) + layer.video_start_offset;
-                                if relative_time > 0.0 {
-                                    let samples_to_skip = (relative_time
-                                        * sample_rate as f32
-                                        * channels as f32)
-                                        as usize;
-                                    for _ in 0..samples_to_skip {
-                                        source.next();
-                                    }
-                                }
+                    let file_pos =
+                        (playhead_time - start) + layer.video_start_offset;
+                    let mut need_create = !self.audio_players.contains_key(&layer.id);
+                    if let Some(player) = self.audio_players.get(&layer.id) {
+                        let buffer_start = self
+                            .audio_player_buffer_offset
+                            .get(&layer.id)
+                            .copied()
+                            .unwrap_or(0.0);
+                        let current_pos = player.get_pos().as_secs_f32();
+                        let expected_player_pos = (file_pos - buffer_start).max(0.0);
+                        if (current_pos - expected_player_pos).abs() > 0.45 {
+                            self.audio_players.remove(&layer.id);
+                            self.audio_player_buffer_offset.remove(&layer.id);
+                            self.audio_prepare_rx.remove(&layer.id);
+                            need_create = true;
+                        } else {
+                            player.set_volume(layer.volume);
+                        }
+                    }
 
-                                let player = rodio::Player::connect_new(mixer);
-                                player.set_volume(layer.volume);
-                                player.append(source);
-                                self.audio_players.insert(layer.id, player);
-                            } else {
-                                self.audio_layers_skip.insert(layer.id);
+                    if need_create && !self.audio_prepare_rx.contains_key(&layer.id) {
+                        if let Some(audio_path) = resolve_audio_path_for_rodio(
+                            &layer.video_path,
+                            &self.audio_extract_status,
+                            &self.audio_pcm_cache,
+                        ) {
+                            let offset = file_pos.max(0.0);
+                            self.audio_player_buffer_offset.insert(layer.id, offset);
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.audio_prepare_rx.insert(layer.id, rx);
+                            let path = audio_path.clone();
+                            let cache = self.audio_pcm_cache.clone();
+                            let spawned = std::thread::Builder::new()
+                                .name("vadadee-audio-prepare".into())
+                                .spawn(move || {
+                                    let msg = crate::audio_extract::prepare_samples_at_offset(
+                                        &path,
+                                        offset,
+                                        &cache,
+                                    );
+                                    let _ = tx.send(msg);
+                                })
+                                .is_ok();
+                            if !spawned {
+                                self.audio_prepare_rx.remove(&layer.id);
+                                self.audio_player_buffer_offset.remove(&layer.id);
                             }
                         }
-                    } else if let Some(player) = self.audio_players.get(&layer.id) {
-                        player.set_volume(layer.volume);
                     }
                 }
             }
         }
 
         self.audio_players
+            .retain(|id, _| active_layer_ids.contains(id));
+        self.audio_player_buffer_offset
+            .retain(|id, _| active_layer_ids.contains(id));
+        self.audio_prepare_rx
             .retain(|id, _| active_layer_ids.contains(id));
     }
 
@@ -6764,14 +6716,27 @@ fn run_video_decode_thread(
             return proposed_translation;
         }
         
-        if self.tools.select.drag_snapshot.is_empty() {
+        let mut original_pts = Vec::new();
+        let mut dragged_circles = Vec::new();
+        
+        // Check if there is a selected Video layer
+        let mut video_selection = Vec::new();
+        for &id in selection {
+            if let Some(l) = self.project.document.layers.iter().find(|l| l.id == id) {
+                if l.kind == crate::document::LayerKind::Video {
+                    video_selection.push(l.id);
+                }
+            }
+        }
+
+        if self.tools.select.drag_snapshot.is_empty() && video_selection.is_empty() {
             return proposed_translation;
         }
 
         let threshold = (8.0 / self.viewport.zoom as f64).max(0.1);
         let mut final_translation = proposed_translation;
 
-        // 1. Identify target nodes and their snap points / circles
+        // 1. Identify target nodes/layers and their snap points
         let mut target_pts = Vec::new();
         let mut target_circles = Vec::new();
         for (id, node) in &self.project.nodes.map {
@@ -6788,9 +6753,58 @@ fn run_video_decode_thread(
             }
         }
 
-        // 2. Identify candidate points and circles in the selection snapshot
-        let mut original_pts = Vec::new();
-        let mut dragged_circles = Vec::new();
+        for layer in &self.project.document.layers {
+            if selection.contains(&layer.id) {
+                continue;
+            }
+            if layer.visible && layer.kind == crate::document::LayerKind::Video {
+                let mut dx = layer.x as f64;
+                let mut dy = layer.y as f64;
+                if let Some(track) = self.project.anim_timeline.nodes.get(&layer.id) {
+                    if let Some(x) = track.pos_x.interpolate(self.anim_current_frame) {
+                        dx = x;
+                    }
+                    if let Some(y) = track.pos_y.interpolate(self.anim_current_frame) {
+                        dy = y;
+                    }
+                }
+                let aspect = self.video_layers.get(&layer.id)
+                    .and_then(|s| s.texture.as_ref())
+                    .map(|tex| {
+                        let tex_w = tex.size()[0] as f32;
+                        let tex_h = tex.size()[1] as f32;
+                        if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                    })
+                    .or_else(|| {
+                        self.video_frame_cache.as_ref()
+                            .filter(|c| c.layer_id == layer.id)
+                            .map(|c| {
+                                let tex_w = c.texture.size()[0] as f32;
+                                let tex_h = c.texture.size()[1] as f32;
+                                if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                            })
+                    })
+                    .unwrap_or(1.0);
+                let mut w = layer.width as f64;
+                let mut h = layer.height as f64;
+                if layer.aspect_ratio_locked {
+                    if w / h > aspect {
+                        w = h * aspect;
+                    } else {
+                        h = w / aspect;
+                    }
+                }
+                let cx = dx + w / 2.0;
+                let cy = dy + h / 2.0;
+                target_pts.push((dx, dy));
+                target_pts.push((dx + w, dy));
+                target_pts.push((dx, dy + h));
+                target_pts.push((dx + w, dy + h));
+                target_pts.push((cx, cy));
+            }
+        }
+
+        // 2. Identify candidate points in selection
         for (_, orig_node) in &self.tools.select.drag_snapshot {
             let pts = self.get_node_snap_points(orig_node);
             original_pts.extend(pts);
@@ -6800,6 +6814,15 @@ fn run_video_decode_thread(
                     dragged_circles.push(((*cx, *cy), *rx));
                 }
             }
+        }
+
+        if !video_selection.is_empty() {
+            let r = self.tools.select.resize_anchor;
+            original_pts.push((r.x0, r.y0));
+            original_pts.push((r.x1, r.y0));
+            original_pts.push((r.x0, r.y1));
+            original_pts.push((r.x1, r.y1));
+            original_pts.push((r.center().x, r.center().y));
         }
 
         // Try equal spacing snap first
@@ -6895,14 +6918,50 @@ fn run_video_decode_thread(
         final_translation.0 += snap_x;
         final_translation.1 += snap_y;
 
+        // 5. Try grid snap if enabled
+        if self.viewport.snap_grid {
+            let g = self.viewport.grid_step as f64;
+            if g > 0.0 {
+                let mut best_grid_dx = threshold;
+                let mut best_grid_dy = threshold;
+                let mut grid_snap_x = 0.0;
+                let mut grid_snap_y = 0.0;
+                let mut snapped_any_x = false;
+                let mut snapped_any_y = false;
+
+                for &opt in &original_pts {
+                    let ppt = (opt.0 + final_translation.0, opt.1 + final_translation.1);
+                    let grid_x = (ppt.0 / g).round() * g;
+                    let grid_y = (ppt.1 / g).round() * g;
+                    let dx = grid_x - ppt.0;
+                    let dy = grid_y - ppt.1;
+                    
+                    if dx.abs() < best_grid_dx.abs() {
+                        best_grid_dx = dx;
+                        grid_snap_x = dx;
+                        snapped_any_x = true;
+                    }
+                    if dy.abs() < best_grid_dy.abs() {
+                        best_grid_dy = dy;
+                        grid_snap_y = dy;
+                        snapped_any_y = true;
+                    }
+                }
+                
+                if snapped_any_x {
+                    final_translation.0 += grid_snap_x;
+                }
+                if snapped_any_y {
+                    final_translation.1 += grid_snap_y;
+                }
+            }
+        }
+
         // Correct guide lines end positions to match final snapped coordinate
         for guide in &mut self.live_snap_guides {
             if !guide.is_tangent {
-                if guide.start.0 == guide.end.0 {
-                    guide.end.1 += snap_y;
-                } else if guide.start.1 == guide.end.1 {
-                    guide.end.0 += snap_x;
-                }
+                let end_ppt_orig = (guide.end.0 - proposed_translation.0, guide.end.1 - proposed_translation.1);
+                guide.end = (end_ppt_orig.0 + final_translation.0, end_ppt_orig.1 + final_translation.1);
             }
         }
 
@@ -8243,7 +8302,7 @@ impl eframe::App for VadadeeBerryApp {
             ctx.request_repaint();
         }
         self.update_text_pan_animation(ctx);
-        self.tick_video_export(ctx);
+        self.poll_video_export(ctx);
         self.keyboard_shortcuts(ctx);
         self.canvas_wheel_zoom(ctx);
         self.sync_audio_playback();
@@ -8461,8 +8520,11 @@ mod tests {
                 clip_mask_signatures: std::collections::HashMap::new(),
                 audio_device: rodio::DeviceSinkBuilder::open_default_sink().ok(),
                 audio_players: std::collections::HashMap::new(),
+            audio_player_buffer_offset: std::collections::HashMap::new(),
                 audio_layers_skip: std::collections::HashSet::new(),
                 audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                audio_prepare_rx: std::collections::HashMap::new(),
 
                 project: Document::new_default_project(),
                 viewport: Viewport::default(),
@@ -8648,135 +8710,113 @@ fn is_video_container_ext(path: &str) -> bool {
     )
 }
 
-/// Rodio/symphonia cannot stream most MP4 containers; extract PCM wav once via ffmpeg asynchronously in background.
+/// Start background stereo MP3 extract for video containers (idempotent).
+fn spawn_video_audio_extract(
+    video_path: &str,
+    status_map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
+    pcm_cache: &crate::audio_extract::AudioPcmCache,
+) {
+    if !is_video_container_ext(video_path) {
+        return;
+    }
+
+    let mut map = status_map.lock().unwrap();
+    match map.get(video_path) {
+        Some(AudioExtractStatus::Ready(pb)) if pb.exists() => return,
+        Some(AudioExtractStatus::Extracting { .. }) => return,
+        Some(AudioExtractStatus::Failed) => {
+            map.remove(video_path);
+        }
+        _ => {}
+    }
+
+    map.insert(
+        video_path.to_string(),
+        AudioExtractStatus::Extracting { progress: 0.0 },
+    );
+    let path_clone = video_path.to_string();
+    let map_for_report = status_map.clone();
+    let map_for_done = status_map.clone();
+    let pcm_cache = pcm_cache.clone();
+    drop(map);
+
+    std::thread::Builder::new()
+        .name("vadadee-audio-extract".into())
+        .spawn(move || {
+            use std::hash::{Hash, Hasher};
+
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            path_clone.hash(&mut hasher);
+            let out_mp3 =
+                std::env::temp_dir().join(format!("vadadee_audio_{:016x}.mp3", hasher.finish()));
+
+            let path_key = path_clone.clone();
+            let report: crate::audio_extract::ExtractProgress = std::sync::Arc::new(move |p| {
+                if let Ok(mut m) = map_for_report.lock() {
+                    m.insert(
+                        path_key.clone(),
+                        AudioExtractStatus::Extracting {
+                            progress: p.clamp(0.0, 1.0),
+                        },
+                    );
+                }
+            });
+
+            let result = crate::audio_extract::extract_audio_to_mp3(
+                std::path::Path::new(&path_clone),
+                &out_mp3,
+                report,
+            );
+
+            let mut m = map_for_done.lock().unwrap();
+            match result {
+                Ok(out_path) if out_path.exists() => {
+                    m.insert(path_clone.clone(), AudioExtractStatus::Ready(out_path.clone()));
+                    crate::audio_extract::spawn_preload_pcm(
+                        pcm_cache,
+                        out_path.to_string_lossy().to_string(),
+                        out_path,
+                    );
+                }
+                Ok(_) | Err(_) => {
+                    m.insert(path_clone, AudioExtractStatus::Failed);
+                }
+            }
+        })
+        .ok();
+}
+
+/// Rodio cannot reliably stream some MP4 layouts; use extracted stereo MP3 (or WAV fallback).
 fn resolve_audio_path_for_rodio(
     video_path: &str,
     status_map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
+    pcm_cache: &crate::audio_extract::AudioPcmCache,
 ) -> Option<std::path::PathBuf> {
     if !is_video_container_ext(video_path) {
-        return Some(std::path::PathBuf::from(video_path));
+        let pb = std::path::PathBuf::from(video_path);
+        crate::audio_extract::spawn_preload_pcm(
+            pcm_cache.clone(),
+            video_path.to_string(),
+            pb.clone(),
+        );
+        return Some(pb);
     }
-    
-    let mut map = status_map.lock().unwrap();
+
+    spawn_video_audio_extract(video_path, status_map, pcm_cache);
+
+    let map = status_map.lock().unwrap();
     match map.get(video_path) {
-        Some(AudioExtractStatus::Ready(pb)) => {
-            if pb.exists() {
-                return Some(pb.clone());
-            }
+        Some(AudioExtractStatus::Ready(pb)) if pb.exists() => {
+            let key = pb.to_string_lossy().to_string();
+            crate::audio_extract::spawn_preload_pcm(
+                pcm_cache.clone(),
+                key,
+                pb.clone(),
+            );
+            Some(pb.clone())
         }
-        Some(AudioExtractStatus::Extracting) => {
-            return None;
-        }
-        Some(AudioExtractStatus::Failed) => {
-            return None;
-        }
-        None => {
-            map.insert(video_path.to_string(), AudioExtractStatus::Extracting);
-            
-            let path_clone = video_path.to_string();
-            let map_clone = status_map.clone();
-            
-            std::thread::spawn(move || {
-                use std::hash::{Hash, Hasher};
-                use std::process::Command;
-
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                path_clone.hash(&mut hasher);
-                let out = std::env::temp_dir().join(format!("vadadee_audio_{:016x}.wav", hasher.finish()));
-
-                let ok = Command::new("ffmpeg")
-                    .args([
-                        "-nostdin",
-                        "-loglevel",
-                        "error",
-                        "-y",
-                        "-i",
-                        &path_clone,
-                        "-vn",
-                        "-acodec",
-                        "pcm_s16le",
-                        "-ar",
-                        "44100",
-                        "-ac",
-                        "2",
-                    ])
-                    .arg(&out)
-                    .status()
-                    .ok()
-                    .is_some_and(|s| s.success())
-                    && out.exists();
-
-                let mut m = map_clone.lock().unwrap();
-                if ok {
-                    m.insert(path_clone, AudioExtractStatus::Ready(out));
-                } else {
-                    m.insert(path_clone, AudioExtractStatus::Failed);
-                }
-            });
-        }
+        _ => None,
     }
-    None
-}
-
-fn extract_video_frame(video_path: &str, frame_idx: usize, fps: f32, backend: VideoBackend) -> Option<Vec<u8>> {
-    use std::process::Command;
-    let time_sec = frame_idx as f32 / fps;
-    
-    // Attempt FFmpeg frame extraction first (seeking to time_sec is extremely fast and accurate)
-    let output = Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-noautorotate")
-        .arg("-ss")
-        .arg(format!("{:.3}", time_sec))
-        .arg("-i")
-        .arg(video_path)
-        .arg("-vframes")
-        .arg("1")
-        .arg("-f")
-        .arg("image2pipe")
-        .arg("-vcodec")
-        .arg("png")
-        .arg("-")
-        .output();
-        
-    if let Ok(out) = output {
-        if out.status.success() && !out.stdout.is_empty() {
-            return Some(out.stdout);
-        }
-    }
-    
-    // Fallback to GStreamer if ffmpeg failed or not found:
-    let temp_png = std::env::temp_dir().join("vadadee_gst_temp.png");
-    let gst_out = Command::new("gst-launch-1.0")
-        .arg("filesrc")
-        .arg(format!("location={}", video_path))
-        .arg("!")
-        .arg("decodebin")
-        .arg("!")
-        .arg("videoconvert")
-        .arg("!")
-        .arg("pngenc")
-        .arg("!")
-        .arg("filesink")
-        .arg(format!("location={}", temp_png.to_string_lossy()))
-        .output();
-    if gst_out.is_ok() {
-        if let Ok(bytes) = std::fs::read(&temp_png) {
-            let _ = std::fs::remove_file(&temp_png);
-            return Some(bytes);
-        }
-    }
-    None
-}
-
-/// Fast async frame extractor using the best available backend:
-/// - libav (libavformat/libavcodec/libswscale dlopen'd at runtime) when available
-/// - ffmpeg process spawn as fallback
-///
-/// Returns (frame_idx, width, height, rgba_bytes). Used by background threads.
-fn extract_video_frame_raw(video_path: &str, frame_idx: usize, fps: f32) -> Option<(usize, u32, u32, Vec<u8>)> {
-    crate::video_decode::decode_frame(video_path, frame_idx, fps)
-        .map(|(w, h, rgba)| (frame_idx, w, h, rgba))
 }
 
 fn apply_color_controls(img: &mut image::RgbaImage, hue: f32, sat: f32, bright: f32, contrast: f32) {

@@ -1,7 +1,7 @@
 use egui::{scroll_area::ScrollBarVisibility, Context, FontFamily, FontId, Rect, RichText, ScrollArea, Ui};
 
 use crate::animation::action_bar_overlay_rect;
-use crate::app::{KeyframeTrack, VadadeeBerryApp};
+use crate::app::{AudioExtractStatus, KeyframeTrack, VadadeeBerryApp};
 use crate::document::{
     compute_whole_object_bounds, compute_tiling_whole_bounds, compute_circular_whole_bounds, default_loft_gap_for_node, find_effect_for_pair, ArcJoin, FillKind, GeometryProfile, LineCap,
     LineJoin, NodeKind, OnPathMode, PathData, TextStyle, A4_HEIGHT_PX, A4_WIDTH_PX,
@@ -50,6 +50,25 @@ impl ActionTab {
             Self::PathMagic => "Path magic",
             Self::Animation => "Animation",
         }
+    }
+
+    /// Tab label in the action bar (video layer → "Color" only; audio hides this tab).
+    fn strip_label(self, app: &crate::app::VadadeeBerryApp) -> String {
+        if self == Self::ColorStroke {
+            if let Some(crate::document::LayerKind::Video) = app.selected_layer_kind() {
+                return "Color".into();
+            }
+        }
+        self.label().to_string()
+    }
+
+    fn visible_in_strip(self, app: &crate::app::VadadeeBerryApp) -> bool {
+        if self == Self::ColorStroke {
+            if let Some(crate::document::LayerKind::Audio) = app.selected_layer_kind() {
+                return false;
+            }
+        }
+        true
     }
 
     fn icon(self) -> &'static str {
@@ -223,11 +242,19 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         app.duplicate_selection();
                         ui.close();
                     }
-                    if ui.button("Raise").clicked() {
+                    if ui
+                        .button("Raise")
+                        .on_hover_text("Raise vs video/audio layers, or within image layer")
+                        .clicked()
+                    {
                         app.nudge_z_order(1);
                         ui.close();
                     }
-                    if ui.button("Lower").clicked() {
+                    if ui
+                        .button("Lower")
+                        .on_hover_text("Lower vs video/audio layers, or within image layer")
+                        .clicked()
+                    {
                         app.nudge_z_order(-1);
                         ui.close();
                     }
@@ -306,21 +333,34 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
         egui::vec2(inner_w + 2.0 * margin_x, inner_h + 2.0 * margin_y),
     );
 
+    let is_video_or_audio_layer = app.project.document.active_layer()
+        .map_or(false, |l| l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio);
+    if is_video_or_audio_layer && app.tools.active != ToolKind::Select && app.tools.active != ToolKind::Eyedropper {
+        app.tools.active = ToolKind::Select;
+    }
+
     // Tools list
-    let tools = [
-        ToolKind::Select,
-        ToolKind::Node,
-        ToolKind::Pen,
-        ToolKind::Rectangle,
-        ToolKind::Circle,
-        ToolKind::Ellipse,
-        ToolKind::Line,
-        ToolKind::Polygon,
-        ToolKind::Arc,
-        ToolKind::Text,
-        ToolKind::Brush,
-        ToolKind::Eyedropper,
-    ];
+    let tools = if is_video_or_audio_layer {
+        vec![
+            ToolKind::Select,
+            ToolKind::Eyedropper,
+        ]
+    } else {
+        vec![
+            ToolKind::Select,
+            ToolKind::Node,
+            ToolKind::Pen,
+            ToolKind::Rectangle,
+            ToolKind::Circle,
+            ToolKind::Ellipse,
+            ToolKind::Line,
+            ToolKind::Polygon,
+            ToolKind::Arc,
+            ToolKind::Text,
+            ToolKind::Brush,
+            ToolKind::Eyedropper,
+        ]
+    };
 
     let get_tool_icon = |tool: ToolKind, polygon_sides: u32| -> &'static str {
         match tool {
@@ -691,11 +731,15 @@ fn action_tab_strip(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let mut first_tab: Option<egui::Response> = None;
                     for (i, tab) in app.action_tab_order.clone().into_iter().enumerate() {
+                        if !tab.visible_in_strip(app) {
+                            continue;
+                        }
                         let selected = app.action_tab == tab;
                         let tab_alpha = app.ui_anim.tab_label_alpha(selected);
-                        let label = format!("{} {}", tab.icon(), tab.label());
+                        let text = tab.strip_label(app);
+                        let label = format!("{} {}", tab.icon(), text);
                         let resp = theme::action_tab_chip(ui, selected, &label, tab_alpha)
-                            .on_hover_text(tab.label());
+                            .on_hover_text(&text);
                         if i == 0 {
                             first_tab = Some(resp.clone());
                         }
@@ -716,6 +760,11 @@ fn action_tab_strip(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 }
 
 fn action_bar_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+    if app.action_tab == ActionTab::ColorStroke {
+        if let Some(crate::document::LayerKind::Audio) = app.selected_layer_kind() {
+            app.action_tab = ActionTab::Layer;
+        }
+    }
     ui.label(RichText::new("Actions").strong().color(colors::TEXT));
     ui.separator();
     action_tab_strip(app, ui);
@@ -1363,39 +1412,43 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         );
         ui.add_space(6.0);
 
-        // Backend
-        ui.horizontal(|ui| {
-            ui.label("Backend");
-            egui::ComboBox::from_id_salt("video_backend_combo")
-                .selected_text(app.video_export.backend.label())
-                .width(110.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut app.video_export.backend,
-                        crate::app::VideoBackend::Ffmpeg,
-                        "FFmpeg",
-                    );
-                    ui.selectable_value(
-                        &mut app.video_export.backend,
-                        crate::app::VideoBackend::Gstreamer,
-                        "GStreamer",
-                    );
-                });
-        });
 
-        // Frame rate
+
+        // Frame rate (integer)
         ui.horizontal(|ui| {
             ui.label("Frame rate");
-            let mut fps = app.video_export.fps;
-            egui::ComboBox::from_id_salt("video_fps_combo")
-                .selected_text(format!("{} fps", fps))
-                .width(90.0)
+            let mut fps = app.video_export.fps as i32;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut fps)
+                        .range(1..=240)
+                        .suffix(" fps")
+                        .speed(1.0),
+                )
+                .changed()
+            {
+                app.video_export.fps = fps.clamp(1, 240) as u32;
+            }
+        });
+
+        // Encode CPU profile
+        ui.horizontal(|ui| {
+            ui.label("CPU");
+            egui::ComboBox::from_id_salt("video_export_power")
+                .selected_text(app.video_export.power_level.label())
+                .width(100.0)
                 .show_ui(ui, |ui| {
-                    for &f in &[24u32, 25, 30, 50, 60] {
-                        ui.selectable_value(&mut fps, f, format!("{} fps", f));
-                    }
+                    ui.selectable_value(
+                        &mut app.video_export.power_level,
+                        crate::app::ExportPowerLevel::PowerSaving,
+                        crate::app::ExportPowerLevel::PowerSaving.label(),
+                    );
+                    ui.selectable_value(
+                        &mut app.video_export.power_level,
+                        crate::app::ExportPowerLevel::FullPower,
+                        crate::app::ExportPowerLevel::FullPower.label(),
+                    );
                 });
-            app.video_export.fps = fps;
         });
 
         // Resolution
@@ -1560,23 +1613,74 @@ fn floating_video_editor(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
         0.0
     };
     let card_w = inset.width() - 2.0 * gap - width_reduction;
-    
-    let expected_h = 130.0;
-    let card_h = app.video_editor_container_h.clamp(expected_h, 450.0);
+
+    let track_count = app
+        .project
+        .document
+        .layers
+        .iter()
+        .filter(|l| {
+            l.kind == crate::document::LayerKind::Video
+                || l.kind == crate::document::LayerKind::Audio
+        })
+        .count();
+    let extracting = video_audio_extracting(app);
+    let show_details = app.project.document.active_layer().is_some_and(|l| {
+        l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio
+    });
+    let card_h = video_editor_panel_height(track_count, extracting, show_details);
+    app.video_editor_container_h = card_h;
+
     let left = inset.left() + gap;
     let screen_y = ctx.content_rect().max.y;
-    let open_top = screen_y - 38.0 - card_h;
-    let travel = card_h + 38.0 + gap;
+    const STATUS_BAR_H: f32 = 30.0;
+    const GAP_ABOVE_STATUS: f32 = 4.0;
+    let anchor = STATUS_BAR_H + GAP_ABOVE_STATUS;
+    let open_top = screen_y - anchor - card_h;
+    let travel = card_h + anchor + gap;
     let top = open_top + (1.0 - open_t) * travel;
-    
+
     let rect = Rect::from_min_size(egui::pos2(left, top), egui::vec2(card_w, card_h));
     let opacity = egui::emath::easing::cubic_out(open_t);
-    
-    if let Some(actual_rect) = theme::show_action_bar_area(ctx, "floating_video_editor", rect, opacity, |ui| {
+
+    theme::show_action_bar_area(ctx, "floating_video_editor", rect, opacity, |ui| {
         video_editor_interior(app, ui, pos);
-    }) {
-        app.video_editor_container_h = actual_rect.height();
+    });
+}
+
+fn video_audio_extracting(app: &VadadeeBerryApp) -> bool {
+    app.audio_extract_status.lock().ok().is_some_and(|m| {
+        m.values()
+            .any(|s| matches!(s, AudioExtractStatus::Extracting { .. }))
+    })
+}
+
+fn video_editor_panel_height(track_count: usize, extracting: bool, show_details: bool) -> f32 {
+    let tracks = track_count.max(1).min(5);
+    let mut h = 52.0 + 20.0 + tracks as f32 * 36.0 + 10.0;
+    if show_details {
+        h += 44.0;
     }
+    if extracting {
+        h += 26.0;
+    }
+    h.max(130.0)
+}
+
+fn best_video_extract_progress(app: &VadadeeBerryApp) -> Option<f32> {
+    let map = app.audio_extract_status.lock().ok()?;
+    let mut best = 0.0f32;
+    let mut any = false;
+    for layer in &app.project.document.layers {
+        if layer.kind != crate::document::LayerKind::Video || layer.video_path.is_empty() {
+            continue;
+        }
+        if let Some(AudioExtractStatus::Extracting { progress }) = map.get(&layer.video_path) {
+            any = true;
+            best = best.max(*progress);
+        }
+    }
+    any.then_some(best.clamp(0.0, 1.0))
 }
 
 fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_pos: usize) {
@@ -1625,6 +1729,12 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(4.0);
+
+        if let Some(progress) = best_video_extract_progress(app) {
+            ui.ctx().request_repaint();
+            paint_video_editor_extract_banner(ui, progress);
+            ui.add_space(4.0);
+        }
 
         let left_col_w = 120.0;
         let track_w = (ui.available_width() - left_col_w - 12.0).max(50.0);
@@ -1792,10 +1902,10 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                             // Split video layer into two sub-bars: Video (top, blue) and Audio (bottom, green)
                             let v_rect = Rect::from_min_max(
                                 egui::pos2(clip_rect.min.x, clip_rect.min.y),
-                                egui::pos2(clip_rect.max.x, clip_rect.min.y + 10.0),
+                                egui::pos2(clip_rect.max.x, clip_rect.min.y + 12.0),
                             );
                             let a_rect = Rect::from_min_max(
-                                egui::pos2(clip_rect.min.x, clip_rect.min.y + 14.0),
+                                egui::pos2(clip_rect.min.x, clip_rect.min.y + 12.0),
                                 egui::pos2(clip_rect.max.x, clip_rect.max.y),
                             );
 
@@ -1807,14 +1917,6 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                                 egui::Color32::from_rgba_unmultiplied(46, 115, 227, 180)
                             };
 
-                            let fill_a_color = if is_hovered && is_down {
-                                egui::Color32::from_rgba_unmultiplied(26, 184, 93, 240)
-                            } else if is_hovered {
-                                egui::Color32::from_rgba_unmultiplied(66, 224, 133, 210)
-                            } else {
-                                egui::Color32::from_rgba_unmultiplied(46, 204, 113, 180)
-                            };
-
                             clip_painter.rect(
                                 v_rect,
                                 egui::CornerRadius::same(2),
@@ -1823,13 +1925,55 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                                 egui::StrokeKind::Inside,
                             );
 
-                            clip_painter.rect(
-                                a_rect,
-                                egui::CornerRadius::same(2),
-                                fill_a_color,
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 255, 160)),
-                                egui::StrokeKind::Inside,
-                            );
+                            let extract_progress = app
+                                .audio_extract_status
+                                .lock()
+                                .ok()
+                                .and_then(|m| m.get(&l.video_path).cloned())
+                                .and_then(|s| match s {
+                                    AudioExtractStatus::Extracting { progress } => Some(progress),
+                                    _ => None,
+                                });
+
+                            if let Some(progress) = extract_progress {
+                                ui.ctx().request_repaint();
+                                clip_painter.rect_filled(
+                                    a_rect,
+                                    egui::CornerRadius::same(2),
+                                    egui::Color32::from_rgb(10, 32, 18),
+                                );
+                                paint_extract_progress_in_rect(&clip_painter, a_rect, progress);
+                                clip_painter.rect_stroke(
+                                    a_rect,
+                                    egui::CornerRadius::same(2),
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 220, 120)),
+                                    egui::StrokeKind::Inside,
+                                );
+                                if a_rect.width() > 36.0 {
+                                    clip_painter.text(
+                                        a_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        format!("{:.0}%", progress * 100.0),
+                                        egui::FontId::proportional(10.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            } else {
+                                let fill_a_color = if is_hovered && is_down {
+                                    egui::Color32::from_rgba_unmultiplied(26, 184, 93, 240)
+                                } else if is_hovered {
+                                    egui::Color32::from_rgba_unmultiplied(66, 224, 133, 210)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(46, 204, 113, 180)
+                                };
+                                clip_painter.rect(
+                                    a_rect,
+                                    egui::CornerRadius::same(2),
+                                    fill_a_color,
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 255, 160)),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
                         } else {
                             // Audio-only track, single solid green bar
                             let fill_color = if is_hovered && is_down {
@@ -1913,6 +2057,7 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(4.0);
+
                 ui.horizontal(|ui| {
                     let display_active_name = if layer.name.chars().count() > 18 {
                         let mut res: String = layer.name.chars().take(15).collect();
@@ -1977,6 +2122,60 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
     }
     if let Some(frame) = apply_anim_for_frame {
         app.apply_animation_for_frame(frame);
+    }
+}
+
+fn paint_video_editor_extract_banner(ui: &mut Ui, progress: f32) {
+    let progress = progress.clamp(0.0, 1.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Audio extraction")
+                .small()
+                .strong()
+                .color(egui::Color32::from_rgb(120, 230, 150)),
+        );
+        ui.add_space(8.0);
+        let w = (ui.available_width() - 48.0).max(80.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 16.0), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(12, 28, 18));
+        paint_extract_progress_in_rect(painter, rect, progress);
+        ui.label(
+            RichText::new(format!("{:.0}%", progress * 100.0))
+                .small()
+                .color(colors::ACCENT),
+        );
+    });
+}
+
+fn paint_extract_progress_in_rect(painter: &egui::Painter, rect: Rect, progress: f32) {
+    let progress = progress.clamp(0.0, 1.0);
+    let dark = egui::Color32::from_rgb(8, 92, 38);
+    let light = egui::Color32::from_rgb(140, 255, 170);
+    let fill_w = rect.width() * progress;
+    if fill_w < 0.5 {
+        return;
+    }
+    let strips = 32usize;
+    for i in 0..strips {
+        let t0 = i as f32 / strips as f32;
+        let t1 = (i + 1) as f32 / strips as f32;
+        let x0 = rect.min.x + fill_w * t0;
+        let x1 = rect.min.x + fill_w * t1;
+        if x1 <= x0 + 0.05 {
+            continue;
+        }
+        let t_mid = (t0 + t1) * 0.5;
+        let lerp = |a: u8, b: u8| -> u8 {
+            (a as f32 + (b as f32 - a as f32) * t_mid).round() as u8
+        };
+        let color = egui::Color32::from_rgb(
+            lerp(dark.r(), light.r()),
+            lerp(dark.g(), light.g()),
+            lerp(dark.b(), light.b()),
+        );
+        let strip = egui::Rect::from_min_max(egui::pos2(x0, rect.min.y), egui::pos2(x1, rect.max.y));
+        painter.rect_filled(strip, 2.0, color);
     }
 }
 
@@ -2331,10 +2530,18 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label(format!("{} selected", app.selection.len()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("▲").on_hover_text("Raise").clicked() {
+            if ui
+                .small_button("▲")
+                .on_hover_text("Raise — move vs video/audio layers or within layer")
+                .clicked()
+            {
                 app.nudge_z_order(1);
             }
-            if ui.small_button("▼").on_hover_text("Lower").clicked() {
+            if ui
+                .small_button("▼")
+                .on_hover_text("Lower — move vs video/audio layers or within layer")
+                .clicked()
+            {
                 app.nudge_z_order(-1);
             }
             if ui.small_button("⧉").on_hover_text("Duplicate").clicked() {
@@ -2464,58 +2671,44 @@ fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     if app.selection.len() == 1 {
         let id = app.selection[0];
         if let Some(pos) = app.project.document.layers.iter().position(|l| l.id == id) {
-            let layer = &mut app.project.document.layers[pos];
-            theme::constraint_block(ui, |ui| {
-                ui.label(RichText::new("🎥 Color Controls").strong().color(colors::ACCENT));
-                ui.add_space(4.0);
-                
-                ui.horizontal(|ui| {
-                    ui.label("Hue:");
-                    ui.add(egui::Slider::new(&mut layer.hue, -180.0..=180.0));
+            let kind = app.project.document.layers[pos].kind;
+            if kind == crate::document::LayerKind::Audio {
+                ui.label(
+                    RichText::new("Use the Layer tab for audio settings.")
+                        .color(colors::TEXT_MUTED)
+                        .italics(),
+                );
+                return;
+            }
+            if kind == crate::document::LayerKind::Video {
+                let layer = &mut app.project.document.layers[pos];
+                theme::constraint_block(ui, |ui| {
+                    ui.label(RichText::new("🎥 Color").strong().color(colors::ACCENT));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Hue:");
+                        ui.add(egui::Slider::new(&mut layer.hue, -180.0..=180.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Saturation:");
+                        ui.add(egui::Slider::new(&mut layer.saturation, 0.0..=2.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Brightness:");
+                        ui.add(egui::Slider::new(&mut layer.brightness, 0.0..=2.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Contrast:");
+                        ui.add(egui::Slider::new(&mut layer.contrast, 0.0..=2.0));
+                    });
                 });
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label("Saturation:");
-                    ui.add(egui::Slider::new(&mut layer.saturation, 0.0..=2.0));
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut layer.name);
                 });
-                ui.horizontal(|ui| {
-                    ui.label("Brightness:");
-                    ui.add(egui::Slider::new(&mut layer.brightness, 0.0..=2.0));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Contrast:");
-                    ui.add(egui::Slider::new(&mut layer.contrast, 0.0..=2.0));
-                });
-            });
-            ui.add_space(6.0);
-            theme::constraint_block(ui, |ui| {
-                ui.label(RichText::new("🎵 Audio Equalizer").strong().color(colors::ACCENT));
-                ui.add_space(4.0);
-                
-                ui.horizontal(|ui| {
-                    ui.label("Bass:");
-                    ui.add(egui::Slider::new(&mut layer.eq_bass, -10.0..=10.0).suffix(" dB"));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Middle:");
-                    ui.add(egui::Slider::new(&mut layer.eq_mid, -10.0..=10.0).suffix(" dB"));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Treble:");
-                    ui.add(egui::Slider::new(&mut layer.eq_treble, -10.0..=10.0).suffix(" dB"));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Volume:");
-                    ui.add(egui::Slider::new(&mut layer.volume, 0.0..=1.0));
-                });
-            });
-            
-            // Name editing
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("Name:");
-                ui.text_edit_singleline(&mut layer.name);
-            });
-            return;
+                return;
+            }
         }
     }
 

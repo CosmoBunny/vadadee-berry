@@ -1,0 +1,575 @@
+//! Background video export — keeps heavy libav + SVG raster work off the UI thread.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
+
+use crate::app::{ExportPowerLevel, VideoFormat};
+use crate::document::{Fill, NodeId, NodeKind, ProjectFile};
+use crate::io;
+use crate::video_decode::{LibavEncoder, VideoStream};
+
+#[derive(Debug, Clone)]
+pub struct ExportJobConfig {
+    pub output_path: PathBuf,
+    pub work_dir: PathBuf,
+    pub fps: u32,
+    pub resolution_pct: u32,
+    pub bitrate_kbps: u32,
+    pub format: VideoFormat,
+    pub power: ExportPowerLevel,
+    pub total_frames: usize,
+    pub restore_anim_frame: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExportWorkerEvent {
+    Progress {
+        frame_done: usize,
+        total: usize,
+        message: String,
+    },
+    Finished {
+        success: bool,
+        message: String,
+    },
+}
+
+pub fn spawn_export_worker(
+    mut project: ProjectFile,
+    config: ExportJobConfig,
+    cancel: Arc<AtomicBool>,
+    tx: Sender<ExportWorkerEvent>,
+) {
+    std::thread::Builder::new()
+        .name("vadadee-video-export".into())
+        .spawn(move || {
+            if let Err(e) = run_export(&mut project, &config, &cancel, &tx) {
+                let _ = tx.send(ExportWorkerEvent::Finished {
+                    success: false,
+                    message: e,
+                });
+            }
+        })
+        .ok();
+}
+
+fn export_cancelled(cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Relaxed)
+}
+
+fn abort_export(
+    encoder: &mut Option<LibavEncoder>,
+    config: &ExportJobConfig,
+    tx: &Sender<ExportWorkerEvent>,
+) -> Result<(), String> {
+    drop(encoder.take());
+    let _ = std::fs::remove_dir_all(&config.work_dir);
+    let _ = tx.send(ExportWorkerEvent::Finished {
+        success: false,
+        message: "Cancelled.".into(),
+    });
+    Ok(())
+}
+
+fn run_export(
+    project: &mut ProjectFile,
+    config: &ExportJobConfig,
+    cancel: &AtomicBool,
+    tx: &Sender<ExportWorkerEvent>,
+) -> Result<(), String> {
+    if !crate::video_decode::is_libav_available() {
+        return Err(
+            "FFmpeg libraries not found (libavformat/libavcodec). Install FFmpeg shared libs."
+                .into(),
+        );
+    }
+
+    let temp_video = config.work_dir.join("temp_encoded_video.mp4");
+    let vcodec = match config.format {
+        VideoFormat::Webm => "libvpx-vp9",
+        VideoFormat::Mov => "prores_ks",
+        _ => "libx264",
+    };
+
+    let scale = (config.resolution_pct as f32 / 100.0).max(0.1);
+    let export_fps = config.fps as f32;
+    let mut encoder: Option<LibavEncoder> = None;
+    let mut video_streams: std::collections::HashMap<String, VideoStream> =
+        std::collections::HashMap::new();
+    let start = std::time::Instant::now();
+
+    for f in 0..config.total_frames {
+        if export_cancelled(cancel) {
+            return abort_export(&mut encoder, config, tx);
+        }
+
+        apply_animation_for_frame_project(project, f);
+
+        let mut video_frames: std::collections::HashMap<uuid::Uuid, (u32, u32, Vec<u8>)> =
+            std::collections::HashMap::new();
+        for layer in &project.document.layers {
+            if export_cancelled(cancel) {
+                return abort_export(&mut encoder, config, tx);
+            }
+            if layer.visible
+                && layer.is_renderer
+                && layer.kind == crate::document::LayerKind::Video
+                && !layer.video_path.is_empty()
+            {
+                let elapsed_time = ((f as f32 / export_fps) - layer.video_timeline_start)
+                    .max(0.0)
+                    .min(layer.video_play_length);
+                let source_time = layer.video_start_offset + elapsed_time;
+                let source_frame_idx = (source_time * export_fps) as usize;
+                if let Some((w, h, mut rgba)) = decode_layer_frame_rgba(
+                    &mut video_streams,
+                    &layer.video_path,
+                    source_frame_idx,
+                    export_fps,
+                ) {
+                    if layer.hue != 0.0
+                        || layer.saturation != 1.0
+                        || layer.brightness != 1.0
+                        || layer.contrast != 1.0
+                    {
+                        if let Some(mut img) = image::RgbaImage::from_raw(w, h, std::mem::take(&mut rgba))
+                        {
+                            apply_color_controls(
+                                &mut img,
+                                layer.hue,
+                                layer.saturation,
+                                layer.brightness,
+                                layer.contrast,
+                            );
+                            rgba = img.into_raw();
+                        }
+                    }
+                    video_frames.insert(layer.id, (w, h, rgba));
+                }
+            }
+        }
+
+        if export_cancelled(cancel) {
+            return abort_export(&mut encoder, config, tx);
+        }
+
+        let (w, h, rgba) = io::composite_export_frame(project, f, &video_frames, scale)
+            .ok_or_else(|| "Frame rasterize failed".to_string())?;
+
+        if encoder.is_none() {
+            let threads = match config.power {
+                ExportPowerLevel::PowerSaving => 1,
+                ExportPowerLevel::FullPower => 0,
+            };
+            encoder = Some(LibavEncoder::new(
+                temp_video.to_str().unwrap(),
+                w,
+                h,
+                config.fps,
+                config.bitrate_kbps,
+                vcodec,
+                threads,
+            )?);
+        }
+
+        if export_cancelled(cancel) {
+            return abort_export(&mut encoder, config, tx);
+        }
+
+        if let Some(enc) = &mut encoder {
+            enc.write_frame(&rgba)?;
+        }
+
+        let frame_done = f + 1;
+        let elapsed = start.elapsed().as_secs_f32();
+        let eta_str = if f > 0 {
+            let avg = elapsed / f as f32;
+            let rem = (config.total_frames - frame_done) as f32 * avg;
+            if rem < 60.0 {
+                format!("{:.0}s", rem)
+            } else {
+                format!("{}:{:02}", (rem / 60.0) as i32, (rem % 60.0) as i32)
+            }
+        } else {
+            "estimating…".to_string()
+        };
+
+        let _ = tx.send(ExportWorkerEvent::Progress {
+            frame_done,
+            total: config.total_frames,
+            message: format!(
+                "Encoding frame {}/{} ({} fps) | ETA: {}",
+                frame_done, config.total_frames, config.fps, eta_str
+            ),
+        });
+    }
+
+    if let Some(enc) = encoder {
+        let _ = enc.finish();
+    }
+
+    let mut success = false;
+    if temp_video.exists() {
+        if std::fs::copy(&temp_video, &config.output_path).is_ok() {
+            success = true;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&config.work_dir);
+
+    let message = if success {
+        format!("Saved {}", config.output_path.display())
+    } else {
+        "Export failed while writing output file.".into()
+    };
+
+    let _ = tx.send(ExportWorkerEvent::Finished {
+        success,
+        message,
+    });
+    let _ = config.restore_anim_frame;
+    Ok(())
+}
+
+fn decode_layer_frame_rgba(
+    streams: &mut std::collections::HashMap<String, VideoStream>,
+    video_path: &str,
+    frame_idx: usize,
+    fps: f32,
+) -> Option<(u32, u32, Vec<u8>)> {
+    if !streams.contains_key(video_path) {
+        if let Some(s) = VideoStream::open(video_path) {
+            streams.insert(video_path.to_string(), s);
+        }
+    }
+    if let Some(stream) = streams.get_mut(video_path) {
+        stream.get_frame(frame_idx, fps)
+    } else {
+        crate::video_decode::decode_frame(video_path, frame_idx, fps)
+    }
+}
+
+fn apply_color_controls(img: &mut image::RgbaImage, hue: f32, sat: f32, bright: f32, contrast: f32) {
+    for pixel in img.pixels_mut() {
+        let [r, g, b, _a] = pixel.0;
+        let mut rf = r as f32 / 255.0;
+        let mut gf = g as f32 / 255.0;
+        let mut bf = b as f32 / 255.0;
+        if contrast != 1.0 {
+            rf = (rf - 0.5) * contrast + 0.5;
+            gf = (gf - 0.5) * contrast + 0.5;
+            bf = (bf - 0.5) * contrast + 0.5;
+        }
+        if bright != 1.0 {
+            rf *= bright;
+            gf *= bright;
+            bf *= bright;
+        }
+        if sat != 1.0 {
+            let lum = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
+            rf = lum + (rf - lum) * sat;
+            gf = lum + (gf - lum) * sat;
+            bf = lum + (bf - lum) * sat;
+        }
+        if hue != 0.0 {
+            let (h0, s0, l0) = rgb_to_hsl(rf, gf, bf);
+            let (nr, ng, nb) = hsl_to_rgb((h0 + hue).rem_euclid(360.0), s0, l0);
+            rf = nr;
+            gf = ng;
+            bf = nb;
+        }
+        pixel.0 = [
+            (rf.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (gf.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (bf.clamp(0.0, 1.0) * 255.0).round() as u8,
+            _a,
+        ];
+    }
+}
+
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    if (max - min).abs() < 1e-6 {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+    let h = if (max - r).abs() < 1e-6 {
+        (g - b) / d + (if g < b { 6.0 } else { 0.0 })
+    } else if (max - g).abs() < 1e-6 {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    (h * 60.0, s, l)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    if s.abs() < 1e-6 {
+        return (l, l, l);
+    }
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let hk = h / 360.0;
+    let t = |n: f32| {
+        let mut k = (n + hk) % 1.0;
+        if k < 1.0 / 3.0 {
+            p + (q - p) * 3.0 * k
+        } else if k < 2.0 / 3.0 {
+            p
+        } else {
+            p + (q - p) * (3.0 - 3.0 * k)
+        }
+    };
+    (t(0.0), t(-1.0 / 3.0), t(-2.0 / 3.0))
+}
+
+/// Apply timeline at `frame` to a detached project clone (export thread).
+pub fn apply_animation_for_frame_project(project: &mut ProjectFile, frame: usize) {
+    let updates: Vec<(
+        NodeId,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f32>,
+        Option<[f32; 4]>,
+        Option<Vec<f64>>,
+    )> = project
+        .anim_timeline
+        .nodes
+        .iter()
+        .map(|(node_id, track)| {
+            let x = track.pos_x.interpolate(frame);
+            let y = track.pos_y.interpolate(frame);
+            let rot = track.rotation.interpolate(frame);
+            let opacity = track.opacity.interpolate(frame).map(|o| o as f32);
+            let r = track.color_r.interpolate(frame);
+            let g = track.color_g.interpolate(frame);
+            let b = track.color_b.interpolate(frame);
+            let a = track.color_a.interpolate(frame);
+            let color = if let (Some(r), Some(g), Some(b), Some(a)) = (r, g, b, a) {
+                Some([r as f32, g as f32, b as f32, a as f32])
+            } else {
+                None
+            };
+            let geom = if !track.geom_tracks.is_empty() {
+                let mut g_vals = Vec::new();
+                let current_geom = get_node_geom_floats_project(project, *node_id);
+                for (idx, t) in track.geom_tracks.iter().enumerate() {
+                    let def_val = current_geom.get(idx).copied().unwrap_or(0.0);
+                    g_vals.push(t.interpolate(frame).unwrap_or(def_val));
+                }
+                Some(g_vals)
+            } else {
+                None
+            };
+            (*node_id, x, y, rot, opacity, color, geom)
+        })
+        .collect();
+
+    for (node_id, target_x, target_y, target_rot, target_op, target_color, target_geom) in updates {
+        if let Some(node) = project.nodes.get_mut(node_id) {
+            let (curr_x, curr_y) = node.get_pos();
+            let dx = target_x.map(|tx| tx - curr_x).unwrap_or(0.0);
+            let dy = target_y.map(|ty| ty - curr_y).unwrap_or(0.0);
+            if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
+                node.translate(dx, dy);
+            }
+            if let Some(rot) = target_rot {
+                node.set_rotation(rot);
+            }
+            if let Some(op) = target_op {
+                node.set_opacity(op);
+            }
+            if let Some(color) = target_color {
+                let mut base_fill = project
+                    .anim_timeline
+                    .nodes
+                    .get(&node_id)
+                    .and_then(|track| track.base_fill.clone());
+                if base_fill.is_none() {
+                    base_fill = Some(node.style.fill.clone());
+                    if let Some(track) = project.anim_timeline.nodes.get_mut(&node_id) {
+                        track.base_fill = base_fill.clone();
+                    }
+                }
+                if let Some(mut bf) = base_fill {
+                    match &mut bf {
+                        Fill::Solid(paint) => {
+                            paint.rgba = color;
+                            node.style.fill = Fill::Solid(*paint);
+                        }
+                        Fill::LinearGradient { stops, .. } | Fill::RadialGradient { stops, .. } => {
+                            for stop in stops {
+                                stop.color.rgba = [
+                                    stop.color.rgba[0] * color[0],
+                                    stop.color.rgba[1] * color[1],
+                                    stop.color.rgba[2] * color[2],
+                                    stop.color.rgba[3] * color[3],
+                                ];
+                            }
+                            node.style.fill = bf;
+                        }
+                        Fill::None => {}
+                    }
+                } else {
+                    node.set_color(color);
+                }
+            }
+            if let Some(geom) = target_geom {
+                set_node_geom_floats_project(project, node_id, &geom);
+            }
+        } else if let Some(layer) = project.document.layers.iter_mut().find(|l| {
+            l.id == node_id
+                && (l.kind == crate::document::LayerKind::Video
+                    || l.kind == crate::document::LayerKind::Audio)
+        }) {
+            if let Some(x) = target_x {
+                layer.x = x as f32;
+            }
+            if let Some(y) = target_y {
+                layer.y = y as f32;
+            }
+            if let Some(rot) = target_rot {
+                layer.rotation = rot as f32;
+            }
+        }
+    }
+}
+
+pub fn get_node_geom_floats_project(project: &ProjectFile, id: NodeId) -> Vec<f64> {
+    let mut v = if let Some(node) = project.nodes.get(id) {
+        node.get_geom_floats()
+    } else {
+        return Vec::new();
+    };
+    if let Some(tiling) = project
+        .document
+        .tiling_effects
+        .values()
+        .find(|e| e.source_id == id)
+    {
+        v.push(tiling.gap_x);
+        v.push(tiling.gap_y);
+        v.push(tiling.count_x as f64);
+        v.push(tiling.count_y as f64);
+        v.push(tiling.offset_x);
+        v.push(tiling.offset_y);
+        v.push(tiling.row_rotation);
+        v.push(tiling.col_rotation);
+        v.push(tiling.row_scale);
+        v.push(tiling.col_scale);
+    }
+    if let Some(circ) = project
+        .document
+        .circular_effects
+        .values()
+        .find(|e| e.source_id == id)
+    {
+        v.push(circ.origin_x);
+        v.push(circ.origin_y);
+        v.push(circ.radius);
+        v.push(circ.copies as f64);
+        v.push(circ.angle_offset);
+        v.push(circ.base_x);
+        v.push(circ.base_y);
+    }
+    if let Some(oop) = project
+        .document
+        .path_effects
+        .values()
+        .find(|e| e.source_id == id)
+    {
+        v.push(oop.gap);
+        v.push(oop.count as f64);
+        v.push(oop.start_offset);
+        v.push(oop.loft_end_scale as f64);
+        v.push(oop.loft_end_opacity as f64);
+    }
+    v
+}
+
+pub fn set_node_geom_floats_project(project: &mut ProjectFile, id: NodeId, floats: &[f64]) {
+    let base_len = project
+        .nodes
+        .get(id)
+        .map(|n| n.get_geom_floats().len())
+        .unwrap_or(0);
+    if base_len > 0 && floats.len() >= base_len {
+        if let Some(node) = project.nodes.get_mut(id) {
+            node.set_geom_floats(&floats[..base_len]);
+        }
+    }
+    let mut idx = base_len;
+    if let Some(tiling_id) = project
+        .document
+        .tiling_effects
+        .values()
+        .find(|e| e.source_id == id)
+        .map(|e| e.id)
+    {
+        if floats.len() >= idx + 10 {
+            if let Some(tiling) = project.document.tiling_effects.get_mut(&tiling_id) {
+                tiling.gap_x = floats[idx];
+                tiling.gap_y = floats[idx + 1];
+                tiling.count_x = floats[idx + 2].round().max(1.0) as usize;
+                tiling.count_y = floats[idx + 3].round().max(1.0) as usize;
+                tiling.offset_x = floats[idx + 4];
+                tiling.offset_y = floats[idx + 5];
+                tiling.row_rotation = floats[idx + 6];
+                tiling.col_rotation = floats[idx + 7];
+                tiling.row_scale = floats[idx + 8];
+                tiling.col_scale = floats[idx + 9];
+            }
+            idx += 10;
+        }
+    }
+    if let Some(circ_id) = project
+        .document
+        .circular_effects
+        .values()
+        .find(|e| e.source_id == id)
+        .map(|e| e.id)
+    {
+        if floats.len() >= idx + 7 {
+            if let Some(circ) = project.document.circular_effects.get_mut(&circ_id) {
+                circ.origin_x = floats[idx];
+                circ.origin_y = floats[idx + 1];
+                circ.radius = floats[idx + 2];
+                circ.copies = floats[idx + 3].round().max(1.0) as usize;
+                circ.angle_offset = floats[idx + 4];
+                circ.base_x = floats[idx + 5];
+                circ.base_y = floats[idx + 6];
+            }
+            idx += 7;
+        }
+    }
+    if let Some(oop_id) = project
+        .document
+        .path_effects
+        .values()
+        .find(|e| e.source_id == id)
+        .map(|e| e.id)
+    {
+        if floats.len() >= idx + 5 {
+            if let Some(oop) = project.document.path_effects.get_mut(&oop_id) {
+                oop.gap = floats[idx];
+                oop.count = floats[idx + 1].round().max(1.0) as usize;
+                oop.start_offset = floats[idx + 2];
+                oop.loft_end_scale = floats[idx + 3] as f32;
+                oop.loft_end_opacity = floats[idx + 4] as f32;
+            }
+        }
+    }
+}

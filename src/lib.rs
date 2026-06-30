@@ -16,6 +16,8 @@ pub mod theme;
 pub mod tools;
 pub mod ui;
 pub mod video_decode;
+pub mod export_worker;
+pub mod audio_extract;
 
 use app::VadadeeBerryApp;
 
