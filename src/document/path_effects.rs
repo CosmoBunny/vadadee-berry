@@ -5,7 +5,7 @@ use kurbo::{BezPath, PathEl, Shape};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{FaceRenderable, Node, NodeId, NodeKind, PathData, PathMagic};
+use super::{FaceRenderable, Node, NodeId, NodeKind, NodeStore, PathData, PathMagic};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OnPathMode {
@@ -32,6 +32,9 @@ pub struct ObjectOnPathEffect {
     pub loft_end_scale: f32,
     pub loft_end_opacity: f32,
     pub hide_source: bool,
+    /// Pick/drag proxy: closed Faceable path matching the combined path-magic form (not drawn).
+    #[serde(default)]
+    pub form_node_id: Option<NodeId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -142,6 +145,7 @@ impl Default for ObjectOnPathEffect {
             loft_end_scale: 1.0,
             loft_end_opacity: 0.75,
             hide_source: false,
+            form_node_id: None,
         }
     }
 }
@@ -476,13 +480,174 @@ pub fn compute_circular_whole_bounds(source: &Node, effect: &CircularCloneEffect
     acc.unwrap_or(b)
 }
 
-pub fn get_effective_bounds(node: &Node, document: &super::Document) -> kurbo::Rect {
+pub fn bez_path_from_rect(r: kurbo::Rect) -> BezPath {
+    let mut bez = BezPath::new();
+    bez.move_to((r.x0, r.y0));
+    bez.line_to((r.x1, r.y0));
+    bez.line_to((r.x1, r.y1));
+    bez.line_to((r.x0, r.y1));
+    bez.close_path();
+    bez
+}
+
+/// Faceable proxy node for grabbing/moving an object-on-path result as one unit.
+pub fn build_path_effect_form_node(
+    source: &Node,
+    effect: &ObjectOnPathEffect,
+    path: &PathData,
+    tolerance: f64,
+) -> Option<Node> {
+    let mut node = if effect.mode == OnPathMode::Loft {
+        loft_sweep_node(source, effect, path, tolerance).or_else(|| {
+            let b = compute_whole_object_bounds(source, effect, path, tolerance);
+            if b.width() < 1e-6 && b.height() < 1e-6 {
+                return None;
+            }
+            Some(Node::path_from_bez(
+                bez_path_from_rect(b),
+                format!("{} on path", source.name),
+            ))
+        })?
+    } else {
+        let b = compute_whole_object_bounds(source, effect, path, tolerance);
+        if b.width() < 1e-6 && b.height() < 1e-6 {
+            return None;
+        }
+        let mut n = Node::path_from_bez(
+            bez_path_from_rect(b),
+            format!("{} on path", source.name),
+        );
+        n.style = source.style.clone();
+        n
+    };
+    node.style.fill = super::Fill::None;
+    node.style.stroke.width = 0.0;
+    Some(node)
+}
+
+pub fn sync_path_effect_form_geometry(
+    form: &mut Node,
+    source: &Node,
+    effect: &ObjectOnPathEffect,
+    path: &PathData,
+    tolerance: f64,
+) {
+    let Some(fresh) = build_path_effect_form_node(source, effect, path, tolerance) else {
+        return;
+    };
+    if let (NodeKind::Path { path: dst }, NodeKind::Path { path: src }) = (&mut form.kind, &fresh.kind)
+    {
+        *dst = src.clone();
+    }
+    form.name = fresh.name;
+}
+
+pub fn path_effect_by_form_node<'a>(
+    effects: &'a IndexMap<Uuid, ObjectOnPathEffect>,
+    form_id: NodeId,
+) -> Option<&'a ObjectOnPathEffect> {
+    effects.values().find(|e| e.form_node_id == Some(form_id))
+}
+
+/// Ids that should move together when dragging a path-magic selection (source, spine path, form).
+pub fn path_effect_move_bundle(
+    document: &super::Document,
+    id: NodeId,
+) -> Vec<NodeId> {
+    if let Some(eff) = path_effect_by_form_node(&document.path_effects, id) {
+        return vec![eff.form_node_id.unwrap_or(id), eff.source_id, eff.path_id];
+    }
+    if let Some(eff) = document
+        .path_effects
+        .values()
+        .find(|e| e.source_id == id || e.path_id == id)
+    {
+        let mut v = vec![eff.source_id, eff.path_id];
+        if let Some(fid) = eff.form_node_id {
+            v.push(fid);
+        }
+        v.sort_by_key(|a| a.as_u128());
+        v.dedup();
+        return v;
+    }
+    vec![id]
+}
+
+pub fn path_effect_form_node_ids(effects: &IndexMap<Uuid, ObjectOnPathEffect>) -> HashSet<NodeId> {
+    effects
+        .values()
+        .filter_map(|e| e.form_node_id)
+        .collect()
+}
+
+pub fn node_uses_extended_pick_bounds(document: &super::Document, id: NodeId) -> bool {
+    document
+        .path_effects
+        .values()
+        .any(|e| e.source_id == id || e.path_id == id || e.form_node_id == Some(id))
+        || document.tiling_effects.values().any(|e| e.source_id == id)
+        || document
+            .circular_effects
+            .values()
+            .any(|e| e.source_id == id)
+}
+
+fn path_data_for_id(nodes: &NodeStore, path_id: NodeId) -> Option<PathData> {
+    nodes.get(path_id).and_then(|n| match &n.kind {
+        NodeKind::Path { path } => Some(path.clone()),
+        _ => None,
+    })
+}
+
+pub fn spatial_index_bounds(
+    node: &Node,
+    document: &super::Document,
+    nodes: &NodeStore,
+) -> kurbo::Rect {
+    if node_uses_extended_pick_bounds(document, node.id) {
+        get_effective_bounds(node, document, nodes)
+    } else {
+        node.bounds()
+    }
+}
+
+pub fn get_effective_bounds(
+    node: &Node,
+    document: &super::Document,
+    nodes: &NodeStore,
+) -> kurbo::Rect {
     let mut b = node.bounds();
     if let Some(e) = document.tiling_effects.values().find(|e| e.source_id == node.id) {
         b = b.union(compute_tiling_whole_bounds(node, e));
     }
     if let Some(e) = document.circular_effects.values().find(|e| e.source_id == node.id) {
         b = b.union(compute_circular_whole_bounds(node, e));
+    }
+    if let Some(e) = document.path_effects.values().find(|e| e.source_id == node.id) {
+        if let Some(path) = path_data_for_id(nodes, e.path_id) {
+            b = b.union(compute_whole_object_bounds(node, e, &path, 0.5));
+        }
+    }
+    for e in document
+        .path_effects
+        .values()
+        .filter(|e| e.path_id == node.id)
+    {
+        let Some(source) = nodes.get(e.source_id) else {
+            continue;
+        };
+        let Some(path) = path_data_for_id(nodes, e.path_id) else {
+            continue;
+        };
+        b = b.union(compute_whole_object_bounds(source, e, &path, 0.5));
+    }
+    if let Some(eff) = path_effect_by_form_node(&document.path_effects, node.id) {
+        if let (Some(source), Some(path)) = (
+            nodes.get(eff.source_id),
+            path_data_for_id(nodes, eff.path_id),
+        ) {
+            b = b.union(compute_whole_object_bounds(source, eff, &path, 0.5));
+        }
     }
     b
 }

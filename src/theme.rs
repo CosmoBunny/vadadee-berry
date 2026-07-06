@@ -26,6 +26,10 @@ pub mod colors {
 }
 
 pub const CHROME_GAP: i8 = 8;
+/// Must match `status` panel `exact_size` in `ui.rs`.
+pub const STATUS_BAR_HEIGHT: f32 = 30.0;
+/// Extra clearance so `Order::Foreground` floaters do not paint over the status bar.
+pub const FLOATING_ABOVE_STATUS_GAP: f32 = 10.0;
 pub const FLOAT_RADIUS: u8 = 12;
 pub const CHROME_RADIUS: u8 = 10;
 pub const TOOLBAR_WIDTH: f32 = 72.0;
@@ -194,7 +198,17 @@ pub fn show_overlay_area(
     if alpha <= 0.004 {
         return None;
     }
-    Some(show_overlay_area_inner(ctx, id, rect, alpha, true, true, add_contents))
+    Some(show_overlay_area_inner(
+        ctx,
+        id,
+        rect,
+        alpha,
+        true,
+        true,
+        None,
+        egui::Order::Foreground,
+        add_contents,
+    ))
 }
 
 /// Action bar: frame + contents share one opacity; no interaction when faded out.
@@ -210,7 +224,110 @@ pub fn show_action_bar_area(
         return None;
     }
     // Must slide fully off-screen; default Area constrain keeps the right edge glued to content_rect.
-    Some(show_overlay_area_inner(ctx, id, rect, alpha, alpha > 0.35, false, add_contents))
+    Some(show_overlay_area_inner(
+        ctx,
+        id,
+        rect,
+        alpha,
+        alpha > 0.35,
+        false,
+        None,
+        egui::Order::Foreground,
+        add_contents,
+    ))
+}
+
+/// Bottom-anchored panel (video timeline): clipped above status bar, below tooltips.
+pub fn show_floating_panel_area(
+    ctx: &egui::Context,
+    id: &'static str,
+    rect: Rect,
+    alpha: f32,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> Option<Rect> {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.004 {
+        return None;
+    }
+    Some(show_overlay_area_inner(
+        ctx,
+        id,
+        rect,
+        alpha,
+        alpha > 0.35,
+        false,
+        Some(above_status_clip_rect(ctx)),
+        egui::Order::Middle,
+        add_contents,
+    ))
+}
+
+/// Bottom panel that **slides** (full opacity); no fade. Wider clip while `slide_active`.
+pub fn show_bottom_slide_panel(
+    ctx: &egui::Context,
+    id: &'static str,
+    rect: Rect,
+    open_t: f32,
+    slide_active: bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> Option<Rect> {
+    if open_t <= 0.001 {
+        return None;
+    }
+    let clip = if slide_active || open_t < 0.999 {
+        Some(ctx.viewport_rect())
+    } else {
+        Some(above_status_clip_rect(ctx))
+    };
+    Some(show_overlay_area_inner(
+        ctx,
+        id,
+        rect,
+        1.0,
+        true,
+        false,
+        clip,
+        egui::Order::Middle,
+        add_contents,
+    ))
+}
+
+/// Canvas work rect for bottom floaters — keeps them out of the status bar band.
+pub fn floater_work_rect(canvas_work: Rect) -> Rect {
+    let gap = chrome_gap();
+    let bottom_trim = STATUS_BAR_HEIGHT + FLOATING_ABOVE_STATUS_GAP + gap;
+    Rect::from_min_max(
+        canvas_work.min + egui::vec2(gap, gap),
+        egui::pos2(
+            canvas_work.max.x - gap,
+            (canvas_work.max.y - bottom_trim).max(canvas_work.min.y + gap),
+        ),
+    )
+}
+
+pub fn above_status_clip_rect(ctx: &egui::Context) -> Rect {
+    let vp = ctx.viewport_rect();
+    let bottom = vp.max.y - STATUS_BAR_HEIGHT - FLOATING_ABOVE_STATUS_GAP;
+    Rect::from_min_max(vp.min, egui::pos2(vp.max.x, bottom.max(vp.min.y)))
+}
+
+/// Slide up from below the viewport; docked with bottom at `work.max.y` when `open_t=1`.
+pub fn bottom_floater_slide_rect(
+    ctx: &egui::Context,
+    work: Rect,
+    left: f32,
+    width: f32,
+    height: f32,
+    open_t: f32,
+) -> Rect {
+    let t = open_t.clamp(0.0, 1.0);
+    let gap = chrome_gap() as f32;
+    let vp = ctx.viewport_rect();
+    let open_bottom = work.max.y;
+    let closed_bottom = vp.max.y + height + gap;
+    let bottom = closed_bottom + (open_bottom - closed_bottom) * t;
+    let top = bottom - height;
+    Rect::from_min_size(Pos2::new(left, top), egui::vec2(width, height))
 }
 
 fn show_overlay_area_inner(
@@ -220,6 +337,8 @@ fn show_overlay_area_inner(
     alpha: f32,
     interactable: bool,
     constrain_to_content: bool,
+    clip_rect: Option<Rect>,
+    layer: egui::Order,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) -> Rect {
     if rect.width() < 8.0 || rect.height() < 8.0 {
@@ -231,9 +350,12 @@ fn show_overlay_area_inner(
         .default_size(rect.size())
         .interactable(interactable)
         .movable(false)
-        .order(egui::Order::Foreground);
+        .order(layer);
     if !constrain_to_content {
         area = area.constrain(false);
+    }
+    if let Some(clip) = clip_rect {
+        area = area.constrain_to(clip);
     }
     let response = area.show(ctx, |ui| {
             ui.set_width(rect.width());

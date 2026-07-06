@@ -59,9 +59,39 @@ pub fn load_pcm_from_file(path: &Path) -> Option<CachedPcm> {
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
     {
-        return load_pcm_from_wav(path);
+        if let Some(pcm) = load_pcm_from_wav(path) {
+            return Some(pcm);
+        }
+    }
+    if let Some(pcm) = load_pcm_decoded(path) {
+        return Some(pcm);
     }
     load_pcm_via_rodio(path)
+}
+
+/// Full-file decode via symphonia, then libav (covers MP4/MOV when rodio cannot stream).
+fn load_pcm_decoded(path: &Path) -> Option<CachedPcm> {
+    let silent: ExtractProgress = std::sync::Arc::new(|_| {});
+    if let Ok(stereo) = decode_audio_stereo_symphonia(path, silent.clone()) {
+        return Some(stereo_pcm_to_cached(stereo));
+    }
+    if let Ok(stereo) = decode_audio_stereo_libav(path, silent) {
+        return Some(stereo_pcm_to_cached(stereo));
+    }
+    None
+}
+
+fn stereo_pcm_to_cached(stereo: StereoPcmI16) -> CachedPcm {
+    let samples: Vec<f32> = stereo
+        .samples
+        .iter()
+        .map(|s| *s as f32 / i16::MAX as f32)
+        .collect();
+    CachedPcm {
+        channels: OUT_CHANNELS,
+        sample_rate: stereo.sample_rate,
+        samples: std::sync::Arc::new(samples),
+    }
 }
 
 fn load_pcm_via_rodio(path: &Path) -> Option<CachedPcm> {
@@ -376,6 +406,56 @@ fn extract_audio_symphonia(input: &Path, output: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Media duration via symphonia (audio files and many containers).
+pub fn probe_media_duration_symphonia(path: &str) -> Option<f32> {
+    let path = Path::new(path);
+    let file = File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    let format = probed.format;
+    let mut best_secs = 0.0_f64;
+    for track in format.tracks() {
+        let params = &track.codec_params;
+        let Some(n_frames) = params.n_frames else {
+            continue;
+        };
+        if n_frames == 0 {
+            continue;
+        }
+        let secs = if let Some(tb) = params.time_base {
+            let t = tb.calc_time(n_frames);
+            t.seconds as f64 + t.frac
+        } else if let Some(rate) = params.sample_rate {
+            if rate > 0 {
+                n_frames as f64 / rate as f64
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+        if secs.is_finite() && secs > best_secs {
+            best_secs = secs;
+        }
+    }
+    if best_secs > 0.05 {
+        Some(best_secs as f32)
+    } else {
+        None
+    }
+}
+
 fn is_audio_track(t: &symphonia::core::formats::Track) -> bool {
     let c = t.codec_params.codec;
     if c == CODEC_TYPE_NULL {
@@ -452,7 +532,7 @@ pub fn rodio_source_from_path(
 }
 
 pub fn write_mono_f32_as_wav(mono: &[f32], src_rate: u32, output: &Path) -> Result<(), String> {
-    let mut pcm: Vec<i16> = mono
+    let pcm: Vec<i16> = mono
         .iter()
         .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
         .collect();

@@ -247,6 +247,15 @@ pub struct MarqueeSelect {
     pub shift: bool,
 }
 
+/// Lightweight bulk move — stores origins only (no full node clones).
+#[derive(Debug, Clone, Default)]
+pub struct BulkDrag {
+    pub ids: Vec<NodeId>,
+    pub origins: Vec<(f64, f64)>,
+    pub preview_dx: f64,
+    pub preview_dy: f64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SelectSession {
     pub drag_mode: Option<SelectDrag>,
@@ -254,11 +263,14 @@ pub struct SelectSession {
     pub last_doc: (f64, f64),
     pub resize_anchor: kurbo::Rect,
     pub drag_snapshot: Vec<(NodeId, Node)>,
+    pub bulk_drag: Option<BulkDrag>,
     pub node_edit_target: Option<PathEditTarget>,
     /// Path anchors selected in node edit mode (ctrl+click toggles).
     pub selected_path_points: Vec<(NodeId, usize)>,
     /// Two anchors spanning a selected path segment (node edit).
     pub selected_path_segment: Option<(NodeId, usize, usize)>,
+    /// Dragging one of the yellow corner curve controls (LPE).
+    pub mid_curve_drag: Option<(NodeId, usize, bool)>, // (id, seg_start, is_first_ctrl)
     pub node_drag_origin: Option<(f64, f64)>,
     pub node_drag_active: bool,
     pub select_rotation_mode: bool,

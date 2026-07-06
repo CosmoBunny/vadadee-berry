@@ -7,9 +7,11 @@ use crate::fonts::FontRegistry;
 use crate::document::{
     default_gradient_stops, default_loft_gap_for_node, effect_placements, find_effect_for_pair,
     loft_sweep_node,
-    has_effect_for_objects, hidden_effect_sources, node_at_placement, BezierHandleMode, Document,
+    build_path_effect_form_node, has_effect_for_objects, hidden_effect_sources, node_at_placement,
+    node_uses_extended_pick_bounds, path_effect_by_form_node, path_effect_form_node_ids,
+    path_effect_move_bundle, sync_path_effect_form_geometry, BezierHandleMode, Document,
     FaceRenderable, Fill, FillKind,
-    GradientStop, Node, NodeId, NodeKind, ObjectOnPathEffect, OnPathMode, Paint, PathData, PathMagic, PathPlacement, Tiling, TilingEffect, CircularClone, CircularCloneEffect,
+    GradientStop, Node, NodeId, NodeKind, ObjectOnPathEffect, OnPathMode, Paint, PathData, PathMagic, PathPlacement, TilingEffect, CircularCloneEffect,
     PathEditTarget, ProjectFile, Stroke, TextStyle, text_display_name,
 };
 use crate::history::{snapshot_document, snapshot_project, History, ProjectEdit};
@@ -98,6 +100,13 @@ pub struct VadadeeBerryApp {
     pub anim_keyframing_mode: bool,
     pub anim_show_timeline_window: bool,
     pub show_video_editor_window: Option<uuid::Uuid>,
+    pub piano_roll_clip: Option<uuid::Uuid>,
+    pub piano_roll_t: f32,
+    pub piano_tool: crate::av_ui::PianoTool,
+    pub piano_zoom: f32,
+    pub piano_scroll_offset: f32,
+    pub piano_pitch_scroll: f32,
+    pub ui_shading_pass_sel: usize,
     pub anim_time_accumulator: f32,
     pub anim_last_seen_frame: usize,
     pub anim_last_applied_states: std::collections::HashMap<NodeId, AnimAppliedState>,
@@ -115,17 +124,36 @@ pub struct VadadeeBerryApp {
     pub anim_graph_kf_drag_start: Option<(String, usize, egui::Pos2)>,
     /// Segment selected between two keyframe indices for bezier-add workflow: (track_lbl, left_frame, right_frame)
     pub anim_graph_selected_segment: Option<(String, usize, usize)>,
+    /// Horizontal pan for the animation graph editor (frame index at left edge).
+    pub anim_graph_scroll: f32,
+    /// Visible frame span in the animation graph plot.
+    pub anim_graph_visible_frames: f32,
     pub anim_fps: u32,
+    /// UI performance: smoothed frames per second.
+    pub ui_fps: f32,
+    /// Rasterize dense image layers to textures for pan/zoom FPS (View → Layer raster cache).
+    pub enable_layer_raster_cache: bool,
+    /// Compile and run shading layer WGSL on the GPU (dynamic `pass.wgsl`).
+    pub gpu_shading: bool,
+    /// Cloned from eframe at startup for runtime WGSL shading passes.
+    pub wgpu_render: Option<egui_wgpu::RenderState>,
     /// Legacy single-frame cache (kept for backward compat with rendering code that reads it).
     pub video_frame_cache: Option<VideoFrameCache>,
     /// Per-layer async decode state. Replaces the single video_frame_cache for multi-video.
     pub video_layers: std::collections::HashMap<uuid::Uuid, VideoLayerState>,
     pub clip_mask_signatures: std::collections::HashMap<uuid::Uuid, String>,
+    /// Cached full-layer rasters for dense vector content (Inkscape-style).
+    layer_raster_cache: std::collections::HashMap<uuid::Uuid, crate::layer_cache::LayerRasterCacheEntry>,
+    layer_cache_pending: std::collections::HashSet<uuid::Uuid>,
+    layer_cache_result_tx: std::sync::mpsc::Sender<crate::layer_cache::LayerCacheResult>,
+    layer_cache_result_rx: std::sync::mpsc::Receiver<crate::layer_cache::LayerCacheResult>,
     /// Keeps the default output device stream alive while audio plays.
     pub audio_device: Option<rodio::MixerDeviceSink>,
     pub audio_players: std::collections::HashMap<uuid::Uuid, rodio::Player>,
     /// File offset (seconds) at which each player's sample buffer starts.
     audio_player_buffer_offset: std::collections::HashMap<uuid::Uuid, f32>,
+    /// Last timeline `file_pos` seen while a player is active (scrub/jump detection).
+    audio_player_last_file_pos: std::collections::HashMap<uuid::Uuid, f32>,
     /// Do not retry rodio open/decode for these layers until playback stops.
     audio_layers_skip: std::collections::HashSet<uuid::Uuid>,
     /// MP4/MOV/… → one-shot symphonia PCM wav for rodio.
@@ -159,6 +187,12 @@ pub struct VadadeeBerryApp {
     pub ui_stroke_line_join: crate::document::LineJoin,
     pub ui_stroke_line_cap: crate::document::LineCap,
     pub ui_stroke_kind: FillKind,
+    // Path marker (arrow / point icons) UI state for start/mid/end on pen paths
+    pub ui_marker_start: crate::document::PathMarker,
+    pub ui_marker_mid: crate::document::PathMarker,
+    pub ui_marker_end: crate::document::PathMarker,
+    pub ui_marker_use_common_size: bool,
+    pub ui_marker_common_size: f32,
     pub ui_stroke_angle: f32,
     pub ui_stroke_line_x0: f32,
     pub ui_stroke_line_y0: f32,
@@ -200,7 +234,9 @@ pub struct VadadeeBerryApp {
     /// Measured height of the Object on Path panel (drives expand animation).
     pub ui_on_path_container_h: f32,
     pub timeline_container_h: f32,
+    pub timeline_container_w: f32,
     pub video_editor_container_h: f32,
+    pub video_editor_container_w: f32,
     // Tiling params (2D)
     pub ui_tiling_rows: usize,
     pub ui_tiling_cols: usize,
@@ -227,8 +263,16 @@ pub struct VadadeeBerryApp {
     canvas_screen_rect: Option<egui::Rect>,
     canvas_origin: Pos2,
     pending_open_svg: bool,
+    pending_open_project: bool,
+    /// Snapshot of the project before the last Open Project (Ctrl+O).
+    cached_project: Option<ProjectFile>,
+    cached_project_label: Option<String>,
     pending_save_project: bool,
     pending_export_svg: bool,
+    pending_export_image: bool,
+    pub export_image_format: io::ExportImageFormat,
+    /// When true, raster export uses selection bounds; otherwise full document.
+    pub export_image_selection_only: bool,
     pub eyedropper_holding: bool,
     pub eyedropper_releasing: bool,
     pub eyedropper_t: f32,
@@ -240,6 +284,8 @@ pub struct VadadeeBerryApp {
     paste_progress: Option<PasteProgress>,
     pub toolbar_expanded: bool,
     pub toolbar_drag_active: bool,
+    /// Updated each frame by `floating_toolbar` (dock anchors here).
+    pub toolbar_outer_rect: Option<egui::Rect>,
     pub text_editor_rect: Option<egui::Rect>,
     text_pan_restore: Option<egui::Vec2>,
     text_pan_anim: Option<TextPanAnim>,
@@ -247,6 +293,57 @@ pub struct VadadeeBerryApp {
     pub path_overlay_rect: Option<egui::Rect>,
     /// Video render-to-file settings and live progress.
     pub video_export: VideoExportState,
+    /// Last saved/opened project path (Ctrl+S saves here when set).
+    pub project_save_path: Option<std::path::PathBuf>,
+    pub left_dock: crate::left_dock::LeftDockState,
+    pub collab: crate::collab::CollabSession,
+    collab_last_cursor_sent: Option<(f64, f64, Option<String>, Option<String>)>,
+
+    collab_canvas_sync_accum: f32,
+    collab_last_ui_sync: (ui::ActionTab, usize),
+    collab_last_wire_hash: u64,
+    collab_asset_cache: std::collections::HashMap<String, Vec<u8>>,
+    pub cursor_bubble_edit: bool,
+    pub cursor_bubble_focus_pending: bool,
+    pub cursor_bubble_text: String,
+    #[cfg(not(target_os = "android"))]
+    mcp_bridge: Option<crate::mcp::McpBridge>,
+    #[cfg(not(target_os = "android"))]
+    pub mcp_preview: McpPreviewState,
+    #[cfg(not(target_os = "android"))]
+    mcp_preview_update_tx: std::sync::mpsc::Sender<McpPreviewUpdate>,
+    #[cfg(not(target_os = "android"))]
+    mcp_preview_update_rx: std::sync::mpsc::Receiver<McpPreviewUpdate>,
+    #[cfg(not(target_os = "android"))]
+    pending_mcp_bulk_rects: Vec<Vec<Node>>,
+    #[cfg(not(target_os = "android"))]
+    mcp_bulk_staging: Vec<Node>,
+    spatial_index: crate::spatial_index::SpatialIndex,
+    cached_draw_order: Vec<NodeId>,
+    cached_draw_order_revision: u64,
+    audio_output_warned: bool,
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Default)]
+pub struct McpPreviewState {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub bounds: [f64; 4],
+    pub resolution_percent: f32,
+    pub updated_at: f64,
+    pub texture: Option<egui::TextureHandle>,
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Debug)]
+struct McpPreviewUpdate {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    bounds: [f64; 4],
+    resolution_percent: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -376,6 +473,8 @@ pub struct VideoExportState {
     pub status_msg: String,
     pub frame_done: usize,
     pub total_frames: usize,
+    /// 0 = auto from timeline/content; otherwise fixed export length in seconds.
+    pub export_duration_secs: f32,
     pub restore_anim_frame: usize,
     pub frames_dir: Option<std::path::PathBuf>,
     pub output_path: Option<std::path::PathBuf>,
@@ -399,6 +498,7 @@ impl Default for VideoExportState {
             status_msg: String::new(),
             frame_done: 0,
             total_frames: 0,
+            export_duration_secs: 0.0,
             restore_anim_frame: 0,
             frames_dir: None,
             output_path: None,
@@ -410,12 +510,52 @@ impl Default for VideoExportState {
     }
 }
 
+fn collab_wire_hash(json: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    json.hash(&mut h);
+    h.finish()
+}
+
 impl VadadeeBerryApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
         let fonts = FontRegistry::new();
         let default_font = fonts.default_family();
-        Self {
+        
+        let mut initial_project = Document::new_default_project();
+        let mut initial_status = "Idle".to_string();
+        let mut initial_save_path: Option<std::path::PathBuf> = None;
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let args: Vec<String> = std::env::args().collect();
+            if args.len() > 1 {
+                let path = std::path::Path::new(&args[1]);
+                if path.exists() && path.is_file() {
+                    match io::load_project(path) {
+                        Ok(p) => {
+                            initial_project = p;
+                            initial_save_path = Some(path.to_path_buf());
+                            initial_status = format!("Loaded project: {}", path.display());
+                        }
+                        Err(e) => {
+                            initial_status = format!("Failed to load project: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        let (mcp_preview_update_tx, mcp_preview_update_rx) = std::sync::mpsc::channel();
+        #[cfg(target_os = "android")]
+        let (mcp_preview_update_tx, mcp_preview_update_rx) = (std::sync::mpsc::channel().0, std::sync::mpsc::channel().1); // dummy
+
+        let (layer_cache_result_tx, layer_cache_result_rx) = std::sync::mpsc::channel();
+        let wgpu_render = cc.wgpu_render_state.clone();
+
+        let app = Self {
             live_snap_guides: Vec::new(),
             snap_magnet: true,
             anim_current_frame: 0,
@@ -423,6 +563,13 @@ impl VadadeeBerryApp {
             anim_keyframing_mode: false,
             anim_show_timeline_window: false,
             show_video_editor_window: None,
+            piano_roll_clip: None,
+            piano_roll_t: 0.0,
+            piano_tool: crate::av_ui::PianoTool::default(),
+            piano_zoom: 1.0,
+            piano_scroll_offset: 0.0,
+            piano_pitch_scroll: 36.0,
+            ui_shading_pass_sel: 0,
             anim_time_accumulator: 0.0,
             anim_last_seen_frame: 0,
             anim_last_applied_states: std::collections::HashMap::new(),
@@ -438,19 +585,30 @@ impl VadadeeBerryApp {
             anim_graph_editor_dragged_handle: None,
             anim_graph_kf_drag_start: None,
             anim_graph_selected_segment: None,
+            anim_graph_scroll: 0.0,
+            anim_graph_visible_frames: 100.0,
             anim_fps: 60,
+            ui_fps: 60.0,
+            enable_layer_raster_cache: false,
+            gpu_shading: true,
+            wgpu_render,
             video_frame_cache: None,
             video_layers: std::collections::HashMap::new(),
             clip_mask_signatures: std::collections::HashMap::new(),
+            layer_raster_cache: std::collections::HashMap::new(),
+            layer_cache_pending: std::collections::HashSet::new(),
+            layer_cache_result_tx,
+            layer_cache_result_rx,
             audio_device: rodio::DeviceSinkBuilder::open_default_sink().ok(),
             audio_players: std::collections::HashMap::new(),
             audio_player_buffer_offset: std::collections::HashMap::new(),
+            audio_player_last_file_pos: std::collections::HashMap::new(),
             audio_layers_skip: std::collections::HashSet::new(),
             audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             audio_prepare_rx: std::collections::HashMap::new(),
 
-            project: Document::new_default_project(),
+            project: initial_project,
             viewport: Viewport::default(),
             tools: ToolState {
                 active: ToolKind::Select,
@@ -492,6 +650,11 @@ impl VadadeeBerryApp {
             ui_stroke_line_cap: crate::document::LineCap::Butt,
             ui_stroke_kind: FillKind::Solid,
             ui_stroke_angle: 0.0,
+            ui_marker_start: crate::document::PathMarker::default(),
+            ui_marker_mid: crate::document::PathMarker::default(),
+            ui_marker_end: crate::document::PathMarker::default(),
+            ui_marker_use_common_size: false,
+            ui_marker_common_size: 10.0,
             ui_stroke_line_x0: {
                 let l = crate::document::linear_line_spanning_bbox(0.0);
                 l.0
@@ -519,7 +682,7 @@ impl VadadeeBerryApp {
             ui_text_italic: false,
             fill_enabled: true,
             stroke_enabled: true,
-            status_message: "Idle".into(),
+            status_message: initial_status,
             clipboard: Vec::new(),
             action_tab_scroll_home: false,
             on_page_text_edit: None,
@@ -542,7 +705,9 @@ impl VadadeeBerryApp {
             ui_on_path_loft_opacity: 0.75,
             ui_on_path_container_h: 280.0,
             timeline_container_h: 56.0,
+            timeline_container_w: 0.0,
             video_editor_container_h: 130.0,
+            video_editor_container_w: 0.0,
             ui_tiling_rows: 3,
             ui_tiling_cols: 3,
             ui_tiling_offset_x: 0.0,
@@ -567,8 +732,14 @@ impl VadadeeBerryApp {
             canvas_screen_rect: None,
             canvas_origin: Pos2::ZERO,
             pending_open_svg: false,
+            pending_open_project: false,
+            cached_project: None,
+            cached_project_label: None,
             pending_save_project: false,
             pending_export_svg: false,
+            pending_export_image: false,
+            export_image_format: io::ExportImageFormat::Png,
+            export_image_selection_only: false,
             eyedropper_holding: false,
             eyedropper_releasing: false,
             eyedropper_t: 0.0,
@@ -578,12 +749,311 @@ impl VadadeeBerryApp {
             paste_progress: None,
             toolbar_expanded: false,
             toolbar_drag_active: false,
+            toolbar_outer_rect: None,
             text_editor_rect: None,
             text_pan_restore: None,
             text_pan_anim: None,
             last_android_text: String::new(),
             path_overlay_rect: None,
             video_export: VideoExportState::default(),
+            project_save_path: initial_save_path,
+            left_dock: crate::left_dock::LeftDockState::default(),
+            collab: crate::collab::CollabSession::new(),
+            collab_last_cursor_sent: None,
+
+            collab_canvas_sync_accum: 0.0,
+            collab_last_ui_sync: (ui::ActionTab::default(), 0),
+            collab_last_wire_hash: 0,
+            collab_asset_cache: std::collections::HashMap::new(),
+            cursor_bubble_edit: false,
+            cursor_bubble_focus_pending: false,
+            cursor_bubble_text: String::new(),
+            #[cfg(not(target_os = "android"))]
+            mcp_bridge: crate::mcp::McpBridge::try_start(),
+            #[cfg(not(target_os = "android"))]
+            mcp_preview: McpPreviewState::default(),
+            #[cfg(not(target_os = "android"))]
+            mcp_preview_update_tx,
+            #[cfg(not(target_os = "android"))]
+            mcp_preview_update_rx,
+            #[cfg(not(target_os = "android"))]
+            pending_mcp_bulk_rects: Vec::new(),
+            #[cfg(not(target_os = "android"))]
+            mcp_bulk_staging: Vec::new(),
+            spatial_index: crate::spatial_index::SpatialIndex::default(),
+            cached_draw_order: Vec::new(),
+            cached_draw_order_revision: u64::MAX,
+            audio_output_warned: false,
+        };
+        if let Some(rs) = &app.wgpu_render {
+            crate::shading::init_callback_resources(rs, crate::VIEWPORT_MSAA_SAMPLES);
+        }
+        app
+    }
+
+    pub fn window_title(&self) -> String {
+        let name = self
+            .project_save_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.project.document.title.clone());
+        format!("{name} — Vadadee Berry")
+    }
+
+    fn sync_window_title(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
+    }
+
+    fn ensure_audio_output(&mut self) -> bool {
+        if self.audio_device.is_some() {
+            return true;
+        }
+        match rodio::DeviceSinkBuilder::open_default_sink() {
+            Ok(sink) => {
+                self.audio_device = Some(sink);
+                self.audio_output_warned = false;
+                true
+            }
+            Err(e) => {
+                if !self.audio_output_warned {
+                    self.audio_output_warned = true;
+                    self.status_message =
+                        format!("No audio output device ({e}). Timeline playback is silent.");
+                    log::warn!("rodio open_default_sink failed: {e}");
+                }
+                false
+            }
+        }
+    }
+
+    fn save_project_to_path(&mut self, path: &std::path::Path) -> Result<(), String> {
+        crate::io::save_project(path, &self.project).map_err(|e| e.to_string())?;
+        self.project_save_path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Document point under the pointer when it is over the canvas (no click required).
+    fn doc_at_pointer_hover(&self, ctx: &egui::Context) -> Option<(f64, f64)> {
+        let rect = self.canvas_screen_rect?;
+        let pos = ctx.input(|i| i.pointer.hover_pos())?;
+        if !rect.contains(pos) {
+            return None;
+        }
+        let mut doc = self.viewport.screen_to_doc(pos, self.canvas_origin);
+        doc = self.viewport.snap(doc);
+        Some(doc)
+    }
+
+    fn ensure_cursor_doc_for_collab_bubble(&mut self, ctx: &egui::Context) {
+        if self.cursor_doc.is_some() {
+            return;
+        }
+        if let Some(doc) = self.doc_at_pointer_hover(ctx) {
+            self.cursor_doc = Some(doc);
+            return;
+        }
+        if let Some(rect) = self.canvas_screen_rect {
+            let center = rect.center();
+            let mut doc = self.viewport.screen_to_doc(center, self.canvas_origin);
+            doc = self.viewport.snap(doc);
+            self.cursor_doc = Some(doc);
+        }
+    }
+
+    fn update_cursor_doc_from_pointer(&mut self, ctx: &egui::Context, response: &egui::Response) {
+        let pointer = response
+            .hover_pos()
+            .or_else(|| response.interact_pointer_pos())
+            .or_else(|| ctx.input(|i| i.pointer.hover_pos()));
+        let pointer = pointer.and_then(|pos| {
+            self.canvas_screen_rect
+                .filter(|r| r.contains(pos))
+                .map(|_| pos)
+        });
+        match pointer {
+            Some(pos) => {
+                let mut doc = self.viewport.screen_to_doc(pos, self.canvas_origin);
+                doc = self.viewport.snap(doc);
+                self.cursor_doc = Some(doc);
+            }
+            None if !self.cursor_bubble_edit => {
+                self.cursor_doc = None;
+            }
+            None => {}
+        }
+    }
+
+    /// Pan/zoom so a collaborator's document point is centered on the canvas.
+    pub fn focus_viewport_on_peer(&mut self, doc_x: f64, doc_y: f64) {
+        let Some(rect) = self.canvas_screen_rect else {
+            return;
+        };
+        let center = rect.center();
+        let origin = self.canvas_origin;
+        self.viewport.pan.x = center.x - origin.x - doc_x as f32 * self.viewport.zoom;
+        self.viewport.pan.y = center.y - origin.y - doc_y as f32 * self.viewport.zoom;
+    }
+
+    fn apply_collab_remote_ui(&mut self, state: crate::collab::CollabUiStateApply) {
+        let layers_len = self.project.document.layers.len();
+        if layers_len > 0 && state.active_layer_index < layers_len {
+            self.project.document.active_layer_index = state.active_layer_index;
+        }
+        if let Some(ref slug) = state.action_tab {
+            if let Some(tab) = ui::ActionTab::from_collab_slug(slug) {
+                if matches!(tab, ui::ActionTab::Layer | ui::ActionTab::Objects)
+                    && self.action_tab != tab
+                {
+                    ui::promote_action_tab_at(self, tab, 0);
+                }
+            }
+        }
+    }
+
+    /// Network poll + canvas merge (runs in `logic`, before UI paints).
+    fn tick_live_collaboration_poll(&mut self, ctx: &egui::Context) {
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+        self.collab.poll();
+        self.collab.tick_network(dt);
+
+        if let Some(state) = self.collab.take_pending_ui_state() {
+            self.apply_collab_remote_ui(state);
+        }
+        for (user, text) in self.collab.take_pending_chat_toasts() {
+            if self.left_dock.game_chat_notifications {
+                self.left_dock.push_chat_toast(user, text);
+            }
+        }
+        if let Some(json) = self.collab.take_pending_canvas_json() {
+            if let Ok(loaded) = serde_json::from_str::<ProjectFile>(&json) {
+                #[cfg(not(target_os = "android"))]
+                {
+                    crate::collab::merge_remote(
+                        &mut self.project,
+                        loaded,
+                        &mut self.collab_asset_cache,
+                    );
+                    let stripped = crate::collab::strip_for_wire(
+                        &self.project,
+                        &mut self.collab_asset_cache,
+                    );
+                    if let Ok(merged_json) = serde_json::to_string(&stripped) {
+                        let hash = collab_wire_hash(&merged_json);
+                        self.collab_last_wire_hash = hash;
+                        self.collab.set_last_sent_canvas_hash(hash);
+                    }
+                    self.pending_mcp_bulk_rects.clear();
+                    self.mcp_bulk_staging.clear();
+                }
+                #[cfg(target_os = "android")]
+                {
+                    self.project = loaded;
+                }
+                self.collab.enable_canvas_outbound();
+                self.status_message = "Canvas synced from peer".into();
+            }
+        }
+        if !self.collab.is_connected() {
+            self.collab_last_cursor_sent = None;
+            self.collab_last_wire_hash = 0;
+            self.collab_canvas_sync_accum = 0.0;
+            return;
+        }
+
+        let layer_idx = self.project.document.active_layer_index;
+        let ui_key = (self.action_tab, layer_idx);
+        if ui_key != self.collab_last_ui_sync {
+            let tab_slug = match self.action_tab {
+                ui::ActionTab::Layer | ui::ActionTab::Objects => {
+                    Some(self.action_tab.collab_slug())
+                }
+                _ => None,
+            };
+            self.collab.send_ui_state(tab_slug, layer_idx);
+            self.collab_last_ui_sync = ui_key;
+        }
+    }
+
+    /// Cursor + canvas sync after `canvas_ui` has updated `cursor_doc` (same frame).
+    pub fn tick_live_collaboration_after_canvas(&mut self, ctx: &egui::Context) {
+        if !self.collab.is_connected() {
+            return;
+        }
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+        // Refresh from global hover so peers see movement without a canvas click.
+        let hover_doc = self.doc_at_pointer_hover(ctx);
+        if let Some(doc) = hover_doc {
+            self.cursor_doc = Some(doc);
+        }
+
+        if let Some((cx, cy)) = self.cursor_doc {
+            let tool = Some(self.tools.active.label().to_string());
+            let bubble = if !self.cursor_bubble_text.is_empty() || self.cursor_bubble_edit {
+                Some(self.cursor_bubble_text.clone())
+            } else {
+                None
+            };
+            let doc_eps = (0.5 / self.viewport.zoom as f64).max(0.01);
+            let changed = self
+                .collab_last_cursor_sent
+                .as_ref()
+                .map(|(px, py, prev_b, prev_tool)| {
+                    (px - cx).hypot(py - cy) > doc_eps
+                        || prev_b != &bubble
+                        || prev_tool != &tool
+                })
+                .unwrap_or(true);
+            if changed {
+                self.collab_last_cursor_sent = Some((
+                    cx,
+                    cy,
+                    bubble.clone(),
+                    tool.clone(),
+                ));
+                self.collab.send_cursor(cx, cy, tool, bubble);
+                ctx.request_repaint();
+            }
+        }
+        if self.cursor_bubble_edit {
+            ctx.request_repaint();
+        }
+
+        self.collab_canvas_sync_accum += dt;
+        let dragging_objects = !self.tools.select.drag_snapshot.is_empty()
+            || self.tools.drag_shape.is_some();
+        let canvas_interval: f32 = if dragging_objects { 0.08 } else { 0.35 };
+        let force_push = self.collab.take_canvas_push_requested();
+        let due = force_push || self.collab_canvas_sync_accum >= canvas_interval;
+        if due {
+            if !force_push {
+                self.collab_canvas_sync_accum = 0.0;
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                const COLLAB_CANVAS_MAX_NODES: usize = 500;
+                if self.collab.canvas_outbound_enabled()
+                    && (force_push || self.project.nodes.map.len() <= COLLAB_CANVAS_MAX_NODES)
+                {
+                    let stripped = crate::collab::strip_for_wire(
+                        &self.project,
+                        &mut self.collab_asset_cache,
+                    );
+                    if let Ok(json) = serde_json::to_string(&stripped) {
+                        let wire_hash = collab_wire_hash(&json);
+                        if force_push || wire_hash != self.collab_last_wire_hash {
+                            self.collab_last_wire_hash = wire_hash;
+                            self.collab.send_canvas_if_changed(&json, force_push);
+                        }
+                    }
+                }
+            }
+            #[cfg(target_os = "android")]
+            if let Ok(json) = serde_json::to_string(&self.project) {
+                self.collab.send_canvas_if_changed(&json, force_push);
+            }
         }
     }
 
@@ -595,6 +1065,7 @@ impl VadadeeBerryApp {
             ProjectEdit::SetDocument { before, after },
         );
         self.selection.clear();
+        self.project_save_path = None;
         self.viewport.pan = egui::vec2(48.0, 48.0);
         self.viewport.zoom = 0.85;
         self.status_message = "New A4 document".into();
@@ -603,6 +1074,10 @@ impl VadadeeBerryApp {
 
     pub fn request_open_svg(&mut self) {
         self.pending_open_svg = true;
+    }
+
+    pub fn request_open_project(&mut self) {
+        self.pending_open_project = true;
     }
 
     pub fn request_import_image(&mut self) {
@@ -631,6 +1106,105 @@ impl VadadeeBerryApp {
     }
     pub fn request_export_svg(&mut self) {
         self.pending_export_svg = true;
+    }
+
+    pub fn request_export_image(&mut self) {
+        self.pending_export_image = true;
+    }
+
+    pub fn apply_media_duration_from_path(&mut self, layer_index: usize, path: &str) {
+        if layer_index >= self.project.document.layers.len() || path.is_empty() {
+            return;
+        }
+        let Some(dur) = crate::video_decode::probe_media_duration_secs(path) else {
+            log::warn!("Could not probe media duration for {}", path);
+            return;
+        };
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        if let Some(layer) = after.layers.get_mut(layer_index) {
+            layer.media_source_duration = Some(dur);
+            layer.video_play_length = dur;
+            if layer.video_start_offset > dur {
+                layer.video_start_offset = 0.0;
+            }
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+    }
+
+    /// Apply probed file duration: always refresh `media_source_duration`; only replace
+    /// `video_play_length` when it is still the default placeholder (≥ 3599s).
+    fn apply_probed_media_duration(layer: &mut crate::document::Layer, dur: f32) {
+        let dur = dur.max(0.0);
+        layer.media_source_duration = Some(dur);
+        if layer.video_play_length >= 3599.0 {
+            layer.video_play_length = dur;
+        } else if layer.video_play_length > dur {
+            layer.video_play_length = dur;
+        }
+        if layer.video_start_offset > dur {
+            layer.video_start_offset = 0.0;
+        }
+    }
+
+    /// Re-probe stale video/audio layers without pushing undo history (video editor UI).
+    pub fn sync_stale_media_layer_durations(&mut self) {
+        for layer in &mut self.project.document.layers {
+            if layer.kind != crate::document::LayerKind::AV
+            {
+                continue;
+            }
+            if layer.video_path.is_empty() {
+                continue;
+            }
+            let needs_probe = layer.video_play_length >= 3599.0 || layer.media_source_duration.is_none();
+            if !needs_probe {
+                continue;
+            }
+            let Some(dur) = crate::video_decode::probe_media_duration_secs(&layer.video_path) else {
+                continue;
+            };
+            Self::apply_probed_media_duration(layer, dur);
+        }
+    }
+
+    /// Re-probe video/audio layers (e.g. after load when play length was still default 3600s).
+    pub fn refresh_all_media_layer_durations(&mut self) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let mut changed = false;
+        for layer in &mut after.layers {
+            if layer.kind != crate::document::LayerKind::AV
+            {
+                continue;
+            }
+            if layer.video_path.is_empty() {
+                continue;
+            }
+            let Some(dur) = crate::video_decode::probe_media_duration_secs(&layer.video_path) else {
+                log::warn!("Could not probe media duration for {}", layer.video_path);
+                continue;
+            };
+            let cap_stale = layer
+                .media_source_duration
+                .is_none_or(|stored| (stored - dur).abs() > 0.05);
+            let play_is_placeholder = layer.video_play_length >= 3599.0;
+            let play_exceeds_file = layer.video_play_length > dur + 0.05;
+            if !cap_stale && !play_is_placeholder && !play_exceeds_file {
+                continue;
+            }
+            Self::apply_probed_media_duration(layer, dur);
+            changed = true;
+        }
+        if changed {
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchDocument { before, after },
+            );
+        }
     }
 
     pub fn do_undo(&mut self) {
@@ -784,6 +1358,9 @@ impl VadadeeBerryApp {
                 }
                 self.ui_stroke_line_join = n.style.stroke.line_join;
                 self.ui_stroke_line_cap = n.style.stroke.line_cap;
+                self.ui_marker_start = n.style.stroke.start_marker.clone();
+                self.ui_marker_mid = n.style.stroke.mid_marker.clone();
+                self.ui_marker_end = n.style.stroke.end_marker.clone();
                 self.fill_enabled = n.style.fill.is_visible();
                 if let NodeKind::Polygon { sides, .. } = &n.kind {
                     self.polygon_sides = *sides;
@@ -981,6 +1558,9 @@ impl VadadeeBerryApp {
             },
             line_join: self.ui_stroke_line_join,
             line_cap: self.ui_stroke_line_cap,
+            start_marker: self.ui_marker_start.clone(),
+            mid_marker: self.ui_marker_mid.clone(),
+            end_marker: self.ui_marker_end.clone(),
         }
     }
 
@@ -1005,7 +1585,27 @@ impl VadadeeBerryApp {
                 continue;
             };
             let mut after = before.clone();
-            after.style.stroke = self.build_ui_stroke();
+            let ui = self.build_ui_stroke();
+            after.style.stroke.style = ui.style;
+            after.style.stroke.width = ui.width;
+            after.style.stroke.line_join = ui.line_join;
+            after.style.stroke.line_cap = ui.line_cap;
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchNode { id, before, after },
+            );
+        }
+    }
+
+    pub fn apply_path_markers_to_selection(&mut self) {
+        for id in self.selection.clone() {
+            let Some(before) = self.project.nodes.get(id).cloned() else {
+                continue;
+            };
+            let mut after = before.clone();
+            after.style.stroke.start_marker = self.ui_marker_start.clone();
+            after.style.stroke.mid_marker = self.ui_marker_mid.clone();
+            after.style.stroke.end_marker = self.ui_marker_end.clone();
             self.history.push(
                 &mut self.project,
                 ProjectEdit::PatchNode { id, before, after },
@@ -1219,7 +1819,7 @@ impl VadadeeBerryApp {
     }
 
     pub fn get_max_animation_frame(&self) -> usize {
-        let mut max_f = 100;
+        let mut max_f = 0usize;
         for anim in self.project.anim_timeline.nodes.values() {
             let tracks = [
                 &anim.pos_x, &anim.pos_y, &anim.rotation, &anim.opacity,
@@ -1230,17 +1830,47 @@ impl VadadeeBerryApp {
                     max_f = max_f.max(last.frame);
                 }
             }
-        }
-
-        let fps = self.anim_fps as f32;
-        for l in &self.project.document.layers {
-            if (l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio) && !l.video_path.is_empty() {
-                let end_frame = ((l.video_timeline_start + l.video_play_length) * fps) as usize;
-                max_f = max_f.max(end_frame);
+            for gt in &anim.geom_tracks {
+                if let Some(last) = gt.keyframes.last() {
+                    max_f = max_f.max(last.frame);
+                }
             }
         }
 
+        let fps = self.anim_fps.max(1) as f32;
+        for l in &self.project.document.layers {
+            if l.kind != crate::document::LayerKind::AV
+            {
+                continue;
+            }
+            if l.video_path.is_empty() {
+                continue;
+            }
+            let end_frame = (l.timeline_end_secs() * fps).ceil().max(0.0) as usize;
+            max_f = max_f.max(end_frame);
+        }
+
+        // Allow extending beyond current content (so user can set keyframes / current frame > prior max)
+        max_f = max_f.max(self.anim_current_frame);
+        if max_f == 0 {
+            max_f = 300; // default room (~5s @60fps) when project is empty
+        }
         max_f
+    }
+
+    pub fn animation_content_duration_secs(&self) -> f32 {
+        let max_frame = self.get_max_animation_frame();
+        (max_frame + 1) as f32 / self.anim_fps.max(1) as f32
+    }
+
+    pub fn cache_current_project_for_open(&mut self) {
+        let label = self.project.document.title.clone();
+        self.cached_project = Some(crate::history::snapshot_project(&self.project));
+        self.cached_project_label = Some(label);
+        let cache_path = std::env::temp_dir().join(".vadadee-berry-open-cache.vadadee-berry.json");
+        if let Err(e) = crate::io::save_project(&cache_path, self.cached_project.as_ref().unwrap()) {
+            log::warn!("Could not write project open cache: {e}");
+        }
     }
 
     pub fn apply_animation_for_frame(&mut self, frame: usize) {
@@ -1335,7 +1965,7 @@ impl VadadeeBerryApp {
                 if let Some(geom) = target_geom {
                     self.set_node_geom_floats(node_id, &geom);
                 }
-            } else if let Some(layer) = self.project.document.layers.iter_mut().find(|l| l.id == node_id && (l.kind == crate::document::LayerKind::Video || l.kind == crate::document::LayerKind::Audio)) {
+            } else if let Some(layer) = self.project.document.layers.iter_mut().find(|l| l.id == node_id && l.kind == crate::document::LayerKind::AV) {
                 if let Some(x) = target_x {
                     layer.x = x as f32;
                 }
@@ -1564,12 +2194,86 @@ impl VadadeeBerryApp {
         );
     }
 
-    pub fn add_video_layer(&mut self, name: &str, video_path: String) {
+    pub fn add_empty_av_layer(&mut self, name: &str) {
         let before = snapshot_document(&self.project.document);
         let mut after = before.clone();
-        let path_for_extract = video_path.clone();
-        let idx = after.add_video_layer(name, video_path);
+        let idx = after.add_empty_av_layer(name);
         after.active_layer_index = idx;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+    }
+
+    pub fn add_shading_layer(&mut self, name: &str) {
+        self.add_shading_layer_with_preset(name, "blackhole");
+    }
+
+    pub fn add_shading_layer_with_preset(&mut self, name: &str, preset: &str) {
+        use crate::document::ShadingPass;
+        let pass: ShadingPass = match preset.to_ascii_lowercase().as_str() {
+            "crt" => ShadingPass::crt_preset(),
+            "vignette" => ShadingPass::vignette_preset(),
+            _ => ShadingPass::blackhole_preset(),
+        };
+        self.add_shading_layer_with_passes(name, vec![pass]);
+    }
+
+    /// MCP / API: shading layer from runtime WGSL source (no built-in preset).
+    pub fn add_shading_layer_with_wgsl(
+        &mut self,
+        layer_name: &str,
+        pass_name: &str,
+        wgsl: &str,
+        uniforms: Option<Vec<f32>>,
+    ) -> Result<(), String> {
+        use crate::document::ShadingPass;
+        let src = wgsl.trim();
+        if src.is_empty() {
+            return Err("wgsl must not be empty".into());
+        }
+        let mut pass = ShadingPass::new_preset(pass_name, src);
+        if let Some(u) = uniforms {
+            pass.uniforms = u;
+        }
+        self.add_shading_layer_with_passes(layer_name, vec![pass]);
+        Ok(())
+    }
+
+    fn add_shading_layer_with_passes(
+        &mut self,
+        name: &str,
+        passes: Vec<crate::document::ShadingPass>,
+    ) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let idx = after.add_shading_layer(name);
+        after.active_layer_index = idx;
+        if let Some(layer) = after.layers.get_mut(idx) {
+            layer.shading_passes.extend(passes);
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+    }
+
+    pub fn add_av_layer(&mut self, name: &str, media_path: String) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let path_for_extract = media_path.clone();
+        let idx = after.add_av_layer(name, media_path);
+        after.active_layer_index = idx;
+        if let Some(layer) = after.layers.get_mut(idx) {
+            if let Some(dur) = crate::video_decode::probe_media_duration_secs(&layer.video_path) {
+                layer.media_source_duration = Some(dur);
+                layer.video_play_length = dur;
+                if let Some(clip) = layer.av_clips.first_mut() {
+                    clip.media_source_duration = Some(dur);
+                    clip.video_play_length = dur;
+                }
+            }
+        }
         self.history.push(
             &mut self.project,
             ProjectEdit::PatchDocument { before, after },
@@ -1581,15 +2285,12 @@ impl VadadeeBerryApp {
         );
     }
 
+    // Back-compat
+    pub fn add_video_layer(&mut self, name: &str, video_path: String) {
+        self.add_av_layer(name, video_path)
+    }
     pub fn add_audio_layer(&mut self, name: &str, audio_path: String) {
-        let before = snapshot_document(&self.project.document);
-        let mut after = before.clone();
-        let idx = after.add_audio_layer(name, audio_path);
-        after.active_layer_index = idx;
-        self.history.push(
-            &mut self.project,
-            ProjectEdit::PatchDocument { before, after },
-        );
+        self.add_av_layer(name, audio_path)
     }
 
 
@@ -1667,6 +2368,8 @@ impl VadadeeBerryApp {
                     PathEditTarget::Anchor(i) => format!("point {i}"),
                     PathEditTarget::HandleOut(i) => format!("handle out {i}"),
                     PathEditTarget::HandleIn(i) => format!("handle in {i}"),
+                    PathEditTarget::MidCtrl1(i) => format!("mid ctrl1 seg {i}"),
+                    PathEditTarget::MidCtrl2(i) => format!("mid ctrl2 seg {i}"),
                 };
                 return Some(format!("Dragging {what}"));
             }
@@ -1791,11 +2494,9 @@ impl VadadeeBerryApp {
             return;
         };
 
-        // 1. Generate selection SVG
-        let svg_str = io::export_selected_svg_string(&self.project, &self.selection, bounds);
-        
-        // 2. Render SVG to RGBA at DPI scale
-        let Some((w, h, bytes)) = io::render_svg_to_rgba(&svg_str, dpi_scale) else {
+        let Some((w, h, bytes)) =
+            io::rasterize_selection_rgba(&self.project, &self.selection, bounds, dpi_scale)
+        else {
             self.status_message = "Copy PNG failed: rasterization error".into();
             return;
         };
@@ -1846,12 +2547,26 @@ impl VadadeeBerryApp {
     }
 
     pub fn begin_video_export(&mut self, output: std::path::PathBuf) {
-        let max_frame = self.get_max_animation_frame().max(100);
+        // Refresh media caps only; do not reset user Play Duration (e.g. 10s trim).
+        self.sync_stale_media_layer_durations();
+        let content_max_frame = self.get_max_animation_frame();
+        let anim_fps = self.anim_fps.max(1);
+        let export_fps = self.video_export.fps.max(1);
+        let content_secs = self.animation_content_duration_secs();
+        let export_secs = if self.video_export.export_duration_secs > 0.05 {
+            self.video_export.export_duration_secs.max(content_secs)
+        } else {
+            content_secs
+        }
+        .max(1.0 / anim_fps as f32);
+        let max_frame = ((export_secs * anim_fps as f32).ceil() as usize)
+            .saturating_sub(1)
+            .max(content_max_frame);
         let temp =
             std::env::temp_dir().join(format!("vadadee_video_{}", uuid::Uuid::new_v4().as_simple()));
         let _ = std::fs::create_dir_all(&temp);
         let restore = self.anim_current_frame;
-        let total_frames = max_frame + 1;
+        let total_frames = (export_secs * export_fps as f32).ceil().max(1.0) as usize;
 
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1865,7 +2580,8 @@ impl VadadeeBerryApp {
             format: self.video_export.format,
             power: self.video_export.power_level,
             total_frames,
-            restore_anim_frame: restore,
+            anim_fps,
+            max_anim_frame: max_frame,
         };
 
         crate::export_worker::spawn_export_worker(
@@ -1926,10 +2642,27 @@ impl VadadeeBerryApp {
         let mut done: Option<(bool, String)> = None;
         while let Ok(ev) = rx.try_recv() {
             match ev {
+                crate::export_worker::ExportWorkerEvent::Phase(phase) => {
+                    self.video_export.status_msg = match phase {
+                        crate::export_worker::ExportPhase::Preparing => {
+                            "Preparing export…".into()
+                        }
+                        crate::export_worker::ExportPhase::Encoding => {
+                            format!(
+                                "Encoding {} frames @ {} fps…",
+                                self.video_export.total_frames, self.video_export.fps
+                            )
+                        }
+                        crate::export_worker::ExportPhase::Finalizing => {
+                            "Finalizing video file…".into()
+                        }
+                    };
+                }
                 crate::export_worker::ExportWorkerEvent::Progress {
                     frame_done,
                     total,
                     message,
+                    ..
                 } => {
                     self.video_export.frame_done = frame_done;
                     self.video_export.total_frames = total;
@@ -2321,7 +3054,7 @@ impl VadadeeBerryApp {
     }
 
     /// Layer index that owns the first selected image-layer node, if any.
-    fn image_layer_index_for_selection(&self) -> Option<usize> {
+    fn layer_index_for_node_selection(&self) -> Option<usize> {
         for id in &self.selection {
             if self.project.nodes.get(*id).is_none() {
                 continue;
@@ -2398,7 +3131,7 @@ impl VadadeeBerryApp {
             }
         }
 
-        if let Some(layer_idx) = self.image_layer_index_for_selection() {
+        if let Some(layer_idx) = self.layer_index_for_node_selection() {
             let target = (layer_idx as isize + delta).clamp(0, len as isize - 1) as usize;
             if target != layer_idx {
                 self.nudge_layer_order(layer_idx, delta);
@@ -2446,10 +3179,22 @@ impl VadadeeBerryApp {
     fn process_file_dialogs(&mut self) {
         #[cfg(target_os = "android")]
         {
-            if self.pending_open_svg || self.pending_save_project || self.pending_export_svg {
+            if self.pending_open_svg
+                || self.pending_open_project
+                || self.pending_save_project
+                || self.pending_export_svg
+                || self.pending_export_image
+            {
                 self.pending_open_svg = false;
+                self.pending_open_project = false;
                 self.pending_save_project = false;
+                #[cfg(not(target_os = "android"))]
+                {
+                    self.pending_mcp_bulk_rects.clear();
+                    self.mcp_bulk_staging.clear();
+                }
                 self.pending_export_svg = false;
+                self.pending_export_image = false;
                 self.status_message =
                     "Project/SVG file dialogs are not available on Android yet".into();
             }
@@ -2457,6 +3202,31 @@ impl VadadeeBerryApp {
         }
         #[cfg(not(target_os = "android"))]
         {
+            if self.pending_open_project {
+                self.pending_open_project = false;
+                self.cache_current_project_for_open();
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Vadadee Berry project", &[io::PROJECT_FILE_EXTENSION])
+                    .pick_file()
+                {
+                    match io::load_project(&path) {
+                        Ok(p) => {
+                            self.project = p;
+                            self.project_save_path = Some(path.clone());
+                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                self.project.document.title = stem.to_string();
+                            }
+                            self.selection.clear();
+                            self.history.clear();
+                            self.viewport.pan = egui::vec2(48.0, 48.0);
+                            self.viewport.zoom = 0.85;
+                            self.refresh_all_media_layer_durations();
+                            self.status_message = format!("Opened project: {}", path.display());
+                        }
+                        Err(e) => self.status_message = format!("Open project failed: {e}"),
+                    }
+                }
+            }
             if self.pending_open_svg {
                 self.pending_open_svg = false;
                 if let Some(path) = rfd::FileDialog::new()
@@ -2485,15 +3255,22 @@ impl VadadeeBerryApp {
             }
             if self.pending_save_project {
                 self.pending_save_project = false;
-                let default_name = io::default_project_filename(&self.project.document.title);
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_file_name(&default_name)
-                    .add_filter("Vadadee Berry project", &[io::PROJECT_FILE_EXTENSION])
-                    .save_file()
-                {
-                    match io::save_project(&path, &self.project) {
+                if let Some(path) = self.project_save_path.clone() {
+                    match self.save_project_to_path(&path) {
                         Ok(()) => self.status_message = format!("Saved {}", path.display()),
                         Err(e) => self.status_message = format!("Save failed: {e}"),
+                    }
+                } else {
+                    let default_name = io::default_project_filename(&self.project.document.title);
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(&default_name)
+                        .add_filter("Vadadee Berry project", &[io::PROJECT_FILE_EXTENSION])
+                        .save_file()
+                    {
+                        match self.save_project_to_path(&path) {
+                            Ok(()) => self.status_message = format!("Saved {}", path.display()),
+                            Err(e) => self.status_message = format!("Save failed: {e}"),
+                        }
                     }
                 }
             }
@@ -2504,6 +3281,44 @@ impl VadadeeBerryApp {
                     .save_file()
                 {
                     match io::export_svg(&path, &self.project) {
+                        Ok(()) => self.status_message = format!("Exported {}", path.display()),
+                        Err(e) => self.status_message = format!("Export failed: {e}"),
+                    }
+                }
+            }
+            if self.pending_export_image {
+                self.pending_export_image = false;
+                let fmt = self.export_image_format;
+                let ext = fmt.extension();
+                let scale = 1.0f32;
+                if self.export_image_selection_only {
+                    let Some(bounds) = self.selection_bounds() else {
+                        self.status_message = "Export image: nothing selected".into();
+                        return;
+                    };
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(format!("selection.{ext}"))
+                        .add_filter("Image", &[ext])
+                        .save_file()
+                    {
+                        match io::export_selection_raster(
+                            &self.project,
+                            &self.selection,
+                            bounds,
+                            fmt,
+                            scale,
+                            &path,
+                        ) {
+                            Ok(()) => self.status_message = format!("Exported {}", path.display()),
+                            Err(e) => self.status_message = format!("Export failed: {e}"),
+                        }
+                    }
+                } else if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name(format!("export.{ext}"))
+                    .add_filter("Image", &[ext])
+                    .save_file()
+                {
+                    match io::export_document_raster(&self.project, fmt, scale, &path) {
                         Ok(()) => self.status_message = format!("Exported {}", path.display()),
                         Err(e) => self.status_message = format!("Export failed: {e}"),
                     }
@@ -2535,12 +3350,13 @@ impl VadadeeBerryApp {
             let has_shift = i.modifiers.shift;
             let mut copy = false;
             let mut copy_png = false;
+            let mut copy_png_from_key = false;
             let mut cut = false;
             let mut paste = false;
             for event in &i.events {
                 match event {
                     Event::Copy => {
-                        if has_shift {
+                        if has_shift || copy_png_from_key {
                             copy_png = true;
                         } else {
                             copy = true;
@@ -2555,6 +3371,7 @@ impl VadadeeBerryApp {
                     } if has_cmd => {
                         if has_shift {
                             copy_png = true;
+                            copy_png_from_key = true;
                         } else {
                             copy = true;
                         }
@@ -2604,13 +3421,13 @@ impl VadadeeBerryApp {
             }
         });
 
-        if want_copy_png {
+        if want_copy_png && !self.selection.is_empty() {
             log::info!("CLIPBOARD: detected copy PNG shortcut");
             self.copy_selection_as_png(ctx.pixels_per_point());
             ctx.request_repaint();
             return false;
         }
-        if want_copy {
+        if want_copy && !want_copy_png {
             log::info!("CLIPBOARD: detected copy shortcut");
             self.copy_selection();
             let txt = if self.clipboard.len() == 1 {
@@ -2671,6 +3488,38 @@ impl VadadeeBerryApp {
 
     fn keyboard_shortcuts(&mut self, ctx: &Context) {
         let text_focused = ctx.wants_keyboard_input();
+        let mut bubble_keys_handled = false;
+        ctx.input_mut(|i| {
+            let cmd = i.modifiers.command || i.modifiers.ctrl;
+            if cmd && self.collab.is_connected() {
+                if i.key_pressed(Key::M) {
+                    let _ = i.consume_key(egui::Modifiers::COMMAND, Key::M);
+                    let _ = i.consume_key(egui::Modifiers::CTRL, Key::M);
+                    self.cursor_bubble_edit = !self.cursor_bubble_edit;
+                    if self.cursor_bubble_edit {
+                        self.ensure_cursor_doc_for_collab_bubble(ctx);
+                        self.cursor_bubble_focus_pending = true;
+                    } else {
+                        self.cursor_bubble_text.clear();
+                    }
+                    self.collab_last_cursor_sent = None;
+                    bubble_keys_handled = true;
+                }
+                if i.key_pressed(Key::Backspace) && self.cursor_bubble_edit {
+                    let _ = i.consume_key(egui::Modifiers::COMMAND, Key::Backspace);
+                    let _ = i.consume_key(egui::Modifiers::CTRL, Key::Backspace);
+                    self.cursor_bubble_text.clear();
+                    self.collab_last_cursor_sent = None;
+                    bubble_keys_handled = true;
+                }
+            }
+        });
+        if bubble_keys_handled {
+            ctx.request_repaint();
+        }
+        if self.cursor_bubble_edit {
+            return;
+        }
         ctx.input_mut(|i| {
             let cmd = i.modifiers.command || i.modifiers.ctrl;
             if cmd {
@@ -2708,7 +3557,7 @@ impl VadadeeBerryApp {
                 if i.key_pressed(Key::O) {
                     let _ = i.consume_key(egui::Modifiers::COMMAND, Key::O);
                     let _ = i.consume_key(egui::Modifiers::CTRL, Key::O);
-                    self.request_open_svg();
+                    self.request_open_project();
                 }
                 if i.key_pressed(Key::S) {
                     let _ = i.consume_key(egui::Modifiers::COMMAND, Key::S);
@@ -3108,6 +3957,322 @@ impl VadadeeBerryApp {
         self.sync_inspector_from_selection();
     }
 
+    /// Bulk insert many nodes as a *single* history entry.
+    /// Dramatically faster and less UI churn than thousands of individual inserts.
+    fn insert_nodes_batch(&mut self, nodes: Vec<Node>) {
+        if nodes.is_empty() {
+            return;
+        }
+        self.history
+            .push(&mut self.project, ProjectEdit::InsertNodes { nodes: nodes.clone() });
+        // Select the last one (consistent with single insert behavior)
+        if let Some(last) = nodes.last() {
+            self.selection = vec![last.id];
+        }
+        self.sync_inspector_from_selection();
+    }
+
+    fn mcp_bulk_active(&self) -> bool {
+        #[cfg(not(target_os = "android"))]
+        {
+            !self.pending_mcp_bulk_rects.is_empty() || !self.mcp_bulk_staging.is_empty()
+        }
+        #[cfg(target_os = "android")]
+        {
+            false
+        }
+    }
+
+    fn apply_nodes_live(project: &mut ProjectFile, nodes: &[Node]) {
+        for node in nodes {
+            let id = project.nodes.insert(node.clone());
+            project.document.append_to_active_layer(id);
+        }
+    }
+
+    fn rebuild_spatial_index(&mut self) {
+        let revision = self.history.revision();
+        let hidden = self.hidden_canvas_sources();
+        self.spatial_index =
+            crate::spatial_index::SpatialIndex::rebuild(&self.project, &hidden, revision);
+        self.cached_draw_order = if self.spatial_index.is_enabled() {
+            self.spatial_index.flat_order().to_vec()
+        } else {
+            self.project.document.ordered_node_ids()
+        };
+        self.cached_draw_order_revision = revision;
+    }
+
+    fn draw_order_cached(&mut self) -> &[NodeId] {
+        let revision = self.history.revision();
+        if self.cached_draw_order_revision != revision {
+            self.rebuild_spatial_index();
+        }
+        &self.cached_draw_order
+    }
+
+    pub fn is_bulk_selection(&self) -> bool {
+        self.selection.len() >= crate::perf::BULK_SELECTION_THRESHOLD
+    }
+
+    fn sync_inspector_if_needed(&mut self) {
+        if self.is_bulk_selection() {
+            self.status_message = format!(
+                "{} objects selected — bulk mode (single undo on move)",
+                self.selection.len()
+            );
+            return;
+        }
+        self.sync_inspector_from_selection();
+    }
+
+    fn setup_bulk_drag_if_needed(&mut self, selection: &[NodeId]) {
+        if selection.len() < crate::perf::BULK_SELECTION_THRESHOLD {
+            return;
+        }
+        let mut ids = Vec::with_capacity(selection.len());
+        let mut origins = Vec::with_capacity(selection.len());
+        for &id in selection {
+            if let Some(node) = self.project.nodes.get(id) {
+                let b = node.bounds();
+                ids.push(id);
+                origins.push((b.x0, b.y0));
+            }
+        }
+        self.tools.select.bulk_drag = Some(crate::tools::BulkDrag {
+            ids,
+            origins,
+            preview_dx: 0.0,
+            preview_dy: 0.0,
+        });
+        self.tools.select.drag_snapshot.clear();
+    }
+
+    fn apply_bulk_move_preview(&mut self, dx: f64, dy: f64) {
+        let Some(bulk) = self.tools.select.bulk_drag.as_mut() else {
+            return;
+        };
+        bulk.preview_dx = dx;
+        bulk.preview_dy = dy;
+        for (i, &id) in bulk.ids.iter().enumerate() {
+            let Some((ox, oy)) = bulk.origins.get(i).copied() else {
+                continue;
+            };
+            if let Some(node) = self.project.nodes.get_mut(id) {
+                let b = node.bounds();
+                let w = b.width();
+                let h = b.height();
+                node.set_bounds(kurbo::Rect::new(ox + dx, oy + dy, ox + dx + w, oy + dy + h));
+            }
+        }
+    }
+
+    fn revert_bulk_move_preview(&mut self) {
+        let Some(bulk) = self.tools.select.bulk_drag.as_ref() else {
+            return;
+        };
+        for (i, &id) in bulk.ids.iter().enumerate() {
+            let Some((ox, oy)) = bulk.origins.get(i).copied() else {
+                continue;
+            };
+            if let Some(node) = self.project.nodes.get_mut(id) {
+                let b = node.bounds();
+                let w = b.width();
+                let h = b.height();
+                node.set_bounds(kurbo::Rect::new(ox, oy, ox + w, oy + h));
+            }
+        }
+    }
+
+    fn commit_bulk_drag(&mut self, dx: f64, dy: f64) {
+        let Some(bulk) = self.tools.select.bulk_drag.take() else {
+            return;
+        };
+        if dx.hypot(dy) < 0.001 {
+            return;
+        }
+        let mut patches = Vec::with_capacity(bulk.ids.len());
+        for (i, &id) in bulk.ids.iter().enumerate() {
+            let Some((ox, oy)) = bulk.origins.get(i).copied() else {
+                continue;
+            };
+            let Some(node) = self.project.nodes.get(id) else {
+                continue;
+            };
+            let b = node.bounds();
+            let w = b.width();
+            let h = b.height();
+            let mut before = node.clone();
+            before.set_bounds(kurbo::Rect::new(ox, oy, ox + w, oy + h));
+            let mut after = before.clone();
+            after.translate(dx, dy);
+            if before != after {
+                patches.push((id, before, after));
+            }
+        }
+        if !patches.is_empty() {
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchNodes { patches },
+            );
+        }
+    }
+
+    pub fn split_active_av_clip_at_playhead(&mut self) {
+        const MIN_SPLIT_SEC: f32 = 0.1;
+        let idx = self.project.document.active_layer_index;
+        let play_sec = self.anim_current_frame as f32 / self.anim_fps as f32;
+        let Some(layer) = self.project.document.layers.get_mut(idx) else {
+            return;
+        };
+        if layer.kind != crate::document::LayerKind::AV {
+            self.status_message = "Select an AV layer to split".into();
+            return;
+        }
+        layer.ensure_av_clips();
+        let clip_pos = layer.av_clips.iter().position(|c| {
+            play_sec > c.video_timeline_start + MIN_SPLIT_SEC
+                && play_sec < c.timeline_end_secs() - MIN_SPLIT_SEC
+        });
+        let Some(clip_idx) = clip_pos else {
+            self.status_message = "Playhead must be inside a clip".into();
+            return;
+        };
+        let clip = layer.av_clips[clip_idx].clone();
+        let left_len = play_sec - clip.video_timeline_start;
+        let right_start = play_sec;
+        let right_offset = clip.video_start_offset + left_len;
+        let right_len = clip.timeline_play_secs() - left_len;
+
+        let mut right = clip.clone();
+        right.id = uuid::Uuid::new_v4();
+        right.name = format!("{} (split)", clip.name);
+        right.video_timeline_start = right_start;
+        right.video_start_offset = right_offset;
+        right.video_play_length = right_len.max(MIN_SPLIT_SEC);
+        right.track_row = clip.track_row;
+
+        if let Some(c) = layer.av_clips.get_mut(clip_idx) {
+            c.video_play_length = left_len.max(MIN_SPLIT_SEC);
+        }
+        layer.av_clips.insert(clip_idx + 1, right);
+        layer.sync_legacy_from_primary_clip();
+        self.status_message = format!("Split clip at {:.2}s", play_sec);
+    }
+
+    pub fn create_music_clip_at_playhead(&mut self) {
+        let idx = self.project.document.active_layer_index;
+        let play_sec = self.anim_current_frame as f32 / self.anim_fps as f32;
+        let Some(layer) = self.project.document.layers.get_mut(idx) else {
+            return;
+        };
+        if layer.kind != crate::document::LayerKind::AV {
+            self.status_message = "Select an AV layer for music".into();
+            return;
+        }
+        layer.ensure_av_clips();
+        let n = layer.music_clips.len() + 1;
+        let end = play_sec + 1.0;
+        let row = crate::document::assign_free_track_row(&layer.av_clips, &layer.music_clips, play_sec, end);
+        let mut clip = crate::document::MusicClip::new_empty(
+            format!("Music {n}"),
+            play_sec,
+            1.0,
+        );
+        clip.track_row = row;
+        let id = clip.id;
+        layer.music_clips.push(clip);
+        self.piano_roll_clip = Some(id);
+        self.status_message = format!("Created 1s music node at {:.2}s", play_sec);
+    }
+
+    fn pick_node_at(&self, doc: (f64, f64), slop: f64) -> Option<NodeId> {
+        let hidden = self.hidden_canvas_sources();
+        if self.spatial_index.is_enabled() {
+            let (hit, _) = self.spatial_index.pick_topmost_with_document(
+                &self.project,
+                &hidden,
+                doc,
+                slop,
+                |id| self.node_uses_extended_bounds(id),
+            );
+            return hit;
+        }
+        for id in self.project.document.ordered_node_ids().into_iter().rev() {
+            if let Some(node) = self.project.nodes.get(id) {
+                let does_hit = if self.node_uses_extended_bounds(id) {
+                    let eb = crate::document::get_effective_bounds(
+                        node,
+                        &self.project.document,
+                        &self.project.nodes,
+                    );
+                    let pt = kurbo::Point::new(doc.0, doc.1);
+                    eb.inflate(slop, slop).contains(pt)
+                } else {
+                    node.hit_test_with_store(&self.project.nodes, doc.0, doc.1, slop)
+                };
+                if does_hit {
+                    return Some(id);
+                }
+            }
+        }
+        None
+    }
+
+    fn pick_node_at_with_bbox_fallback(
+        &self,
+        doc: (f64, f64),
+        slop: f64,
+    ) -> (Option<NodeId>, Option<NodeId>) {
+        let hidden = self.hidden_canvas_sources();
+        if self.spatial_index.is_enabled() {
+            return self.spatial_index.pick_topmost_with_document(
+                &self.project,
+                &hidden,
+                doc,
+                slop,
+                |id| self.node_uses_extended_bounds(id),
+            );
+        }
+        let mut hit: Option<NodeId> = None;
+        let mut bbox_only: Option<NodeId> = None;
+        for id in self.project.document.ordered_node_ids().into_iter().rev() {
+            if let Some(node) = self.project.nodes.get(id) {
+                let does_hit = if self.node_uses_extended_bounds(id) {
+                    let eb = crate::document::get_effective_bounds(
+                        node,
+                        &self.project.document,
+                        &self.project.nodes,
+                    );
+                    let pt = kurbo::Point::new(doc.0, doc.1);
+                    eb.inflate(slop, slop).contains(pt)
+                } else {
+                    node.hit_test_with_store(&self.project.nodes, doc.0, doc.1, slop)
+                };
+                if does_hit {
+                    let pt = kurbo::Point::new(doc.0, doc.1);
+                    let precise = if self.node_uses_extended_bounds(id) {
+                        true
+                    } else {
+                        node.bez_path().contains(pt)
+                            || matches!(node.kind, NodeKind::Text { .. })
+                            || matches!(node.kind, NodeKind::Image { .. })
+                    };
+                    if precise {
+                        hit = Some(id);
+                        break;
+                    } else if bbox_only.is_none() && !matches!(node.kind, NodeKind::Image { .. }) {
+                        bbox_only = Some(id);
+                    }
+                }
+            }
+        }
+        if hit.is_none() {
+            hit = bbox_only;
+        }
+        (hit, bbox_only)
+    }
+
     /// Load (or reload) texture for an Image node from its embedded bytes.
     fn ensure_image_texture(&mut self, id: NodeId, bytes: &[u8], ctx: &Context) {
         if self.image_textures.contains_key(&id) && self.image_pixel_cache.contains_key(&id) {
@@ -3206,12 +4371,31 @@ fn run_video_decode_thread(
         let fps = self.anim_fps as f32;
         let current_frame = self.anim_current_frame;
 
-        // Collect layer metadata without borrowing self.video_layers yet
-        let layers_info: Vec<(uuid::Uuid, String, f32, f32, f32, f32, f32, f32, f32)> = self.project.document.layers
-            .iter()
-            .filter(|l| l.visible && l.kind == crate::document::LayerKind::Video && !l.video_path.is_empty())
-            .map(|l| (l.id, l.video_path.clone(), l.hue, l.saturation, l.brightness, l.contrast, l.video_start_offset, l.video_play_length, l.video_timeline_start))
-            .collect();
+        // Collect clip metadata (video clips only) without borrowing self.video_layers yet
+        let mut layers_info: Vec<(uuid::Uuid, String, f32, f32, f32, f32, f32, f32, f32)> = Vec::new();
+        for l in &self.project.document.layers {
+            if !l.visible || l.kind != crate::document::LayerKind::AV {
+                continue;
+            }
+            let mut layer = l.clone();
+            layer.ensure_av_clips();
+            for c in &layer.av_clips {
+                if c.is_audio_only() || c.media_path.is_empty() {
+                    continue;
+                }
+                layers_info.push((
+                    c.id,
+                    c.media_path.clone(),
+                    l.hue,
+                    l.saturation,
+                    l.brightness,
+                    l.contrast,
+                    c.video_start_offset,
+                    c.video_play_length,
+                    c.video_timeline_start,
+                ));
+            }
+        }
 
         // Clean up deleted/inactive video layers to terminate their channels and background processes
         let active_ids: std::collections::HashSet<uuid::Uuid> = layers_info.iter().map(|info| info.0).collect();
@@ -3387,7 +4571,7 @@ fn run_video_decode_thread(
         self.canvas_screen_rect = Some(rect);
         self.canvas_origin = origin;
 
-        // Handle dropped image files (png/jpeg) -> create Image node at drop location or center
+        // Handle dropped files (png/jpeg/project) -> create Image node or load project
         let drops: Vec<_> = ui.input(|i| i.raw.dropped_files.clone());
         for f in drops {
             let bytes: Vec<u8> = if let Some(b) = &f.bytes {
@@ -3399,6 +4583,34 @@ fn run_video_decode_thread(
             };
             if bytes.is_empty() { continue; }
             let name = f.name.to_lowercase();
+            if name.ends_with(".vadadee-berry.json") {
+                let path_to_load = f.path.clone();
+                if let Some(p) = path_to_load {
+                    match io::load_project(&p) {
+                        Ok(loaded_proj) => {
+                            self.project = loaded_proj;
+                            self.selection.clear();
+                            self.history.clear();
+                            self.viewport.pan = egui::vec2(48.0, 48.0);
+                            self.viewport.zoom = 0.85;
+                            self.status_message = format!("Loaded project: {}", p.display());
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Failed to load project: {e}");
+                        }
+                    }
+                } else {
+                    if let Ok(loaded_proj) = serde_json::from_slice::<ProjectFile>(&bytes) {
+                        self.project = loaded_proj;
+                        self.selection.clear();
+                        self.history.clear();
+                        self.viewport.pan = egui::vec2(48.0, 48.0);
+                        self.viewport.zoom = 0.85;
+                        self.status_message = format!("Loaded project: {}", f.name);
+                    }
+                }
+                continue;
+            }
             if name.ends_with(".png") || name.ends_with(".jpg") || name.ends_with(".jpeg")
                 || bytes.starts_with(b"\x89PNG") || bytes.starts_with(b"\xFF\xD8")
             {
@@ -3422,7 +4634,7 @@ fn run_video_decode_thread(
             render::draw_grid(&painter, &self.viewport, origin, page);
             render::draw_page_shadow(&painter, page, self.project.document.page_color_egui());
 
-            let order = self.project.document.ordered_node_ids();
+            let order = self.draw_order_cached().to_vec();
             let ctx = ui.ctx().clone();
             for id in &order {
                 if let Some(node) = self.project.nodes.get(*id) {
@@ -3433,6 +4645,10 @@ fn run_video_decode_thread(
             }
             self.fonts
                 .ensure_loaded(&ctx, &self.ui_text_font_family);
+            // Ensure textures for any Image nodes (decode from embedded bytes if needed)
+            let image_ids: Vec<_> = order.iter().copied().filter(|id| {
+                self.project.nodes.get(*id).map_or(false, |n| matches!(n.kind, NodeKind::Image { .. }))
+            }).collect();
             // While on-page editing a text, suppress its normal draw so the in-place editor provides
             // the visible glyphs + caret with no duplicate/offset.
             let draw_order: Vec<NodeId> = if let Some(edit_id) = self.on_page_text_edit {
@@ -3440,10 +4656,6 @@ fn run_video_decode_thread(
             } else {
                 order
             };
-            // Ensure textures for any Image nodes (decode from embedded bytes if needed)
-            let image_ids: Vec<_> = self.project.document.ordered_node_ids().into_iter().filter(|id| {
-                self.project.nodes.get(*id).map_or(false, |n| matches!(n.kind, NodeKind::Image { .. }))
-            }).collect();
             for id in image_ids {
                 if let Some(bytes) = self.project.nodes.get(id).and_then(|n| {
                     if let NodeKind::Image { bytes, .. } = &n.kind {
@@ -3459,22 +4671,13 @@ fn run_video_decode_thread(
             // Async video decode: non-blocking poll + kick off background decode if needed
             self.tick_video_layers(&ctx);
 
-            let hidden_sources =
-                hidden_effect_sources(&self.project.document.path_effects);
-            let mut hidden_sources = hidden_sources;
-            for e in self.project.document.tiling_effects.values() {
-                if e.hide_source { hidden_sources.insert(e.source_id); }
-            }
-            for e in self.project.document.circular_effects.values() {
-                if e.hide_source { hidden_sources.insert(e.source_id); }
-            }
-            // Hide clip mask source (rendered clipped) and mask (used as clip region)
-            for cm in self.project.document.clip_masks.values() {
-                hidden_sources.insert(cm.source_id);
-                if cm.hide_mask {
-                    hidden_sources.insert(cm.mask_id);
-                }
-            }
+            let mut hidden_sources = self.hidden_canvas_sources();
+            hidden_sources.extend(path_effect_form_node_ids(
+                &self.project.document.path_effects,
+            ));
+            let dragging_objects = !self.tools.select.drag_snapshot.is_empty();
+            let revision = self.history.revision();
+            let anim_frame = self.anim_current_frame;
             let loft_paths: std::collections::HashSet<NodeId> = self.project.document.path_effects.values()
                 .filter(|e| e.mode == OnPathMode::Loft)
                 .map(|e| e.path_id)
@@ -3487,36 +4690,110 @@ fn run_video_decode_thread(
                 }
                 match layer.kind {
                     crate::document::LayerKind::Image => {
-                        let layer_draw_order: Vec<NodeId> = draw_order
-                            .iter()
-                            .copied()
-                            .filter(|id| layer.nodes.contains(id))
-                            .collect();
-                        
-                        render::draw_nodes(
-                            &painter,
-                            &self.project.nodes,
-                            &layer_draw_order,
-                            &self.viewport,
-                            origin,
-                            self.project.document.width as f32,
-                            self.project.document.height as f32,
-                            &self.selection,
-                            &hidden_sources,
-                            &loft_paths,
-                            &self.fonts,
-                            &self.image_textures,
-                        );
+                        let use_raster_cache = self.enable_layer_raster_cache
+                            && !dragging_objects
+                            && self.on_page_text_edit.is_none()
+                            && crate::layer_cache::should_cache_layer(
+                                &self.project,
+                                layer,
+                                &hidden_sources,
+                                self.enable_layer_raster_cache,
+                                dragging_objects,
+                                self.on_page_text_edit.is_some(),
+                                self.anim_is_playing,
+                                self.mcp_bulk_active(),
+                            )
+                            && self
+                                .layer_raster_cache
+                                .get(&layer.id)
+                                .is_some_and(|e| {
+                                    crate::layer_cache::cache_entry_valid(e, revision, anim_frame)
+                                });
+
+                        if use_raster_cache {
+                            if let Some(entry) = self.layer_raster_cache.get(&layer.id) {
+                                let page = self.viewport.page_rect(
+                                    origin,
+                                    self.project.document.width as f32,
+                                    self.project.document.height as f32,
+                                );
+                                painter.image(
+                                    entry.texture.id(),
+                                    page,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            let skip_overlay = self.is_bulk_selection()
+                                && self.selection.len() >= crate::perf::BULK_OVERLAY_SKIP;
+                            let layer_set: std::collections::HashSet<NodeId> =
+                                layer.nodes.iter().copied().collect();
+                            let selection_overlay: Vec<NodeId> = self
+                                .selection
+                                .iter()
+                                .copied()
+                                .filter(|id| layer_set.contains(id))
+                                .collect();
+                            if !skip_overlay && !selection_overlay.is_empty() {
+                                render::draw_nodes(
+                                    &painter,
+                                    &self.project.nodes,
+                                    &selection_overlay,
+                                    &self.viewport,
+                                    origin,
+                                    self.project.document.width as f32,
+                                    self.project.document.height as f32,
+                                    &self.selection,
+                                    &hidden_sources,
+                                    &loft_paths,
+                                    &self.fonts,
+                                    &self.image_textures,
+                                );
+                            }
+                        } else {
+                            // O(n) membership — layer.nodes is Vec; .contains() per id was O(n²).
+                            let layer_set: std::collections::HashSet<NodeId> =
+                                layer.nodes.iter().copied().collect();
+                            let layer_draw_order: Vec<NodeId> = draw_order
+                                .iter()
+                                .copied()
+                                .filter(|id| layer_set.contains(id))
+                                .collect();
+                            render::draw_nodes(
+                                &painter,
+                                &self.project.nodes,
+                                &layer_draw_order,
+                                &self.viewport,
+                                origin,
+                                self.project.document.width as f32,
+                                self.project.document.height as f32,
+                                &self.selection,
+                                &hidden_sources,
+                                &loft_paths,
+                                &self.fonts,
+                                &self.image_textures,
+                            );
+                        }
                     }
-                    crate::document::LayerKind::Video => {
-                        // Use per-layer texture from async decode system
-                        let tex = self.video_layers.get(&layer.id)
+                    crate::document::LayerKind::AV => {
+                        if !layer.has_canvas_video() {
+                            continue;
+                        }
+                        let mut layer_clips = layer.clone();
+                        layer_clips.ensure_av_clips();
+                        let primary_id = layer_clips
+                            .av_clips
+                            .iter()
+                            .find(|c| !c.is_audio_only())
+                            .map(|c| c.id)
+                            .unwrap_or(layer.id);
+                        let tex = self.video_layers.get(&primary_id)
                             .and_then(|s| s.texture.as_ref())
                             .cloned()
-                            // Fallback to legacy single cache for the first render before async kicks in
+                            .or_else(|| self.video_layers.get(&layer.id).and_then(|s| s.texture.as_ref()).cloned())
                             .or_else(|| {
                                 self.video_frame_cache.as_ref()
-                                    .filter(|c| c.layer_id == layer.id)
+                                    .filter(|c| c.layer_id == primary_id || c.layer_id == layer.id)
                                     .map(|c| c.texture.clone())
                             });
                         if let Some(texture) = tex {
@@ -3596,15 +4873,56 @@ fn run_video_decode_thread(
                             }
                         }
                     }
-                    crate::document::LayerKind::Audio => {}
+                    crate::document::LayerKind::Shading => {
+                        if !layer.shading_passes.is_empty() {
+                            let page = self.viewport.page_rect(
+                                origin,
+                                self.project.document.width as f32,
+                                self.project.document.height as f32,
+                            );
+                            let shade_time = ctx.input(|i| i.time) as f32;
+                            let gpu = self
+                                .gpu_shading
+                                .then(|| self.wgpu_render.as_ref())
+                                .flatten();
+                            if let Some(rs) = gpu {
+                                if crate::shading::shading_passes_need_input(&layer.shading_passes) {
+                                    let view = io::default_document_view(&self.project);
+                                    if let Some((w, h, rgba)) = io::rasterize_document_view(
+                                        &self.project,
+                                        view,
+                                        50.0,
+                                        self.anim_current_frame,
+                                        &std::collections::HashMap::new(),
+                                    ) {
+                                        crate::shading::queue_shading_input(rs, w, h, rgba);
+                                    }
+                                }
+                            }
+                            crate::shading::draw_shading_passes(
+                                &painter,
+                                page,
+                                &layer.shading_passes,
+                                shade_time,
+                                gpu,
+                            );
+                            if layer.shading_passes.iter().any(|p| p.enabled) {
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
                 }
             }
 
             // Draw large selection outline for Tiling/Circular sources using effective bounds
             for &id in &self.selection {
-                if self.node_has_tiling_or_circular(id) {
+                if self.node_uses_extended_bounds(id) {
                     if let Some(node) = self.project.nodes.get(id) {
-                        let eb = crate::document::get_effective_bounds(node, &self.project.document);
+                        let eb = crate::document::get_effective_bounds(
+                            node,
+                            &self.project.document,
+                            &self.project.nodes,
+                        );
                         let tl = self.viewport.doc_to_screen((eb.x0, eb.y0), origin);
                         let br = self.viewport.doc_to_screen((eb.x1, eb.y1), origin);
                         let r = egui::Rect::from_min_max(tl, br);
@@ -3661,7 +4979,11 @@ fn run_video_decode_thread(
                 if self.selection.len() == 1 {
                     if let Some(id) = self.selection.first() {
                         if let Some(node) = self.project.nodes.get(*id) {
-                            let eb = crate::document::get_effective_bounds(node, &self.project.document);
+                            let eb = crate::document::get_effective_bounds(
+                                node,
+                                &self.project.document,
+                                &self.project.nodes,
+                            );
                             let tl = self.viewport.doc_to_screen((eb.x0, eb.y0), origin);
                             let br = self.viewport.doc_to_screen((eb.x1, eb.y1), origin);
                             let mut sr = egui::Rect::from_min_max(tl, br);
@@ -3673,9 +4995,13 @@ fn run_video_decode_thread(
                                 sr.min.y -= 8.0;
                                 sr.max.y += 8.0;
                             }
-                            render::draw_transform_handles(&painter, sr, self.tools.select.select_rotation_mode);
+                            render::draw_transform_handles(
+                                &painter,
+                                sr,
+                                self.tools.select.select_rotation_mode,
+                            );
                         } else if let Some(l) = self.project.document.layers.iter().find(|l| l.id == *id) {
-                            if l.kind == crate::document::LayerKind::Video {
+                            if l.kind == crate::document::LayerKind::AV {
                                 let mut dx = l.x as f64;
                                 let mut dy = l.y as f64;
                                 if let Some(track) = self.project.anim_timeline.nodes.get(&l.id) {
@@ -3729,6 +5055,16 @@ fn run_video_decode_thread(
                         &self.project.document.circular_effects,
                     ) {
                         render::draw_group_selection_bounds(&painter, sr);
+                        if self.is_bulk_selection() {
+                            let label = format!("{} objects", self.selection.len());
+                            painter.text(
+                                sr.center(),
+                                egui::Align2::CENTER_CENTER,
+                                label,
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
                     }
                 }
             }
@@ -3745,7 +5081,7 @@ fn run_video_decode_thread(
                 }
             }
 
-            if self.tools.active == ToolKind::Node {
+            if self.tools.active == ToolKind::Node && !self.is_bulk_selection() {
                 for id in &self.selection {
                     if let Some(node) = self.project.nodes.get(*id) {
                         render::draw_node_handles(
@@ -3894,6 +5230,9 @@ fn run_video_decode_thread(
                     painter.line_segment([p1, p2], egui::Stroke::new(1.5, color));
                 }
             }
+
+            crate::left_dock::draw_local_cursor_bubble(self, ui, origin);
+            crate::left_dock::draw_remote_cursors(self, ui, origin);
 
             if self.tools.active == ToolKind::Brush && !self.tools.brush.points.is_empty() {
                  let stroke_color = match &self.build_brush_fill() {
@@ -4051,7 +5390,7 @@ fn run_video_decode_thread(
                 }
             }
         }
-        let pointer = response.interact_pointer_pos();
+        self.update_cursor_doc_from_pointer(&response.ctx, response);
         self.live_snap_guides.clear();
         let primary_down = response.is_pointer_button_down_on();
         let primary_pressed = response.ctx.input(|i| {
@@ -4081,14 +5420,11 @@ fn run_video_decode_thread(
             return;
         }
 
-        let Some(pos) = pointer else {
-            self.cursor_doc = None;
+        let Some(doc) = self.cursor_doc else {
             self.gradient_flow_drag = None;
             return;
         };
-        let mut doc = self.viewport.screen_to_doc(pos, origin);
-        doc = self.viewport.snap(doc);
-        self.cursor_doc = Some(doc);
+        let pos = self.viewport.doc_to_screen(doc, origin);
 
         if self.handle_gradient_flow_input(
             origin,
@@ -4211,6 +5547,7 @@ fn run_video_decode_thread(
         self.tools.select.node_edit_target = None;
         self.tools.select.node_drag_origin = None;
         self.tools.select.node_drag_active = false;
+        self.tools.select.mid_curve_drag = None;
     }
 
     fn update_clip_mask_textures(&mut self, ctx: &egui::Context) {
@@ -4258,7 +5595,7 @@ fn run_video_decode_thread(
                     source_svg
                 );
                 
-                let opt = usvg::Options::default();
+                let opt = crate::fonts::usvg_options();
                 if let Ok(tree) = usvg::Tree::from_str(&svg_data, &opt) {
                     if let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(pixel_w, pixel_h) {
                         resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
@@ -4283,13 +5620,115 @@ fn run_video_decode_thread(
         self.clip_mask_signatures.retain(|id, _| active_clip_ids.contains(id));
     }
 
+    fn hidden_canvas_sources(&self) -> std::collections::HashSet<NodeId> {
+        let mut hidden =
+            crate::document::hidden_effect_sources(&self.project.document.path_effects);
+        for e in self.project.document.tiling_effects.values() {
+            if e.hide_source {
+                hidden.insert(e.source_id);
+            }
+        }
+        for e in self.project.document.circular_effects.values() {
+            if e.hide_source {
+                hidden.insert(e.source_id);
+            }
+        }
+        for cm in self.project.document.clip_masks.values() {
+            hidden.insert(cm.source_id);
+            if cm.hide_mask {
+                hidden.insert(cm.mask_id);
+            }
+        }
+        hidden
+    }
+
+    fn update_layer_raster_cache(&mut self, ctx: &egui::Context) {
+        use crate::layer_cache::{
+            cache_entry_valid, install_cache_result, should_cache_layer, spawn_layer_raster_job,
+        };
+
+        if !self.enable_layer_raster_cache {
+            while self.layer_cache_result_rx.try_recv().is_ok() {}
+            self.layer_raster_cache.clear();
+            self.layer_cache_pending.clear();
+            return;
+        }
+
+        while let Ok(result) = self.layer_cache_result_rx.try_recv() {
+            install_cache_result(
+                &mut self.layer_raster_cache,
+                &mut self.layer_cache_pending,
+                ctx,
+                result,
+            );
+        }
+
+        let hidden = self.hidden_canvas_sources();
+        let dragging = !self.tools.select.drag_snapshot.is_empty();
+        let text_editing = self.on_page_text_edit.is_some();
+        let revision = self.history.revision();
+        let anim_frame = self.anim_current_frame;
+        let anim_playing = self.anim_is_playing;
+
+        let mut active_layer_ids = std::collections::HashSet::new();
+        let layers: Vec<_> = self.project.document.layers.clone();
+
+        for layer in &layers {
+            if layer.kind != crate::document::LayerKind::Image {
+                continue;
+            }
+            active_layer_ids.insert(layer.id);
+
+            if !should_cache_layer(
+                &self.project,
+                layer,
+                &hidden,
+                self.enable_layer_raster_cache,
+                dragging,
+                text_editing,
+                anim_playing,
+                self.mcp_bulk_active(),
+            ) {
+                self.layer_raster_cache.remove(&layer.id);
+                self.layer_cache_pending.remove(&layer.id);
+                continue;
+            }
+
+            if self
+                .layer_raster_cache
+                .get(&layer.id)
+                .is_some_and(|e| cache_entry_valid(e, revision, anim_frame))
+            {
+                continue;
+            }
+            if self.layer_cache_pending.contains(&layer.id) {
+                continue;
+            }
+
+            self.layer_cache_pending.insert(layer.id);
+            spawn_layer_raster_job(
+                self.project.clone(),
+                layer.clone(),
+                hidden.clone(),
+                revision,
+                anim_frame,
+                self.layer_cache_result_tx.clone(),
+            );
+        }
+
+        self.layer_raster_cache
+            .retain(|id, _| active_layer_ids.contains(id));
+        self.layer_cache_pending
+            .retain(|id| active_layer_ids.contains(id));
+    }
+
     pub fn sync_audio_playback(&mut self) {
-        use rodio::Source;
         use std::num::{NonZeroU16, NonZeroU32};
 
         if !self.anim_is_playing {
             self.audio_players.clear();
             self.audio_player_buffer_offset.clear();
+            self.audio_player_last_file_pos.clear();
             self.audio_layers_skip.clear();
             self.audio_prepare_rx.clear();
             return;
@@ -4299,8 +5738,7 @@ fn run_video_decode_thread(
         let mut active_layer_ids = std::collections::HashSet::new();
         for layer in &self.project.document.layers {
             if layer.visible
-                && (layer.kind == crate::document::LayerKind::Video
-                    || layer.kind == crate::document::LayerKind::Audio)
+                && layer.kind == crate::document::LayerKind::AV
                 && !layer.video_path.is_empty()
             {
                 let start = layer.video_timeline_start;
@@ -4311,6 +5749,9 @@ fn run_video_decode_thread(
             }
         }
 
+        if !self.ensure_audio_output() {
+            return;
+        }
         let Some(device) = self.audio_device.as_ref() else {
             return;
         };
@@ -4355,6 +5796,10 @@ fn run_video_decode_thread(
                     .find(|l| l.id == layer_id)
                 {
                     player.set_volume(layer.volume);
+                    let start = layer.video_timeline_start;
+                    let file_pos = (playhead_time - start) + layer.video_start_offset;
+                    let fp = file_pos.max(0.0);
+                    self.audio_player_last_file_pos.insert(layer_id, fp);
                 }
                 player.append(source);
                 self.audio_players.insert(layer_id, player);
@@ -4366,7 +5811,7 @@ fn run_video_decode_thread(
 
         for layer in &self.project.document.layers {
             if layer.visible
-                && (layer.kind == crate::document::LayerKind::Video || layer.kind == crate::document::LayerKind::Audio)
+                && layer.kind == crate::document::LayerKind::AV
                 && !layer.video_path.is_empty()
             {
                 let start = layer.video_timeline_start;
@@ -4388,22 +5833,26 @@ fn run_video_decode_thread(
 
                     let file_pos =
                         (playhead_time - start) + layer.video_start_offset;
+                    let frame_time = 1.0 / self.anim_fps.max(1) as f32;
+                    let jump_threshold = (frame_time * 4.0).max(0.35);
                     let mut need_create = !self.audio_players.contains_key(&layer.id);
                     if let Some(player) = self.audio_players.get(&layer.id) {
-                        let buffer_start = self
-                            .audio_player_buffer_offset
+                        let last_pos = self
+                            .audio_player_last_file_pos
                             .get(&layer.id)
                             .copied()
-                            .unwrap_or(0.0);
-                        let current_pos = player.get_pos().as_secs_f32();
-                        let expected_player_pos = (file_pos - buffer_start).max(0.0);
-                        if (current_pos - expected_player_pos).abs() > 0.45 {
+                            .unwrap_or(file_pos);
+                        let delta = (file_pos - last_pos).abs();
+                        // Resync only on timeline scrub/jump, not during steady playback.
+                        if delta > jump_threshold {
                             self.audio_players.remove(&layer.id);
                             self.audio_player_buffer_offset.remove(&layer.id);
+                            self.audio_player_last_file_pos.remove(&layer.id);
                             self.audio_prepare_rx.remove(&layer.id);
                             need_create = true;
                         } else {
                             player.set_volume(layer.volume);
+                            self.audio_player_last_file_pos.insert(layer.id, file_pos);
                         }
                     }
 
@@ -4415,6 +5864,7 @@ fn run_video_decode_thread(
                         ) {
                             let offset = file_pos.max(0.0);
                             self.audio_player_buffer_offset.insert(layer.id, offset);
+                            self.audio_player_last_file_pos.insert(layer.id, offset);
                             let (tx, rx) = std::sync::mpsc::channel();
                             self.audio_prepare_rx.insert(layer.id, rx);
                             let path = audio_path.clone();
@@ -4443,6 +5893,8 @@ fn run_video_decode_thread(
         self.audio_players
             .retain(|id, _| active_layer_ids.contains(id));
         self.audio_player_buffer_offset
+            .retain(|id, _| active_layer_ids.contains(id));
+        self.audio_player_last_file_pos
             .retain(|id, _| active_layer_ids.contains(id));
         self.audio_prepare_rx
             .retain(|id, _| active_layer_ids.contains(id));
@@ -4492,6 +5944,54 @@ fn run_video_decode_thread(
         } else {
             format!("Sharp point {}", anchor_idx + 1)
         };
+    }
+
+    /// Enable corner curve (LPE-style fillet) at the sharp vertex. Creates two yellow tangent points
+    /// on the legs. Non-destructive. Yellows are always equidistant via D = R / tan(θ/2) formula.
+    /// Drag either to adjust the radius R for a proper circular arc.
+    pub fn make_corner_curve(&mut self, id: NodeId, corner_idx: usize) {
+        let Some(before) = self.project.nodes.get(id).cloned() else {
+            return;
+        };
+        let mut after = before.clone();
+        if let NodeKind::Path { path } = &mut after.kind {
+            let anchors = path.anchor_positions();
+            let n = anchors.len();
+            if corner_idx >= n {
+                return;
+            }
+            let p = anchors[corner_idx];
+            // prev leg
+            let prev = if corner_idx > 0 { corner_idx - 1 } else if path.is_closed() && n > 2 { n-1 } else { return };
+            let pa = anchors[prev];
+            let len_prev = ((p.0 - pa.0).powi(2) + (p.1 - pa.1).powi(2)).sqrt();
+            // next leg
+            let next = if corner_idx + 1 < n { corner_idx + 1 } else if path.is_closed() && n > 2 { 0 } else { return };
+            let pb = anchors[next];
+            let len_next = ((p.0 - pb.0).powi(2) + (p.1 - pb.1).powi(2)).sqrt();
+            let d = 0.10 * len_prev.min(len_next).max(1.0);
+            // Compute R such that initial D = 0.1*min_len  =>  R = D * tan(θ/2)
+            let r = if let Some(theta) = path.corner_angle_at(corner_idx) {
+                let h = theta / 2.0;
+                let th = h.tan();
+                if th > 1e-9 { d * th } else { d }
+            } else {
+                d
+            };
+            path.set_corner_fillet(corner_idx, r);
+        } else {
+            return;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchNode { id, before, after },
+        );
+        self.tools.select.selected_path_points.clear();
+        self.tools.select.selected_path_points.push((id, corner_idx));
+        self.tools.select.selected_path_segment = None;
+        self.tools.select.node_edit_target = Some(PathEditTarget::Anchor(corner_idx));
+        ui::promote_action_tab(self, ui::ActionTab::Geometry);
+        self.status_message = "Corner curve enabled (two yellow points on legs)".into();
     }
 
     pub fn smooth_selected_path_points(&mut self) {
@@ -4562,6 +6062,13 @@ fn run_video_decode_thread(
     }
 
     pub fn selection_path_and_objects(&self) -> Option<(Vec<NodeId>, NodeId)> {
+        if self.selection.len() == 1 {
+            if let Some(eff) =
+                path_effect_by_form_node(&self.project.document.path_effects, self.selection[0])
+            {
+                return Some((vec![eff.source_id], eff.path_id));
+            }
+        }
         let mut paths = Vec::new();
         let mut objects = Vec::new();
         for id in &self.selection {
@@ -4599,6 +6106,7 @@ fn run_video_decode_thread(
                 self.ui_on_path_rotate = effect.rotate_to_tangent;
                 self.ui_on_path_loft_scale = effect.loft_end_scale;
                 self.ui_on_path_loft_opacity = effect.loft_end_opacity;
+                self.backfill_path_effect_forms_if_needed(path, &[obj]);
                 return;
             }
         }
@@ -4617,6 +6125,7 @@ fn run_video_decode_thread(
                     self.ui_on_path_loft_opacity = effect.loft_end_opacity;
                 }
             }
+            self.backfill_path_effect_forms_if_needed(path, &objs);
         }
     }
 
@@ -4707,10 +6216,18 @@ fn run_video_decode_thread(
             loft_end_scale: self.ui_on_path_loft_scale,
             loft_end_opacity: self.ui_on_path_loft_opacity,
             hide_source: true,
+            form_node_id: None,
         }
     }
 
     pub fn object_on_path_panel_context(&self) -> Option<(Vec<NodeId>, NodeId)> {
+        if self.selection.len() == 1 {
+            if let Some(eff) =
+                path_effect_by_form_node(&self.project.document.path_effects, self.selection[0])
+            {
+                return Some((vec![eff.source_id], eff.path_id));
+            }
+        }
         if let Some(ctx) = self.selection_path_and_objects() {
             return Some(ctx);
         }
@@ -4760,8 +6277,29 @@ fn run_video_decode_thread(
     }
 
     fn node_has_tiling_or_circular(&self, id: NodeId) -> bool {
-        self.project.document.tiling_effects.values().any(|e| e.source_id == id) ||
-        self.project.document.circular_effects.values().any(|e| e.source_id == id)
+        self.project.document.tiling_effects.values().any(|e| e.source_id == id)
+            || self
+                .project
+                .document
+                .circular_effects
+                .values()
+                .any(|e| e.source_id == id)
+    }
+
+    fn node_uses_extended_bounds(&self, id: NodeId) -> bool {
+        node_uses_extended_pick_bounds(&self.project.document, id)
+    }
+
+    fn expand_drag_ids_for_path_effects(&self, ids: &[NodeId]) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = Vec::new();
+        for &id in ids {
+            for bid in path_effect_move_bundle(&self.project.document, id) {
+                if !out.contains(&bid) {
+                    out.push(bid);
+                }
+            }
+        }
+        out
     }
 
     /// Commit object-on-path for the current path + object selection.
@@ -4769,17 +6307,31 @@ fn run_video_decode_thread(
         let Some((objects, path_id)) = self.selection_path_and_objects() else {
             return;
         };
+        let path_data = self.project.nodes.get(path_id).and_then(|n| match &n.kind {
+            NodeKind::Path { path } => Some(path.clone()),
+            _ => None,
+        });
+        let Some(path_data) = path_data else {
+            return;
+        };
+        let tol = 0.5 / self.viewport.zoom as f64;
         let before_doc = snapshot_document(&self.project.document);
         let mut after_doc = before_doc.clone();
-        let mut created: Vec<(NodeId, uuid::Uuid)> = Vec::new();
+        let mut created: Vec<(NodeId, uuid::Uuid, Option<Node>)> = Vec::new();
         for source_id in &objects {
             if has_effect_for_objects(&after_doc.path_effects, &[*source_id], path_id) {
                 continue;
             }
             let effect_id = uuid::Uuid::new_v4();
-            let effect = self.build_on_path_effect(effect_id, *source_id, path_id);
+            let mut effect = self.build_on_path_effect(effect_id, *source_id, path_id);
+            let form_node = self.project.nodes.get(*source_id).and_then(|source| {
+                build_path_effect_form_node(source, &effect, &path_data, tol)
+            });
+            if let Some(ref form) = form_node {
+                effect.form_node_id = Some(form.id);
+            }
             after_doc.path_effects.insert(effect_id, effect);
-            created.push((*source_id, effect_id));
+            created.push((*source_id, effect_id, form_node));
         }
         if created.is_empty() {
             return;
@@ -4791,7 +6343,14 @@ fn run_video_decode_thread(
                 after: after_doc,
             },
         );
-        for (source_id, effect_id) in created {
+        let mut form_selection: Vec<NodeId> = Vec::new();
+        for (source_id, effect_id, form_node) in created {
+            if let Some(form) = form_node {
+                let form_id = form.id;
+                self.history
+                    .push(&mut self.project, ProjectEdit::InsertNode { node: form });
+                form_selection.push(form_id);
+            }
             for id in [source_id, path_id] {
                 let Some(before) = self.project.nodes.get(id).cloned() else {
                     continue;
@@ -4807,22 +6366,97 @@ fn run_video_decode_thread(
                 );
             }
         }
-        self.status_message = "Object on path applied".into();
+        if form_selection.len() == 1 {
+            self.selection = form_selection;
+        }
+        self.status_message = "Object on path applied — drag the combined form to move".into();
     }
 
     /// Update parameters on effects that are already applied (live, no undo step).
+    /// Create missing pick/drag form proxies for effects saved before form nodes existed.
+    fn backfill_path_effect_forms_if_needed(&mut self, path_id: NodeId, source_ids: &[NodeId]) {
+        let path_data = self.project.nodes.get(path_id).and_then(|n| match &n.kind {
+            NodeKind::Path { path } => Some(path.clone()),
+            _ => None,
+        });
+        let Some(path_data) = path_data else {
+            return;
+        };
+        let tol = 0.5 / self.viewport.zoom as f64;
+        for &source_id in source_ids {
+            let Some(existing) =
+                find_effect_for_pair(&self.project.document.path_effects, source_id, path_id)
+            else {
+                continue;
+            };
+            if existing.form_node_id.is_some() {
+                continue;
+            }
+            let Some(source) = self.project.nodes.get(source_id).cloned() else {
+                continue;
+            };
+            let Some(form) = build_path_effect_form_node(&source, existing, &path_data, tol) else {
+                continue;
+            };
+            let form_id = form.id;
+            let effect_id = existing.id;
+            let before_doc = snapshot_document(&self.project.document);
+            let mut after_doc = before_doc.clone();
+            if let Some(e) = after_doc.path_effects.get_mut(&effect_id) {
+                e.form_node_id = Some(form_id);
+            }
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchDocument {
+                    before: before_doc,
+                    after: after_doc,
+                },
+            );
+            self.history
+                .push(&mut self.project, ProjectEdit::InsertNode { node: form });
+        }
+    }
+
     pub fn update_object_on_path_effects_live(&mut self) {
         let Some((objects, path_id)) = self.object_on_path_panel_context() else {
             return;
         };
+        self.backfill_path_effect_forms_if_needed(path_id, &objects);
+        let path_data = self.project.nodes.get(path_id).and_then(|n| match &n.kind {
+            NodeKind::Path { path } => Some(path.clone()),
+            _ => None,
+        });
+        let Some(path_data) = path_data else {
+            return;
+        };
+        let tol = 0.5 / self.viewport.zoom as f64;
         for source_id in objects {
             let Some(existing) =
                 find_effect_for_pair(&self.project.document.path_effects, source_id, path_id)
             else {
                 continue;
             };
-            let effect = self.build_on_path_effect(existing.id, source_id, path_id);
-            self.project.document.path_effects.insert(existing.id, effect);
+            let form_id = existing.form_node_id;
+            let mut effect = self.build_on_path_effect(existing.id, source_id, path_id);
+            effect.form_node_id = form_id;
+            self.project
+                .document
+                .path_effects
+                .insert(existing.id, effect.clone());
+            if let (Some(fid), Some(source)) = (
+                form_id,
+                self.project.nodes.get(source_id).cloned(),
+            ) {
+                if let Some(form) = self.project.nodes.get_mut(fid) {
+                    sync_path_effect_form_geometry(
+                        form,
+                        &source,
+                        &effect,
+                        &path_data,
+                        tol,
+                    );
+                }
+            }
         }
     }
 
@@ -4880,6 +6514,7 @@ fn run_video_decode_thread(
             return;
         };
         let effect_id = effect.id;
+        let form_id = effect.form_node_id;
         let before_doc = snapshot_document(&self.project.document);
         let mut after_doc = before_doc.clone();
         after_doc.path_effects.swap_remove(&effect_id);
@@ -4890,6 +6525,26 @@ fn run_video_decode_thread(
                 after: after_doc,
             },
         );
+        if let Some(fid) = form_id {
+            if let Some(node) = self.project.nodes.get(fid).cloned() {
+                let layer_index = self.project.document.active_layer_index;
+                let layer_nodes_before = self
+                    .project
+                    .document
+                    .active_layer()
+                    .map(|l| l.nodes.clone())
+                    .unwrap_or_default();
+                self.history.push(
+                    &mut self.project,
+                    ProjectEdit::RemoveNodes {
+                        removed: vec![(fid, node)],
+                        layer_index,
+                        layer_nodes_before,
+                    },
+                );
+                self.selection.retain(|id| *id != fid);
+            }
+        }
         for id in [source_id, path_id] {
             let Some(before) = self.project.nodes.get(id).cloned() else {
                 continue;
@@ -5701,41 +7356,8 @@ fn run_video_decode_thread(
     }
 
     pub fn color_at_doc_pos(&self, doc: (f64, f64)) -> egui::Color32 {
-        let mut hit: Option<NodeId> = None;
-        let mut bbox_only: Option<NodeId> = None;
-        for id in self.project.document.ordered_node_ids().into_iter().rev() {
-            if let Some(node) = self.project.nodes.get(id) {
-                let does_hit = if self.node_has_tiling_or_circular(id) {
-                    let eb = crate::document::get_effective_bounds(node, &self.project.document);
-                    let pt = kurbo::Point::new(doc.0, doc.1);
-                    let slop = 4.0 / self.viewport.zoom as f64;
-                    eb.inflate(slop, slop).contains(pt)
-                } else {
-                    node.hit_test_with_store(
-                        &self.project.nodes,
-                        doc.0,
-                        doc.1,
-                        4.0 / self.viewport.zoom as f64,
-                    )
-                };
-                if does_hit {
-                    let pt = kurbo::Point::new(doc.0, doc.1);
-                    let precise = if self.node_has_tiling_or_circular(id) {
-                        true
-                    } else {
-                        node.bez_path().contains(pt)
-                            || matches!(node.kind, NodeKind::Text { .. })
-                            || matches!(node.kind, NodeKind::Image { .. })
-                    };
-                    if precise {
-                        hit = Some(id);
-                        break;
-                    } else if bbox_only.is_none() && !matches!(node.kind, NodeKind::Image { .. }) {
-                        bbox_only = Some(id);
-                    }
-                }
-            }
-        }
+        let slop = 4.0 / self.viewport.zoom as f64;
+        let (mut hit, bbox_only) = self.pick_node_at_with_bbox_fallback(doc, slop);
         if hit.is_none() {
             hit = bbox_only;
         }
@@ -5816,45 +7438,12 @@ fn run_video_decode_thread(
     }
 
     pub fn tool_eyedropper(&mut self, doc: (f64, f64)) {
-        let mut hit: Option<NodeId> = None;
-        let mut bbox_only: Option<NodeId> = None;
-        for id in self.project.document.ordered_node_ids().into_iter().rev() {
-            if let Some(node) = self.project.nodes.get(id) {
-                let does_hit = if self.node_has_tiling_or_circular(id) {
-                    let eb = crate::document::get_effective_bounds(node, &self.project.document);
-                    let pt = kurbo::Point::new(doc.0, doc.1);
-                    let slop = 4.0 / self.viewport.zoom as f64;
-                    eb.inflate(slop, slop).contains(pt)
-                } else {
-                    node.hit_test_with_store(
-                        &self.project.nodes,
-                        doc.0,
-                        doc.1,
-                        4.0 / self.viewport.zoom as f64,
-                    )
-                };
-                if does_hit {
-                    let pt = kurbo::Point::new(doc.0, doc.1);
-                    let precise = if self.node_has_tiling_or_circular(id) {
-                        true
-                    } else {
-                        node.bez_path().contains(pt)
-                            || matches!(node.kind, NodeKind::Text { .. })
-                            || matches!(node.kind, NodeKind::Image { .. })
-                    };
-                    if precise {
-                        hit = Some(id);
-                        break;
-                    } else if bbox_only.is_none() && !matches!(node.kind, NodeKind::Image { .. }) {
-                        bbox_only = Some(id);
-                    }
-                }
-            }
-        }
+        let slop = 4.0 / self.viewport.zoom as f64;
+        let (mut hit, bbox_only) = self.pick_node_at_with_bbox_fallback(doc, slop);
         if hit.is_none() {
             hit = bbox_only;
         }
-        
+
         let mut picked_fill = None;
         let mut node_name = String::new();
         if let Some(id) = hit {
@@ -5935,43 +7524,7 @@ fn run_video_decode_thread(
         double_clicked: bool,
     ) {
         if double_clicked {
-            let mut hit: Option<NodeId> = None;
-            let mut bbox_only: Option<NodeId> = None;
-            for id in self.project.document.ordered_node_ids().into_iter().rev() {
-                if let Some(node) = self.project.nodes.get(id) {
-                    let does_hit = if self.node_has_tiling_or_circular(id) {
-                        let eb = crate::document::get_effective_bounds(node, &self.project.document);
-                        let pt = kurbo::Point::new(doc.0, doc.1);
-                        let slop = 4.0 / self.viewport.zoom as f64;
-                        eb.inflate(slop, slop).contains(pt)
-                    } else {
-                        node.hit_test_with_store(
-                            &self.project.nodes,
-                            doc.0,
-                            doc.1,
-                            4.0 / self.viewport.zoom as f64,
-                        )
-                    };
-                    if does_hit {
-                        let pt = kurbo::Point::new(doc.0, doc.1);
-                        let precise = if self.node_has_tiling_or_circular(id) {
-                            true
-                        } else {
-                            node.bez_path().contains(pt)
-                                || matches!(node.kind, NodeKind::Text { .. })
-                        };
-                        if precise {
-                            hit = Some(id);
-                            break;
-                        } else if bbox_only.is_none() {
-                            bbox_only = Some(id);
-                        }
-                    }
-                }
-            }
-            if hit.is_none() {
-                hit = bbox_only;
-            }
+            let hit = self.pick_node_at(doc, 4.0 / self.viewport.zoom as f64);
             if let Some(id) = hit {
                 self.tools.select.drag_mode = None;
                 self.tools.select.marquee = None;
@@ -5998,7 +7551,7 @@ fn run_video_decode_thread(
                 if let Some(id) = self.selection.first().copied() {
                     let mut layer_doc_rect = None;
                     if let Some(l) = self.project.document.layers.iter().find(|l| l.id == id) {
-                        if l.kind == crate::document::LayerKind::Video {
+                        if l.kind == crate::document::LayerKind::AV {
                             let mut dx = l.x as f64;
                             let mut dy = l.y as f64;
                             if let Some(track) = self.project.anim_timeline.nodes.get(&l.id) {
@@ -6164,7 +7717,7 @@ fn run_video_decode_thread(
             let mut hit_layer_id = None;
             let mut hit_layer_rect = None;
             for layer in self.project.document.layers.iter().rev() {
-                if layer.visible && layer.kind == crate::document::LayerKind::Video {
+                if layer.visible && layer.kind == crate::document::LayerKind::AV && layer.has_canvas_video() {
                     let mut dx = layer.x as f64;
                     let mut dy = layer.y as f64;
                     let mut rot = layer.rotation as f64;
@@ -6244,46 +7797,7 @@ fn run_video_decode_thread(
                 return;
             }
 
-            // Hit topmost first (rev order). Prefer nodes where the actual geometry contains the point
-            // (precise fill/stroke) so that a small circle inside a large object's bbox is selectable
-            // without the large bbox "stealing" via its inflated bounds.
-            let mut hit: Option<NodeId> = None;
-            let mut bbox_only: Option<NodeId> = None;
-            for id in self.project.document.ordered_node_ids().into_iter().rev() {
-                if let Some(node) = self.project.nodes.get(id) {
-                    let does_hit = if self.node_has_tiling_or_circular(id) {
-                        let eb = crate::document::get_effective_bounds(node, &self.project.document);
-                        let pt = kurbo::Point::new(doc.0, doc.1);
-                        let slop = 4.0 / self.viewport.zoom as f64;
-                        eb.inflate(slop, slop).contains(pt)
-                    } else {
-                        node.hit_test_with_store(
-                            &self.project.nodes,
-                            doc.0,
-                            doc.1,
-                            4.0 / self.viewport.zoom as f64,
-                        )
-                    };
-                    if does_hit {
-                        let pt = kurbo::Point::new(doc.0, doc.1);
-                        let precise = if self.node_has_tiling_or_circular(id) {
-                            true
-                        } else {
-                            node.bez_path().contains(pt)
-                                || matches!(node.kind, NodeKind::Text { .. })
-                        };
-                        if precise {
-                            hit = Some(id);
-                            break;
-                        } else if bbox_only.is_none() {
-                            bbox_only = Some(id);
-                        }
-                    }
-                }
-            }
-            if hit.is_none() {
-                hit = bbox_only;
-            }
+            let hit = self.pick_node_at(doc, 4.0 / self.viewport.zoom as f64);
             if let Some(edit_id) = self.on_page_text_edit {
                 let keep_editing = hit == Some(edit_id);
                 if !keep_editing {
@@ -6308,21 +7822,26 @@ fn run_video_decode_thread(
                 if !self.selection.is_empty() {
                     self.tools.select.drag_mode = Some(SelectDrag::Move);
                     self.tools.select.drag_start_doc = Some(doc);
-                    let mut nodes_to_snapshot = Vec::new();
-                    for &sid in &self.selection {
-                        if let Some(node) = self.project.nodes.get(sid) {
-                            if let NodeKind::Group { children } = &node.kind {
-                                for &cid in children {
-                                    if let Some(child) = self.project.nodes.get(cid) {
-                                        nodes_to_snapshot.push((cid, child.clone()));
+                    let selection = self.selection.clone();
+                    self.setup_bulk_drag_if_needed(&selection);
+                    if self.tools.select.bulk_drag.is_none() {
+                        let mut nodes_to_snapshot = Vec::new();
+                        let drag_ids = self.expand_drag_ids_for_path_effects(&selection);
+                        for &sid in &drag_ids {
+                            if let Some(node) = self.project.nodes.get(sid) {
+                                if let NodeKind::Group { children } = &node.kind {
+                                    for &cid in children {
+                                        if let Some(child) = self.project.nodes.get(cid) {
+                                            nodes_to_snapshot.push((cid, child.clone()));
+                                        }
                                     }
+                                } else {
+                                    nodes_to_snapshot.push((sid, node.clone()));
                                 }
-                            } else {
-                                nodes_to_snapshot.push((sid, node.clone()));
                             }
                         }
+                        self.tools.select.drag_snapshot = nodes_to_snapshot;
                     }
-                    self.tools.select.drag_snapshot = nodes_to_snapshot;
                 }
             } else {
                 self.tools.select.drag_mode = None;
@@ -6344,22 +7863,29 @@ fn run_video_decode_thread(
                         let drag_start = self.tools.select.drag_start_doc.unwrap_or(self.tools.select.last_doc);
                         let total_dx = doc.0 - drag_start.0;
                         let total_dy = doc.1 - drag_start.1;
-                        let selection_ids = self.selection.clone();
-                        let (snapped_dx, snapped_dy) = self.apply_snapping((total_dx, total_dy), &selection_ids);
-                        
-                        // Move Video Layers in selection
-                        for &sid in &selection_ids {
-                            if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == sid) {
-                                let layer = &mut self.project.document.layers[pos];
-                                layer.x = (self.tools.select.resize_anchor.x0 + snapped_dx) as f32;
-                                layer.y = (self.tools.select.resize_anchor.y0 + snapped_dy) as f32;
+                        let screen_dist = (total_dx.hypot(total_dy) * self.viewport.zoom as f64).abs();
+
+                        if screen_dist > 4.0 {
+                            let selection_ids = self.selection.clone();
+                            let (snapped_dx, snapped_dy) = self.apply_snapping((total_dx, total_dy), &selection_ids);
+
+                            for &sid in &selection_ids {
+                                if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == sid) {
+                                    let layer = &mut self.project.document.layers[pos];
+                                    layer.x = (self.tools.select.resize_anchor.x0 + snapped_dx) as f32;
+                                    layer.y = (self.tools.select.resize_anchor.y0 + snapped_dy) as f32;
+                                }
                             }
-                        }
-                        
-                        for &(id, ref orig_node) in &self.tools.select.drag_snapshot {
-                            if let Some(node) = self.project.nodes.get_mut(id) {
-                                *node = orig_node.clone();
-                                node.translate(snapped_dx, snapped_dy);
+
+                            if self.tools.select.bulk_drag.is_some() {
+                                self.apply_bulk_move_preview(snapped_dx, snapped_dy);
+                            } else {
+                                for &(id, ref orig_node) in &self.tools.select.drag_snapshot {
+                                    if let Some(node) = self.project.nodes.get_mut(id) {
+                                        *node = orig_node.clone();
+                                        node.translate(snapped_dx, snapped_dy);
+                                    }
+                                }
                             }
                         }
                         self.tools.select.last_doc = doc;
@@ -6439,26 +7965,31 @@ fn run_video_decode_thread(
             if let Some(m) = self.tools.select.marquee.take() {
                 if tools::marquee_is_drag(m.origin_doc, m.current_doc) {
                     let rect = tools::marquee_rect(m.origin_doc, m.current_doc);
-                    let picked: Vec<NodeId> = self
-                        .project
-                        .document
-                        .ordered_node_ids()
-                        .into_iter()
-                        .filter(|id| {
-                            self.project
-                                .nodes
-                                .get(*id)
-                                .is_some_and(|n| {
-                                    if self.node_has_tiling_or_circular(*id) {
-                                        let eb = crate::document::get_effective_bounds(n, &self.project.document);
+                    let hidden = self.hidden_canvas_sources();
+                    let picked: Vec<NodeId> = if self.spatial_index.is_enabled() {
+                        self.spatial_index.nodes_in_marquee(&self.project, &hidden, rect)
+                    } else {
+                        self.project
+                            .document
+                            .ordered_node_ids()
+                            .into_iter()
+                            .filter(|id| {
+                                self.project.nodes.get(*id).is_some_and(|n| {
+                                    if self.node_uses_extended_bounds(*id) {
+                                        let eb = crate::document::get_effective_bounds(
+                                            n,
+                                            &self.project.document,
+                                            &self.project.nodes,
+                                        );
                                         let overlap = eb.intersect(rect);
                                         overlap.width() > 0.0 && overlap.height() > 0.0
                                     } else {
                                         tools::node_bounds_intersects_marquee(n, rect)
                                     }
                                 })
-                        })
-                        .collect();
+                            })
+                            .collect()
+                    };
                     if m.shift {
                         for id in picked {
                             if !self.selection.contains(&id) {
@@ -6472,27 +8003,40 @@ fn run_video_decode_thread(
                     self.selection.clear();
                     self.tools.select.select_rotation_mode = false;
                 }
-                self.sync_inspector_from_selection();
+                self.sync_inspector_if_needed();
             } else if let Some(mode) = self.tools.select.drag_mode.take() {
                 if !matches!(mode, SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_)) {
                     if matches!(mode, SelectDrag::Move) {
                         let drag_start = self.tools.select.drag_start_doc.unwrap_or(self.tools.select.last_doc);
-                        let doc_dist = (doc.0 - drag_start.0).hypot(doc.1 - drag_start.1);
+                        let total_dx = doc.0 - drag_start.0;
+                        let total_dy = doc.1 - drag_start.1;
+                        let doc_dist = total_dx.hypot(total_dy);
                         let screen_dist = doc_dist * self.viewport.zoom as f64;
                         if screen_dist < 2.0 {
-                            // Revert all moved nodes to their pre-drag states
-                            for &(id, ref orig_node) in &self.tools.select.drag_snapshot {
-                                if let Some(node) = self.project.nodes.get_mut(id) {
-                                    *node = orig_node.clone();
+                            if self.tools.select.bulk_drag.is_some() {
+                                self.revert_bulk_move_preview();
+                                self.tools.select.bulk_drag = None;
+                            } else {
+                                for &(id, ref orig_node) in &self.tools.select.drag_snapshot {
+                                    if let Some(node) = self.project.nodes.get_mut(id) {
+                                        *node = orig_node.clone();
+                                    }
                                 }
                             }
-                            // Toggle rotation mode only if it was already selected and it's a single selection
                             if self.selection.len() == 1 && self.tools.select.clicked_already_selected {
                                 self.tools.select.select_rotation_mode = !self.tools.select.select_rotation_mode;
                             }
+                        } else if self.tools.select.bulk_drag.is_some() {
+                            let selection_ids = self.selection.clone();
+                            let (snapped_dx, snapped_dy) =
+                                self.apply_snapping((total_dx, total_dy), &selection_ids);
+                            self.revert_bulk_move_preview();
+                            self.commit_bulk_drag(snapped_dx, snapped_dy);
                         }
                     }
-                    self.commit_drag_edits();
+                    if self.tools.select.bulk_drag.is_none() {
+                        self.commit_drag_edits();
+                    }
                 } else {
                     self.tools.select.drag_snapshot.clear();
                 }
@@ -6510,6 +8054,11 @@ fn run_video_decode_thread(
         pts.push((b.x1, b.y0));
         pts.push((b.x0, b.y1));
         pts.push((b.x1, b.y1));
+        // bbox midsides for center/corner/middle-line magnetic snap on all objects
+        pts.push((cx, b.y0));
+        pts.push((cx, b.y1));
+        pts.push((b.x0, cy));
+        pts.push((b.x1, cy));
         
         match &node.kind {
             NodeKind::Polygon { cx, cy, r, sides, rotation_rad } => {
@@ -6538,6 +8087,7 @@ fn run_video_decode_thread(
                 pts.push((*cx, *cy));
             }
             NodeKind::Path { path } => {
+                // detailed path points + bbox mids/corners/center already added above
                 for p in &path.points {
                     pts.push((p[0], p[1]));
                 }
@@ -6545,6 +8095,17 @@ fn run_video_decode_thread(
             _ => {}
         }
         pts
+    }
+
+    pub fn get_canvas_snap_points(&self) -> Vec<(f64, f64)> {
+        let w = self.project.document.width.max(1.0);
+        let h = self.project.document.height.max(1.0);
+        vec![
+            (0.0, 0.0), (w, 0.0), (0.0, h), (w, h), // corners
+            (w * 0.5, 0.0), (w * 0.5, h), // top/bottom mid
+            (0.0, h * 0.5), (w, h * 0.5), // left/right mid
+            (w * 0.5, h * 0.5), // center
+        ]
     }
 
     pub fn try_equal_spacing_snap(
@@ -6658,6 +8219,7 @@ fn run_video_decode_thread(
         let threshold = (8.0 / self.viewport.zoom as f64).max(0.1);
 
         let mut target_pts = Vec::new();
+        target_pts.extend(self.get_canvas_snap_points());
         for (_, node) in &self.project.nodes.map {
             target_pts.extend(self.get_node_snap_points(node));
         }
@@ -6723,7 +8285,7 @@ fn run_video_decode_thread(
         let mut video_selection = Vec::new();
         for &id in selection {
             if let Some(l) = self.project.document.layers.iter().find(|l| l.id == id) {
-                if l.kind == crate::document::LayerKind::Video {
+                if l.kind == crate::document::LayerKind::AV {
                     video_selection.push(l.id);
                 }
             }
@@ -6739,6 +8301,7 @@ fn run_video_decode_thread(
         // 1. Identify target nodes/layers and their snap points
         let mut target_pts = Vec::new();
         let mut target_circles = Vec::new();
+        target_pts.extend(self.get_canvas_snap_points());
         for (id, node) in &self.project.nodes.map {
             if selection.contains(id) {
                 continue;
@@ -6757,7 +8320,7 @@ fn run_video_decode_thread(
             if selection.contains(&layer.id) {
                 continue;
             }
-            if layer.visible && layer.kind == crate::document::LayerKind::Video {
+            if layer.visible && layer.kind == crate::document::LayerKind::AV {
                 let mut dx = layer.x as f64;
                 let mut dy = layer.y as f64;
                 if let Some(track) = self.project.anim_timeline.nodes.get(&layer.id) {
@@ -7590,6 +9153,9 @@ fn run_video_decode_thread(
                     width: 0.0,
                     line_join: crate::document::LineJoin::Miter,
                     line_cap: crate::document::LineCap::Butt,
+                    start_marker: crate::document::PathMarker::default(),
+                    mid_marker: crate::document::PathMarker::default(),
+                    end_marker: crate::document::PathMarker::default(),
                 };
                 self.insert_node(node);
             }
@@ -7603,7 +9169,7 @@ fn run_video_decode_thread(
         origin: Pos2,
         doc: (f64, f64),
     ) -> Option<(NodeId, usize, usize, f64, f64)> {
-        let threshold_doc = 16.0 / self.viewport.zoom as f64;
+        let threshold_doc = 6.0 / self.viewport.zoom as f64; // tighter to avoid selecting when mouse shifted a bit left or far
         let ids: Vec<NodeId> = if self.selection.is_empty() {
             self.project.document.ordered_node_ids()
         } else {
@@ -7628,7 +9194,7 @@ fn run_video_decode_thread(
                 best = Some((id, from, to, px, py, d));
             }
         }
-        let screen_thresh = 16.0;
+        let screen_thresh = 6.0;
         best.filter(|(.., d)| *d <= screen_thresh)
             .map(|(id, from, to, px, py, _)| (id, from, to, px, py))
     }
@@ -7638,8 +9204,8 @@ fn run_video_decode_thread(
         screen: Pos2,
         origin: Pos2,
     ) -> Option<(NodeId, PathEditTarget)> {
-        let anchor_threshold = 14.0;
-        let handle_threshold = 16.0;
+        let anchor_threshold = 7.0; // tighter selection to prevent picking left/nearby objects when mouse shifted
+        let handle_threshold = 9.0;
         let mut best: Option<(NodeId, PathEditTarget, f32)> = None;
         let ids: Vec<NodeId> = if self.selection.is_empty() {
             self.project.document.ordered_node_ids()
@@ -7656,13 +9222,14 @@ fn run_video_decode_thread(
                     PathEditTarget::HandleOut(_) | PathEditTarget::HandleIn(_) => {
                         handle_threshold
                     }
+                    PathEditTarget::MidCtrl1(_) | PathEditTarget::MidCtrl2(_) => 15.0, // easier to hit the yellow tangent points; zoom-robust screen px
                 };
                 let ps = self.viewport.doc_to_screen(p, origin);
                 let d = screen.distance(ps);
                 if d < threshold {
                     let prefer = matches!(
                         target,
-                        PathEditTarget::HandleOut(_) | PathEditTarget::HandleIn(_)
+                        PathEditTarget::HandleOut(_) | PathEditTarget::HandleIn(_) | PathEditTarget::MidCtrl1(_) | PathEditTarget::MidCtrl2(_)
                     );
                     let replace = best.as_ref().map_or(true, |(_, bt, bd)| {
                         if prefer && !matches!(bt, PathEditTarget::Anchor(_)) {
@@ -7837,40 +9404,8 @@ fn run_video_decode_thread(
                 return;
             }
 
-            let mut hit: Option<NodeId> = None;
-            let mut bbox_only: Option<NodeId> = None;
-            for id in self.project.document.ordered_node_ids().into_iter().rev() {
-                if let Some(node) = self.project.nodes.get(id) {
-                    let does_hit = if self.node_has_tiling_or_circular(id) {
-                        let eb = crate::document::get_effective_bounds(node, &self.project.document);
-                        let pt = kurbo::Point::new(doc.0, doc.1);
-                        let slop = 16.0 / self.viewport.zoom as f64;
-                        eb.inflate(slop, slop).contains(pt)
-                    } else {
-                        node.hit_test_with_store(
-                            &self.project.nodes,
-                            doc.0,
-                            doc.1,
-                            16.0 / self.viewport.zoom as f64,
-                        )
-                    };
-                    if does_hit {
-                        let pt = kurbo::Point::new(doc.0, doc.1);
-                        let precise = if self.node_has_tiling_or_circular(id) {
-                            true
-                        } else {
-                            node.bez_path().contains(pt)
-                                || matches!(node.kind, NodeKind::Text { .. })
-                        };
-                        if precise {
-                            hit = Some(id);
-                            break;
-                        } else if bbox_only.is_none() {
-                            bbox_only = Some(id);
-                        }
-                    }
-                }
-            }
+            let slop = 16.0 / self.viewport.zoom as f64;
+            let (mut hit, bbox_only) = self.pick_node_at_with_bbox_fallback(doc, slop);
             if hit.is_none() {
                 hit = bbox_only;
             }
@@ -7907,10 +9442,11 @@ fn run_video_decode_thread(
         if down {
             if let Some(marquee) = self.tools.select.marquee.as_mut() {
                 marquee.current_doc = doc;
-            } else if let (Some((id, _)), Some(target)) = (
-                self.tools.select.drag_snapshot.first(),
+            } else if let (Some(drag_first), Some(target)) = (
+                self.tools.select.drag_snapshot.first().cloned(),
                 self.tools.select.node_edit_target,
             ) {
+                let (id, _) = drag_first;
                 let threshold = 3.0 / self.viewport.zoom as f64;
                 if let Some(origin) = self.tools.select.node_drag_origin {
                     if !self.tools.select.node_drag_active {
@@ -7922,21 +9458,1343 @@ fn run_video_decode_thread(
                     }
                 }
                 if self.tools.select.node_drag_active {
-                    let indices = self.tools.select.points_on_path(*id);
+                    let mut use_doc = doc;
+                    // Apply grid snap for bezier handle / anchor interaction.
+                    // Skip snap for yellow fillet points (MidCtrl) to allow precise radius adjust, esp. when zoomed in.
+                    let is_yellow = matches!(target, PathEditTarget::MidCtrl1(_) | PathEditTarget::MidCtrl2(_));
+                    if self.viewport.snap_grid && !is_yellow {
+                        let g = self.viewport.grid_step as f64;
+                        if g > 0.0 {
+                            use_doc = (
+                                (doc.0 / g).round() * g,
+                                (doc.1 / g).round() * g,
+                            );
+                        }
+                    }
+                    // Extend magnetic (object/canvas) snap to edit mode (esp. path anchors/handles)
+                    if self.snap_magnet && !is_yellow {
+                        if matches!(target, PathEditTarget::Anchor(_) | PathEditTarget::HandleIn(_) | PathEditTarget::HandleOut(_)) {
+                            use_doc = self.snap_cursor(use_doc);
+                        }
+                    }
+                    let indices = self.tools.select.points_on_path(id);
                     if matches!(target, PathEditTarget::Anchor(_)) && indices.len() > 1 {
-                        let dx = doc.0 - self.tools.select.last_doc.0;
-                        let dy = doc.1 - self.tools.select.last_doc.1;
-                        self.tools.select.last_doc = doc;
-                        if let Some(node) = self.project.nodes.get_mut(*id) {
+                        let dx = use_doc.0 - self.tools.select.last_doc.0;
+                        let dy = use_doc.1 - self.tools.select.last_doc.1;
+                        self.tools.select.last_doc = use_doc;
+                        if let Some(node) = self.project.nodes.get_mut(id) {
                             if let NodeKind::Path { path } = &mut node.kind {
                                 path.move_anchors_by(&indices, dx, dy);
                             }
                         }
-                    } else if let Some(node) = self.project.nodes.get_mut(*id) {
-                        node.apply_path_edit_target(target, doc.0, doc.1);
-                        self.tools.select.last_doc = doc;
+                    } else if let Some(node) = self.project.nodes.get_mut(id) {
+                        node.apply_path_edit_target(target, use_doc.0, use_doc.1);
+                        // Equidistance for yellows (T1/T2) is now always enforced mathematically via R + D = R / tan(θ/2) in apply + fillet_tangent_d.
+                        // If holding CTRL we can skip grid snap (handled above for mids) for fine control.
+                        self.tools.select.last_doc = use_doc;
                     }
                 }
+            }
+        }
+    }
+
+    fn mcp_kind_label(kind: &crate::document::NodeKind) -> &'static str {
+        match kind {
+            crate::document::NodeKind::Rect { .. } => "rect",
+            crate::document::NodeKind::Ellipse { .. } => "ellipse",
+            crate::document::NodeKind::Polygon { .. } => "polygon",
+            crate::document::NodeKind::Path { .. } => "path",
+            crate::document::NodeKind::Text { .. } => "text",
+            crate::document::NodeKind::Group { .. } => "group",
+            crate::document::NodeKind::Image { .. } => "image",
+            crate::document::NodeKind::Arc { .. } => "arc",
+            crate::document::NodeKind::BrushStroke { .. } => "brush",
+        }
+    }
+
+
+    fn mcp_paint_hex(node: &crate::document::Node) -> Option<String> {
+        use crate::document::Fill;
+        if let Fill::Solid(p) = node.style.fill {
+            let r = (p.rgba[0] * 255.0).round() as u32;
+            let g = (p.rgba[1] * 255.0).round() as u32;
+            let b = (p.rgba[2] * 255.0).round() as u32;
+            return Some(format!("#{:02X}{:02X}{:02X}", r, g, b));
+        }
+        None
+    }
+
+    fn mcp_list_all_objects_json(&self) -> Result<String, String> {
+        let mut items = Vec::new();
+        for (layer_idx, layer) in self.project.document.layers.iter().enumerate() {
+            if !layer.visible || !layer.is_renderer || layer.kind != crate::document::LayerKind::Image {
+                continue;
+            }
+            let layer_editable = !layer.locked;
+            for id in &layer.nodes {
+                let Some(node) = self.project.nodes.get(*id) else { continue };
+                let b = node.bounds();
+                items.push(serde_json::json!({
+                    "id": id.to_string(),
+                    "layer_index": layer_idx,
+                    "layer_name": layer.name,
+                    "name": node.name,
+                    "kind": Self::mcp_kind_label(&node.kind),
+                    "editable": layer_editable,
+                    "bounds": { "x": b.x0, "y": b.y0, "w": b.width(), "h": b.height() },
+                    "transform": {
+                        "translate_x": node.transform.translation[0],
+                        "translate_y": node.transform.translation[1],
+                        "scale_x": node.transform.scale[0],
+                        "scale_y": node.transform.scale[1],
+                        "rotation_deg": node.transform.rotation_rad.to_degrees(),
+                    },
+                    "opacity": node.style.opacity,
+                    "fill_color": Self::mcp_paint_hex(node),
+                    "stroke_width": node.style.stroke.width,
+                }));
+            }
+        }
+        serde_json::to_string_pretty(&items).map_err(|e| e.to_string())
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn mcp_capture_canvas_raster(
+        &mut self,
+        resolution_percent: f32,
+        x: Option<f64>,
+        y: Option<f64>,
+        w: Option<f64>,
+        h: Option<f64>,
+        save_path: Option<String>,
+    ) -> Result<crate::mcp::McpHostResponse, String> {
+        use base64::Engine;
+        let view = io::resolve_capture_view(&self.project, x, y, w, h);
+        let pct = resolution_percent.clamp(1.0, 100.0);
+        let (pw, ph, rgba) = io::rasterize_document_view(
+            &self.project,
+            view,
+            pct,
+            self.anim_current_frame,
+            &std::collections::HashMap::new(),
+        )
+        .ok_or("Rasterize failed (empty region or SVG error)")?;
+        if let Some(path) = save_path {
+            let p = std::path::PathBuf::from(path);
+            io::write_image_file(&p, io::ExportImageFormat::Png, pw, ph, &rgba)
+                .map_err(|e| e.to_string())?;
+        }
+        let png = image::RgbaImage::from_raw(pw, ph, rgba.clone())
+            .ok_or("Invalid RGBA buffer")?;
+        let mut buf = Vec::new();
+        png.write_to(
+            &mut std::io::Cursor::new(&mut buf),
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| e.to_string())?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        self.mcp_preview.rgba = rgba;
+        self.mcp_preview.width = pw;
+        self.mcp_preview.height = ph;
+        self.mcp_preview.bounds = [view.x0, view.y0, view.width(), view.height()];
+        self.mcp_preview.resolution_percent = pct;
+        self.mcp_preview.texture = None;
+        self.mcp_preview.updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let meta = serde_json::json!({
+            "pixel_width": pw,
+            "pixel_height": ph,
+            "resolution_percent": pct,
+            "bounds": {
+                "x": view.x0,
+                "y": view.y0,
+                "w": view.width(),
+                "h": view.height(),
+            },
+            "document_size": {
+                "w": self.project.document.width,
+                "h": self.project.document.height,
+            },
+            "objects_remain_editable": true,
+            "hint": "Use list_all_objects + get_object/update_object/set_object_* to edit vectors after preview."
+        });
+        Ok(crate::mcp::McpHostResponse::RasterPreview {
+            meta_json: serde_json::to_string_pretty(&meta).unwrap_or_default(),
+            png_base64: b64,
+        })
+    }
+
+    fn mcp_list_objects_json(&self) -> Result<String, String> {
+        let layer = self
+            .project
+            .document
+            .active_layer()
+            .ok_or("No active layer")?;
+        let layer_editable = !layer.locked && layer.visible;
+        let mut items = Vec::new();
+        for id in &layer.nodes {
+            let Some(node) = self.project.nodes.get(*id) else {
+                continue;
+            };
+            let b = node.bounds();
+            items.push(serde_json::json!({
+                "id": id.to_string(),
+                "name": node.name,
+                "kind": Self::mcp_kind_label(&node.kind),
+                "editable": layer_editable,
+                "fill_color": Self::mcp_paint_hex(node),
+                "bounds": {
+                    "x": b.x0,
+                    "y": b.y0,
+                    "w": b.width(),
+                    "h": b.height(),
+                }
+            }));
+        }
+        serde_json::to_string_pretty(&items).map_err(|e| e.to_string())
+    }
+
+    fn mcp_get_object_json(&self, id_str: &str) -> Result<String, String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        let node = self
+            .project
+            .nodes
+            .get(id)
+            .ok_or_else(|| format!("Object not found: {id_str}"))?
+            .clone();
+        let mut value = serde_json::to_value(&node).map_err(|e| e.to_string())?;
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(kind) = obj.get_mut("kind") {
+                if let Some(img) = kind.get_mut("Image") {
+                    if let Some(bytes) = img.get_mut("bytes") {
+                        if let Some(n) = bytes.as_array().map(|a| a.len()) {
+                            *bytes = serde_json::json!(format!("<{n} bytes omitted>"));
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+    }
+
+
+    fn mcp_ensure_editable(&self) -> Result<(), String> {
+        if !self.layer_editable() {
+            return Err("Active layer is locked or hidden".into());
+        }
+        Ok(())
+    }
+
+    fn mcp_finish_node(&mut self, mut node: crate::document::Node, style: &crate::mcp::drawing::McpShapeStyle) {
+        if let Some(n) = style.name.clone() {
+            node.name = n;
+        }
+        // Always apply stroke settings so users can remove stroke by passing stroke_width:0 (and optionally stroke_alpha:0)
+        // even without specifying a stroke_color. Text and rects will get clean solid fill only when requested.
+        node.style.stroke = crate::mcp::drawing::stroke_from_style(style);
+        let id = node.id;
+        self.insert_node(node);
+        let _ = id;
+    }
+
+    fn mcp_drawing_tool(&mut self, name: &str, args: serde_json::Value) -> Result<String, String> {
+        use crate::document::{ArcJoin, Fill, Node, NodeKind, TextStyle};
+        use crate::mcp::drawing::{fill_from_style, parse_arc_join, style_from_args, stroke_from_style};
+        if !matches!(name, "add_layer" | "add_shading_layer") {
+            self.mcp_ensure_editable()?;
+        }
+        let style = style_from_args(&args);
+        match name {
+            "create_rectangle" => {
+                let x = args.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = args.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let w = args.get("w").and_then(|v| v.as_f64()).unwrap_or(100.0);
+                let h = args.get("h").and_then(|v| v.as_f64()).unwrap_or(80.0);
+                let rx = args.get("rx").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+                let mut node = Node::rect(x, y, w.max(1.0), h.max(1.0), fill_from_style(&style));
+                if let NodeKind::Rect { rx: ref mut r, .. } = node.kind {
+                    *r = rx;
+                }
+                let id = node.id;
+                self.mcp_finish_node(node, &style);
+                Ok(format!("Created rectangle {id}"))
+            }
+            "create_image" => {
+                use crate::mcp::drawing::{image_pixel_size, load_image_bytes_from_args};
+                let bytes = load_image_bytes_from_args(&args)?;
+                let (pw, ph) = image_pixel_size(&bytes)?;
+                let scale = args
+                    .get("scale")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0)
+                    .max(0.01);
+                let default_w = pw as f64 * scale;
+                let default_h = ph as f64 * scale;
+                let x = args.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = args.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let w = args
+                    .get("width")
+                    .or_else(|| args.get("w"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(default_w)
+                    .max(1.0);
+                let h = args
+                    .get("height")
+                    .or_else(|| args.get("h"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(default_h)
+                    .max(1.0);
+                let mut node = Node::image(x, y, w, h, bytes);
+                if let Some(n) = style.name.clone() {
+                    node.name = n;
+                } else if let Some(n) = args.get("name").and_then(|v| v.as_str()) {
+                    node.name = n.to_string();
+                }
+                let id = node.id;
+                self.insert_node(node);
+                Ok(format!(
+                    "Created image {id} ({pw}x{ph}px → display {w:.0}x{h:.0})"
+                ))
+            }
+            "create_rectangles" => {
+                let rects = args.get("rects").and_then(|v| v.as_array()).ok_or("rects array required")?;
+                let mut batch: Vec<crate::document::Node> = Vec::with_capacity(rects.len());
+                for r in rects {
+                    let x = r.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let y = r.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let w = r.get("w").and_then(|v| v.as_f64()).unwrap_or(4.0).max(1.0);
+                    let h = r.get("h").and_then(|v| v.as_f64()).unwrap_or(4.0).max(1.0);
+                    let local_style = crate::mcp::drawing::style_from_args(r);
+                    let mut node = Node::rect(x, y, w, h, fill_from_style(&local_style));
+                    if local_style.stroke_rgb.is_some() {
+                        node.style.stroke = stroke_from_style(&local_style);
+                    }
+                    batch.push(node);
+                }
+                let n = batch.len();
+                if n > 0 {
+                    // Queue for incremental processing to avoid blocking main thread long enough
+                    // to trigger epaint RwLock deadlock (10s timeout) or starve audio/collab.
+                    // Large pixel-art batches (e.g. blackhole/galaxy) are spread over frames.
+                    self.pending_mcp_bulk_rects.push(batch);
+                }
+                Ok(format!("Created {} rectangles (queued for smooth creation)", n))
+            }
+            "create_circle" => {
+                let cx = args.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let cy = args.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let r = args.get("r").and_then(|v| v.as_f64()).unwrap_or(50.0).max(0.5);
+                let mut node = Node::ellipse(cx, cy, r, r, fill_from_style(&style));
+                node.name = "Circle".into();
+                let id = node.id;
+                self.mcp_finish_node(node, &style);
+                Ok(format!("Created circle {id}"))
+            }
+            "create_ellipse" => {
+                let cx = args.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let cy = args.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let rx = args.get("rx").and_then(|v| v.as_f64()).unwrap_or(60.0).max(0.5);
+                let ry = args.get("ry").and_then(|v| v.as_f64()).unwrap_or(40.0).max(0.5);
+                let node = Node::ellipse(cx, cy, rx, ry, fill_from_style(&style));
+                let id = node.id;
+                self.mcp_finish_node(node, &style);
+                Ok(format!("Created ellipse {id}"))
+            }
+            "create_line" => {
+                let x0 = args.get("x0").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y0 = args.get("y0").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let x1 = args.get("x1").and_then(|v| v.as_f64()).unwrap_or(100.0);
+                let y1 = args.get("y1").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let mut node = Node::line(x0, y0, x1, y1, stroke_from_style(&style));
+                let id = node.id;
+                self.mcp_finish_node(node, &style);
+                Ok(format!("Created line {id}"))
+            }
+            "create_polygon" => {
+                let cx = args.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let cy = args.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let r = args.get("r").and_then(|v| v.as_f64()).unwrap_or(50.0).max(0.5);
+                let sides = args.get("sides").and_then(|v| v.as_u64()).unwrap_or(6) as u32;
+                let rot = args
+                    .get("rotation_deg")
+                    .and_then(|v| v.as_f64())
+                    .map(|d| d.to_radians())
+                    .unwrap_or(0.0);
+                let mut node = Node::polygon(cx, cy, r, sides.max(3), fill_from_style(&style));
+                if let NodeKind::Polygon { rotation_rad, .. } = &mut node.kind {
+                    *rotation_rad = rot;
+                }
+                let id = node.id;
+                self.mcp_finish_node(node, &style);
+                Ok(format!("Created polygon {id}"))
+            }
+            "create_arc" => {
+                let cx = args.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let cy = args.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let radius = args.get("radius").and_then(|v| v.as_f64()).unwrap_or(50.0).max(0.5);
+                let start = args
+                    .get("start_angle_deg")
+                    .and_then(|v| v.as_f64())
+                    .map(|d| d.to_radians())
+                    .unwrap_or(0.0);
+                let sweep = args
+                    .get("sweep_angle_deg")
+                    .and_then(|v| v.as_f64())
+                    .map(|d| d.to_radians())
+                    .unwrap_or(90.0_f64.to_radians());
+                let join = parse_arc_join(args.get("join").unwrap_or(&serde_json::Value::Null));
+                let node = Node::arc(cx, cy, radius, start, sweep, join, fill_from_style(&style));
+                let id = node.id;
+                self.mcp_finish_node(node, &style);
+                Ok(format!("Created arc {id}"))
+            }
+            "create_text" => {
+                let x = args.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = args.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let content = args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Text")
+                    .to_string();
+                let font_size = args
+                    .get("font_size")
+                    .and_then(|v| v.as_f64())
+                    .map(|s| s.max(1.0) as f32)
+                    .unwrap_or(24.0);
+                let mut text_style = TextStyle {
+                    content,
+                    font_size,
+                    ..TextStyle::default()
+                };
+                let fill = fill_from_style(&style);
+                if let Fill::Solid(p) = fill {
+                    let _ = p;
+                }
+                let mut node = Node::text(x, y, text_style);
+                node.style.fill = fill_from_style(&style);
+                // Text should default to clean solid fill (no stroke) unless stroke params are explicitly given.
+                // This prevents "bold" look from default stroke width.
+                let has_stroke_param = args.get("stroke_width").is_some()
+                    || args.get("stroke_color").is_some()
+                    || args.get("stroke").is_some()
+                    || args.get("stroke_alpha").is_some();
+                let mut effective_style = style;
+                if !has_stroke_param {
+                    effective_style.stroke_width = 0.0;
+                }
+                let id = node.id;
+                self.mcp_finish_node(node, &effective_style);
+                Ok(format!("Created text {id}"))
+            }
+            "set_object_style" => {
+                // Support both single "id" and "ids": [...] for convenience
+                if let Some(arr) = args.get("ids").and_then(|v| v.as_array()) {
+                    self.mcp_set_objects_style_from_args(arr, &args)
+                } else {
+                    let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                    self.mcp_patch_node(id_str, &args)
+                }
+            }
+            "set_objects_style" => {
+                let arr = args.get("ids").and_then(|v| v.as_array()).ok_or("ids array required")?;
+                self.mcp_set_objects_style_from_args(arr, &args)
+            }
+            "set_object_transform" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let patch = args.clone();
+                self.mcp_patch_node(id_str, &patch)
+            }
+            "set_object_geometry" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let geom = args.get("geometry").cloned().unwrap_or(serde_json::json!({}));
+                self.mcp_patch_node(id_str, &geom)
+            }
+
+            // === Animation tools ===
+            "set_keyframe" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let property = args.get("property").and_then(|v| v.as_str()).ok_or("property required")?.to_string();
+                let frame = args.get("frame").and_then(|v| v.as_u64()).ok_or("frame required")? as usize;
+                let value = args.get("value").and_then(|v| v.as_f64()).ok_or("value required")?;
+                let interp_str = args.get("interpolation").and_then(|v| v.as_str()).unwrap_or("linear");
+                let mode = match interp_str.to_lowercase().as_str() {
+                    "bezier" | "cubic" => crate::document::InterpolationMode::Bezier,
+                    _ => crate::document::InterpolationMode::Linear,
+                };
+                self.mcp_set_keyframe(id_str, &property, frame, value, mode)
+            }
+            "remove_keyframe" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let property = args.get("property").and_then(|v| v.as_str()).ok_or("property required")?.to_string();
+                let frame = args.get("frame").and_then(|v| v.as_u64()).ok_or("frame required")? as usize;
+                self.mcp_remove_keyframe(id_str, &property, frame)
+            }
+            "get_keyframes" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let property = args.get("property").and_then(|v| v.as_str()).map(|s| s.to_string());
+                self.mcp_get_keyframes(id_str, property.as_deref())
+            }
+            "set_keyframe_interpolation" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let property = args.get("property").and_then(|v| v.as_str()).ok_or("property required")?.to_string();
+                let frame = args.get("frame").and_then(|v| v.as_u64()).ok_or("frame required")? as usize;
+                let interp_str = args.get("interpolation").and_then(|v| v.as_str());
+                let handle_left = args.get("handle_left").and_then(|v| v.as_array()).map(|a| {
+                    (a.get(0).and_then(|x| x.as_f64()).unwrap_or(-5.0),
+                     a.get(1).and_then(|y| y.as_f64()).unwrap_or(0.0))
+                });
+                let handle_right = args.get("handle_right").and_then(|v| v.as_array()).map(|a| {
+                    (a.get(0).and_then(|x| x.as_f64()).unwrap_or(5.0),
+                     a.get(1).and_then(|y| y.as_f64()).unwrap_or(0.0))
+                });
+                let handle_mode_str = args.get("handle_mode").and_then(|v| v.as_str());
+                self.mcp_set_keyframe_interpolation(id_str, &property, frame, interp_str, handle_left, handle_right, handle_mode_str)
+            }
+            "set_current_anim_frame" => {
+                let frame = args.get("frame").and_then(|v| v.as_u64()).ok_or("frame required")? as usize;
+                self.anim_current_frame = frame;
+                self.apply_animation_for_frame(frame);
+                Ok(format!("Current frame set to {}", frame))
+            }
+            "get_current_anim_frame" => {
+                Ok(format!("{}", self.anim_current_frame))
+            }
+            "set_keyframes" => {
+                let kfs = args.get("keyframes").and_then(|v| v.as_array()).ok_or("keyframes array required")?;
+                self.mcp_set_keyframes(kfs)
+            }
+            "clear_animation_track" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let property = args.get("property").and_then(|v| v.as_str()).ok_or("property required")?.to_string();
+                self.mcp_clear_animation_track(id_str, &property)
+            }
+
+            "create_path" => {
+                let svg_d = args
+                    .get("svg_d")
+                    .and_then(|v| v.as_str())
+                    .ok_or("svg_d required")?;
+                let bez = crate::mcp::path_parse::bez_from_svg_d(svg_d)?;
+                let mut node = crate::document::Node::path_from_bez(bez, "Path");
+                node.style.fill = fill_from_style(&style);
+                if style.stroke_rgb.is_some() {
+                    node.style.stroke = stroke_from_style(&style);
+                }
+                let id = node.id;
+                self.mcp_finish_node(node, &style);
+                Ok(format!("Created path {id}"))
+            }
+            "add_layer" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Layer");
+                self.add_layer(name);
+                Ok(format!("Added layer \"{name}\""))
+            }
+            "add_shading_layer" => {
+                let wgsl = args
+                    .get("wgsl")
+                    .and_then(|v| v.as_str())
+                    .ok_or("add_shading_layer requires \"wgsl\" (WGSL fragment source, compiled at runtime)")?;
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Shading");
+                let pass_name = args
+                    .get("pass_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Shader");
+                let uniforms = args.get("uniforms").and_then(|v| v.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_f64().map(|f| f as f32))
+                        .collect::<Vec<f32>>()
+                });
+                self.add_shading_layer_with_wgsl(name, pass_name, wgsl, uniforms)?;
+                Ok(format!(
+                    "Added shading layer \"{name}\" with runtime WGSL pass \"{pass_name}\""
+                ))
+            }
+            _ => Err(format!("Unknown drawing tool: {name}")),
+        }
+    }
+
+    fn mcp_patch_nodes(&mut self, patches: Vec<(uuid::Uuid, crate::document::Node, crate::document::Node)>) -> Result<String, String> {
+        if patches.is_empty() {
+            return Ok("No changes".into());
+        }
+        let count = patches.len();
+        let real: Vec<_> = patches.into_iter().filter(|(_, b, a)| b != a).collect();
+        if !real.is_empty() {
+            self.history.push(&mut self.project, crate::history::ProjectEdit::PatchNodes { patches: real });
+        }
+        Ok(format!("Updated style on {} object(s)", count))
+    }
+
+    fn mcp_set_objects_style_from_args(&mut self, id_values: &[serde_json::Value], args: &serde_json::Value) -> Result<String, String> {
+        use crate::mcp::drawing::apply_style_patch;
+        let mut patches = Vec::new();
+        for idv in id_values {
+            if let Some(id_str) = idv.as_str() {
+                if let Ok(id) = uuid::Uuid::parse_str(id_str) {
+                    if let Some(before) = self.project.nodes.get(id).cloned() {
+                        let mut after = before.clone();
+                        if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
+                            after.name = name.to_string();
+                        }
+                        let _ = apply_style_patch(&mut after.style, args);
+                        // basic transform? not for style tool
+                        if before != after {
+                            patches.push((id, before, after));
+                        }
+                    }
+                }
+            }
+        }
+        self.mcp_patch_nodes(patches)
+    }
+
+    // === Animation MCP helpers ===
+    fn mcp_set_keyframe(&mut self, id_str: &str, property: &str, frame: usize, value: f64, mode: crate::document::InterpolationMode) -> Result<String, String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        let before = self.project.anim_timeline.clone();
+        let entry = self.project.anim_timeline.nodes.entry(id).or_default();
+        if let Some(track) = entry.get_track_mut(property) {
+            if track.keyframes.is_empty() && frame != 0 {
+                // seed frame 0 if first keyframe not at 0
+                if let Some(node) = self.project.nodes.get(id) {
+                    let def = match property {
+                        "pos_x" => node.get_pos().0,
+                        "pos_y" => node.get_pos().1,
+                        "rotation" => node.get_rotation(),
+                        "opacity" => node.get_opacity() as f64,
+                        "color_r" => node.get_color()[0] as f64,
+                        "color_g" => node.get_color()[1] as f64,
+                        "color_b" => node.get_color()[2] as f64,
+                        "color_a" => node.get_color()[3] as f64,
+                        _ => 0.0,
+                    };
+                    track.insert(0, def);
+                }
+            }
+            track.insert(frame, value);
+            // set interpolation on the keyframe we just touched
+            if let Some(kf) = track.keyframes.iter_mut().find(|k| k.frame == frame) {
+                kf.interpolation = mode;
+            }
+            self.apply_animation_for_frame(self.anim_current_frame);
+            let after = self.project.anim_timeline.clone();
+            self.history.push(&mut self.project, crate::history::ProjectEdit::PatchTimeline { before, after });
+            Ok(format!("Set keyframe {}@{} = {}", property, frame, value))
+        } else {
+            Err(format!("Unknown animation property '{}'", property))
+        }
+    }
+
+    fn mcp_remove_keyframe(&mut self, id_str: &str, property: &str, frame: usize) -> Result<String, String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        self.delete_keyframe(id, property, frame);
+        Ok(format!("Removed keyframe {}@{}", property, frame))
+    }
+
+    fn mcp_get_keyframes(&mut self, id_str: &str, property: Option<&str>) -> Result<String, String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        let anim = match self.project.anim_timeline.nodes.get(&id) {
+            Some(a) => a,
+            None => return Ok("[]".to_string()),
+        };
+        let mut out = serde_json::Map::new();
+        let props = if let Some(p) = property {
+            vec![p.to_string()]
+        } else {
+            vec!["pos_x".into(), "pos_y".into(), "rotation".into(), "opacity".into(),
+                 "color_r".into(), "color_g".into(), "color_b".into(), "color_a".into()]
+        };
+        for prop in &props {
+            if let Some(track) = anim.get_track(prop) {
+                let kfs: Vec<_> = track.keyframes.iter().map(|kf| {
+                    serde_json::json!({
+                        "frame": kf.frame,
+                        "value": kf.value,
+                        "interpolation": match kf.interpolation {
+                            crate::document::InterpolationMode::Linear => "linear",
+                            crate::document::InterpolationMode::Bezier => "bezier",
+                        }
+                    })
+                }).collect();
+                out.insert(prop.clone(), serde_json::json!(kfs));
+            }
+            // also handle geom_ if requested
+            if prop.starts_with("geom_") {
+                if let Some(track) = anim.get_track(prop) {
+                    let kfs: Vec<_> = track.keyframes.iter().map(|kf| serde_json::json!({"frame": kf.frame, "value": kf.value})).collect();
+                    out.insert(prop.clone(), serde_json::json!(kfs));
+                }
+            }
+        }
+        // include geom tracks if no specific property or all
+        if property.is_none() || property.unwrap_or("").starts_with("geom") {
+            for (i, track) in anim.geom_tracks.iter().enumerate() {
+                if !track.keyframes.is_empty() {
+                    let name = format!("geom_{}", i);
+                    let kfs: Vec<_> = track.keyframes.iter().map(|kf| serde_json::json!({"frame": kf.frame, "value": kf.value})).collect();
+                    out.insert(name, serde_json::json!(kfs));
+                }
+            }
+        }
+        Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
+    }
+
+    fn mcp_set_keyframe_interpolation(&mut self, id_str: &str, property: &str, frame: usize, interp: Option<&str>, handle_left: Option<(f64,f64)>, handle_right: Option<(f64,f64)>, handle_mode: Option<&str>) -> Result<String, String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        let before = self.project.anim_timeline.clone();
+        let changed = if let Some(anim) = self.project.anim_timeline.nodes.get_mut(&id) {
+            if let Some(track) = anim.get_track_mut(property) {
+                if let Some(kf) = track.keyframes.iter_mut().find(|k| k.frame == frame) {
+                    if let Some(i) = interp {
+                        kf.interpolation = match i.to_lowercase().as_str() {
+                            "bezier" => crate::document::InterpolationMode::Bezier,
+                            _ => crate::document::InterpolationMode::Linear,
+                        };
+                    }
+                    if let Some(hl) = handle_left {
+                        kf.handle_left = hl;
+                    }
+                    if let Some(hr) = handle_right {
+                        kf.handle_right = hr;
+                    }
+                    if let Some(m) = handle_mode {
+                        kf.handle_mode = match m.to_lowercase().as_str() {
+                            "left" | "leftonly" => crate::document::BezierHandleMode::LeftOnly,
+                            "right" | "rightonly" => crate::document::BezierHandleMode::RightOnly,
+                            "asymmetric" => crate::document::BezierHandleMode::Asymmetric,
+                            "equal" | "equallength" => crate::document::BezierHandleMode::EqualLength,
+                            "sym" | "symmetric" => crate::document::BezierHandleMode::Symmetric,
+                            _ => crate::document::BezierHandleMode::Both,
+                        };
+                    }
+                    true
+                } else { false }
+            } else { false }
+        } else { false };
+        if changed {
+            let after = self.project.anim_timeline.clone();
+            self.history.push(&mut self.project, crate::history::ProjectEdit::PatchTimeline { before, after });
+            self.apply_animation_for_frame(self.anim_current_frame);
+            Ok(format!("Updated interpolation for {}@{}", property, frame))
+        } else {
+            Err("Keyframe not found or no change".into())
+        }
+    }
+
+    fn mcp_clear_animation_track(&mut self, id_str: &str, property: &str) -> Result<String, String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        let before = self.project.anim_timeline.clone();
+        let mut changed = false;
+        if let Some(anim) = self.project.anim_timeline.nodes.get_mut(&id) {
+            if let Some(track) = anim.get_track_mut(property) {
+                if !track.keyframes.is_empty() {
+                    track.keyframes.clear();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let after = self.project.anim_timeline.clone();
+            self.history.push(&mut self.project, crate::history::ProjectEdit::PatchTimeline { before, after });
+            self.apply_animation_for_frame(self.anim_current_frame);
+            Ok(format!("Cleared track {}", property))
+        } else {
+            Ok("No keyframes to clear".into())
+        }
+    }
+
+    fn mcp_set_keyframes(&mut self, kfs: &[serde_json::Value]) -> Result<String, String> {
+        if kfs.is_empty() {
+            return Ok("No keyframes provided".into());
+        }
+        let before = self.project.anim_timeline.clone();
+        let mut count = 0usize;
+        for kf in kfs {
+            let id_str = kf.get("id").and_then(|v| v.as_str()).ok_or("id required in keyframe")?;
+            let property = kf.get("property").and_then(|v| v.as_str()).ok_or("property required")?;
+            let frame = kf.get("frame").and_then(|v| v.as_u64()).ok_or("frame required")? as usize;
+            let value = kf.get("value").and_then(|v| v.as_f64()).ok_or("value required")?;
+            let interp_str = kf.get("interpolation").and_then(|v| v.as_str()).unwrap_or("linear");
+            let mode = match interp_str.to_lowercase().as_str() {
+                "bezier" | "cubic" => crate::document::InterpolationMode::Bezier,
+                _ => crate::document::InterpolationMode::Linear,
+            };
+            let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+            let entry = self.project.anim_timeline.nodes.entry(id).or_default();
+            if let Some(track) = entry.get_track_mut(property) {
+                if track.keyframes.is_empty() && frame != 0 {
+                    // seed initial if needed (simplified)
+                    track.insert(0, value);
+                }
+                track.insert(frame, value);
+                if let Some(k) = track.keyframes.iter_mut().find(|k| k.frame == frame) {
+                    k.interpolation = mode;
+                }
+                count += 1;
+            }
+        }
+        self.apply_animation_for_frame(self.anim_current_frame);
+        let after = self.project.anim_timeline.clone();
+        if before != after {
+            self.history.push(&mut self.project, crate::history::ProjectEdit::PatchTimeline { before, after });
+        }
+        Ok(format!("Set {} keyframes (batched)", count))
+    }
+
+    fn mcp_patch_node(&mut self, id_str: &str, patch: &serde_json::Value) -> Result<String, String> {
+        use crate::document::NodeKind;
+        use crate::mcp::drawing::apply_style_patch;
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        let before = self
+            .project
+            .nodes
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Object not found: {id_str}"))?;
+        let mut after = before.clone();
+        if let Some(name) = patch.get("name").and_then(|v| v.as_str()) {
+            after.name = name.to_string();
+        }
+        apply_style_patch(&mut after.style, patch)?;
+        if let Some(tx) = patch.get("translate_x").and_then(|v| v.as_f64()) {
+            after.transform.translation[0] = tx;
+        }
+        if let Some(ty) = patch.get("translate_y").and_then(|v| v.as_f64()) {
+            after.transform.translation[1] = ty;
+        }
+        if let Some(sx) = patch.get("scale_x").and_then(|v| v.as_f64()) {
+            after.transform.scale[0] = sx;
+        }
+        if let Some(sy) = patch.get("scale_y").and_then(|v| v.as_f64()) {
+            after.transform.scale[1] = sy;
+        }
+        if let Some(deg) = patch.get("rotation_deg").and_then(|v| v.as_f64()) {
+            after.transform.rotation_rad = deg.to_radians();
+        }
+        Self::mcp_apply_geometry_patch(&mut after, patch)?;
+        if before != after {
+            self.history.push(
+                &mut self.project,
+                crate::history::ProjectEdit::PatchNode { id, before, after },
+            );
+        }
+        Ok(format!("Updated object {id_str}"))
+    }
+
+    fn mcp_apply_geometry_patch(node: &mut crate::document::Node, patch: &serde_json::Value) -> Result<(), String> {
+        use crate::document::{ArcJoin, NodeKind, PathData};
+        use crate::mcp::drawing::parse_arc_join;
+        match &mut node.kind {
+            NodeKind::Rect { x, y, w, h, rx } => {
+                if let Some(v) = patch.get("x").and_then(|v| v.as_f64()) {
+                    *x = v;
+                }
+                if let Some(v) = patch.get("y").and_then(|v| v.as_f64()) {
+                    *y = v;
+                }
+                if let Some(v) = patch.get("w").and_then(|v| v.as_f64()) {
+                    *w = v.max(1.0);
+                }
+                if let Some(v) = patch.get("h").and_then(|v| v.as_f64()) {
+                    *h = v.max(1.0);
+                }
+                if let Some(v) = patch.get("rx").and_then(|v| v.as_f64()) {
+                    *rx = v.max(0.0);
+                }
+            }
+            NodeKind::Ellipse { cx, cy, rx, ry } => {
+                if let Some(v) = patch.get("cx").and_then(|v| v.as_f64()) {
+                    *cx = v;
+                }
+                if let Some(v) = patch.get("cy").and_then(|v| v.as_f64()) {
+                    *cy = v;
+                }
+                if let Some(v) = patch.get("rx").and_then(|v| v.as_f64()) {
+                    *rx = v.max(0.5);
+                }
+                if let Some(v) = patch.get("ry").and_then(|v| v.as_f64()) {
+                    *ry = v.max(0.5);
+                }
+                if let Some(v) = patch.get("r").and_then(|v| v.as_f64()) {
+                    *rx = v.max(0.5);
+                    *ry = v.max(0.5);
+                }
+            }
+            NodeKind::Polygon {
+                cx,
+                cy,
+                r,
+                sides,
+                rotation_rad,
+            } => {
+                if let Some(v) = patch.get("cx").and_then(|v| v.as_f64()) {
+                    *cx = v;
+                }
+                if let Some(v) = patch.get("cy").and_then(|v| v.as_f64()) {
+                    *cy = v;
+                }
+                if let Some(v) = patch.get("r").and_then(|v| v.as_f64()) {
+                    *r = v.max(0.5);
+                }
+                if let Some(v) = patch.get("sides").and_then(|v| v.as_u64()) {
+                    *sides = (v as u32).max(3);
+                }
+                if let Some(v) = patch.get("rotation_deg").and_then(|v| v.as_f64()) {
+                    *rotation_rad = v.to_radians();
+                }
+            }
+            NodeKind::Path { path } => {
+                if let Some(d) = patch.get("svg_d").and_then(|v| v.as_str()) {
+                    if let Ok(bez) = crate::mcp::path_parse::bez_from_svg_d(d) {
+                        *path = crate::document::PathData::from_bez(&bez);
+                    }
+                }
+                let (x0, y0, x1, y1) = (
+                    patch.get("x0").and_then(|v| v.as_f64()),
+                    patch.get("y0").and_then(|v| v.as_f64()),
+                    patch.get("x1").and_then(|v| v.as_f64()),
+                    patch.get("y1").and_then(|v| v.as_f64()),
+                );
+                if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (x0, y0, x1, y1) {
+                    *path = PathData {
+                        verbs: vec![0, 1],
+                        points: vec![[x0, y0], [x1, y1]],
+                        closed: false,
+                        smooth_anchors: Vec::new(),
+                        handle_out_offset: std::collections::HashMap::new(),
+                        handle_in_offset: std::collections::HashMap::new(),
+                        handle_modes: std::collections::HashMap::new(),
+                        corner_fillets: std::collections::HashMap::new(),
+                    };
+                }
+            }
+            NodeKind::Arc {
+                cx,
+                cy,
+                radius,
+                start_angle_rad,
+                sweep_angle_rad,
+                join,
+            } => {
+                if let Some(v) = patch.get("cx").and_then(|v| v.as_f64()) {
+                    *cx = v;
+                }
+                if let Some(v) = patch.get("cy").and_then(|v| v.as_f64()) {
+                    *cy = v;
+                }
+                if let Some(v) = patch
+                    .get("radius")
+                    .or_else(|| patch.get("r"))
+                    .and_then(|v| v.as_f64())
+                {
+                    *radius = v.max(0.5);
+                }
+                if let Some(v) = patch.get("start_angle_deg").and_then(|v| v.as_f64()) {
+                    *start_angle_rad = v.to_radians();
+                }
+                if let Some(v) = patch.get("sweep_angle_deg").and_then(|v| v.as_f64()) {
+                    *sweep_angle_rad = v.to_radians();
+                }
+                if patch.get("join").is_some() {
+                    *join = parse_arc_join(patch.get("join").unwrap());
+                }
+            }
+            NodeKind::Text { x, y, style } => {
+                if let Some(v) = patch.get("x").and_then(|v| v.as_f64()) {
+                    *x = v;
+                }
+                if let Some(v) = patch.get("y").and_then(|v| v.as_f64()) {
+                    *y = v;
+                }
+                if let Some(t) = patch.get("text").and_then(|v| v.as_str()) {
+                    style.content = t.to_string();
+                }
+                if let Some(v) = patch.get("font_size").and_then(|v| v.as_f64()) {
+                    style.font_size = v.max(1.0) as f32;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+
+    fn mcp_update_object(&mut self, id_str: &str, patch: serde_json::Value) -> Result<(), String> {
+        self.mcp_patch_node(id_str, &patch).map(|_| ())
+    }
+
+    fn mcp_delete_object(&mut self, id_str: &str) -> Result<(), String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        if self.project.nodes.get(id).is_none() {
+            return Err(format!("Object not found: {id_str}"));
+        }
+        self.selection = vec![id];
+        self.delete_selection();
+        Ok(())
+    }
+
+    fn process_pending_mcp_bulk_rects(&mut self) {
+        #[cfg(target_os = "android")]
+        { return; }
+        #[cfg(not(target_os = "android"))]
+        {
+            const MAX_PER_FRAME: usize = 64;
+            let mut chunk: Vec<Node> = Vec::new();
+            while chunk.len() < MAX_PER_FRAME {
+                if let Some(mut batch) = self.pending_mcp_bulk_rects.pop() {
+                    let take = MAX_PER_FRAME - chunk.len();
+                    if batch.len() <= take {
+                        chunk.append(&mut batch);
+                    } else {
+                        let rest = batch.split_off(take);
+                        chunk.append(&mut batch);
+                        self.pending_mcp_bulk_rects.push(rest);
+                    }
+                } else {
+                    break;
+                }
+            }
+            if !chunk.is_empty() {
+                Self::apply_nodes_live(&mut self.project, &chunk);
+                self.mcp_bulk_staging.extend(chunk);
+            }
+            if self.pending_mcp_bulk_rects.is_empty() && !self.mcp_bulk_staging.is_empty() {
+                let last_id = self.mcp_bulk_staging.last().map(|n| n.id);
+                let nodes = std::mem::take(&mut self.mcp_bulk_staging);
+                self.history.push_applied(
+                    &mut self.project,
+                    ProjectEdit::InsertNodesApplied { nodes },
+                );
+                if let Some(id) = last_id {
+                    self.selection = vec![id];
+                    self.sync_inspector_from_selection();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn poll_mcp_bridge(&mut self) {
+        #[cfg(target_os = "android")]
+        {
+            return;
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            // Drain any completed heavy captures from bg threads (preview side effects)
+            while let Ok(up) = self.mcp_preview_update_rx.try_recv() {
+                self.mcp_preview.rgba = up.rgba;
+                self.mcp_preview.width = up.width;
+                self.mcp_preview.height = up.height;
+                self.mcp_preview.bounds = up.bounds;
+                self.mcp_preview.resolution_percent = up.resolution_percent;
+                self.mcp_preview.texture = None;
+                self.mcp_preview.updated_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+            }
+
+            let pending = match self.mcp_bridge.as_mut() {
+                Some(bridge) => bridge.drain_pending(),
+                None => return,
+            };
+            for (req, reply_tx) in pending {
+                // Heavy rasterize off main thread to avoid blocking egui paint lock (prevents 10s RwLock deadlock panic)
+                if let crate::mcp::McpHostRequest::CaptureCanvasRaster {
+                    resolution_percent,
+                    x,
+                    y,
+                    w,
+                    h,
+                    save_path,
+                } = req
+                {
+                    let proj = self.project.clone();
+                    let anim_frame = self.anim_current_frame;
+                    let preview_tx = self.mcp_preview_update_tx.clone();
+                    std::thread::spawn(move || {
+                        use base64::Engine;
+                        let view = crate::io::resolve_capture_view(&proj, x, y, w, h);
+                        let pct = resolution_percent.clamp(1.0, 100.0);
+                        if let Some((pw, ph, rgba)) = crate::io::rasterize_document_view(
+                            &proj,
+                            view,
+                            pct,
+                            anim_frame,
+                            &std::collections::HashMap::new(),
+                        ) {
+                            if let Some(p) = save_path {
+                                let path = std::path::PathBuf::from(p);
+                                let _ = crate::io::write_image_file(
+                                    &path,
+                                    crate::io::ExportImageFormat::Png,
+                                    pw,
+                                    ph,
+                                    &rgba,
+                                );
+                            }
+                            // update preview (non blocking send)
+                            let _ = preview_tx.send(McpPreviewUpdate {
+                                rgba: rgba.clone(),
+                                width: pw,
+                                height: ph,
+                                bounds: [view.x0, view.y0, view.width(), view.height()],
+                                resolution_percent: pct,
+                            });
+                            // compute response and send from this thread
+                            if let Some(png) = image::RgbaImage::from_raw(pw, ph, rgba.clone()) {
+                                let mut buf = Vec::new();
+                                if png
+                                    .write_to(
+                                        &mut std::io::Cursor::new(&mut buf),
+                                        image::ImageFormat::Png,
+                                    )
+                                    .is_ok()
+                                {
+                                    let b64 =
+                                        base64::engine::general_purpose::STANDARD.encode(&buf);
+                                    let meta = serde_json::json!({
+                                        "pixel_width": pw,
+                                        "pixel_height": ph,
+                                        "resolution_percent": pct,
+                                        "bounds": { "x": view.x0, "y": view.y0, "w": view.width(), "h": view.height() },
+                                        "document_size": { "w": proj.document.width, "h": proj.document.height },
+                                        "objects_remain_editable": true,
+                                    });
+                                    let resp = crate::mcp::McpHostResponse::RasterPreview {
+                                        meta_json: serde_json::to_string_pretty(&meta)
+                                            .unwrap_or_default(),
+                                        png_base64: b64,
+                                    };
+                                    let _ = reply_tx.send(resp);
+                                    return;
+                                }
+                            }
+                        }
+                        let _ = reply_tx.send(crate::mcp::McpHostResponse::Err {
+                            message: "Capture raster failed".into(),
+                        });
+                    });
+                    continue;
+                }
+
+                let resp = self.handle_mcp_request(req);
+                let _ = reply_tx.send(resp);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn handle_mcp_request(
+        &mut self,
+        req: crate::mcp::McpHostRequest,
+    ) -> crate::mcp::McpHostResponse {
+        match req {
+            crate::mcp::McpHostRequest::Snapshot => crate::mcp::McpHostResponse::Snapshot(
+                crate::mcp::McpAppSnapshot {
+                    title: self.project.document.title.clone(),
+                    project_path: self
+                        .project_save_path
+                        .as_ref()
+                        .map(|p| p.display().to_string()),
+                    status_message: self.status_message.clone(),
+                    collab_text: self.collab.chat_log_plain(),
+                    anim_frame: self.anim_current_frame,
+                    anim_playing: self.anim_is_playing,
+                    ui_fps: self.ui_fps,
+                },
+            ),
+            crate::mcp::McpHostRequest::SaveProject { path } => {
+                if let Some(p) = path.as_deref().map(std::path::Path::new) {
+                    match self.save_project_to_path(p) {
+                        Ok(()) => crate::mcp::McpHostResponse::Ok {
+                            message: format!("Saved {}", p.display()),
+                        },
+                        Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+                    }
+                } else if let Some(p) = self.project_save_path.clone() {
+                    match self.save_project_to_path(&p) {
+                        Ok(()) => crate::mcp::McpHostResponse::Ok {
+                            message: format!("Saved {}", p.display()),
+                        },
+                        Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+                    }
+                } else {
+                    self.pending_save_project = true;
+                    crate::mcp::McpHostResponse::Ok {
+                        message: "No path set — opened Save dialog on UI thread".into(),
+                    }
+                }
+            }
+            crate::mcp::McpHostRequest::SetTitle(title) => {
+                self.set_document_title(title);
+                crate::mcp::McpHostResponse::Ok {
+                    message: "Title updated".into(),
+                }
+            }
+            crate::mcp::McpHostRequest::GetCollabText => {
+                crate::mcp::McpHostResponse::Text(self.collab.chat_log_plain())
+            }
+            crate::mcp::McpHostRequest::SetCollabText(text) => {
+                self.collab.send_chat(text);
+                crate::mcp::McpHostResponse::Ok {
+                    message: "Chat message sent".into(),
+                }
+            }
+            crate::mcp::McpHostRequest::ProjectJson => {
+                match serde_json::to_string_pretty(&self.project) {
+                    Ok(j) => crate::mcp::McpHostResponse::Text(j),
+                    Err(e) => crate::mcp::McpHostResponse::Err {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            crate::mcp::McpHostRequest::CaptureCanvasRaster {
+                resolution_percent,
+                x,
+                y,
+                w,
+                h,
+                save_path,
+            } => match self.mcp_capture_canvas_raster(
+                resolution_percent,
+                x,
+                y,
+                w,
+                h,
+                save_path,
+            ) {
+                Ok(resp) => resp,
+                Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+            },
+            crate::mcp::McpHostRequest::ListAllObjects => {
+                match self.mcp_list_all_objects_json() {
+                    Ok(j) => crate::mcp::McpHostResponse::Text(j),
+                    Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+                }
+            }
+            crate::mcp::McpHostRequest::ListObjects => {
+                match self.mcp_list_objects_json() {
+                    Ok(j) => crate::mcp::McpHostResponse::Text(j),
+                    Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+                }
+            }
+            crate::mcp::McpHostRequest::GetObject { id } => {
+                match self.mcp_get_object_json(&id) {
+                    Ok(j) => crate::mcp::McpHostResponse::Text(j),
+                    Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+                }
+            }
+            crate::mcp::McpHostRequest::DrawingTool { name, args } => {
+                match self.mcp_drawing_tool(&name, args) {
+                    Ok(msg) => crate::mcp::McpHostResponse::Ok { message: msg },
+                    Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+                }
+            }
+            crate::mcp::McpHostRequest::UpdateObject { id, patch } => {
+                match self.mcp_update_object(&id, patch) {
+                    Ok(()) => crate::mcp::McpHostResponse::Ok {
+                        message: format!("Updated {id}"),
+                    },
+                    Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+                }
+            }
+            crate::mcp::McpHostRequest::DeleteObject { id } => {
+                match self.mcp_delete_object(&id) {
+                    Ok(()) => crate::mcp::McpHostResponse::Ok {
+                        message: format!("Deleted {id}"),
+                    },
+                    Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+                }
+            }
+            crate::mcp::McpHostRequest::UiHealth => {
+                // Count by kind for diagnosis
+                let mut kind_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                for node in self.project.nodes.map.values() {
+                    let k = match &node.kind {
+                        NodeKind::Rect { .. } => "rect",
+                        NodeKind::Ellipse { .. } => "ellipse",
+                        NodeKind::Text { .. } => "text",
+                        NodeKind::Path { .. } => "path",
+                        NodeKind::Polygon { .. } => "polygon",
+                        NodeKind::Image { .. } => "image",
+                        NodeKind::Group { .. } => "group",
+                        NodeKind::Arc { .. } => "arc",
+                        NodeKind::BrushStroke { .. } => "brush",
+                    }.to_string();
+                    *kind_counts.entry(k).or_default() += 1;
+                }
+                let path_count = *kind_counts.get("path").unwrap_or(&0);
+                let text_count = *kind_counts.get("text").unwrap_or(&0);
+                let rect_count = *kind_counts.get("rect").unwrap_or(&0);
+                let object_count = self.project.nodes.map.len();
+                let fps = self.ui_fps;
+                let cpu_stress = fps < 25.0 && object_count > 150;
+                let path_heavy = path_count > 80;
+                let mut hints: Vec<String> = Vec::new();
+                if cpu_stress {
+                    hints.push(format!(
+                        "Low UI FPS ({fps:.1}) with {object_count} objects — CPU-bound canvas paint."
+                    ));
+                }
+                if path_heavy {
+                    hints.push(format!(
+                        "{path_count} path nodes (each MCP create_line is a separate path). \
+                         Prefer one create_path with M/C cubic beziers per curve instead of hundreds of segments."
+                    ));
+                }
+                if object_count > 200 && !self.enable_layer_raster_cache {
+                    hints.push(
+                        "Dense rect-only layers: enable View → Layer raster cache; keep off for text-heavy docs."
+                            .into(),
+                    );
+                } else if object_count > 200
+                    && self.enable_layer_raster_cache
+                    && self.layer_raster_cache.is_empty()
+                {
+                    hints.push(
+                        "Layer raster cache on but inactive (text on layer, drag, or <150 nodes per layer)."
+                            .into(),
+                    );
+                }
+                if cpu_stress {
+                    hints.push(
+                        "Run optimized binary: cargo build --release (fat LTO, codegen-units=1 in Cargo.toml)."
+                            .into(),
+                    );
+                }
+                let suggestion = if hints.is_empty() {
+                    String::new()
+                } else {
+                    hints.join(" ")
+                };
+                let health = serde_json::json!({
+                    "fps": fps,
+                    "cpu_stress": cpu_stress,
+                    "object_count": object_count,
+                    "kind_counts": kind_counts,
+                    "path_count": path_count,
+                    "text_count": text_count,
+                    "rect_count": rect_count,
+                    "current_anim_frame": self.anim_current_frame,
+                    "anim_playing": self.anim_is_playing,
+                    "num_animated_nodes": self.project.anim_timeline.nodes.len(),
+                    "layer_raster_cache_enabled": self.enable_layer_raster_cache,
+                    "layer_raster_cache_count": self.layer_raster_cache.len(),
+                    "layer_raster_cache_pending": self.layer_cache_pending.len(),
+                    "spatial_index_enabled": self.spatial_index.is_enabled(),
+                    "history_revision": self.history.revision(),
+                    "suggestion_for_low_fps": suggestion,
+                });
+                crate::mcp::McpHostResponse::Text(serde_json::to_string_pretty(&health).unwrap_or_default())
             }
         }
     }
@@ -7945,6 +10803,10 @@ fn run_video_decode_thread(
 impl eframe::App for VadadeeBerryApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.update_clip_mask_textures(ctx);
+        self.update_layer_raster_cache(ctx);
+        if self.cached_draw_order_revision != self.history.revision() {
+            self.rebuild_spatial_index();
+        }
         // Graph editor transition animation tick
         let dt = ctx.input(|i| i.stable_dt);
         let target_t = if self.anim_graph_editor_track.is_some() && self.anim_graph_editor_target_track.is_none() {
@@ -7967,6 +10829,26 @@ impl eframe::App for VadadeeBerryApp {
                 self.anim_graph_editor_track = self.anim_graph_editor_target_track.take();
                 ctx.request_repaint();
             }
+        }
+
+        let piano_target = if self.piano_roll_clip.is_some() { 1.0 } else { 0.0 };
+        if (self.piano_roll_t - piano_target).abs() > 0.001 {
+            let speed = 6.0;
+            if self.piano_roll_t < piano_target {
+                self.piano_roll_t = (self.piano_roll_t + dt * speed).min(piano_target);
+            } else {
+                self.piano_roll_t = (self.piano_roll_t - dt * speed).max(piano_target);
+            }
+            ctx.request_repaint();
+        } else {
+            self.piano_roll_t = piano_target;
+        }
+
+        // --- UI FPS tracking for health check ---
+        let dt = ctx.input(|i| i.stable_dt);
+        if dt > 0.0001 {
+            let instant = 1.0 / dt;
+            self.ui_fps = self.ui_fps * 0.85 + instant * 0.15;
         }
 
         // --- ANIMATION TIMELINE PLAYBACK & RECORDING ---
@@ -8016,7 +10898,7 @@ impl eframe::App for VadadeeBerryApp {
                         geom_floats: gf,
                         fill: node.style.fill.clone(),
                     });
-                } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::Video) {
+                } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::AV) {
                     self.anim_last_applied_states.entry(*id).or_insert_with(|| AnimAppliedState {
                         pos: (layer.x as f64, layer.y as f64),
                         rotation: layer.rotation as f64,
@@ -8175,7 +11057,7 @@ impl eframe::App for VadadeeBerryApp {
                             keyframes_updated = true;
                         }
                     }
-                } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::Video) {
+                } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::AV) {
                     let pos = (layer.x as f64, layer.y as f64);
                     let rot = layer.rotation as f64;
                     let last_state = self.anim_last_applied_states.get(id);
@@ -8237,7 +11119,7 @@ impl eframe::App for VadadeeBerryApp {
                             geom_floats: gf,
                             fill: node.style.fill.clone(),
                         });
-                    } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::Video) {
+                    } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::AV) {
                         self.anim_last_applied_states.insert(*id, AnimAppliedState {
                             pos: (layer.x as f64, layer.y as f64),
                             rotation: layer.rotation as f64,
@@ -8306,6 +11188,10 @@ impl eframe::App for VadadeeBerryApp {
         self.keyboard_shortcuts(ctx);
         self.canvas_wheel_zoom(ctx);
         self.sync_audio_playback();
+        self.tick_live_collaboration_poll(ctx);
+        self.poll_mcp_bridge();
+        self.process_pending_mcp_bulk_rects();
+        self.sync_window_title(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
@@ -8499,6 +11385,13 @@ mod tests {
                 anim_keyframing_mode: false,
                 anim_show_timeline_window: false,
                 show_video_editor_window: None,
+                piano_roll_clip: None,
+                piano_roll_t: 0.0,
+                piano_tool: crate::av_ui::PianoTool::default(),
+                piano_zoom: 1.0,
+                piano_scroll_offset: 0.0,
+                piano_pitch_scroll: 36.0,
+                ui_shading_pass_sel: 0,
                 anim_time_accumulator: 0.0,
                 anim_last_seen_frame: 0,
                 anim_last_applied_states: std::collections::HashMap::new(),
@@ -8514,13 +11407,30 @@ mod tests {
                 anim_graph_editor_dragged_handle: None,
                 anim_graph_kf_drag_start: None,
                 anim_graph_selected_segment: None,
+                anim_graph_scroll: 0.0,
+                anim_graph_visible_frames: 100.0,
                 anim_fps: 60,
+                ui_fps: 60.0,
+                enable_layer_raster_cache: false,
+            gpu_shading: true,
+            wgpu_render: None,
                 video_frame_cache: None,
                 video_layers: std::collections::HashMap::new(),
                 clip_mask_signatures: std::collections::HashMap::new(),
+                layer_raster_cache: std::collections::HashMap::new(),
+                layer_cache_pending: std::collections::HashSet::new(),
+                layer_cache_result_tx: {
+                    let (tx, _rx) = std::sync::mpsc::channel();
+                    tx
+                },
+                layer_cache_result_rx: {
+                    let (_tx, rx) = std::sync::mpsc::channel();
+                    rx
+                },
                 audio_device: rodio::DeviceSinkBuilder::open_default_sink().ok(),
                 audio_players: std::collections::HashMap::new(),
             audio_player_buffer_offset: std::collections::HashMap::new(),
+            audio_player_last_file_pos: std::collections::HashMap::new(),
                 audio_layers_skip: std::collections::HashSet::new(),
                 audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -8556,6 +11466,11 @@ mod tests {
                 ui_stroke_line_cap: crate::document::LineCap::Butt,
                 ui_stroke_kind: FillKind::Solid,
                 ui_stroke_angle: 0.0,
+                ui_marker_start: crate::document::PathMarker::default(),
+                ui_marker_mid: crate::document::PathMarker::default(),
+                ui_marker_end: crate::document::PathMarker::default(),
+                ui_marker_use_common_size: false,
+                ui_marker_common_size: 10.0,
                 ui_stroke_line_x0: 0.0,
                 ui_stroke_line_y0: 0.5,
                 ui_stroke_line_x1: 1.0,
@@ -8594,7 +11509,9 @@ mod tests {
                 ui_on_path_loft_opacity: 0.75,
                 ui_on_path_container_h: 280.0,
                 timeline_container_h: 56.0,
+                timeline_container_w: 0.0,
                 video_editor_container_h: 130.0,
+                video_editor_container_w: 0.0,
                 ui_tiling_rows: 3,
                 ui_tiling_cols: 3,
                 ui_tiling_offset_x: 0.0,
@@ -8619,8 +11536,14 @@ mod tests {
                 canvas_screen_rect: None,
                 canvas_origin: Pos2::ZERO,
                 pending_open_svg: false,
+                pending_open_project: false,
+            cached_project: None,
+            cached_project_label: None,
                 pending_save_project: false,
                 pending_export_svg: false,
+                pending_export_image: false,
+                export_image_format: io::ExportImageFormat::Png,
+                export_image_selection_only: false,
                 eyedropper_holding: false,
                 eyedropper_releasing: false,
                 eyedropper_t: 0.0,
@@ -8629,13 +11552,48 @@ mod tests {
                 paste_hotkey_was_down: false,
                 paste_progress: None,
                 toolbar_expanded: false,
+                toolbar_outer_rect: None,
                 toolbar_drag_active: false,
                 text_editor_rect: None,
                 text_pan_restore: None,
                 text_pan_anim: None,
                 last_android_text: String::new(),
                 path_overlay_rect: None,
-            video_export: VideoExportState::default(),
+                video_export: VideoExportState::default(),
+                project_save_path: None,
+                left_dock: crate::left_dock::LeftDockState::default(),
+                collab: crate::collab::CollabSession::new(),
+                collab_last_cursor_sent: None,
+
+            collab_canvas_sync_accum: 0.0,
+            collab_last_ui_sync: (ui::ActionTab::default(), 0),
+            collab_last_wire_hash: 0,
+            collab_asset_cache: std::collections::HashMap::new(),
+            cursor_bubble_edit: false,
+            cursor_bubble_focus_pending: false,
+            cursor_bubble_text: String::new(),
+                #[cfg(not(target_os = "android"))]
+                mcp_bridge: None,
+                #[cfg(not(target_os = "android"))]
+                mcp_preview: McpPreviewState::default(),
+                #[cfg(not(target_os = "android"))]
+                mcp_preview_update_tx: {
+                    let (tx, _rx) = std::sync::mpsc::channel();
+                    tx
+                },
+                #[cfg(not(target_os = "android"))]
+                mcp_preview_update_rx: {
+                    let (_tx, rx) = std::sync::mpsc::channel();
+                    rx
+                },
+                #[cfg(not(target_os = "android"))]
+                pending_mcp_bulk_rects: Vec::new(),
+                #[cfg(not(target_os = "android"))]
+                mcp_bulk_staging: Vec::new(),
+                spatial_index: crate::spatial_index::SpatialIndex::default(),
+                cached_draw_order: Vec::new(),
+                cached_draw_order_revision: u64::MAX,
+                audio_output_warned: false,
             }
         }
     }
@@ -8863,7 +11821,7 @@ fn apply_color_controls(img: &mut image::RgbaImage, hue: f32, sat: f32, bright: 
 }
 
 fn adjust_frame_color(bytes: &[u8], hue: f32, sat: f32, bright: f32, contrast: f32) -> Option<Vec<u8>> {
-    if let Ok(mut dyn_img) = image::load_from_memory(bytes) {
+    if let Ok(dyn_img) = image::load_from_memory(bytes) {
         let mut rgba = dyn_img.to_rgba8();
         apply_color_controls(&mut rgba, hue, sat, bright, contrast);
         let mut out_bytes = Vec::new();

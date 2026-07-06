@@ -1,4 +1,0 @@
-/home/angsudo/Android/Sdk/cmake/3.22.1/bin/ninja \
-  -C \
-  /home/angsudo/project/vadadee-berry/app/.cxx/Debug/4i48133m/arm64-v8a \
-  dummy

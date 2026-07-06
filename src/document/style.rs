@@ -400,6 +400,64 @@ pub enum LineCap {
     Square,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MarkerKind {
+    #[default]
+    None,
+    /// Classic arrowhead
+    Triangle,
+    Square,
+    HollowSquare,
+    /// Hollow circle / ring
+    Ring,
+    /// Short tick / line marker
+    Line,
+    /// Arrow (length indicator style)
+    Arrow,
+}
+
+impl MarkerKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Triangle => "Triangle",
+            Self::Square => "Square",
+            Self::HollowSquare => "Hollow Square",
+            Self::Ring => "Ring",
+            Self::Line => "Line",
+            Self::Arrow => "Arrow",
+        }
+    }
+    pub fn all() -> &'static [Self] {
+        use MarkerKind::*;
+        &[None, Triangle, Square, HollowSquare, Ring, Line, Arrow]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PathMarker {
+    pub kind: MarkerKind,
+    pub color: Paint,
+    pub size: f32,
+    /// 2D offset in the marker's local space (after rotation)
+    pub offset: [f64; 2],
+    pub rotation: f64,
+    pub auto_rotate: bool,
+}
+
+impl Default for PathMarker {
+    fn default() -> Self {
+        Self {
+            kind: MarkerKind::None,
+            color: Paint::from_hex(0x000000, 1.0),
+            size: 10.0,
+            offset: [0.0, 0.0],
+            rotation: 0.0,
+            auto_rotate: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stroke {
     pub style: Fill,
@@ -408,6 +466,13 @@ pub struct Stroke {
     pub line_join: LineJoin,
     #[serde(default)]
     pub line_cap: LineCap,
+    /// Arrow / point geometry decorations on the path (start/mid/end)
+    #[serde(default)]
+    pub start_marker: PathMarker,
+    #[serde(default)]
+    pub mid_marker: PathMarker,
+    #[serde(default)]
+    pub end_marker: PathMarker,
 }
 
 impl Default for Stroke {
@@ -417,6 +482,9 @@ impl Default for Stroke {
             width: 2.0,
             line_join: LineJoin::Miter,
             line_cap: LineCap::Butt,
+            start_marker: PathMarker::default(),
+            mid_marker: PathMarker::default(),
+            end_marker: PathMarker::default(),
         }
     }
 }

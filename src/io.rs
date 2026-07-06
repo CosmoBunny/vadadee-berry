@@ -5,9 +5,20 @@ use kurbo::BezPath;
 use thiserror::Error;
 
 use crate::document::{
-    Document, Fill, LineCap, LineJoin, Node, NodeKind, NodeStore, Paint, PathData, ProjectFile,
-    Stroke, regular_polygon_vertices,
+    ArcJoin, Document, Fill, LineCap, LineJoin, Node, NodeId, NodeKind, NodeStore, PageUnit,
+    Paint, PathData, ProjectFile, Stroke, regular_polygon_vertices,
 };
+
+/// Decoded video layer pixels for one export frame.
+#[derive(Debug, Clone)]
+pub struct VideoLayerBuffer {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+pub type VideoFrameMap = rustc_hash::FxHashMap<uuid::Uuid, VideoLayerBuffer>;
+
 
 /// Native project file extension (e.g. `drawing.vadadee-berry.json`).
 pub const PROJECT_FILE_EXTENSION: &str = "vadadee-berry.json";
@@ -50,7 +61,7 @@ pub fn save_project(path: &Path, project: &ProjectFile) -> Result<(), IoError> {
 
 pub fn import_svg(path: &Path) -> Result<ProjectFile, IoError> {
     let data = fs::read(path).map_err(|e| IoError::Msg(e.to_string()))?;
-    let opt = usvg::Options::default();
+    let opt = crate::fonts::usvg_options();
     let tree = usvg::Tree::from_data(&data, &opt).map_err(|e| IoError::Msg(e.to_string()))?;
     let size = tree.size();
     let mut document = Document {
@@ -69,6 +80,7 @@ pub fn import_svg(path: &Path) -> Result<ProjectFile, IoError> {
         circular_effects: Default::default(),
         clip_masks: Default::default(),
         page_color: [1.0, 1.0, 1.0, 1.0],
+        page_unit: PageUnit::Px,
     };
     let mut nodes = NodeStore::default();
     let mut layer_nodes = Vec::new();
@@ -227,7 +239,7 @@ pub fn document_svg_string(
                     }
                 }
             }
-            crate::document::LayerKind::Video => {
+            crate::document::LayerKind::AV => {
                 if let Some(bytes) = video_frames.get(&layer.id) {
                     let mut opacity = 1.0;
                     let mut dx = layer.x as f64;
@@ -280,7 +292,7 @@ pub fn document_svg_string(
                     ));
                 }
             }
-            crate::document::LayerKind::Audio => {}
+            crate::document::LayerKind::Shading => {}
         }
     }
     svg.push_str("</svg>\n");
@@ -308,7 +320,18 @@ pub fn node_svg_for_bounds(node: &Node, bounds: kurbo::Rect, nodes: &crate::docu
 pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> String {
     let fill_grad_id = format!("fill-{}", node.id.as_simple());
     let stroke_grad_id = format!("stroke-{}", node.id.as_simple());
-    let (fill, fill_defs) = fill_svg(&node.style.fill, &fill_grad_id);
+    let arc_open = matches!(
+        &node.kind,
+        NodeKind::Arc {
+            join: ArcJoin::NoJoin,
+            ..
+        }
+    );
+    let (fill, fill_defs) = if arc_open {
+        (r#"fill="none""#.into(), String::new())
+    } else {
+        fill_svg(&node.style.fill, &fill_grad_id)
+    };
     let (stroke, stroke_defs) = if node.style.stroke.width > 0.0 && node.style.stroke.style.is_visible() {
         stroke_svg(&node.style.stroke, &stroke_grad_id)
     } else {
@@ -347,7 +370,7 @@ pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> 
         NodeKind::Text { x, y, style } => {
             let weight = if style.bold { "bold" } else { "normal" };
             let font_style = if style.italic { "italic" } else { "normal" };
-            let family = style.font_family.replace('"', "'");
+            let family = crate::fonts::sanitize_svg_font_family(&style.font_family);
             let escaped = style
                 .content
                 .replace('&', "&amp;")
@@ -367,7 +390,14 @@ pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> 
             }
             format!(r#"<g>{inner}</g>"#)
         }
-        NodeKind::Image { x, y, width, height, bytes } => {
+        NodeKind::Image {
+            x,
+            y,
+            width,
+            height,
+            bytes,
+            ..
+        } => {
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
             format!(
@@ -530,35 +560,24 @@ fn paint_attr(p: &Paint) -> String {
 }
 
 fn path_to_svg_d(path: &PathData) -> String {
-    let mut out = String::new();
-    let mut pi = 0;
-    for v in &path.verbs {
-        match v {
-            0 => {
-                if pi < path.points.len() {
-                    let p = path.points[pi];
-                    out.push_str(&format!("M {} {} ", p[0], p[1]));
-                    pi += 1;
-                }
-            }
-            1 => {
-                if pi < path.points.len() {
-                    let p = path.points[pi];
-                    out.push_str(&format!("L {} {} ", p[0], p[1]));
-                    pi += 1;
-                }
-            }
-            4 => out.push('Z'),
-            _ => {}
-        }
-    }
-    out
+    path.to_bez().to_svg()
 }
 
-use crate::document::NodeId;
 use kurbo::Rect;
 
+/// Selected nodes in bottom-to-top paint order (matches canvas).
+pub fn selection_paint_order(project: &ProjectFile, selection: &[NodeId]) -> Vec<NodeId> {
+    let set: std::collections::HashSet<NodeId> = selection.iter().copied().collect();
+    project
+        .document
+        .ordered_node_ids()
+        .into_iter()
+        .filter(|id| set.contains(id))
+        .collect()
+}
+
 pub fn export_selected_svg_string(project: &ProjectFile, selection: &[NodeId], bounds: Rect) -> String {
+    let ordered = selection_paint_order(project, selection);
     let w = bounds.width();
     let h = bounds.height();
     let mut svg = format!(
@@ -569,7 +588,7 @@ pub fn export_selected_svg_string(project: &ProjectFile, selection: &[NodeId], b
         tx = -bounds.x0,
         ty = -bounds.y0
     );
-    for id in selection {
+    for id in &ordered {
         let Some(node) = project.nodes.get(*id) else { continue };
         svg.push_str(&node_to_svg_fragment(node, &project.nodes));
     }
@@ -577,8 +596,179 @@ pub fn export_selected_svg_string(project: &ProjectFile, selection: &[NodeId], b
     svg
 }
 
+/// Rasterize current selection (merged) to RGBA.
+pub fn rasterize_selection_rgba(
+    project: &ProjectFile,
+    selection: &[NodeId],
+    bounds: Rect,
+    scale: f32,
+) -> Option<(u32, u32, Vec<u8>)> {
+    if selection.is_empty() {
+        return None;
+    }
+    let svg = export_selected_svg_string(project, selection, bounds);
+    render_svg_to_rgba_even(&svg, scale)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportImageFormat {
+    Png,
+    Jpeg,
+    Bmp,
+    /// Width, height, then premultiplied RGBA8 (little-endian header).
+    RawRgba,
+}
+
+impl ExportImageFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Png => "PNG",
+            Self::Jpeg => "JPEG",
+            Self::Bmp => "Bitmap (BMP)",
+            Self::RawRgba => "Raw RGBA",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+            Self::Bmp => "bmp",
+            Self::RawRgba => "rgba",
+        }
+    }
+}
+
+pub fn write_image_file(
+    path: &Path,
+    format: ExportImageFormat,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<(), IoError> {
+    match format {
+        ExportImageFormat::RawRgba => {
+            let mut out = Vec::with_capacity(8 + rgba.len());
+            out.extend_from_slice(&width.to_le_bytes());
+            out.extend_from_slice(&height.to_le_bytes());
+            out.extend_from_slice(rgba);
+            fs::write(path, out).map_err(|e| IoError::Msg(e.to_string()))
+        }
+        ExportImageFormat::Png | ExportImageFormat::Jpeg | ExportImageFormat::Bmp => {
+            let Some(img) = image::RgbaImage::from_raw(width, height, rgba.to_vec()) else {
+                return Err(IoError::Msg("Invalid RGBA buffer".into()));
+            };
+            match format {
+                ExportImageFormat::Png => {
+                    img.save(path).map_err(|e| IoError::Msg(e.to_string()))?;
+                }
+                ExportImageFormat::Jpeg => {
+                    let rgb = image::DynamicImage::ImageRgba8(img).into_rgb8();
+                    rgb.save_with_format(path, image::ImageFormat::Jpeg)
+                        .map_err(|e| IoError::Msg(e.to_string()))?;
+                }
+                ExportImageFormat::Bmp => {
+                    let rgb = image::DynamicImage::ImageRgba8(img).into_rgb8();
+                    rgb.save_with_format(path, image::ImageFormat::Bmp)
+                        .map_err(|e| IoError::Msg(e.to_string()))?;
+                }
+                ExportImageFormat::RawRgba => unreachable!(),
+            }
+            Ok(())
+        }
+    }
+}
+
+pub fn export_document_raster(
+    project: &ProjectFile,
+    format: ExportImageFormat,
+    scale: f32,
+    path: &Path,
+) -> Result<(), IoError> {
+    let svg = document_svg_string(project, 0, &std::collections::HashMap::new());
+    let (w, h, rgba) = render_svg_to_rgba_even(&svg, scale)
+        .ok_or_else(|| IoError::Msg("Rasterize failed".into()))?;
+    write_image_file(path, format, w, h, &rgba)
+}
+
+pub fn export_selection_raster(
+    project: &ProjectFile,
+    selection: &[NodeId],
+    bounds: Rect,
+    format: ExportImageFormat,
+    scale: f32,
+    path: &Path,
+) -> Result<(), IoError> {
+    let (w, h, rgba) = rasterize_selection_rgba(project, selection, bounds, scale)
+        .ok_or_else(|| IoError::Msg("Selection rasterize failed".into()))?;
+    write_image_file(path, format, w, h, &rgba)
+}
+
+
+
+/// Document SVG cropped to a document-space rectangle (`viewBox`).
+pub fn document_svg_for_view(
+    project: &ProjectFile,
+    view: kurbo::Rect,
+    current_frame: usize,
+    video_frames: &std::collections::HashMap<uuid::Uuid, Vec<u8>>,
+) -> String {
+    let mut svg = document_svg_string(project, current_frame, video_frames);
+    let vw = view.width().max(1.0);
+    let vh = view.height().max(1.0);
+    if let Some(start) = svg.find("<svg ") {
+        if let Some(rel) = svg[start..].find('>') {
+            let end = start + rel + 1;
+            let head = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{vw}" height="{vh}" viewBox="{} {} {vw} {vh}""#,
+                view.x0,
+                view.y0,
+            );
+            svg.replace_range(start..end, &(head + ">"));
+        }
+    }
+    svg
+}
+
+pub fn default_document_view(project: &ProjectFile) -> kurbo::Rect {
+    kurbo::Rect::new(
+        0.0,
+        0.0,
+        project.document.width,
+        project.document.height,
+    )
+}
+
+pub fn resolve_capture_view(
+    project: &ProjectFile,
+    x: Option<f64>,
+    y: Option<f64>,
+    w: Option<f64>,
+    h: Option<f64>,
+) -> kurbo::Rect {
+    let full = default_document_view(project);
+    let x0 = x.unwrap_or(full.x0);
+    let y0 = y.unwrap_or(full.y0);
+    let ww = w.unwrap_or(full.width());
+    let hh = h.unwrap_or(full.height());
+    kurbo::Rect::new(x0, y0, x0 + ww.max(1.0), y0 + hh.max(1.0))
+}
+
+/// Rasterize a document region. `resolution_percent` is 1..100 (100 = 1:1 px per doc unit).
+pub fn rasterize_document_view(
+    project: &ProjectFile,
+    view: kurbo::Rect,
+    resolution_percent: f32,
+    current_frame: usize,
+    video_frames: &std::collections::HashMap<uuid::Uuid, Vec<u8>>,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let svg = document_svg_for_view(project, view, current_frame, video_frames);
+    let scale = (resolution_percent / 100.0).clamp(0.01, 2.0);
+    render_svg_to_rgba_even(&svg, scale)
+}
+
 pub fn render_svg_to_rgba(svg_data: &str, scale: f32) -> Option<(u32, u32, Vec<u8>)> {
-    let opt = usvg::Options::default();
+    let opt = crate::fonts::usvg_options();
     let tree = usvg::Tree::from_str(svg_data, &opt).ok()?;
 
     let pixmap_size = tree.size().to_int_size();
@@ -598,7 +788,7 @@ pub fn render_svg_to_rgba(svg_data: &str, scale: f32) -> Option<(u32, u32, Vec<u
 }
 
 pub fn render_svg_to_rgba_even(svg_data: &str, scale: f32) -> Option<(u32, u32, Vec<u8>)> {
-    let opt = usvg::Options::default();
+    let opt = crate::fonts::usvg_options();
     let tree = usvg::Tree::from_str(svg_data, &opt).ok()?;
 
     let pixmap_size = tree.size().to_int_size();
@@ -712,9 +902,10 @@ fn append_image_layer_nodes_to_svg(
     project: &ProjectFile,
     clip_map: &std::collections::HashMap<uuid::Uuid, crate::document::ClipMaskEffect>,
     mask_set: &std::collections::HashSet<uuid::Uuid>,
+    hidden: &std::collections::HashSet<crate::document::NodeId>,
 ) {
     for id in &layer.nodes {
-        if mask_set.contains(id) {
+        if mask_set.contains(id) || hidden.contains(id) {
             continue;
         }
         let Some(node) = project.nodes.get(*id) else {
@@ -733,13 +924,12 @@ fn append_image_layer_nodes_to_svg(
     }
 }
 
-fn document_svg_single_image_layer(
+pub fn document_svg_single_image_layer(
     project: &ProjectFile,
     layer: &crate::document::Layer,
-    defs_str: &str,
-    clip_map: &std::collections::HashMap<uuid::Uuid, crate::document::ClipMaskEffect>,
-    mask_set: &std::collections::HashSet<uuid::Uuid>,
+    hidden: &std::collections::HashSet<crate::document::NodeId>,
 ) -> String {
+    let (defs_str, clip_map, mask_set) = clip_defs_and_maps(project);
     let w = project.document.width;
     let h = project.document.height;
     let mut svg = format!(
@@ -747,16 +937,27 @@ fn document_svg_single_image_layer(
 <svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
 {defs_str}"#,
     );
-    append_image_layer_nodes_to_svg(&mut svg, layer, project, clip_map, mask_set);
+    append_image_layer_nodes_to_svg(&mut svg, layer, project, &clip_map, &mask_set, hidden);
     svg.push_str("</svg>\n");
     svg
+}
+
+/// Rasterize one image layer to RGBA at `scale` document-pixels per doc unit.
+pub fn rasterize_image_layer(
+    project: &ProjectFile,
+    layer: &crate::document::Layer,
+    hidden: &std::collections::HashSet<crate::document::NodeId>,
+    scale: f32,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let svg = document_svg_single_image_layer(project, layer, hidden);
+    render_svg_to_rgba_even(&svg, scale)
 }
 
 /// Raster export frame following document layer stack order (bottom → top).
 pub fn composite_export_frame(
     project: &ProjectFile,
     current_frame: usize,
-    video_frames: &std::collections::HashMap<uuid::Uuid, (u32, u32, Vec<u8>)>,
+    video_frames: &VideoFrameMap,
     scale: f32,
 ) -> Option<(u32, u32, Vec<u8>)> {
     use resvg::tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
@@ -786,36 +987,31 @@ pub fn composite_export_frame(
     .unwrap_or(Color::WHITE);
     pixmap.fill(bg);
 
-    let (defs_str, clip_map, mask_set) = clip_defs_and_maps(project);
     let scale_x = pixel_w as f32 / doc_w as f32;
     let scale_y = pixel_h as f32 / doc_h as f32;
     let svg_scale = Transform::from_scale(scale_x, scale_y);
-    let opt = usvg::Options::default();
+    let opt = crate::fonts::usvg_options();
 
     for layer in &project.document.layers {
         if !layer.visible || !layer.is_renderer {
             continue;
         }
         match layer.kind {
-            crate::document::LayerKind::Video => {
-                let Some((fw, fh, rgba)) = video_frames.get(&layer.id) else {
+            crate::document::LayerKind::AV => {
+                let Some(buf) = video_frames.get(&layer.id) else {
                     continue;
                 };
-                let Some(src) = Pixmap::from_vec(
-                    rgba.clone(),
-                    resvg::tiny_skia::IntSize::from_wh(*fw, *fh)?,
-                ) else {
-                    continue;
-                };
+                let mut src = Pixmap::new(buf.width, buf.height)?;
+                src.data_mut().copy_from_slice(&buf.rgba);
                 let (dx, dy, rot, opacity) =
                     layer_anim_transform(layer, project, current_frame);
-                let (dw, dh) = video_layer_dest_size(layer, *fw, *fh);
+                let (dw, dh) = video_layer_dest_size(layer, buf.width, buf.height);
                 let x = (dx as f32) * scale;
                 let y = (dy as f32) * scale;
                 let w = dw * scale;
                 let h = dh * scale;
-                let sx = w / *fw as f32;
-                let sy = h / *fh as f32;
+                let sx = w / buf.width as f32;
+                let sy = h / buf.height as f32;
                 let transform = if rot != 0.0 {
                     Transform::from_translate(x, y).pre_concat(
                         Transform::from_translate(w / 2.0, h / 2.0)
@@ -831,14 +1027,44 @@ pub fn composite_export_frame(
                 pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
             }
             crate::document::LayerKind::Image => {
-                let svg = document_svg_single_image_layer(project, layer, &defs_str, &clip_map, &mask_set);
+                let svg = document_svg_single_image_layer(project, layer, &std::collections::HashSet::new());
                 if let Ok(tree) = usvg::Tree::from_str(&svg, &opt) {
                     resvg::render(&tree, svg_scale, &mut pixmap.as_mut());
                 }
             }
-            crate::document::LayerKind::Audio => {}
+            crate::document::LayerKind::Shading => {}
         }
     }
 
     Some((pixel_w, pixel_h, pixmap.take()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_to_svg_d_includes_cubic_segments() {
+        let mut path = PathData {
+            verbs: vec![0, 1, 1, 1, 4],
+            points: vec![
+                [0.0, 0.0],
+                [10.0, 0.0],
+                [20.0, 0.0],
+                [20.0, 10.0],
+                [10.0, 20.0],
+            ],
+            closed: true,
+            smooth_anchors: Vec::new(),
+            handle_out_offset: Default::default(),
+            handle_in_offset: Default::default(),
+            handle_modes: Default::default(),
+            corner_fillets: Default::default(),
+        };
+        // Trigger a cubic via corner fillet (non-destructive arc approx)
+        path.set_corner_fillet(2, 3.0);
+        let d = path_to_svg_d(&path);
+        assert!(d.contains('C') || d.contains('c'), "expected cubic in {d}");
+        assert!(d.contains('Z') || d.contains('z'));
+    }
 }

@@ -1,1 +1,36 @@
+# Rust
 /target/
+
+# Android / Gradle
+.gradle/
+app/build/
+app/.cxx/
+local.properties
+*.apk
+*.aab
+
+# Native libs copied from Rust builds (regenerated on compile)
+app/src/main/jniLibs/**/*.so
+
+# Editor project files (MCP save/load)
+*.vadadee-berry.json
+
+# MCP / script generated assets (keep source art if you add it under assets/)
+/mcp_output/
+*_preview.png
+__pycache__/
+*.pyc
+
+# Ad-hoc generated images from create_*.py MCP scripts
+pixelated_blackhole*.png
+bunnygirl*.png
+vadadee_berry_logo*.png
+vadadee_berry_icon.png
+earth_4x4*.png
+eeg_dl*.png
+dl_learning_flowchart*.png
+thermo_roadmap*.png
+ragebait_story*.png
+.grok-logo-preview.png
+output.svg
+animation.mp4

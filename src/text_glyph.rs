@@ -1,6 +1,6 @@
 //! Vector text: glyph outlines tessellated with Lyon (true fill + stroke on paths).
 
-use egui::{Color32, Mesh, Painter, Pos2, Shape};
+use egui::{Mesh, Painter, Pos2, Shape};
 use lyon::math::Point;
 use lyon::path::Path;
 use lyon::tessellation::{
@@ -147,7 +147,7 @@ fn tessellate_stroke_mesh(
         .tessellate_path(
             path,
             &options,
-            &mut BuffersBuilder::new(&mut buffers, |v: StrokeVertex| v.position()),
+            &mut BuffersBuilder::new(&mut buffers, |v: StrokeVertex<'_, '_>| v.position()),
         )
         .ok()?;
     if buffers.indices.is_empty() {

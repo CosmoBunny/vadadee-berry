@@ -13,12 +13,15 @@ pub enum PathEditTarget {
     Anchor(usize),
     HandleOut(usize),
     HandleIn(usize),
+    /// Yellow control for mid-curve on segment starting at this anchor index (LPE style)
+    MidCtrl1(usize),
+    MidCtrl2(usize),
 }
 
 impl PathEditTarget {
     pub fn anchor_index(self) -> usize {
         match self {
-            Self::Anchor(i) | Self::HandleOut(i) | Self::HandleIn(i) => i,
+            Self::Anchor(i) | Self::HandleOut(i) | Self::HandleIn(i) | Self::MidCtrl1(i) | Self::MidCtrl2(i) => i,
         }
     }
 }
@@ -52,6 +55,15 @@ impl BezierHandleMode {
             Self::Both => "Both",
         }
     }
+}
+
+/// Non-destructive corner fillet / live corner curve at a sharp vertex (Point B).
+/// Keeps the original sharp corner node; the arc is overlaid between two tangent points on the adjacent legs.
+/// Uses a radius R; the equidistant tangent points are placed at D = R / tan(θ/2) from V on each leg.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CornerFillet {
+    /// Radius of the circular arc. Tangent points T1/T2 are placed equidistantly using D = R / tan(θ/2).
+    pub radius: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -167,6 +179,9 @@ pub enum NodeKind {
         height: f64,
         /// Embedded original bytes (PNG or JPEG) for fidelity and save/load.
         bytes: Vec<u8>,
+        /// SHA256 hex for collab wire sync (bytes stripped on send).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collab_asset_sha256: Option<String>,
     },
     Arc {
         cx: f64,
@@ -273,6 +288,9 @@ pub struct PathData {
     /// Per-anchor handle coupling mode.
     #[serde(default)]
     pub handle_modes: HashMap<usize, BezierHandleMode>,
+    /// Corner fillets at sharp anchors (non-destructive, keyed by the corner anchor index).
+    #[serde(default)]
+    pub corner_fillets: HashMap<usize, CornerFillet>,
 }
 
 impl PathData {
@@ -312,6 +330,7 @@ impl PathData {
             handle_out_offset: HashMap::new(),
             handle_in_offset: HashMap::new(),
             handle_modes: HashMap::new(),
+            corner_fillets: HashMap::new(),
         }
     }
 
@@ -377,6 +396,7 @@ impl PathData {
             handle_out_offset,
             handle_in_offset,
             handle_modes: HashMap::new(),
+            corner_fillets: HashMap::new(),
         };
         path.rebuild_with_smooth_anchors(anchors);
         path
@@ -1005,57 +1025,83 @@ impl PathData {
     }
 
     pub fn to_bez(&self) -> BezPath {
-        let mut path = BezPath::new();
-        let mut pi = 0;
-        for v in &self.verbs {
-            match v {
-                0 => {
-                    if pi < self.points.len() {
-                        let p = self.points[pi];
-                        path.move_to((p[0], p[1]));
-                        pi += 1;
-                    }
-                }
-                1 => {
-                    if pi < self.points.len() {
-                        let p = self.points[pi];
-                        path.line_to((p[0], p[1]));
-                        pi += 1;
-                    }
-                }
-                2 => {
-                    if pi + 1 < self.points.len() {
-                        let p1 = self.points[pi];
-                        let p2 = self.points[pi + 1];
-                        path.quad_to((p1[0], p1[1]), (p2[0], p2[1]));
-                        pi += 2;
-                    }
-                }
-                3 => {
-                    if pi + 1 < self.points.len() {
-                        let p1 = self.points[pi];
-                        let p2 = self.points[pi + 1];
-                        if pi + 2 < self.points.len() {
-                            let p3 = self.points[pi + 2];
-                            path.curve_to((p1[0], p1[1]), (p2[0], p2[1]), (p3[0], p3[1]));
-                            pi += 3;
-                        } else if let Some(kurbo::PathEl::MoveTo(start)) =
-                            path.elements().first()
-                        {
-                            path.curve_to((p1[0], p1[1]), (p2[0], p2[1]), (start.x, start.y));
-                            pi += 2;
-                        }
-                    }
-                }
-                4 => path.close_path(),
-                _ => {}
+        let anchors = self.anchor_positions();
+        if anchors.is_empty() {
+            return BezPath::new();
+        }
+        let n = anchors.len();
+        let closed = self.is_closed();
+        let mut bez = BezPath::new();
+        bez.move_to((anchors[0].0, anchors[0].1));
+        let seg_count = if closed { n } else { n.saturating_sub(1) };
+        for i in 0..seg_count {
+            let j = (i + 1) % n;
+            let p0 = anchors[i];
+            let p1 = anchors[j];
+            // Use D computed from radius via D = R / tan(θ/2) so T's are always equidistant.
+            let start_d = self.fillet_tangent_d(i);
+            let end_d = self.fillet_tangent_d(j);
+            let dx = p1.0 - p0.0;
+            let dy = p1.1 - p0.1;
+            let len = dx.hypot(dy).max(1e-9);
+            let ux = dx / len;
+            let uy = dy / len;
+            let t_start = (p0.0 + ux * start_d, p0.1 + uy * start_d);
+            let t_end = (p1.0 - ux * end_d, p1.1 - uy * end_d);
+            bez.line_to(t_start);
+            bez.line_to(t_end);
+            if self.has_corner_fillet(j) {
+                // Respect original closed state; do not assume wrap for open paths.
+                let next = if j + 1 < n {
+                    j + 1
+                } else if closed {
+                    0
+                } else {
+                    continue; // no outgoing leg on open path end; skip invalid fillet arc
+                };
+                let p2 = anchors[next];
+                let d_out = self.fillet_tangent_d(j);
+                let dxo = p2.0 - p1.0;
+                let dyo = p2.1 - p1.1;
+                let leno = dxo.hypot(dyo).max(1e-9);
+                let uxo = dxo / leno;
+                let uyo = dyo / leno;
+                // Ensure T1 and T2 are placed at exact equal distance D from V (per formula) BEFORE computing Bezier controls.
+                let D = end_d; // guaranteed equal to d_out by fillet_tangent_d using same R+θ
+                let t1 = (p1.0 - ux * D, p1.1 - uy * D);
+                let t2 = (p1.0 + uxo * D, p1.1 + uyo * D);
+                // Interior angle θ between the two line segments at V.
+                let va_x = p0.0 - p1.0;
+                let va_y = p0.1 - p1.1;
+                let vc_x = p2.0 - p1.0;
+                let vc_y = p2.1 - p1.1;
+                let ma = (va_x * va_x + va_y * va_y).sqrt().max(1e-9);
+                let mc = (vc_x * vc_x + vc_y * vc_y).sqrt().max(1e-9);
+                let cos_theta = ((va_x * vc_x + va_y * vc_y) / (ma * mc)).clamp(-1.0, 1.0);
+                let theta = cos_theta.acos();
+                let alpha = std::f64::consts::PI - theta;
+                // R from storage (or equivalently R = D * tan(θ/2))
+                let R = self.corner_fillets.get(&j).map_or(0.0, |f| f.radius);
+                let d = R * (4.0 / 3.0) * (alpha / 4.0).tan().max(0.0);
+                // C1 from T1 toward V
+                let v1x = p1.0 - t1.0;
+                let v1y = p1.1 - t1.1;
+                let l1 = (v1x * v1x + v1y * v1y).sqrt().max(1e-9);
+                let c1x = t1.0 + (v1x / l1) * d;
+                let c1y = t1.1 + (v1y / l1) * d;
+                // C2 from T2 toward V
+                let v2x = p1.0 - t2.0;
+                let v2y = p1.1 - t2.1;
+                let l2 = (v2x * v2x + v2y * v2y).sqrt().max(1e-9);
+                let c2x = t2.0 + (v2x / l2) * d;
+                let c2y = t2.1 + (v2y / l2) * d;
+                bez.curve_to((c1x, c1y), (c2x, c2y), (t2.0, t2.1));
             }
         }
-        // Verb 4 already emits close_path(); avoid a second ClosePath (breaks Lyon tessellation).
-        if self.closed && !self.verbs.contains(&4) {
-            path.close_path();
+        if closed {
+            bez.close_path();
         }
-        path
+        bez
     }
 
     pub fn is_closed(&self) -> bool {
@@ -1069,6 +1115,79 @@ impl PathData {
         }
         if !closed {
             self.verbs.retain(|v| *v != 4);
+        }
+    }
+
+    // --- Corner fillet (non-destructive LPE style) ---
+    pub fn set_corner_fillet(&mut self, anchor: usize, radius: f64) {
+        if radius > 1e-6 {
+            self.corner_fillets.insert(anchor, CornerFillet { radius });
+        } else {
+            self.corner_fillets.remove(&anchor);
+        }
+    }
+
+    pub fn clear_corner_fillet(&mut self, anchor: usize) {
+        self.corner_fillets.remove(&anchor);
+    }
+
+    pub fn get_corner_fillet(&self, anchor: usize) -> Option<&CornerFillet> {
+        self.corner_fillets.get(&anchor)
+    }
+
+    pub fn has_corner_fillet(&self, anchor: usize) -> bool {
+        self.corner_fillets.contains_key(&anchor)
+    }
+
+    /// Compute the interior angle θ (in radians, 0..π) at the given anchor using adjacent legs.
+    /// Used for fillet math: D = R / tan(θ/2).
+    pub fn corner_angle_at(&self, k: usize) -> Option<f64> {
+        let anchors = self.anchor_positions();
+        let n = anchors.len();
+        if k >= n {
+            return None;
+        }
+        let p = anchors[k];
+        let prev = if k > 0 {
+            k - 1
+        } else if self.is_closed() && n > 2 {
+            n - 1
+        } else {
+            return None;
+        };
+        let pa = anchors[prev];
+        let nxt = if k + 1 < n {
+            k + 1
+        } else if self.is_closed() && n > 2 {
+            0
+        } else {
+            return None;
+        };
+        let pb = anchors[nxt];
+        let va_x = pa.0 - p.0;
+        let va_y = pa.1 - p.1;
+        let vc_x = pb.0 - p.0;
+        let vc_y = pb.1 - p.1;
+        let ma = (va_x * va_x + va_y * va_y).sqrt().max(1e-9);
+        let mc = (vc_x * vc_x + vc_y * vc_y).sqrt().max(1e-9);
+        let cos_theta = ((va_x * vc_x + va_y * vc_y) / (ma * mc)).clamp(-1.0, 1.0);
+        Some(cos_theta.acos())
+    }
+
+    /// Tangent point distance D from vertex for this fillet, using D = R / tan(θ/2) to guarantee equidistant T1/T2.
+    pub fn fillet_tangent_d(&self, k: usize) -> f64 {
+        let Some(f) = self.corner_fillets.get(&k) else {
+            return 0.0;
+        };
+        let Some(theta) = self.corner_angle_at(k) else {
+            return f.radius;
+        };
+        let h = theta / 2.0;
+        let tan_h = h.tan();
+        if tan_h > 1e-9 {
+            f.radius / tan_h
+        } else {
+            f.radius
         }
     }
 
@@ -1664,7 +1783,14 @@ impl Node {
 
     pub fn image(x: f64, y: f64, width: f64, height: f64, bytes: Vec<u8>) -> Self {
         Self::new(
-            NodeKind::Image { x, y, width, height, bytes },
+            NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                bytes,
+                collab_asset_sha256: None,
+            },
             "Image",
         )
     }
@@ -1702,6 +1828,7 @@ impl Node {
             handle_out_offset: HashMap::new(),
             handle_in_offset: HashMap::new(),
             handle_modes: HashMap::new(),
+            corner_fillets: HashMap::new(),
         };
         let mut n = Self::new(NodeKind::Path { path }, "Line");
         n.style.fill = Fill::none();
@@ -2236,6 +2363,29 @@ impl Node {
                         hits.push((PathEditTarget::HandleIn(ai), ci));
                     }
                 }
+                // Yellow tangent points for active corner fillets (one per leg, slidable).
+                // Positions computed via D = R / tan(θ/2) so always equidistant from vertex.
+                let anchors_list = path.anchor_positions();
+                for (&k, _f) in &path.corner_fillets {
+                    if k >= anchors_list.len() { continue; }
+                    let p = anchors_list[k];
+                    let prev_idx = if k > 0 { k - 1 } else if path.is_closed() && anchors_list.len() > 2 { anchors_list.len() - 1 } else { continue };
+                    let pa = anchors_list[prev_idx];
+                    let lenp = ((p.0 - pa.0).powi(2) + (p.1 - pa.1).powi(2)).sqrt().max(1e-9);
+                    let uxp = (pa.0 - p.0) / lenp;
+                    let uyp = (pa.1 - p.1) / lenp;
+                    let D = path.fillet_tangent_d(k);
+                    let t1 = (p.0 + uxp * D, p.1 + uyp * D);
+                    hits.push((PathEditTarget::MidCtrl1(k), t1));
+                    // next leg
+                    let nxt_idx = if k + 1 < anchors_list.len() { k + 1 } else if path.is_closed() && anchors_list.len() > 2 { 0 } else { continue };
+                    let pb = anchors_list[nxt_idx];
+                    let lenn = ((p.0 - pb.0).powi(2) + (p.1 - pb.1).powi(2)).sqrt().max(1e-9);
+                    let uxn = (pb.0 - p.0) / lenn;
+                    let uyn = (pb.1 - p.1) / lenn;
+                    let t2 = (p.0 + uxn * D, p.1 + uyn * D);
+                    hits.push((PathEditTarget::MidCtrl2(k), t2));
+                }
                 hits
             }
             _ => self
@@ -2258,6 +2408,39 @@ impl Node {
             PathEditTarget::HandleIn(i) => {
                 if let NodeKind::Path { path } = &mut self.kind {
                     path.set_handle_in(i, x, y);
+                }
+            }
+            PathEditTarget::MidCtrl1(seg) | PathEditTarget::MidCtrl2(seg) => {
+                if let NodeKind::Path { path } = &mut self.kind {
+                    let anchors = path_anchor_positions(path);
+                    if path.has_corner_fillet(seg) {
+                        let p = anchors.get(seg).copied().unwrap_or((0.0, 0.0));
+                        let is_prev_leg = matches!(target, PathEditTarget::MidCtrl1(_));
+                        let other_idx = if is_prev_leg {
+                            if seg > 0 { seg - 1 } else if path.is_closed() && anchors.len() > 2 { anchors.len() - 1 } else { seg }
+                        } else {
+                            if seg + 1 < anchors.len() { seg + 1 } else if path.is_closed() && anchors.len() > 2 { 0 } else { seg }
+                        };
+                        let other = anchors.get(other_idx).copied().unwrap_or(p);
+                        // project (x,y) onto the leg line from p to other
+                        let vx = other.0 - p.0;
+                        let vy = other.1 - p.1;
+                        let leg_len = vx.hypot(vy).max(1e-9);
+                        let wx = x - p.0;
+                        let wy = y - p.1;
+                        let t = ((wx * vx + wy * vy) / (leg_len * leg_len)).clamp(0.0, 0.95);
+                        let new_d = t * leg_len;
+                        // Derive R from desired D (on the dragged leg) + current interior angle θ so that D = R / tan(θ/2)
+                        // This guarantees equidistant T1/T2.
+                        let r = if let Some(theta) = path.corner_angle_at(seg) {
+                            let h = theta / 2.0;
+                            let th = h.tan();
+                            if th > 1e-9 { new_d * th } else { new_d }
+                        } else {
+                            new_d
+                        };
+                        path.set_corner_fillet(seg, r);
+                    }
                 }
             }
         }
@@ -2891,6 +3074,7 @@ mod bezier_tests {
             handle_out_offset: HashMap::new(),
             handle_in_offset: HashMap::new(),
             handle_modes: HashMap::new(),
+            corner_fillets: HashMap::new(),
         };
         path.set_anchor_smooth(1, true);
         assert!(path.verbs.contains(&3), "verbs: {:?}", path.verbs);

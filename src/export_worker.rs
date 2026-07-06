@@ -1,14 +1,24 @@
 //! Background video export — keeps heavy libav + SVG raster work off the UI thread.
+//!
+//! Rasterizes frames on a worker thread and encodes with libav on the same thread.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::Instant;
+
+use rustc_hash::FxHashMap;
 
 use crate::app::{ExportPowerLevel, VideoFormat};
-use crate::document::{Fill, NodeId, NodeKind, ProjectFile};
-use crate::io;
-use crate::video_decode::{LibavEncoder, VideoStream};
+use crate::document::{Fill, NodeId, ProjectFile};
+use crate::io::{self, VideoFrameMap, VideoLayerBuffer};
+use crate::recorder::{Frame, RecorderConfig, SyncRecorder};
+use crate::video_decode::VideoStream;
+
+/// How often progress events are emitted (frames).
+const PROGRESS_EVERY_N_FRAMES: usize = 1;
+
 
 #[derive(Debug, Clone)]
 pub struct ExportJobConfig {
@@ -20,12 +30,23 @@ pub struct ExportJobConfig {
     pub format: VideoFormat,
     pub power: ExportPowerLevel,
     pub total_frames: usize,
-    pub restore_anim_frame: usize,
+    pub anim_fps: u32,
+    pub max_anim_frame: usize,
+}
+
+/// Readiness phases — worker only advances when the previous step is complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportPhase {
+    Preparing,
+    Encoding,
+    Finalizing,
 }
 
 #[derive(Debug, Clone)]
 pub enum ExportWorkerEvent {
+    Phase(ExportPhase),
     Progress {
+        phase: ExportPhase,
         frame_done: usize,
         total: usize,
         message: String,
@@ -42,7 +63,8 @@ pub fn spawn_export_worker(
     cancel: Arc<AtomicBool>,
     tx: Sender<ExportWorkerEvent>,
 ) {
-    std::thread::Builder::new()
+    let tx_fail = tx.clone();
+    match std::thread::Builder::new()
         .name("vadadee-video-export".into())
         .spawn(move || {
             if let Err(e) = run_export(&mut project, &config, &cancel, &tx) {
@@ -51,142 +73,209 @@ pub fn spawn_export_worker(
                     message: e,
                 });
             }
-        })
-        .ok();
+        }) {
+        Ok(_) => {}
+        Err(e) => {
+            let _ = tx_fail.send(ExportWorkerEvent::Finished {
+                success: false,
+                message: format!("Could not spawn export thread: {e}"),
+            });
+        }
+    }
 }
 
 fn export_cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed)
 }
 
-fn abort_export(
-    encoder: &mut Option<LibavEncoder>,
-    config: &ExportJobConfig,
-    tx: &Sender<ExportWorkerEvent>,
-) -> Result<(), String> {
-    drop(encoder.take());
-    let _ = std::fs::remove_dir_all(&config.work_dir);
-    let _ = tx.send(ExportWorkerEvent::Finished {
-        success: false,
-        message: "Cancelled.".into(),
-    });
-    Ok(())
+#[derive(Clone)]
+struct ColorAdjust {
+    hue: f32,
+    saturation: f32,
+    brightness: f32,
+    contrast: f32,
 }
 
-fn run_export(
-    project: &mut ProjectFile,
-    config: &ExportJobConfig,
-    cancel: &AtomicBool,
-    tx: &Sender<ExportWorkerEvent>,
-) -> Result<(), String> {
-    if !crate::video_decode::is_libav_available() {
-        return Err(
-            "FFmpeg libraries not found (libavformat/libavcodec). Install FFmpeg shared libs."
-                .into(),
-        );
+impl ColorAdjust {
+    fn active(&self) -> bool {
+        self.hue != 0.0
+            || self.saturation != 1.0
+            || self.brightness != 1.0
+            || self.contrast != 1.0
+    }
+}
+
+struct ExportVideoLayer {
+    id: uuid::Uuid,
+    path: String,
+    timeline_start: f32,
+    start_offset: f32,
+    play_secs: f32,
+    color: ColorAdjust,
+}
+
+struct ExportSession<'a> {
+    project: &'a mut ProjectFile,
+    config: &'a ExportJobConfig,
+    cancel: &'a AtomicBool,
+    tx: &'a Sender<ExportWorkerEvent>,
+    phase: ExportPhase,
+    started_at: Instant,
+    export_fps: f32,
+    anim_fps: f32,
+    scale: f32,
+    vcodec: &'static str,
+    temp_video: PathBuf,
+    video_layers: Vec<ExportVideoLayer>,
+    video_streams: FxHashMap<String, VideoStream>,
+    video_frames: VideoFrameMap,
+    recorder: Option<SyncRecorder>,
+}
+
+impl<'a> ExportSession<'a> {
+    fn new(
+        project: &'a mut ProjectFile,
+        config: &'a ExportJobConfig,
+        cancel: &'a AtomicBool,
+        tx: &'a Sender<ExportWorkerEvent>,
+    ) -> Self {
+        let scale = (config.resolution_pct as f32 / 100.0).max(0.1);
+        let vcodec = match config.format {
+            VideoFormat::Webm => "libvpx-vp9",
+            VideoFormat::Mov => "prores_ks",
+            _ => "libx264",
+        };
+        let video_layers = collect_export_video_layers(project);
+        Self {
+            project,
+            config,
+            cancel,
+            tx,
+            phase: ExportPhase::Preparing,
+            started_at: Instant::now(),
+            export_fps: config.fps as f32,
+            anim_fps: config.anim_fps.max(1) as f32,
+            scale,
+            vcodec,
+            temp_video: config.work_dir.join("temp_encoded_video.mp4"),
+            video_layers,
+            video_streams: FxHashMap::default(),
+            video_frames: VideoFrameMap::default(),
+            recorder: None,
+        }
     }
 
-    let temp_video = config.work_dir.join("temp_encoded_video.mp4");
-    let vcodec = match config.format {
-        VideoFormat::Webm => "libvpx-vp9",
-        VideoFormat::Mov => "prores_ks",
-        _ => "libx264",
-    };
-
-    let scale = (config.resolution_pct as f32 / 100.0).max(0.1);
-    let export_fps = config.fps as f32;
-    let mut encoder: Option<LibavEncoder> = None;
-    let mut video_streams: std::collections::HashMap<String, VideoStream> =
-        std::collections::HashMap::new();
-    let start = std::time::Instant::now();
-
-    for f in 0..config.total_frames {
-        if export_cancelled(cancel) {
-            return abort_export(&mut encoder, config, tx);
+    fn set_phase(&mut self, phase: ExportPhase) -> Result<(), String> {
+        if self.phase == phase {
+            return Ok(());
         }
+        self.phase = phase;
+        let _ = self.tx.send(ExportWorkerEvent::Phase(phase));
+        Ok(())
+    }
 
-        apply_animation_for_frame_project(project, f);
+    fn check_cancel(&self) -> Result<(), String> {
+        if export_cancelled(self.cancel) {
+            Err("Cancelled.".into())
+        } else {
+            Ok(())
+        }
+    }
 
-        let mut video_frames: std::collections::HashMap<uuid::Uuid, (u32, u32, Vec<u8>)> =
-            std::collections::HashMap::new();
-        for layer in &project.document.layers {
-            if export_cancelled(cancel) {
-                return abort_export(&mut encoder, config, tx);
-            }
-            if layer.visible
-                && layer.is_renderer
-                && layer.kind == crate::document::LayerKind::Video
-                && !layer.video_path.is_empty()
-            {
-                let elapsed_time = ((f as f32 / export_fps) - layer.video_timeline_start)
-                    .max(0.0)
-                    .min(layer.video_play_length);
-                let source_time = layer.video_start_offset + elapsed_time;
-                let source_frame_idx = (source_time * export_fps) as usize;
-                if let Some((w, h, mut rgba)) = decode_layer_frame_rgba(
-                    &mut video_streams,
-                    &layer.video_path,
-                    source_frame_idx,
-                    export_fps,
-                ) {
-                    if layer.hue != 0.0
-                        || layer.saturation != 1.0
-                        || layer.brightness != 1.0
-                        || layer.contrast != 1.0
+    fn prepare(&mut self) -> Result<(), String> {
+        self.set_phase(ExportPhase::Preparing)?;
+        if !crate::video_decode::is_libav_available() {
+            return Err(
+                "FFmpeg libraries not found (libavformat/libavcodec). Install FFmpeg shared libs."
+                    .into(),
+            );
+        }
+        self.check_cancel()
+    }
+
+    fn ensure_encoder(&mut self, width: u32, height: u32) -> Result<(), String> {
+        if self.recorder.is_some() {
+            return Ok(());
+        }
+        self.check_cancel()?;
+        let threads = match self.config.power {
+            ExportPowerLevel::PowerSaving => 1,
+            ExportPowerLevel::FullPower => 0,
+        };
+        let output = self
+            .temp_video
+            .to_str()
+            .ok_or_else(|| format!("Invalid temp video path: {}", self.temp_video.display()))?;
+        let recorder = SyncRecorder::start(RecorderConfig {
+            output_path: PathBuf::from(output),
+            width,
+            height,
+            fps: self.config.fps,
+            bitrate_kbps: self.config.bitrate_kbps,
+            vcodec: self.vcodec.to_string(),
+            encoder_threads: threads,
+        })?;
+        self.recorder = Some(recorder);
+        self.set_phase(ExportPhase::Encoding)
+    }
+
+    fn decode_video_layers(&mut self, timeline_sec: f32) -> Result<(), String> {
+        self.video_frames.clear();
+        for layer in &self.video_layers {
+            self.check_cancel()?;
+            let elapsed_time = (timeline_sec - layer.timeline_start)
+                .max(0.0)
+                .min(layer.play_secs);
+            let source_time = layer.start_offset + elapsed_time;
+            let source_frame_idx = (source_time * self.export_fps) as usize;
+            if let Some((w, h, mut rgba)) = decode_layer_frame_rgba(
+                &mut self.video_streams,
+                &layer.path,
+                source_frame_idx,
+                self.export_fps,
+            ) {
+                if layer.color.active() {
+                    if let Some(mut img) = image::RgbaImage::from_raw(w, h, std::mem::take(&mut rgba))
                     {
-                        if let Some(mut img) = image::RgbaImage::from_raw(w, h, std::mem::take(&mut rgba))
-                        {
-                            apply_color_controls(
-                                &mut img,
-                                layer.hue,
-                                layer.saturation,
-                                layer.brightness,
-                                layer.contrast,
-                            );
-                            rgba = img.into_raw();
-                        }
+                        apply_color_controls(
+                            &mut img,
+                            layer.color.hue,
+                            layer.color.saturation,
+                            layer.color.brightness,
+                            layer.color.contrast,
+                        );
+                        rgba = img.into_raw();
                     }
-                    video_frames.insert(layer.id, (w, h, rgba));
                 }
+                self.video_frames.insert(
+                    layer.id,
+                    VideoLayerBuffer {
+                        width: w,
+                        height: h,
+                        rgba,
+                    },
+                );
             }
         }
+        Ok(())
+    }
 
-        if export_cancelled(cancel) {
-            return abort_export(&mut encoder, config, tx);
+    fn stream_frame(&mut self, width: u32, height: u32, rgba: Vec<u8>) -> Result<(), String> {
+        let recorder = self
+            .recorder
+            .as_mut()
+            .ok_or_else(|| "Export encoder not ready".to_string())?;
+        recorder.write_frame(&Frame::new(width, height, rgba))
+    }
+
+    fn emit_progress(&self, frame_done: usize) {
+        if frame_done % PROGRESS_EVERY_N_FRAMES != 0 && frame_done != self.config.total_frames {
+            return;
         }
-
-        let (w, h, rgba) = io::composite_export_frame(project, f, &video_frames, scale)
-            .ok_or_else(|| "Frame rasterize failed".to_string())?;
-
-        if encoder.is_none() {
-            let threads = match config.power {
-                ExportPowerLevel::PowerSaving => 1,
-                ExportPowerLevel::FullPower => 0,
-            };
-            encoder = Some(LibavEncoder::new(
-                temp_video.to_str().unwrap(),
-                w,
-                h,
-                config.fps,
-                config.bitrate_kbps,
-                vcodec,
-                threads,
-            )?);
-        }
-
-        if export_cancelled(cancel) {
-            return abort_export(&mut encoder, config, tx);
-        }
-
-        if let Some(enc) = &mut encoder {
-            enc.write_frame(&rgba)?;
-        }
-
-        let frame_done = f + 1;
-        let elapsed = start.elapsed().as_secs_f32();
-        let eta_str = if f > 0 {
-            let avg = elapsed / f as f32;
-            let rem = (config.total_frames - frame_done) as f32 * avg;
+        let elapsed = self.started_at.elapsed().as_secs_f32();
+        let eta_str = if frame_done > 1 {
+            let avg = elapsed / (frame_done - 1) as f32;
+            let rem = (self.config.total_frames - frame_done) as f32 * avg;
             if rem < 60.0 {
                 format!("{:.0}s", rem)
             } else {
@@ -195,45 +284,138 @@ fn run_export(
         } else {
             "estimating…".to_string()
         };
-
-        let _ = tx.send(ExportWorkerEvent::Progress {
+        let _ = self.tx.send(ExportWorkerEvent::Progress {
+            phase: self.phase,
             frame_done,
-            total: config.total_frames,
+            total: self.config.total_frames,
             message: format!(
                 "Encoding frame {}/{} ({} fps) | ETA: {}",
-                frame_done, config.total_frames, config.fps, eta_str
+                frame_done, self.config.total_frames, self.config.fps, eta_str
             ),
         });
     }
 
-    if let Some(enc) = encoder {
-        let _ = enc.finish();
-    }
+    fn encode_all_frames(&mut self) -> Result<(), String> {
+        for f in 0..self.config.total_frames {
+            self.check_cancel()?;
 
-    let mut success = false;
-    if temp_video.exists() {
-        if std::fs::copy(&temp_video, &config.output_path).is_ok() {
-            success = true;
+            let timeline_sec = f as f32 / self.export_fps;
+            let anim_frame = ((timeline_sec * self.anim_fps).round() as usize)
+                .min(self.config.max_anim_frame);
+            apply_animation_for_frame_project(self.project, anim_frame);
+
+            self.decode_video_layers(timeline_sec)?;
+
+            let (w, h, rgba) = io::composite_export_frame(
+                self.project,
+                anim_frame,
+                &self.video_frames,
+                self.scale,
+            )
+            .ok_or_else(|| "Frame rasterize failed".to_string())?;
+
+            self.ensure_encoder(w, h)?;
+            self.stream_frame(w, h, rgba)?;
+            self.emit_progress(f + 1);
         }
+        Ok(())
     }
-    let _ = std::fs::remove_dir_all(&config.work_dir);
 
+    fn finalize(&mut self) -> Result<bool, String> {
+        self.set_phase(ExportPhase::Finalizing)?;
+        self.check_cancel()?;
+        let _ = self.tx.send(ExportWorkerEvent::Progress {
+            phase: ExportPhase::Finalizing,
+            frame_done: self.config.total_frames,
+            total: self.config.total_frames,
+            message: "Muxing audio…".into(),
+        });
+        if let Some(recorder) = self.recorder.take() {
+            recorder.finish()?;
+        }
+
+        let duration_secs =
+            self.config.total_frames as f32 / self.config.fps.max(1) as f32;
+        let success = if self.temp_video.exists() {
+            crate::export_audio::export_mux_with_audio(
+                self.project,
+                &self.temp_video,
+                &self.config.output_path,
+                &self.config.work_dir,
+                duration_secs,
+                self.config.format,
+            )?
+        } else {
+            false
+        };
+        let _ = std::fs::remove_dir_all(&self.config.work_dir);
+        Ok(success)
+    }
+
+    fn abort(&mut self) {
+        self.recorder.take();
+        let _ = std::fs::remove_dir_all(&self.config.work_dir);
+        let _ = self.tx.send(ExportWorkerEvent::Finished {
+            success: false,
+            message: "Cancelled.".into(),
+        });
+    }
+}
+
+fn run_export(
+    project: &mut ProjectFile,
+    config: &ExportJobConfig,
+    cancel: &AtomicBool,
+    tx: &Sender<ExportWorkerEvent>,
+) -> Result<(), String> {
+    let mut session = ExportSession::new(project, config, cancel, tx);
+    if let Err(e) = session.prepare().and_then(|_| session.encode_all_frames()) {
+        if e == "Cancelled." {
+            session.abort();
+            return Ok(());
+        }
+        return Err(e);
+    }
+
+    let success = session.finalize()?;
     let message = if success {
         format!("Saved {}", config.output_path.display())
     } else {
         "Export failed while writing output file.".into()
     };
-
-    let _ = tx.send(ExportWorkerEvent::Finished {
-        success,
-        message,
-    });
-    let _ = config.restore_anim_frame;
+    let _ = tx.send(ExportWorkerEvent::Finished { success, message });
     Ok(())
 }
 
+fn collect_export_video_layers(project: &ProjectFile) -> Vec<ExportVideoLayer> {
+    project
+        .document
+        .layers
+        .iter()
+        .filter(|layer| {
+            layer.visible
+                && layer.is_renderer
+                && layer.kind == crate::document::LayerKind::AV
+                && !layer.video_path.is_empty()
+        })
+        .map(|layer| ExportVideoLayer {
+            id: layer.id,
+            path: layer.video_path.clone(),
+            timeline_start: layer.video_timeline_start,
+            start_offset: layer.video_start_offset,
+            play_secs: layer.timeline_play_secs(),
+            color: ColorAdjust {
+                hue: layer.hue,
+                saturation: layer.saturation,
+                brightness: layer.brightness,
+                contrast: layer.contrast,
+            },
+        })
+        .collect()
+}
+
 fn decode_layer_frame_rgba(
-    streams: &mut std::collections::HashMap<String, VideoStream>,
+    streams: &mut FxHashMap<String, VideoStream>,
     video_path: &str,
     frame_idx: usize,
     fps: f32,
@@ -323,7 +505,7 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     let p = 2.0 * l - q;
     let hk = h / 360.0;
     let t = |n: f32| {
-        let mut k = (n + hk) % 1.0;
+        let k = (n + hk) % 1.0;
         if k < 1.0 / 3.0 {
             p + (q - p) * 3.0 * k
         } else if k < 2.0 / 3.0 {
@@ -432,8 +614,7 @@ pub fn apply_animation_for_frame_project(project: &mut ProjectFile, frame: usize
             }
         } else if let Some(layer) = project.document.layers.iter_mut().find(|l| {
             l.id == node_id
-                && (l.kind == crate::document::LayerKind::Video
-                    || l.kind == crate::document::LayerKind::Audio)
+                && l.kind == crate::document::LayerKind::AV
         }) {
             if let Some(x) = target_x {
                 layer.x = x as f32;

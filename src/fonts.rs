@@ -1,7 +1,10 @@
 use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 
-use egui::{Context, FontData, FontDefinitions, FontFamily};
+use egui::{Context, FontData, FontFamily};
 use fontdb::{Database, Family, Query};
+
+use crate::icons;
 
 pub const DEFAULT_FONT: &str = "Noto Sans";
 
@@ -99,4 +102,66 @@ impl FontRegistry {
         ctx.set_fonts(defs);
         self.loaded.insert(key);
     }
+}
+
+static USVG_FONTDB: OnceLock<Arc<Database>> = OnceLock::new();
+
+/// Strip quotes sometimes stored in project text styles (breaks usvg font matching).
+pub fn sanitize_svg_font_family(name: &str) -> String {
+    name.trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string()
+}
+
+fn register_nerd_font_aliases(db: &mut Database) {
+    let bytes = include_bytes!("../assets/DaddyTimeMonoNerdFont-Regular.ttf").to_vec();
+    let source = fontdb::Source::Binary(Arc::new(bytes));
+    let ids = db.load_font_source(source);
+    let Some(primary) = ids.first().copied() else {
+        return;
+    };
+    let Some(template) = db.face(primary).cloned() else {
+        return;
+    };
+
+    const ALIASES: &[&str] = &[
+        "AnonymicePro Nerd Font",
+        "Anonymice Pro Nerd Font",
+        icons::FONT_NAME,
+        "DaddyTimeMono Nerd Font",
+        "DaddyTimeMonoNerdFont",
+    ];
+
+    for alias in ALIASES {
+        let query = Query {
+            families: &[Family::Name(alias)],
+            weight: fontdb::Weight::NORMAL,
+            stretch: fontdb::Stretch::Normal,
+            style: fontdb::Style::Normal,
+        };
+        if db.query(&query).is_some() {
+            continue;
+        }
+        let mut info = template.clone();
+        info.id = fontdb::ID::dummy();
+        info.families = vec![(alias.to_string(), fontdb::Language::English_UnitedStates)];
+        db.push_face_info(info);
+    }
+}
+
+fn build_usvg_fontdb() -> Arc<Database> {
+    let mut db = Database::new();
+    db.set_sans_serif_family(DEFAULT_FONT);
+    db.load_system_fonts();
+    register_nerd_font_aliases(&mut db);
+    Arc::new(db)
+}
+
+/// Shared [`usvg::Options`] with system fonts and embedded Nerd Font aliases for export/rasterize.
+pub fn usvg_options() -> usvg::Options<'static> {
+    let mut opt = usvg::Options::default();
+    opt.fontdb = USVG_FONTDB.get_or_init(build_usvg_fontdb).clone();
+    opt.font_family = DEFAULT_FONT.to_string();
+    opt
 }

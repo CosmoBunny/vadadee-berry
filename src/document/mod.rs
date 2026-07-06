@@ -2,11 +2,17 @@ mod node;
 mod path_effects;
 mod style;
 mod animation;
+mod av_clip;
+mod music;
+mod shading;
 
+pub use av_clip::*;
 pub use node::*;
 pub use path_effects::*;
 pub use style::*;
 pub use animation::*;
+pub use music::*;
+pub use shading::*;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -15,6 +21,23 @@ use uuid::Uuid;
 /// A4 at 96 DPI (pixels), portrait.
 pub const A4_WIDTH_PX: f64 = 794.0;
 pub const A4_HEIGHT_PX: f64 = 1123.0;
+/// CSS / Inkscape style: 96 px per inch.
+pub const PX_PER_MM: f64 = 96.0 / 25.4;
+
+pub fn px_to_mm(px: f64) -> f64 {
+    px / PX_PER_MM
+}
+
+pub fn mm_to_px(mm: f64) -> f64 {
+    mm * PX_PER_MM
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PageUnit {
+    #[default]
+    Px,
+    Mm,
+}
 
 /// Inkscape-like document: page size + layer stack of drawable nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +64,9 @@ pub struct Document {
     pub clip_masks: IndexMap<Uuid, ClipMaskEffect>,
     #[serde(default = "default_page_color")]
     pub page_color: [f32; 4],
+    /// Display unit for page size fields in the UI (stored width/height are always px).
+    #[serde(default)]
+    pub page_unit: PageUnit,
 }
 
 fn default_page_color() -> [f32; 4] {
@@ -50,8 +76,10 @@ fn default_page_color() -> [f32; 4] {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LayerKind {
     Image,
-    Video,
-    Audio,
+    /// Unified Audio/Video (media) layer. A single AV layer can provide video frames and/or audio.
+    AV,
+    /// WGSL post-process passes composited over the canvas.
+    Shading,
 }
 
 impl Default for LayerKind {
@@ -109,6 +137,18 @@ pub struct Layer {
     pub video_play_length: f32,
     #[serde(default = "default_zero")]
     pub video_timeline_start: f32,
+    /// Probed file duration (seconds); caps timeline/export when set.
+    #[serde(default)]
+    pub media_source_duration: Option<f32>,
+    /// Media clips on the AV timeline (video and/or audio objects inside one layer).
+    #[serde(default)]
+    pub av_clips: Vec<AvClip>,
+    /// DAW-style music clips on the AV timeline (same layer as media).
+    #[serde(default)]
+    pub music_clips: Vec<MusicClip>,
+    /// WGSL shading passes when `kind == Shading`.
+    #[serde(default)]
+    pub shading_passes: Vec<ShadingPass>,
 }
 
 fn default_max_duration() -> f32 {
@@ -163,67 +203,159 @@ impl Layer {
             video_start_offset: 0.0,
             video_play_length: 3600.0,
             video_timeline_start: 0.0,
+            media_source_duration: None,
+            av_clips: Vec::new(),
+            music_clips: Vec::new(),
+            shading_passes: Vec::new(),
         }
     }
 
+    pub fn new_av_layer(id: Uuid, name: String, media_path: String) -> Self {
+        Self {
+            id,
+            name,
+            visible: true,
+            locked: false,
+            nodes: vec![],
+            kind: LayerKind::AV,
+            video_path: media_path,
+            volume: 1.0,
+            is_renderer: true,
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            width: A4_WIDTH_PX as f32,
+            height: A4_HEIGHT_PX as f32,
+            aspect_ratio_locked: true,
+            hue: 0.0,
+            saturation: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            eq_bass: 0.0,
+            eq_mid: 0.0,
+            eq_treble: 0.0,
+            video_start_offset: 0.0,
+            video_play_length: 3600.0,
+            video_timeline_start: 0.0,
+            media_source_duration: None,
+            av_clips: Vec::new(),
+            music_clips: Vec::new(),
+            shading_passes: Vec::new(),
+        }
+    }
+
+    pub fn new_empty_av_layer(id: Uuid, name: String) -> Self {
+        Self::new_av_layer(id, name, String::new())
+    }
+
+    pub fn new_shading_layer(id: Uuid, name: String) -> Self {
+        Self {
+            id,
+            name,
+            visible: true,
+            locked: false,
+            nodes: vec![],
+            kind: LayerKind::Shading,
+            video_path: String::new(),
+            volume: 1.0,
+            is_renderer: true,
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            width: A4_WIDTH_PX as f32,
+            height: A4_HEIGHT_PX as f32,
+            aspect_ratio_locked: true,
+            hue: 0.0,
+            saturation: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            eq_bass: 0.0,
+            eq_mid: 0.0,
+            eq_treble: 0.0,
+            video_start_offset: 0.0,
+            video_play_length: 3600.0,
+            video_timeline_start: 0.0,
+            media_source_duration: None,
+            av_clips: Vec::new(),
+            music_clips: Vec::new(),
+            shading_passes: vec![ShadingPass::vignette_preset()],
+        }
+    }
+
+    /// Migrate legacy single-clip fields into `av_clips` (idempotent).
+    pub fn ensure_av_clips(&mut self) {
+        if self.kind != LayerKind::AV || !self.av_clips.is_empty() {
+            return;
+        }
+        if self.video_path.is_empty()
+            && self.video_timeline_start == 0.0
+            && self.video_play_length >= 3599.0
+        {
+            return;
+        }
+        self.av_clips.push(AvClip::from_legacy(
+            self.id,
+            self.name.clone(),
+            self.video_path.clone(),
+            self.video_start_offset,
+            self.video_play_length,
+            self.video_timeline_start,
+            self.media_source_duration,
+        ));
+    }
+
+    pub fn has_canvas_video(&self) -> bool {
+        if self.kind != LayerKind::AV {
+            return false;
+        }
+        if !self.av_clips.is_empty() {
+            return self.av_clips.iter().any(|c| !c.is_audio_only());
+        }
+        !self.video_path.is_empty() && !AvClip::from_legacy(
+            self.id,
+            String::new(),
+            self.video_path.clone(),
+            0.0,
+            0.0,
+            0.0,
+            None,
+        )
+        .is_audio_only()
+    }
+
+    pub fn sync_legacy_from_primary_clip(&mut self) {
+        if let Some(clip) = self.av_clips.first() {
+            self.video_path = clip.media_path.clone();
+            self.video_start_offset = clip.video_start_offset;
+            self.video_play_length = clip.video_play_length;
+            self.video_timeline_start = clip.video_timeline_start;
+            self.media_source_duration = clip.media_source_duration;
+        }
+    }
+
+    // Back-compat shims (now both create unified AV layer)
     pub fn new_video(id: Uuid, name: String, video_path: String) -> Self {
-        Self {
-            id,
-            name,
-            visible: true,
-            locked: false,
-            nodes: vec![],
-            kind: LayerKind::Video,
-            video_path,
-            volume: 1.0,
-            is_renderer: true,
-            x: 0.0,
-            y: 0.0,
-            rotation: 0.0,
-            width: A4_WIDTH_PX as f32,
-            height: A4_HEIGHT_PX as f32,
-            aspect_ratio_locked: true,
-            hue: 0.0,
-            saturation: 1.0,
-            brightness: 1.0,
-            contrast: 1.0,
-            eq_bass: 0.0,
-            eq_mid: 0.0,
-            eq_treble: 0.0,
-            video_start_offset: 0.0,
-            video_play_length: 3600.0,
-            video_timeline_start: 0.0,
-        }
+        Self::new_av_layer(id, name, video_path)
+    }
+    pub fn new_audio(id: Uuid, name: String, audio_path: String) -> Self {
+        Self::new_av_layer(id, name, audio_path)
     }
 
-    pub fn new_audio(id: Uuid, name: String, audio_path: String) -> Self {
-        Self {
-            id,
-            name,
-            visible: true,
-            locked: false,
-            nodes: vec![],
-            kind: LayerKind::Audio,
-            video_path: audio_path,
-            volume: 1.0,
-            is_renderer: true,
-            x: 0.0,
-            y: 0.0,
-            rotation: 0.0,
-            width: A4_WIDTH_PX as f32,
-            height: A4_HEIGHT_PX as f32,
-            aspect_ratio_locked: true,
-            hue: 0.0,
-            saturation: 1.0,
-            brightness: 1.0,
-            contrast: 1.0,
-            eq_bass: 0.0,
-            eq_mid: 0.0,
-            eq_treble: 0.0,
-            video_start_offset: 0.0,
-            video_play_length: 3600.0,
-            video_timeline_start: 0.0,
+    /// Seconds of source media used on the timeline (play length capped by probe).
+    pub fn timeline_play_secs(&self) -> f32 {
+        let cap = self
+            .media_source_duration
+            .unwrap_or(self.video_play_length)
+            .max(0.0);
+        if self.video_play_length >= 3599.0 {
+            return cap;
         }
+        self.video_play_length.min(cap)
+    }
+
+    /// End time of this clip on the project timeline (seconds).
+    pub fn timeline_end_secs(&self) -> f32 {
+        self.video_timeline_start + self.timeline_play_secs()
     }
 }
 
@@ -255,6 +387,7 @@ impl Document {
             circular_effects: IndexMap::new(),
             clip_masks: IndexMap::new(),
             page_color: default_page_color(),
+            page_unit: PageUnit::Px,
         };
         ProjectFile::new(document, NodeStore::default())
     }
@@ -311,16 +444,35 @@ impl Document {
         self.layers.len() - 1
     }
 
-    pub fn add_video_layer(&mut self, name: impl Into<String>, video_path: String) -> usize {
-        let layer = Layer::new_video(Uuid::new_v4(), name.into(), video_path);
+    pub fn add_av_layer(&mut self, name: impl Into<String>, media_path: String) -> usize {
+        let mut layer = Layer::new_av_layer(Uuid::new_v4(), name.into(), media_path.clone());
+        if !media_path.is_empty() {
+            let mut clip = AvClip::new_from_media(layer.name.clone(), media_path, 0.0);
+            clip.id = layer.id;
+            layer.av_clips.push(clip);
+        }
         self.layers.push(layer);
         self.layers.len() - 1
     }
 
-    pub fn add_audio_layer(&mut self, name: impl Into<String>, audio_path: String) -> usize {
-        let layer = Layer::new_audio(Uuid::new_v4(), name.into(), audio_path);
+    pub fn add_empty_av_layer(&mut self, name: impl Into<String>) -> usize {
+        let layer = Layer::new_empty_av_layer(Uuid::new_v4(), name.into());
         self.layers.push(layer);
         self.layers.len() - 1
+    }
+
+    pub fn add_shading_layer(&mut self, name: impl Into<String>) -> usize {
+        let layer = Layer::new_shading_layer(Uuid::new_v4(), name.into());
+        self.layers.push(layer);
+        self.layers.len() - 1
+    }
+
+    // Back-compat (now both create AV layers)
+    pub fn add_video_layer(&mut self, name: impl Into<String>, video_path: String) -> usize {
+        self.add_av_layer(name, video_path)
+    }
+    pub fn add_audio_layer(&mut self, name: impl Into<String>, audio_path: String) -> usize {
+        self.add_av_layer(name, audio_path)
     }
 
 

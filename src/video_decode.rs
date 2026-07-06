@@ -9,12 +9,21 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+
+/// FFmpeg shared libs are not safe for concurrent use across threads in this crate.
+static LIBAV_LOCK: Mutex<()> = Mutex::new(());
+
+#[inline]
+fn libav_guard() -> std::sync::MutexGuard<'static, ()> {
+    LIBAV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // ── FFmpeg ABI constants ──────────────────────────────────────────────────────
 const AVMEDIA_TYPE_VIDEO: c_int = 0;
 const AVMEDIA_TYPE_AUDIO: c_int = 1;
 const AV_PIX_FMT_RGBA: c_int = 26;
+const AV_PIX_FMT_NONE: c_int = -1;
 const AVERROR_EAGAIN: c_int = -11;
 const SWS_BILINEAR: c_int = 2;
 
@@ -60,9 +69,10 @@ struct FfmpegLibs {
     avformat_free_context:          unsafe extern "C" fn(*mut AVFormatContext),
 
     // avcodec
+    avcodec_version:               unsafe extern "C" fn() -> std::os::raw::c_uint,
     avcodec_alloc_context3:        unsafe extern "C" fn(*const AVCodec) -> *mut AVCodecContext,
     avcodec_parameters_to_context: unsafe extern "C" fn(*mut AVCodecContext, *const ()) -> c_int,
-    avcodec_open2:                 unsafe extern "C" fn(*mut AVCodecContext, *const AVCodec, *mut ()) -> c_int,
+    avcodec_open2:                 unsafe extern "C" fn(*mut AVCodecContext, *const AVCodec, *mut *mut ()) -> c_int,
     avcodec_free_context:          unsafe extern "C" fn(*mut *mut AVCodecContext),
     avcodec_send_packet:           unsafe extern "C" fn(*mut AVCodecContext, *const AVPacket) -> c_int,
     avcodec_receive_frame:         unsafe extern "C" fn(*mut AVCodecContext, *mut AVFrame) -> c_int,
@@ -75,14 +85,25 @@ struct FfmpegLibs {
     av_frame_free:                 unsafe extern "C" fn(*mut *mut AVFrame),
 
     avcodec_parameters_from_context: unsafe extern "C" fn(*mut (), *const AVCodecContext) -> c_int,
+    avcodec_parameters_copy:         unsafe extern "C" fn(*mut (), *const ()) -> c_int,
     avcodec_find_decoder:           unsafe extern "C" fn(c_int) -> *const AVCodec,
     avcodec_find_encoder_by_name:  unsafe extern "C" fn(*const c_char) -> *const AVCodec,
     avcodec_send_frame:            unsafe extern "C" fn(*mut AVCodecContext, *const AVFrame) -> c_int,
     avcodec_receive_packet:        unsafe extern "C" fn(*mut AVCodecContext, *mut AVPacket) -> c_int,
+    av_packet_rescale_ts:          unsafe extern "C" fn(*mut AVPacket, AVRational, AVRational),
 
     // avutil
     av_frame_get_buffer:           unsafe extern "C" fn(*mut AVFrame, c_int) -> c_int,
     av_opt_set:                    unsafe extern "C" fn(*mut (), *const c_char, *const c_char, c_int) -> c_int,
+    av_opt_set_int:                unsafe extern "C" fn(*mut (), *const c_char, i64, c_int) -> c_int,
+    av_opt_set_q:                  unsafe extern "C" fn(*mut (), *const c_char, AVRational, c_int) -> c_int,
+    av_opt_get_int:                unsafe extern "C" fn(*mut (), *const c_char, c_int, *mut i64) -> c_int,
+    av_get_pix_fmt:                unsafe extern "C" fn(*const c_char) -> c_int,
+    av_get_sample_fmt:             unsafe extern "C" fn(*const c_char) -> c_int,
+    av_channel_layout_from_string: unsafe extern "C" fn(*mut (), *const c_char) -> c_int,
+    av_channel_layout_copy:        unsafe extern "C" fn(*mut (), *const ()) -> c_int,
+    av_dict_set:                   unsafe extern "C" fn(*mut *mut (), *const c_char, *const c_char, c_int) -> c_int,
+    av_dict_free:                  unsafe extern "C" fn(*mut *mut ()),
 
     // swscale
     sws_getContext: unsafe extern "C" fn(c_int,c_int,c_int,c_int,c_int,c_int,c_int,*mut (),*mut (),*const f64) -> *mut SwsContext,
@@ -115,10 +136,10 @@ fn try_load_ffmpeg() -> Option<FfmpegLibs> {
         };
     }
 
-    let avformat = open_lib!(["libavformat.so.60","libavformat.so","libavformat.60.dylib","avformat-60.dll"]);
-    let avcodec  = open_lib!(["libavcodec.so.60", "libavcodec.so", "libavcodec.60.dylib", "avcodec-60.dll" ]);
-    let avutil   = open_lib!(["libavutil.so.58",  "libavutil.so",  "libavutil.58.dylib",  "avutil-58.dll"  ]);
-    let swscale  = open_lib!(["libswscale.so.7",  "libswscale.so", "libswscale.7.dylib",  "swscale-7.dll"  ]);
+    let avformat = open_lib!(["libavformat.so.61","libavformat.so.60","libavformat.so","libavformat.61.dylib","libavformat.60.dylib","avformat-61.dll","avformat-60.dll"]);
+    let avcodec  = open_lib!(["libavcodec.so.61", "libavcodec.so.60", "libavcodec.so", "libavcodec.61.dylib", "libavcodec.60.dylib", "avcodec-61.dll", "avcodec-60.dll" ]);
+    let avutil   = open_lib!(["libavutil.so.59",  "libavutil.so.58",  "libavutil.so",  "libavutil.59.dylib",  "libavutil.58.dylib",  "avutil-59.dll",  "avutil-58.dll"  ]);
+    let swscale  = open_lib!(["libswscale.so.8",  "libswscale.so.7",  "libswscale.so", "libswscale.8.dylib",  "libswscale.7.dylib",  "swscale-8.dll",  "swscale-7.dll"  ]);
 
     Some(FfmpegLibs {
         avformat_version:              sym!(avformat, unsafe extern "C" fn() -> std::os::raw::c_uint,                                                         b"avformat_version\0"),
@@ -138,9 +159,10 @@ fn try_load_ffmpeg() -> Option<FfmpegLibs> {
         avio_closep:                    sym!(avformat, unsafe extern "C" fn(*mut *mut AVIOContext) -> c_int, b"avio_closep\0"),
         avformat_free_context:          sym!(avformat, unsafe extern "C" fn(*mut AVFormatContext), b"avformat_free_context\0"),
 
+        avcodec_version:               sym!(avcodec,  unsafe extern "C" fn() -> std::os::raw::c_uint,                                                          b"avcodec_version\0"),
         avcodec_alloc_context3:        sym!(avcodec,  unsafe extern "C" fn(*const AVCodec)->*mut AVCodecContext,                                             b"avcodec_alloc_context3\0"),
         avcodec_parameters_to_context: sym!(avcodec,  unsafe extern "C" fn(*mut AVCodecContext,*const ())->c_int,                                            b"avcodec_parameters_to_context\0"),
-        avcodec_open2:                 sym!(avcodec,  unsafe extern "C" fn(*mut AVCodecContext,*const AVCodec,*mut ())->c_int,                                b"avcodec_open2\0"),
+        avcodec_open2:                 sym!(avcodec,  unsafe extern "C" fn(*mut AVCodecContext,*const AVCodec,*mut *mut ())->c_int,                          b"avcodec_open2\0"),
         avcodec_free_context:          sym!(avcodec,  unsafe extern "C" fn(*mut *mut AVCodecContext),                                                         b"avcodec_free_context\0"),
         avcodec_send_packet:           sym!(avcodec,  unsafe extern "C" fn(*mut AVCodecContext,*const AVPacket)->c_int,                                       b"avcodec_send_packet\0"),
         avcodec_receive_frame:         sym!(avcodec,  unsafe extern "C" fn(*mut AVCodecContext,*mut AVFrame)->c_int,                                          b"avcodec_receive_frame\0"),
@@ -153,13 +175,24 @@ fn try_load_ffmpeg() -> Option<FfmpegLibs> {
         av_frame_free:                 sym!(avcodec,  unsafe extern "C" fn(*mut *mut AVFrame),                                                                b"av_frame_free\0"),
 
         avcodec_parameters_from_context: sym!(avcodec, unsafe extern "C" fn(*mut (), *const AVCodecContext) -> c_int, b"avcodec_parameters_from_context\0"),
+        avcodec_parameters_copy:         sym!(avcodec, unsafe extern "C" fn(*mut (), *const ()) -> c_int, b"avcodec_parameters_copy\0"),
         avcodec_find_decoder:           sym!(avcodec,  unsafe extern "C" fn(c_int) -> *const AVCodec, b"avcodec_find_decoder\0"),
         avcodec_find_encoder_by_name:  sym!(avcodec,  unsafe extern "C" fn(*const c_char) -> *const AVCodec, b"avcodec_find_encoder_by_name\0"),
         avcodec_send_frame:            sym!(avcodec,  unsafe extern "C" fn(*mut AVCodecContext, *const AVFrame) -> c_int, b"avcodec_send_frame\0"),
         avcodec_receive_packet:        sym!(avcodec,  unsafe extern "C" fn(*mut AVCodecContext, *mut AVPacket) -> c_int, b"avcodec_receive_packet\0"),
+        av_packet_rescale_ts:          sym!(avcodec,  unsafe extern "C" fn(*mut AVPacket, AVRational, AVRational), b"av_packet_rescale_ts\0"),
 
         av_frame_get_buffer:           sym!(avutil,   unsafe extern "C" fn(*mut AVFrame, c_int) -> c_int, b"av_frame_get_buffer\0"),
         av_opt_set:                    sym!(avutil,   unsafe extern "C" fn(*mut (), *const c_char, *const c_char, c_int) -> c_int, b"av_opt_set\0"),
+        av_opt_set_int:                sym!(avutil,   unsafe extern "C" fn(*mut (), *const c_char, i64, c_int) -> c_int, b"av_opt_set_int\0"),
+        av_opt_set_q:                  sym!(avutil,   unsafe extern "C" fn(*mut (), *const c_char, AVRational, c_int) -> c_int, b"av_opt_set_q\0"),
+        av_opt_get_int:                sym!(avutil,   unsafe extern "C" fn(*mut (), *const c_char, c_int, *mut i64) -> c_int, b"av_opt_get_int\0"),
+        av_get_pix_fmt:                sym!(avutil,   unsafe extern "C" fn(*const c_char) -> c_int, b"av_get_pix_fmt\0"),
+        av_get_sample_fmt:             sym!(avutil,   unsafe extern "C" fn(*const c_char) -> c_int, b"av_get_sample_fmt\0"),
+        av_channel_layout_from_string: sym!(avutil,   unsafe extern "C" fn(*mut (), *const c_char) -> c_int, b"av_channel_layout_from_string\0"),
+        av_channel_layout_copy:        sym!(avutil,   unsafe extern "C" fn(*mut (), *const ()) -> c_int, b"av_channel_layout_copy\0"),
+        av_dict_set:                   sym!(avutil,   unsafe extern "C" fn(*mut *mut (), *const c_char, *const c_char, c_int) -> c_int, b"av_dict_set\0"),
+        av_dict_free:                  sym!(avutil,   unsafe extern "C" fn(*mut *mut ()), b"av_dict_free\0"),
 
         sws_getContext: sym!(swscale, unsafe extern "C" fn(c_int,c_int,c_int,c_int,c_int,c_int,c_int,*mut (),*mut (),*const f64)->*mut SwsContext, b"sws_getContext\0"),
         sws_scale:      sym!(swscale, unsafe extern "C" fn(*mut SwsContext,*const *const u8,*const c_int,c_int,c_int,*const *mut u8,*const c_int)->c_int, b"sws_scale\0"),
@@ -180,10 +213,10 @@ fn try_load_ffmpeg() -> Option<FfmpegLibs> {
 // AVFrame:         data[0]@0, linesize[0]@64, width@104, height@108, format@116
 
 unsafe fn stream_time_base_num(stream: *mut u8) -> i32 {
-    stream.add(24).cast::<i32>().read()
+    unsafe { stream.add(24).cast::<i32>().read() }
 }
 unsafe fn stream_time_base_den(stream: *mut u8) -> i32 {
-    stream.add(28).cast::<i32>().read()
+    unsafe { stream.add(28).cast::<i32>().read() }
 }
 
 unsafe fn fmt_stream(c: *mut AVFormatContext, i: u32) -> *mut u8 {
@@ -224,10 +257,475 @@ unsafe fn frame_linesize(f: *mut AVFrame, plane: usize) -> c_int {
 unsafe fn frame_width(f: *mut AVFrame)  -> i32 { unsafe { (f as *const u8).add(104).cast::<i32>().read() } }
 unsafe fn frame_height(f: *mut AVFrame) -> i32 { unsafe { (f as *const u8).add(108).cast::<i32>().read() } }
 unsafe fn frame_format(f: *mut AVFrame) -> i32 { unsafe { (f as *const u8).add(116).cast::<i32>().read() } }
-unsafe fn frame_nb_samples(f: *mut AVFrame) -> i32 { unsafe { (f as *const u8).add(88).cast::<i32>().read() } }
+unsafe fn frame_nb_samples(f: *mut AVFrame) -> i32 {
+    unsafe { (f as *const u8).add(112).cast::<i32>().read() }
+}
 unsafe fn codecpar_codec_id(cp: *mut u8) -> i32 { unsafe { cp.add(4).cast::<i32>().read() } }
 
+unsafe fn stream_set_time_base(stream: *mut u8, num: i32, den: i32, avformat_major: u32) {
+    unsafe {
+        let (no, doff) = if avformat_major >= 59 {
+            (32, 36)
+        } else {
+            (24, 28)
+        };
+        stream.add(no).cast::<i32>().write(num);
+        stream.add(doff).cast::<i32>().write(den);
+    }
+}
+
+unsafe fn pkt_set_stream_index(pkt: *mut AVPacket, idx: i32) {
+    unsafe { (pkt as *mut u8).add(36).cast::<i32>().write(idx); }
+}
+unsafe fn pkt_set_pts(pkt: *mut AVPacket, pts: i64) {
+    unsafe { (pkt as *mut u8).add(8).cast::<i64>().write(pts); }
+}
+unsafe fn pkt_set_dts(pkt: *mut AVPacket, dts: i64) {
+    unsafe { (pkt as *mut u8).add(16).cast::<i64>().write(dts); }
+}
+unsafe fn pkt_set_duration(pkt: *mut AVPacket, dur: i64) {
+    unsafe { (pkt as *mut u8).add(24).cast::<i64>().write(dur); }
+}
+
+unsafe fn fmt_nb_streams(fmt: *mut AVFormatContext) -> u32 {
+    unsafe { (fmt as *const u8).add(44).cast::<u32>().read() }
+}
+
+unsafe fn fmt_set_pb(fmt: *mut AVFormatContext, io: *mut AVIOContext, _avformat_major: u32) {
+    unsafe {
+        // AVFormatContext.pb @ 32 on LP64 (FFmpeg n6.1 / n7.1).
+        (fmt as *mut u8).add(32).cast::<*mut AVIOContext>().write(io);
+    }
+}
+
+const AV_OPT_SEARCH_CHILDREN: c_int = 2;
+
+struct CodecCtxVideoLayout {
+    width: usize,
+    height: usize,
+    pix_fmt: usize,
+    gop_size: usize,
+    bit_rate: usize,
+    tb_num: usize,
+    tb_den: usize,
+}
+
+struct CodecCtxAudioLayout {
+    sample_rate: usize,
+    channels: Option<usize>,
+    sample_fmt: usize,
+}
+
+/// `AVChannelLayout` public ABI size (FFmpeg 5+).
+const AV_SAMPLE_FMT_FLTP: i32 = 8;
+const AV_CHANNEL_LAYOUT_SIZE: usize = 24;
+const AV_CHANNEL_ORDER_NATIVE: i32 = 1;
+const AV_CH_LAYOUT_STEREO: u64 = 3;
+fn codec_ctx_ch_layout_offset(avcodec_major: u32) -> Option<usize> {
+    // LP64 offsetof(AVCodecContext.ch_layout); major 60 validated on libavcodec 60.x.
+    match avcodec_major {
+        60 => Some(376),
+        61..=62 => Some(368),
+        _ => None,
+    }
+}
+
+fn codec_ctx_audio_layout(avcodec_major: u32) -> CodecCtxAudioLayout {
+    if avcodec_major >= 61 {
+        CodecCtxAudioLayout {
+            sample_rate: 344,
+            channels: None,
+            sample_fmt: 348,
+        }
+    } else {
+        CodecCtxAudioLayout {
+            sample_rate: 352,
+            channels: Some(356),
+            sample_fmt: 360,
+        }
+    }
+}
+
+fn frame_ch_layout_offset(_avutil_major: u32) -> usize {
+    // offsetof(AVFrame, ch_layout) on LP64 FFmpeg n6.1 / n7.1.
+    448
+}
+
+unsafe fn stereo_ch_layout_write_raw(dst: *mut u8) {
+    unsafe {
+        dst.cast::<i32>().write(AV_CHANNEL_ORDER_NATIVE);
+        dst.add(4).cast::<i32>().write(2);
+        dst.add(8).cast::<u64>().write(AV_CH_LAYOUT_STEREO);
+        dst.add(16).cast::<*mut u8>().write(std::ptr::null_mut());
+    }
+}
+
+unsafe fn stereo_ch_layout_apply(libs: &FfmpegLibs, dst: *mut u8) {
+    unsafe {
+        let stereo = CString::new("stereo").unwrap();
+        let ret = (libs.av_channel_layout_from_string)(dst as *mut (), stereo.as_ptr());
+        if ret < 0 {
+            stereo_ch_layout_write_raw(dst);
+        }
+    }
+}
+
+unsafe fn stereo_layout_buf(libs: &FfmpegLibs) -> [u8; AV_CHANNEL_LAYOUT_SIZE] {
+    let mut layout = [0u8; AV_CHANNEL_LAYOUT_SIZE];
+    unsafe {
+        stereo_ch_layout_apply(libs, layout.as_mut_ptr());
+    }
+    layout
+}
+
+unsafe fn codec_ctx_apply_stereo_ch_layout(libs: &FfmpegLibs, cc: *mut AVCodecContext, avcodec_major: u32) {
+    unsafe {
+        let Some(off) = codec_ctx_ch_layout_offset(avcodec_major) else {
+            return;
+        };
+        let stereo = stereo_layout_buf(libs);
+        let _ = (libs.av_channel_layout_copy)(
+            (cc as *mut u8).add(off) as *mut (),
+            stereo.as_ptr() as *const (),
+        );
+    }
+}
+
+unsafe fn frame_prepare_stereo_audio(
+    libs: &FfmpegLibs,
+    frame: *mut AVFrame,
+    nb_samples: i32,
+    sample_rate: i32,
+    sample_fmt: i32,
+) {
+    unsafe {
+        frame_set_nb_samples(frame, nb_samples);
+        frame_set_format(frame, sample_fmt);
+        frame_set_sample_rate(frame, sample_rate);
+        let ch_off = frame_ch_layout_offset(0);
+        stereo_ch_layout_apply(libs, (frame as *mut u8).add(ch_off));
+        let frame_void = frame as *mut ();
+        let _ = (libs.av_opt_set)(
+            frame_void,
+            CString::new("ch_layout").unwrap().as_ptr(),
+            CString::new("stereo").unwrap().as_ptr(),
+            AV_OPT_SEARCH_CHILDREN,
+        );
+    }
+}
+
+unsafe fn codec_ctx_apply_audio_encoder(
+    libs: &FfmpegLibs,
+    cc: *mut AVCodecContext,
+    avcodec_major: u32,
+    sample_rate: u32,
+    sample_fmt: i32,
+) {
+    unsafe {
+        let audio = codec_ctx_audio_layout(avcodec_major);
+        let video = codec_ctx_video_layout(avcodec_major);
+        let p = cc as *mut u8;
+        let sr = sample_rate.max(1) as i32;
+        let fmt = if sample_fmt >= 0 {
+            sample_fmt
+        } else {
+            let name = CString::new("fltp").unwrap();
+            (libs.av_get_sample_fmt)(name.as_ptr())
+        };
+        p.add(audio.sample_rate).cast::<i32>().write(sr);
+        p.add(audio.sample_fmt).cast::<i32>().write(fmt);
+        p.add(video.tb_num).cast::<i32>().write(1);
+        p.add(video.tb_den).cast::<i32>().write(sr);
+    }
+}
+
+fn codec_ctx_video_layout(avcodec_major: u32) -> CodecCtxVideoLayout {
+    // Offsets from offsetof(AVCodecContext, …) on LP64 (FFmpeg n6.1.1 / n7.1 headers).
+    if avcodec_major >= 61 {
+        CodecCtxVideoLayout {
+            bit_rate: 56,
+            tb_num: 84,
+            tb_den: 88,
+            width: 116,
+            height: 120,
+            gop_size: 332,
+            pix_fmt: 140,
+        }
+    } else {
+        CodecCtxVideoLayout {
+            bit_rate: 56,
+            tb_num: 100,
+            tb_den: 104,
+            width: 116,
+            height: 120,
+            gop_size: 132,
+            pix_fmt: 136,
+        }
+    }
+}
+
+unsafe fn codec_ctx_read_time_base(cc: *mut AVCodecContext, avcodec_major: u32) -> AVRational {
+    unsafe {
+        let layout = codec_ctx_video_layout(avcodec_major);
+        let p = cc as *const u8;
+        AVRational {
+            num: p.add(layout.tb_num).cast::<i32>().read(),
+            den: p.add(layout.tb_den).cast::<i32>().read().max(1),
+        }
+    }
+}
+
+unsafe fn stream_read_time_base(stream: *mut u8, avformat_major: u32) -> AVRational {
+    unsafe {
+        let (no, doff) = if avformat_major >= 59 {
+            (32, 36)
+        } else {
+            (24, 28)
+        };
+        AVRational {
+            num: stream.add(no).cast::<i32>().read(),
+            den: stream.add(doff).cast::<i32>().read().max(1),
+        }
+    }
+}
+
+unsafe fn libav_opt_set(
+    libs: &FfmpegLibs,
+    obj: *mut (),
+    key: &str,
+    val: &str,
+    flags: c_int,
+) -> Result<(), String> {
+    unsafe {
+        let k = CString::new(key).map_err(|e| e.to_string())?;
+        let v = CString::new(val).map_err(|e| e.to_string())?;
+        let r = (libs.av_opt_set)(obj, k.as_ptr(), v.as_ptr(), flags);
+        if r < 0 {
+            Err(format!("av_opt_set({key}={val}) failed ({r})"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+unsafe fn libav_opt_set_int(
+    libs: &FfmpegLibs,
+    obj: *mut (),
+    key: &str,
+    val: i64,
+    flags: c_int,
+) -> Result<(), String> {
+    unsafe {
+        let k = CString::new(key).map_err(|e| e.to_string())?;
+        let r = (libs.av_opt_set_int)(obj, k.as_ptr(), val, flags);
+        if r < 0 {
+            Err(format!("av_opt_set_int({key}={val}) failed ({r})"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+unsafe fn libav_opt_get_int(
+    libs: &FfmpegLibs,
+    obj: *mut (),
+    key: &str,
+    flags: c_int,
+) -> Result<i64, String> {
+    unsafe {
+        let k = CString::new(key).map_err(|e| e.to_string())?;
+        let mut out: i64 = 0;
+        let r = (libs.av_opt_get_int)(obj, k.as_ptr(), flags, &mut out);
+        if r < 0 {
+            Err(format!("av_opt_get_int({key}) failed ({r})"))
+        } else {
+            Ok(out)
+        }
+    }
+}
+
+unsafe fn codec_ctx_read_dims(cc: *mut AVCodecContext, avcodec_major: u32) -> (i32, i32) {
+    unsafe {
+        let layout = codec_ctx_video_layout(avcodec_major);
+        let p = cc as *const u8;
+        (
+            p.add(layout.width).cast::<i32>().read(),
+            p.add(layout.height).cast::<i32>().read(),
+        )
+    }
+}
+
+unsafe fn encoder_yuv420p_pix_fmt(libs: &FfmpegLibs) -> Result<c_int, String> {
+    unsafe {
+        let name = CString::new("yuv420p").map_err(|e| e.to_string())?;
+        let fmt = (libs.av_get_pix_fmt)(name.as_ptr());
+        if fmt < 0 {
+            return Err("av_get_pix_fmt(yuv420p) failed".into());
+        }
+        Ok(fmt)
+    }
+}
+
+unsafe fn codec_ctx_set_pix_fmt(cc: *mut AVCodecContext, avcodec_major: u32, pix_fmt: c_int) {
+    unsafe {
+        let layout = codec_ctx_video_layout(avcodec_major);
+        (cc as *mut u8)
+            .add(layout.pix_fmt)
+            .cast::<c_int>()
+            .write(pix_fmt);
+    }
+}
+
+unsafe fn codec_ctx_read_pix_fmt(cc: *mut AVCodecContext, avcodec_major: u32) -> c_int {
+    unsafe {
+        let layout = codec_ctx_video_layout(avcodec_major);
+        (cc as *const u8)
+            .add(layout.pix_fmt)
+            .cast::<c_int>()
+            .read()
+    }
+}
+
+unsafe fn codec_ctx_pix_fmt_ok(cc: *mut AVCodecContext, avcodec_major: u32, pix_fmt: c_int) -> bool {
+    unsafe { codec_ctx_read_pix_fmt(cc, avcodec_major) == pix_fmt }
+}
+
+/// Set direct AVCodecContext fields that are not reliably exposed as AVOptions on all builds.
+unsafe fn codec_ctx_apply_video(
+    cc: *mut AVCodecContext,
+    avcodec_major: u32,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    pix_fmt: c_int,
+) {
+    unsafe {
+        let layout = codec_ctx_video_layout(avcodec_major);
+        let p = cc as *mut u8;
+        let fps_i = fps.max(1) as i32;
+        p.add(layout.bit_rate).cast::<i64>().write((bitrate_kbps as i64) * 1000);
+        p.add(layout.width).cast::<i32>().write(width as i32);
+        p.add(layout.height).cast::<i32>().write(height as i32);
+        p.add(layout.gop_size).cast::<i32>().write(fps_i);
+        p.add(layout.pix_fmt).cast::<c_int>().write(pix_fmt);
+    }
+}
+
+unsafe fn codec_ctx_dims_ok(cc: *mut AVCodecContext, avcodec_major: u32, width: u32, height: u32) -> bool {
+    let (rw, rh) = unsafe { codec_ctx_read_dims(cc, avcodec_major) };
+    rw == width as i32 && rh == height as i32 && rh > 0
+}
+
+unsafe fn configure_video_encoder(
+    libs: &FfmpegLibs,
+    cc: *mut AVCodecContext,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+) -> Result<c_int, String> {
+    unsafe {
+        if width == 0 || height == 0 || fps == 0 {
+            return Err(format!(
+                "Invalid encoder dimensions {width}x{height} @ {fps} fps"
+            ));
+        }
+        let avcodec_major = (libs.avcodec_version)() >> 16;
+        let fps_i = fps.max(1) as c_int;
+        let pix_fmt = encoder_yuv420p_pix_fmt(libs)?;
+        codec_ctx_apply_video(cc, avcodec_major, width, height, fps, bitrate_kbps, pix_fmt);
+        if !codec_ctx_dims_ok(cc, avcodec_major, width, height) {
+            return Err(format!(
+                "Could not set encoder dimensions to {width}x{height} (libavcodec major {avcodec_major})"
+            ));
+        }
+        if !codec_ctx_pix_fmt_ok(cc, avcodec_major, pix_fmt) {
+            return Err(format!(
+                "Could not set encoder pix_fmt to {pix_fmt} (libavcodec major {avcodec_major})"
+            ));
+        }
+
+        let obj = cc as *mut ();
+        let time_base = AVRational { num: 1, den: fps_i };
+        let framerate = AVRational { num: fps_i, den: 1 };
+        let tb_key = CString::new("time_base").unwrap();
+        let fr_key = CString::new("framerate").unwrap();
+        let ret_tb = (libs.av_opt_set_q)(obj, tb_key.as_ptr(), time_base, 0);
+        if ret_tb < 0 {
+            return Err(format!("av_opt_set_q(time_base) failed ({ret_tb})"));
+        }
+        let _ = (libs.av_opt_set_q)(obj, fr_key.as_ptr(), framerate, 0);
+
+        Ok(pix_fmt)
+    }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
+
+unsafe fn fmt_duration_secs(fmt: *mut AVFormatContext, avformat_major: u32) -> f64 {
+    // AVFormatContext.duration is in AV_TIME_BASE (microseconds). Offset 40 is `pb` on FFmpeg 6.x x86_64.
+    unsafe {
+        let off = if avformat_major >= 59 { 72 } else { 56 };
+        let dur_us = (fmt as *const u8).add(off).cast::<i64>().read();
+        if dur_us <= 0 {
+            return 0.0;
+        }
+        dur_us as f64 / 1_000_000.0
+    }
+}
+
+/// Duration in seconds (libav first, then symphonia).
+pub fn probe_media_duration_secs(path: &str) -> Option<f32> {
+    if let Some(secs) = probe_media_duration_libav(path) {
+        return Some(secs);
+    }
+    crate::audio_extract::probe_media_duration_symphonia(path)
+}
+
+fn probe_media_duration_libav(path: &str) -> Option<f32> {
+    let libs = FFMPEG_LIBS.get_or_init(|| try_load_ffmpeg()).as_ref()?;
+    let path_c = CString::new(path).ok()?;
+    unsafe {
+        let mut fmt: *mut AVFormatContext = std::ptr::null_mut();
+        if (libs.avformat_open_input)(&mut fmt, path_c.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut())
+            < 0
+        {
+            return None;
+        }
+        if (libs.avformat_find_stream_info)(fmt, std::ptr::null_mut()) < 0 {
+            (libs.avformat_close_input)(&mut fmt);
+            return None;
+        }
+        let avformat_major = (libs.avformat_version)() >> 16;
+
+        let fmt_secs = fmt_duration_secs(fmt, avformat_major);
+        if fmt_secs > 0.05 {
+            (libs.avformat_close_input)(&mut fmt);
+            return Some(fmt_secs as f32);
+        }
+
+        let mut best: f64 = 0.0;
+        let nb = fmt_nb_streams(fmt);
+        for i in 0..nb {
+            let stream = fmt_stream(fmt, i);
+            let dur_ts = stream_duration(stream, avformat_major);
+            let tb_n = stream_tb_num(stream, avformat_major);
+            let tb_d = stream_tb_den(stream, avformat_major).max(1);
+            if dur_ts > 0 && tb_n > 0 {
+                let secs = dur_ts as f64 * tb_n as f64 / tb_d as f64;
+                if secs.is_finite() {
+                    best = best.max(secs);
+                }
+            }
+        }
+        (libs.avformat_close_input)(&mut fmt);
+        if best > 0.05 {
+            return Some(best as f32);
+        }
+    }
+    None
+}
 
 /// Decode one video frame from `video_path` at `source_frame` index.
 /// Returns `(width, height, rgba_bytes)`.
@@ -486,8 +984,8 @@ pub fn decode_audio_to_stereo_i16_libav(
     Ok((interleaved, sample_rate))
 }
 
-const AV_SAMPLE_FMT_FLTP: i32 = 8;
 const MP3_FRAME_SAMPLES: usize = 1152;
+const AAC_FRAME_SAMPLES: usize = 1024;
 
 /// Encode interleaved stereo i16 PCM to MP3 via libmp3lame (libav, no subprocess).
 pub fn write_stereo_i16_as_mp3_libav(
@@ -562,8 +1060,11 @@ pub fn write_stereo_i16_as_mp3_libav(
                 cc_void,
                 CString::new("sample_fmt").unwrap().as_ptr(),
                 CString::new("fltp").unwrap().as_ptr(),
-                0,
+                AV_OPT_SEARCH_CHILDREN,
             );
+            let avcodec_major = (libs.avcodec_version)() >> 16;
+            codec_ctx_apply_audio_encoder(libs, cc, avcodec_major, sample_rate, AV_SAMPLE_FMT_FLTP);
+            codec_ctx_apply_stereo_ch_layout(libs, cc, avcodec_major);
 
             let ret = (libs.avcodec_open2)(cc, codec, std::ptr::null_mut());
             if ret >= 0 {
@@ -634,14 +1135,12 @@ pub fn write_stereo_i16_as_mp3_libav(
 
         while src_frame < total_frames {
             let chunk = (total_frames - src_frame).min(MP3_FRAME_SAMPLES);
-            frame_set_nb_samples(frame, chunk as i32);
-            frame_set_format(frame, AV_SAMPLE_FMT_FLTP);
-            let frame_void = frame as *mut ();
-            let _ = (libs.av_opt_set)(
-                frame_void,
-                CString::new("ch_layout").unwrap().as_ptr(),
-                CString::new("stereo").unwrap().as_ptr(),
-                0,
+            frame_prepare_stereo_audio(
+                libs,
+                frame,
+                chunk as i32,
+                sample_rate as i32,
+                AV_SAMPLE_FMT_FLTP,
             );
             if (libs.av_frame_get_buffer)(frame, 0) < 0 {
                 break;
@@ -703,128 +1202,591 @@ pub fn write_stereo_i16_as_mp3_libav(
     Ok(())
 }
 
+/// Encode mixed stereo PCM into an AAC-in-MP4 sidecar for remux.
+pub fn write_stereo_i16_as_aac_mp4_libav(
+    output: &std::path::Path,
+    samples: &[i16],
+    sample_rate: u32,
+    bitrate_kbps: u32,
+    mut on_progress: impl FnMut(f32),
+) -> Result<(), String> {
+    let _guard = libav_guard();
+    if samples.len() < 2 {
+        return Err("Not enough audio samples".into());
+    }
+    let libs = FFMPEG_LIBS
+        .get_or_init(|| try_load_ffmpeg())
+        .as_ref()
+        .ok_or_else(|| "FFmpeg libraries not loaded".to_string())?;
+
+    let out_path = output.to_str().ok_or("bad output path")?;
+    let out_c = CString::new(out_path).map_err(|e| e.to_string())?;
+
+    unsafe {
+        let mut fmt_ctx: *mut AVFormatContext = std::ptr::null_mut();
+        let ret = (libs.avformat_alloc_output_context2)(
+            &mut fmt_ctx,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            out_c.as_ptr(),
+        );
+        if ret < 0 || fmt_ctx.is_null() {
+            return Err(format!("Could not allocate AAC muxer (code {})", ret));
+        }
+
+        let candidates = ["aac"];
+        let mut opened_codec = std::ptr::null();
+        let mut opened_cc = std::ptr::null_mut();
+
+        for &candidate in &candidates {
+            let candidate_c = CString::new(candidate).unwrap();
+            let codec = (libs.avcodec_find_encoder_by_name)(candidate_c.as_ptr());
+            if codec.is_null() {
+                continue;
+            }
+            let cc = (libs.avcodec_alloc_context3)(codec);
+            if cc.is_null() {
+                continue;
+            }
+            let cc_void = cc as *mut ();
+            let sr_i = sample_rate.max(1) as c_int;
+            let avcodec_major = (libs.avcodec_version)() >> 16;
+            let time_base = AVRational { num: 1, den: sr_i };
+            let tb_key = CString::new("time_base").unwrap();
+            let ret_tb = (libs.av_opt_set_q)(cc_void, tb_key.as_ptr(), time_base, 0);
+            let _ = libav_opt_set(libs, cc_void, "time_base", &format!("1/{sr_i}"), 0);
+            let layout = codec_ctx_video_layout(avcodec_major);
+            let p = cc as *mut u8;
+            p.add(layout.tb_num).cast::<i32>().write(1);
+            p.add(layout.tb_den).cast::<i32>().write(sr_i);
+            if ret_tb < 0 {
+                log::warn!("AAC av_opt_set_q(time_base) failed ({ret_tb}), using struct fallback");
+            }
+
+            let sr = CString::new(sample_rate.to_string()).unwrap();
+            let ch = CString::new("2").unwrap();
+            let br = CString::new((bitrate_kbps * 1000).to_string()).unwrap();
+            let _ = (libs.av_opt_set)(
+                cc_void,
+                CString::new("sample_rate").unwrap().as_ptr(),
+                sr.as_ptr(),
+                0,
+            );
+            let _ = (libs.av_opt_set)(cc_void, CString::new("channels").unwrap().as_ptr(), ch.as_ptr(), 0);
+            let _ = (libs.av_opt_set)(
+                cc_void,
+                CString::new("ch_layout").unwrap().as_ptr(),
+                CString::new("stereo").unwrap().as_ptr(),
+                AV_OPT_SEARCH_CHILDREN,
+            );
+            let _ = (libs.av_opt_set)(
+                cc_void,
+                CString::new("channel_layout").unwrap().as_ptr(),
+                CString::new("stereo").unwrap().as_ptr(),
+                AV_OPT_SEARCH_CHILDREN,
+            );
+            let _ = (libs.av_opt_set)(cc_void, CString::new("b").unwrap().as_ptr(), br.as_ptr(), 0);
+            let _ = (libs.av_opt_set)(
+                cc_void,
+                CString::new("sample_fmt").unwrap().as_ptr(),
+                CString::new("fltp").unwrap().as_ptr(),
+                AV_OPT_SEARCH_CHILDREN,
+            );
+            let _ = (libs.av_opt_set_int)(
+                cc_void,
+                CString::new("sample_fmt").unwrap().as_ptr(),
+                AV_SAMPLE_FMT_FLTP as i64,
+                AV_OPT_SEARCH_CHILDREN,
+            );
+            codec_ctx_apply_audio_encoder(libs, cc, avcodec_major, sample_rate, AV_SAMPLE_FMT_FLTP);
+            codec_ctx_apply_stereo_ch_layout(libs, cc, avcodec_major);
+
+            let ret = (libs.avcodec_open2)(cc, codec, std::ptr::null_mut());
+            if ret >= 0 {
+                opened_codec = codec;
+                opened_cc = cc;
+                break;
+            }
+            log::warn!("AAC encoder open failed ({ret})");
+            (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+        }
+
+        if opened_codec.is_null() {
+            (libs.avformat_free_context)(fmt_ctx);
+            return Err("AAC encoder open failed (timebase or codec not available)".into());
+        }
+
+        let cc = opened_cc;
+        let avcodec_major = (libs.avcodec_version)() >> 16;
+        let stream = (libs.avformat_new_stream)(fmt_ctx, opened_codec);
+        if stream.is_null() {
+            (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+            (libs.avformat_free_context)(fmt_ctx);
+            return Err("Could not create AAC stream".into());
+        }
+
+        let avformat_major = (libs.avformat_version)() >> 16;
+        let stream_u8 = stream as *mut u8;
+        let codecpar = stream_codecpar(stream_u8, avformat_major);
+        if (libs.avcodec_parameters_from_context)(codecpar as *mut (), cc) < 0 {
+            (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+            (libs.avformat_free_context)(fmt_ctx);
+            return Err("avcodec_parameters_from_context failed".into());
+        }
+        stream_set_time_base(stream_u8, 1, sample_rate.max(1) as i32, avformat_major);
+
+        let mut io_ctx: *mut AVIOContext = std::ptr::null_mut();
+        if (libs.avio_open)(&mut io_ctx, out_c.as_ptr(), 2) < 0 {
+            (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+            (libs.avformat_free_context)(fmt_ctx);
+            return Err("avio_open failed".into());
+        }
+        fmt_set_pb(fmt_ctx, io_ctx, avformat_major);
+
+        if (libs.avformat_write_header)(fmt_ctx, std::ptr::null_mut()) < 0 {
+            (libs.avio_closep)(&mut io_ctx);
+            (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+            (libs.avformat_free_context)(fmt_ctx);
+            return Err("avformat_write_header failed".into());
+        }
+
+        let frame = (libs.av_frame_alloc)();
+        let pkt = (libs.av_packet_alloc)();
+        if frame.is_null() || pkt.is_null() {
+            if !frame.is_null() {
+                (libs.av_frame_free)(&mut frame.cast::<AVFrame>());
+            }
+            if !pkt.is_null() {
+                (libs.av_packet_free)(&mut pkt.cast::<AVPacket>());
+            }
+            (libs.avio_closep)(&mut io_ctx);
+            (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+            (libs.avformat_free_context)(fmt_ctx);
+            return Err("alloc frame/packet failed".into());
+        }
+
+        let total_frames = samples.len() / 2;
+        let mut src_frame = 0usize;
+        let mut pts: i64 = 0;
+        let mut enc_tb = codec_ctx_read_time_base(cc, avcodec_major);
+        if enc_tb.num <= 0 || enc_tb.den <= 0 {
+            enc_tb = AVRational {
+                num: 1,
+                den: sample_rate.max(1) as c_int,
+            };
+        }
+        let mux_tb = stream_read_time_base(stream_u8, avformat_major);
+        let mut packets_written: u64 = 0;
+
+        while src_frame < total_frames {
+            let chunk = (total_frames - src_frame).min(AAC_FRAME_SAMPLES);
+            frame_prepare_stereo_audio(
+                libs,
+                frame,
+                chunk as i32,
+                sample_rate as i32,
+                AV_SAMPLE_FMT_FLTP,
+            );
+            if (libs.av_frame_get_buffer)(frame, 0) < 0 {
+                return Err("AAC av_frame_get_buffer failed".into());
+            }
+
+            let l_plane = frame_data(frame, 0) as *mut f32;
+            let r_plane = frame_data(frame, 1) as *mut f32;
+            if l_plane.is_null() || r_plane.is_null() {
+                return Err("AAC frame planes are null".into());
+            }
+            for i in 0..chunk {
+                let base = (src_frame + i) * 2;
+                let l = samples[base] as f32 / i16::MAX as f32;
+                let r = samples.get(base + 1).copied().unwrap_or(samples[base]) as f32 / i16::MAX as f32;
+                *l_plane.add(i) = l.clamp(-1.0, 1.0);
+                *r_plane.add(i) = r.clamp(-1.0, 1.0);
+            }
+            frame_set_pts(frame, pts);
+            pts += chunk as i64;
+
+            let send_ret = (libs.avcodec_send_frame)(cc, frame);
+            if send_ret < 0 {
+                return Err(format!("AAC avcodec_send_frame failed ({send_ret})"));
+            }
+            loop {
+                (libs.av_packet_unref)(pkt);
+                let ret = (libs.avcodec_receive_packet)(cc, pkt);
+                if ret == AVERROR_EAGAIN || ret < -1000 {
+                    break;
+                }
+                if ret < 0 {
+                    break;
+                }
+                pkt_set_stream_index(pkt, 0);
+                (libs.av_packet_rescale_ts)(pkt, enc_tb, mux_tb);
+                let wr = (libs.av_interleaved_write_frame)(fmt_ctx, pkt);
+                if wr < 0 {
+                    return Err(format!("AAC av_interleaved_write_frame failed ({wr})"));
+                }
+                packets_written += 1;
+            }
+
+            src_frame += chunk;
+            on_progress((src_frame as f32 / total_frames as f32).clamp(0.0, 1.0));
+            (libs.av_frame_unref)(frame);
+        }
+
+        let _ = (libs.avcodec_send_frame)(cc, std::ptr::null());
+        loop {
+            (libs.av_packet_unref)(pkt);
+            let ret = (libs.avcodec_receive_packet)(cc, pkt);
+            if ret == AVERROR_EAGAIN || ret < -1000 {
+                break;
+            }
+            if ret < 0 {
+                break;
+            }
+            pkt_set_stream_index(pkt, 0);
+            (libs.av_packet_rescale_ts)(pkt, enc_tb, mux_tb);
+            let wr = (libs.av_interleaved_write_frame)(fmt_ctx, pkt);
+            if wr < 0 {
+                return Err(format!("AAC flush write failed ({wr})"));
+            }
+            packets_written += 1;
+        }
+
+        if packets_written == 0 {
+            return Err("AAC encoder produced no packets".into());
+        }
+
+        (libs.av_write_trailer)(fmt_ctx);
+        (libs.av_packet_free)(&mut pkt.cast::<AVPacket>());
+        (libs.av_frame_free)(&mut frame.cast::<AVFrame>());
+        (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+        (libs.avio_closep)(&mut io_ctx);
+        (libs.avformat_free_context)(fmt_ctx);
+    }
+
+    on_progress(1.0);
+    Ok(())
+}
+
+/// Stream-copy video + audio into one container (no re-encode).
+pub fn remux_video_and_audio_libav(
+    video_path: &std::path::Path,
+    audio_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<(), String> {
+    let _guard = libav_guard();
+    let libs = FFMPEG_LIBS
+        .get_or_init(|| try_load_ffmpeg())
+        .as_ref()
+        .ok_or_else(|| "FFmpeg libraries not loaded".to_string())?;
+
+    let video_c = CString::new(video_path.to_string_lossy().as_ref())
+        .map_err(|e| e.to_string())?;
+    let audio_c = CString::new(audio_path.to_string_lossy().as_ref())
+        .map_err(|e| e.to_string())?;
+    let out_c = CString::new(output_path.to_string_lossy().as_ref())
+        .map_err(|e| e.to_string())?;
+
+    unsafe {
+        let mut in_video: *mut AVFormatContext = std::ptr::null_mut();
+        let mut in_audio: *mut AVFormatContext = std::ptr::null_mut();
+        if (libs.avformat_open_input)(&mut in_video, video_c.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut())
+            < 0
+        {
+            return Err("Could not open temp video for remux".into());
+        }
+        if (libs.avformat_find_stream_info)(in_video, std::ptr::null_mut()) < 0 {
+            (libs.avformat_close_input)(&mut in_video);
+            return Err("Could not read temp video stream info".into());
+        }
+        if (libs.avformat_open_input)(&mut in_audio, audio_c.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut())
+            < 0
+        {
+            (libs.avformat_close_input)(&mut in_video);
+            return Err("Could not open temp audio for remux".into());
+        }
+        if (libs.avformat_find_stream_info)(in_audio, std::ptr::null_mut()) < 0 {
+            (libs.avformat_close_input)(&mut in_audio);
+            (libs.avformat_close_input)(&mut in_video);
+            return Err("Could not read temp audio stream info".into());
+        }
+
+        let mut v_codec: *const AVCodec = std::ptr::null();
+        let v_si = (libs.av_find_best_stream)(
+            in_video,
+            AVMEDIA_TYPE_VIDEO,
+            -1,
+            -1,
+            &mut v_codec,
+            0,
+        );
+        let mut a_codec: *const AVCodec = std::ptr::null();
+        let a_si = (libs.av_find_best_stream)(
+            in_audio,
+            AVMEDIA_TYPE_AUDIO,
+            -1,
+            -1,
+            &mut a_codec,
+            0,
+        );
+        if v_si < 0 || a_si < 0 {
+            (libs.avformat_close_input)(&mut in_audio);
+            (libs.avformat_close_input)(&mut in_video);
+            return Err("Remux inputs missing video or audio stream".into());
+        }
+
+        let mut out_fmt: *mut AVFormatContext = std::ptr::null_mut();
+        if (libs.avformat_alloc_output_context2)(
+            &mut out_fmt,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            out_c.as_ptr(),
+        ) < 0
+            || out_fmt.is_null()
+        {
+            (libs.avformat_close_input)(&mut in_audio);
+            (libs.avformat_close_input)(&mut in_video);
+            return Err("Could not allocate remux output".into());
+        }
+
+        let avformat_major = (libs.avformat_version)() >> 16;
+        let in_v_stream = fmt_stream(in_video, v_si as u32);
+        let in_a_stream = fmt_stream(in_audio, a_si as u32);
+        let in_v_cp = stream_codecpar(in_v_stream, avformat_major);
+        let in_a_cp = stream_codecpar(in_a_stream, avformat_major);
+
+        let out_v_stream = (libs.avformat_new_stream)(out_fmt, std::ptr::null());
+        let out_a_stream = (libs.avformat_new_stream)(out_fmt, std::ptr::null());
+        if out_v_stream.is_null() || out_a_stream.is_null() {
+            (libs.avformat_free_context)(out_fmt);
+            (libs.avformat_close_input)(&mut in_audio);
+            (libs.avformat_close_input)(&mut in_video);
+            return Err("Could not create remux output streams".into());
+        }
+
+        let out_v_u8 = out_v_stream as *mut u8;
+        let out_a_u8 = out_a_stream as *mut u8;
+        let out_v_cp = stream_codecpar(out_v_u8, avformat_major);
+        let out_a_cp = stream_codecpar(out_a_u8, avformat_major);
+        if (libs.avcodec_parameters_copy)(out_v_cp as *mut (), in_v_cp as *const ()) < 0
+            || (libs.avcodec_parameters_copy)(out_a_cp as *mut (), in_a_cp as *const ()) < 0
+        {
+            (libs.avformat_free_context)(out_fmt);
+            (libs.avformat_close_input)(&mut in_audio);
+            (libs.avformat_close_input)(&mut in_video);
+            return Err("avcodec_parameters_copy failed".into());
+        }
+
+        let in_v_tb = stream_read_time_base(in_v_stream, avformat_major);
+        let in_a_tb = stream_read_time_base(in_a_stream, avformat_major);
+        stream_set_time_base(out_v_u8, in_v_tb.num, in_v_tb.den, avformat_major);
+        stream_set_time_base(out_a_u8, in_a_tb.num, in_a_tb.den, avformat_major);
+        let out_v_tb = in_v_tb;
+        let out_a_tb = in_a_tb;
+
+        let mut io_ctx: *mut AVIOContext = std::ptr::null_mut();
+        if (libs.avio_open)(&mut io_ctx, out_c.as_ptr(), 2) < 0 {
+            (libs.avformat_free_context)(out_fmt);
+            (libs.avformat_close_input)(&mut in_audio);
+            (libs.avformat_close_input)(&mut in_video);
+            return Err("Could not open remux output file".into());
+        }
+        fmt_set_pb(out_fmt, io_ctx, avformat_major);
+        if (libs.avformat_write_header)(out_fmt, std::ptr::null_mut()) < 0 {
+            (libs.avio_closep)(&mut io_ctx);
+            (libs.avformat_free_context)(out_fmt);
+            (libs.avformat_close_input)(&mut in_audio);
+            (libs.avformat_close_input)(&mut in_video);
+            return Err("Could not write remux header".into());
+        }
+
+        let pkt = (libs.av_packet_alloc)();
+        if pkt.is_null() {
+            (libs.avio_closep)(&mut io_ctx);
+            (libs.avformat_free_context)(out_fmt);
+            (libs.avformat_close_input)(&mut in_audio);
+            (libs.avformat_close_input)(&mut in_video);
+            return Err("Could not allocate remux packet".into());
+        }
+
+        while (libs.av_read_frame)(in_video, pkt) >= 0 {
+            if pkt_stream_index(pkt) == v_si {
+                pkt_set_stream_index(pkt, 0);
+                (libs.av_packet_rescale_ts)(pkt, in_v_tb, out_v_tb);
+                let ret = (libs.av_interleaved_write_frame)(out_fmt, pkt);
+                if ret < 0 {
+                    (libs.av_packet_free)(&mut pkt.cast::<AVPacket>());
+                    (libs.avio_closep)(&mut io_ctx);
+                    (libs.avformat_free_context)(out_fmt);
+                    (libs.avformat_close_input)(&mut in_audio);
+                    (libs.avformat_close_input)(&mut in_video);
+                    return Err(format!("remux video packet failed ({ret})"));
+                }
+            }
+            (libs.av_packet_unref)(pkt);
+        }
+        while (libs.av_read_frame)(in_audio, pkt) >= 0 {
+            if pkt_stream_index(pkt) == a_si {
+                pkt_set_stream_index(pkt, 1);
+                (libs.av_packet_rescale_ts)(pkt, in_a_tb, out_a_tb);
+                let ret = (libs.av_interleaved_write_frame)(out_fmt, pkt);
+                if ret < 0 {
+                    (libs.av_packet_free)(&mut pkt.cast::<AVPacket>());
+                    (libs.avio_closep)(&mut io_ctx);
+                    (libs.avformat_free_context)(out_fmt);
+                    (libs.avformat_close_input)(&mut in_audio);
+                    (libs.avformat_close_input)(&mut in_video);
+                    return Err(format!("remux audio packet failed ({ret})"));
+                }
+            }
+            (libs.av_packet_unref)(pkt);
+        }
+
+        (libs.av_write_trailer)(out_fmt);
+        (libs.av_packet_free)(&mut pkt.cast::<AVPacket>());
+        (libs.avio_closep)(&mut io_ctx);
+        (libs.avformat_free_context)(out_fmt);
+        (libs.avformat_close_input)(&mut in_audio);
+        (libs.avformat_close_input)(&mut in_video);
+    }
+
+    Ok(())
+}
+
 unsafe fn frame_set_nb_samples(f: *mut AVFrame, n: i32) {
-    (f as *mut u8).add(88).cast::<i32>().write(n);
+    unsafe { (f as *mut u8).add(112).cast::<i32>().write(n); }
+}
+
+unsafe fn frame_set_sample_rate(f: *mut AVFrame, rate: i32) {
+    unsafe { (f as *mut u8).add(208).cast::<i32>().write(rate); }
 }
 unsafe fn frame_set_format(f: *mut AVFrame, fmt: i32) {
-    (f as *mut u8).add(116).cast::<i32>().write(fmt);
+    unsafe { (f as *mut u8).add(116).cast::<i32>().write(fmt); }
 }
 unsafe fn frame_set_pts(f: *mut AVFrame, pts: i64) {
-    (f as *mut u8).add(32).cast::<i64>().write(pts);
+    // AVFrame.pts @ 136 on LP64 (FFmpeg n6.x / n7.x). Do not write @ 32 (data[4] pointer).
+    unsafe {
+        (f as *mut u8).add(136).cast::<i64>().write(pts);
+    }
 }
 
 unsafe fn stream_duration(stream: *mut u8, avformat_major: u32) -> i64 {
-    let off = if avformat_major >= 59 { 40 } else { 32 };
-    (stream.add(off).cast::<i64>().read()).max(0)
+    unsafe {
+        let off = if avformat_major >= 59 { 48 } else { 32 };
+        (stream.add(off).cast::<i64>().read()).max(0)
+    }
 }
 
 unsafe fn append_libav_audio_frame_stereo_i16(out: &mut Vec<i16>, frame: *mut AVFrame) {
-    let n = frame_nb_samples(frame).max(0) as usize;
-    if n == 0 {
-        return;
-    }
-    let fmt = frame_format(frame);
-    let mut planes = 0usize;
-    for p in 0..8 {
-        if frame_data(frame, p).is_null() {
-            break;
+    unsafe {
+        let n = frame_nb_samples(frame).max(0) as usize;
+        if n == 0 {
+            return;
         }
-        planes += 1;
-    }
-    if planes == 0 {
-        planes = 1;
-    }
-    if fmt == 3 {
-        for i in 0..n {
-            let l = *(frame_data(frame, 0) as *const f32).add(i);
-            let r = if planes > 1 {
-                *(frame_data(frame, 1) as *const f32).add(i)
-            } else {
-                l
-            };
-            out.push((l.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
-            out.push((r.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+        let fmt = frame_format(frame);
+        let mut planes = 0usize;
+        for p in 0..8 {
+            if frame_data(frame, p).is_null() {
+                break;
+            }
+            planes += 1;
         }
-    } else if fmt == 1 {
-        let ptr = frame_data(frame, 0) as *const i16;
-        let total = n * planes;
-        for i in 0..n {
-            let l = *ptr.add(i * planes);
-            let r = if planes > 1 {
-                *ptr.add(i * planes + 1)
-            } else {
-                l
-            };
-            out.push(l);
-            out.push(r);
+        if planes == 0 {
+            planes = 1;
         }
-        let _ = total;
-    } else if fmt == 7 {
-        for i in 0..n {
-            let l = *(frame_data(frame, 0) as *const i16).add(i);
-            let r = if planes > 1 {
-                *(frame_data(frame, 1) as *const i16).add(i)
-            } else {
-                l
-            };
-            out.push(l);
-            out.push(r);
+        if fmt == 3 {
+            for i in 0..n {
+                let l = *(frame_data(frame, 0) as *const f32).add(i);
+                let r = if planes > 1 {
+                    *(frame_data(frame, 1) as *const f32).add(i)
+                } else {
+                    l
+                };
+                out.push((l.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+                out.push((r.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+            }
+        } else if fmt == 1 {
+            let ptr = frame_data(frame, 0) as *const i16;
+            let total = n * planes;
+            for i in 0..n {
+                let l = *ptr.add(i * planes);
+                let r = if planes > 1 {
+                    *ptr.add(i * planes + 1)
+                } else {
+                    l
+                };
+                out.push(l);
+                out.push(r);
+            }
+            let _ = total;
+        } else if fmt == 7 {
+            for i in 0..n {
+                let l = *(frame_data(frame, 0) as *const i16).add(i);
+                let r = if planes > 1 {
+                    *(frame_data(frame, 1) as *const i16).add(i)
+                } else {
+                    l
+                };
+                out.push(l);
+                out.push(r);
+            }
         }
     }
 }
-
 unsafe fn append_libav_audio_frame(out: &mut Vec<f32>, frame: *mut AVFrame) {
-    let n = frame_nb_samples(frame).max(0) as usize;
-    if n == 0 {
-        return;
-    }
-    let fmt = frame_format(frame);
-    let mut planes = 0usize;
-    for p in 0..8 {
-        if frame_data(frame, p).is_null() {
-            break;
+    unsafe {
+        let n = frame_nb_samples(frame).max(0) as usize;
+        if n == 0 {
+            return;
         }
-        planes += 1;
-    }
-    if planes == 0 {
-        planes = 1;
-    }
-    // AV_SAMPLE_FMT_FLTP = 3, S16P = 7, S16 = 1
-    if fmt == 3 {
-        for i in 0..n {
-            let mut sum = 0.0f32;
-            for p in 0..planes {
-                let ptr = frame_data(frame, p) as *const f32;
-                sum += *ptr.add(i);
+        let fmt = frame_format(frame);
+        let mut planes = 0usize;
+        for p in 0..8 {
+            if frame_data(frame, p).is_null() {
+                break;
             }
-            out.push(sum / planes as f32);
+            planes += 1;
         }
-    } else if fmt == 1 {
-        let ptr = frame_data(frame, 0) as *const i16;
-        let total = n * planes;
-        for i in 0..total {
-            let s = *ptr.add(i) as f32 / i16::MAX as f32;
-            if i % planes == 0 {
-                out.push(s);
-            } else {
-                let last = out.len() - 1;
-                out[last] = (out[last] + s) / 2.0;
-            }
+        if planes == 0 {
+            planes = 1;
         }
-    } else if fmt == 7 {
-        for i in 0..n {
-            let mut sum = 0.0f32;
-            for p in 0..planes {
-                let ptr = frame_data(frame, p) as *const i16;
-                sum += *ptr.add(i) as f32 / i16::MAX as f32;
+        // AV_SAMPLE_FMT_FLTP = 3, S16P = 7, S16 = 1
+        if fmt == 3 {
+            for i in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..planes {
+                    let ptr = frame_data(frame, p) as *const f32;
+                    sum += *ptr.add(i);
+                }
+                out.push(sum / planes as f32);
             }
-            out.push(sum / planes as f32);
+        } else if fmt == 1 {
+            let ptr = frame_data(frame, 0) as *const i16;
+            let total = n * planes;
+            for i in 0..total {
+                let s = *ptr.add(i) as f32 / i16::MAX as f32;
+                if i % planes == 0 {
+                    out.push(s);
+                } else {
+                    let last = out.len() - 1;
+                    out[last] = (out[last] + s) / 2.0;
+                }
+            }
+        } else if fmt == 7 {
+            for i in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..planes {
+                    let ptr = frame_data(frame, p) as *const i16;
+                    sum += *ptr.add(i) as f32 / i16::MAX as f32;
+                }
+                out.push(sum / planes as f32);
+            }
         }
     }
 }
-
 // ── libav backend ─────────────────────────────────────────────────────────────
 fn decode_libav(libs: &FfmpegLibs, path: &str, source_frame: usize, fps: f32) -> Option<(u32, u32, Vec<u8>)> {
+    let _guard = libav_guard();
     let path_c = CString::new(path).ok()?;
     let time_sec = source_frame as f64 / fps as f64;
 
@@ -973,6 +1935,7 @@ unsafe impl Sync for VideoStream {}
 
 impl VideoStream {
     pub fn open(path: &str) -> Option<Self> {
+        let _guard = libav_guard();
         let libs = FFMPEG_LIBS.get()?.as_ref()?;
         let path_c = CString::new(path).ok()?;
         
@@ -1040,6 +2003,7 @@ impl VideoStream {
     }
 
     pub fn get_frame(&mut self, frame_idx: usize, fps: f32) -> Option<(u32, u32, Vec<u8>)> {
+        let _guard = libav_guard();
         let time_sec = frame_idx as f64 / fps as f64;
         
         unsafe {
@@ -1150,6 +2114,7 @@ impl VideoStream {
 
 impl Drop for VideoStream {
     fn drop(&mut self) {
+        let _guard = libav_guard();
         unsafe {
             if !self.pkt.is_null() { (self.libs.av_packet_free)(&mut self.pkt.cast::<AVPacket>()); }
             if !self.frame.is_null() { (self.libs.av_frame_free)(&mut self.frame.cast::<AVFrame>()); }
@@ -1169,8 +2134,14 @@ pub struct LibavEncoder {
     pts: i64,
     width: u32,
     height: u32,
+    fps: u32,
+    stream_index: i32,
     avformat_major: u32,
-    finished: bool,
+    avcodec_major: u32,
+    enc_pix_fmt: c_int,
+    enc_time_base: AVRational,
+    stream_time_base: AVRational,
+    released: bool,
 }
 
 unsafe impl Send for LibavEncoder {}
@@ -1187,6 +2158,7 @@ impl LibavEncoder {
         // Encoder threads: `1` = power saving, `0` = libav auto (all cores).
         encoder_threads: u32,
     ) -> Result<Self, String> {
+        let _guard = libav_guard();
         let libs = FFMPEG_LIBS.get_or_init(|| try_load_ffmpeg()).as_ref()
             .ok_or_else(|| "FFmpeg shared libraries not loaded".to_string())?;
 
@@ -1208,6 +2180,7 @@ impl LibavEncoder {
             let candidates = [vcodec_name, "libx264", "h264"];
             let mut opened_codec = std::ptr::null();
             let mut opened_cc = std::ptr::null_mut();
+            let mut enc_pix_fmt: c_int = AV_PIX_FMT_NONE;
 
             for &candidate in &candidates {
                 let candidate_c = CString::new(candidate).unwrap();
@@ -1221,45 +2194,52 @@ impl LibavEncoder {
                     continue;
                 }
 
-                // Configure codec context fields using ABI-safe av_opt_set
-                let cc_void = cc as *mut ();
-                let width_str = CString::new(width.to_string()).unwrap();
-                let height_str = CString::new(height.to_string()).unwrap();
-                let fps_str = CString::new(format!("1/{}", fps)).unwrap();
-                let bitrate_str = CString::new((bitrate_kbps * 1000).to_string()).unwrap();
-                
-                let size_str = CString::new(format!("{}x{}", width, height)).unwrap();
-                let r1 = (libs.av_opt_set)(cc_void, CString::new("video_size").unwrap().as_ptr(), size_str.as_ptr(), 0);
-                let r2 = (libs.av_opt_set)(cc_void, CString::new("pixel_format").unwrap().as_ptr(), CString::new("yuv420p").unwrap().as_ptr(), 0);
-                let r3 = (libs.av_opt_set)(cc_void, CString::new("b").unwrap().as_ptr(), bitrate_str.as_ptr(), 0);
-                let r4 = (libs.av_opt_set)(cc_void, CString::new("g").unwrap().as_ptr(), CString::new("12").unwrap().as_ptr(), 0);
-                let r5 = (libs.av_opt_set)(cc_void, CString::new("time_base").unwrap().as_ptr(), fps_str.as_ptr(), 0);
-                let threads_str = CString::new(encoder_threads.to_string()).unwrap();
-                let preset = if encoder_threads <= 1 {
-                    CString::new("veryfast").unwrap()
-                } else {
-                    CString::new("medium").unwrap()
+                let configured_pix_fmt = match configure_video_encoder(libs, cc, width, height, fps, bitrate_kbps) {
+                    Ok(fmt) => fmt,
+                    Err(e) => {
+                        log::warn!(
+                            "Encoder configure failed for candidate {}: {}",
+                            candidate,
+                            e
+                        );
+                        (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+                        continue;
+                    }
                 };
-                let _ = (libs.av_opt_set)(
-                    cc_void,
-                    CString::new("threads").unwrap().as_ptr(),
-                    threads_str.as_ptr(),
-                    0,
-                );
-                let _ = (libs.av_opt_set)(
-                    cc_void,
-                    CString::new("preset").unwrap().as_ptr(),
-                    preset.as_ptr(),
-                    0,
-                );
-                let _ = (r1, r2, r3, r4, r5);
+                let threads_str = CString::new(encoder_threads.to_string()).unwrap();
+                let preset_name = if encoder_threads <= 1 {
+                    "veryfast"
+                } else {
+                    "medium"
+                };
+                let preset_c = CString::new(preset_name).unwrap();
+                let threads_key = CString::new("threads").unwrap();
+                let preset_key = CString::new("preset").unwrap();
 
-                // Open codec
-                let ret = (libs.avcodec_open2)(cc, codec, std::ptr::null_mut());
+                let mut opts: *mut () = std::ptr::null_mut();
+                let _ = (libs.av_dict_set)(&mut opts, preset_key.as_ptr(), preset_c.as_ptr(), 0);
+                let _ = (libs.av_dict_set)(&mut opts, threads_key.as_ptr(), threads_str.as_ptr(), 0);
+
+                let ret = (libs.avcodec_open2)(cc, codec, &mut opts);
+                (libs.av_dict_free)(&mut opts);
                 if ret >= 0 {
+                    let avcodec_major = (libs.avcodec_version)() >> 16;
+                    let opened_pix = codec_ctx_read_pix_fmt(cc, avcodec_major);
+                    if opened_pix < 0 {
+                        log::warn!(
+                            "Encoder {} opened with invalid pix_fmt ({opened_pix}); trying next candidate",
+                            candidate
+                        );
+                        (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+                        continue;
+                    }
                     opened_codec = codec;
                     opened_cc = cc;
-                    log::info!("Successfully opened video encoder candidate: {}", candidate);
+                    enc_pix_fmt = opened_pix;
+                    log::info!(
+                        "Opened video encoder {} (pix_fmt={opened_pix}, libavcodec major {avcodec_major})",
+                        candidate
+                    );
                     break;
                 } else {
                     log::warn!("Failed to open video encoder candidate {}: error {}", candidate, ret);
@@ -1283,18 +2263,35 @@ impl LibavEncoder {
                 return Err("Could not create stream".to_string());
             }
 
-            // Copy codec context parameters to stream's codecpar
             let avformat_major = (libs.avformat_version)() >> 16;
-            let stream_offset = if avformat_major >= 59 { 16 } else { 8 };
-            let codecpar_ptr = (stream as *mut u8).add(stream_offset) as *mut *mut ();
-            let codecpar = codecpar_ptr.read();
+            let stream_u8 = stream as *mut u8;
+            let codecpar = stream_codecpar(stream_u8, avformat_major);
+            if codecpar.is_null() {
+                (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+                (libs.avformat_free_context)(fmt_ctx);
+                return Err("Stream codecpar is null".to_string());
+            }
 
-            let ret = (libs.avcodec_parameters_from_context)(codecpar, cc);
+            let ret = (libs.avcodec_parameters_from_context)(codecpar as *mut (), cc);
             if ret < 0 {
                 (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
                 (libs.avformat_free_context)(fmt_ctx);
                 return Err("Could not copy codec parameters".to_string());
             }
+
+            let stream_index = (fmt_nb_streams(fmt_ctx).saturating_sub(1)) as i32;
+            let avcodec_major = (libs.avcodec_version)() >> 16;
+            let stream_time_base = AVRational {
+                num: 1,
+                den: fps.max(1) as c_int,
+            };
+            let stream_u8 = stream as *mut u8;
+            stream_set_time_base(
+                stream_u8,
+                stream_time_base.num,
+                stream_time_base.den,
+                avformat_major,
+            );
 
             // Open output file
             let mut io_ctx: *mut AVIOContext = std::ptr::null_mut();
@@ -1304,7 +2301,7 @@ impl LibavEncoder {
                 (libs.avformat_free_context)(fmt_ctx);
                 return Err(format!("Could not open output file '{}' (code {})", output_path, ret));
             }
-            (fmt_ctx as *mut u8).add(32).cast::<*mut AVIOContext>().write(io_ctx);
+            fmt_set_pb(fmt_ctx, io_ctx, avformat_major);
 
             // Write header
             let ret = (libs.avformat_write_header)(fmt_ctx, std::ptr::null_mut());
@@ -1315,6 +2312,15 @@ impl LibavEncoder {
                 return Err(format!("Could not write format header (code {})", ret));
             }
 
+            let mut enc_time_base = codec_ctx_read_time_base(cc, avcodec_major);
+            if enc_time_base.num <= 0 || enc_time_base.den <= 0 {
+                enc_time_base = stream_time_base;
+            }
+            let mut mux_stream_time_base = stream_read_time_base(stream_u8, avformat_major);
+            if mux_stream_time_base.num <= 0 || mux_stream_time_base.den <= 0 {
+                mux_stream_time_base = stream_time_base;
+            }
+
             // Prepare frame for conversion (YUV420P)
             let frame = (libs.av_frame_alloc)();
             if frame.is_null() {
@@ -1323,7 +2329,7 @@ impl LibavEncoder {
                 (libs.avformat_free_context)(fmt_ctx);
                 return Err("Could not allocate frame".to_string());
             }
-            (frame as *mut u8).add(116).cast::<c_int>().write(0); // format = YUV420P
+            (frame as *mut u8).add(116).cast::<c_int>().write(enc_pix_fmt);
             (frame as *mut u8).add(104).cast::<c_int>().write(width as c_int);
             (frame as *mut u8).add(108).cast::<c_int>().write(height as c_int);
 
@@ -1336,15 +2342,29 @@ impl LibavEncoder {
                 return Err(format!("Could not allocate frame data (code {})", ret));
             }
 
-            // Prepare packet
             let pkt = (libs.av_packet_alloc)();
+            if pkt.is_null() {
+                (libs.av_frame_free)(&mut frame.cast::<AVFrame>());
+                (libs.avio_closep)(&mut io_ctx);
+                (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+                (libs.avformat_free_context)(fmt_ctx);
+                return Err("Could not allocate packet".to_string());
+            }
 
             // sws context for RGBA -> YUV420P
             let sws = (libs.sws_getContext)(
                 width as c_int, height as c_int, AV_PIX_FMT_RGBA,
-                width as c_int, height as c_int, 0, // AV_PIX_FMT_YUV420P
+                width as c_int, height as c_int, enc_pix_fmt,
                 SWS_BILINEAR, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
             );
+            if sws.is_null() {
+                (libs.av_frame_free)(&mut frame.cast::<AVFrame>());
+                (libs.av_packet_free)(&mut pkt.cast::<AVPacket>());
+                (libs.avio_closep)(&mut io_ctx);
+                (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+                (libs.avformat_free_context)(fmt_ctx);
+                return Err("sws_getContext failed".into());
+            }
 
             Ok(Self {
                 fmt_ctx,
@@ -1356,13 +2376,32 @@ impl LibavEncoder {
                 pts: 0,
                 width,
                 height,
+                fps,
+                stream_index,
                 avformat_major,
-                finished: false,
+                avcodec_major,
+                enc_pix_fmt,
+                enc_time_base,
+                stream_time_base: mux_stream_time_base,
+                released: false,
             })
         }
     }
 
+    unsafe fn mux_encoded_packet(&mut self, libs: &FfmpegLibs) -> Result<(), String> {
+        unsafe {
+            (libs.av_packet_rescale_ts)(self.pkt, self.enc_time_base, self.stream_time_base);
+            pkt_set_stream_index(self.pkt, self.stream_index);
+            let ret = (libs.av_interleaved_write_frame)(self.fmt_ctx, self.pkt);
+            if ret < 0 {
+                return Err(format!("av_interleaved_write_frame failed with code {}", ret));
+            }
+        }
+        Ok(())
+    }
+
     pub fn write_frame(&mut self, rgba_data: &[u8]) -> Result<(), String> {
+        let _guard = libav_guard();
         let libs = FFMPEG_LIBS.get()
             .and_then(|opt| opt.as_ref())
             .ok_or_else(|| "FFmpeg libs not loaded".to_string())?;
@@ -1402,7 +2441,8 @@ impl LibavEncoder {
                 dst_ls.as_ptr(),
             );
 
-            (self.frame as *mut u8).add(136).cast::<i64>().write(self.pts);
+            let pts = self.pts;
+            frame_set_pts(self.frame, pts);
             self.pts += 1;
 
             let ret = (libs.avcodec_send_frame)(self.cc, self.frame);
@@ -1419,65 +2459,83 @@ impl LibavEncoder {
                 if ret < 0 {
                     return Err(format!("avcodec_receive_packet failed with code {}", ret));
                 }
-                (libs.av_interleaved_write_frame)(self.fmt_ctx, self.pkt);
+                self.mux_encoded_packet(libs)?;
             }
         }
         Ok(())
     }
 
     pub fn finish(mut self) -> Result<(), String> {
+        let _guard = libav_guard();
         let libs = FFMPEG_LIBS.get()
             .and_then(|opt| opt.as_ref())
             .ok_or_else(|| "FFmpeg libs not loaded".to_string())?;
 
         unsafe {
-            // Flush encoder
-            let ret = (libs.avcodec_send_frame)(self.cc, std::ptr::null());
-            if ret >= 0 {
-                loop {
-                    (libs.av_packet_unref)(self.pkt);
-                    let ret = (libs.avcodec_receive_packet)(self.cc, self.pkt);
-                    if ret == AVERROR_EAGAIN || ret < -1000 {
-                        break;
+            if !self.released && !self.cc.is_null() {
+                let ret = (libs.avcodec_send_frame)(self.cc, std::ptr::null());
+                if ret >= 0 {
+                    loop {
+                        (libs.av_packet_unref)(self.pkt);
+                        let ret = (libs.avcodec_receive_packet)(self.cc, self.pkt);
+                        if ret == AVERROR_EAGAIN || ret < -1000 {
+                            break;
+                        }
+                        if ret < 0 {
+                            break;
+                        }
+                        self.mux_encoded_packet(libs)?;
                     }
-                    if ret < 0 {
-                        break;
-                    }
-                    (libs.av_interleaved_write_frame)(self.fmt_ctx, self.pkt);
                 }
             }
-
-            (libs.av_write_trailer)(self.fmt_ctx);
+            if !self.released && !self.fmt_ctx.is_null() {
+                (libs.av_write_trailer)(self.fmt_ctx);
+            }
         }
-        self.finished = true;
+        self.release_resources();
         Ok(())
+    }
+
+    fn release_resources(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let Some(Some(libs)) = FFMPEG_LIBS.get().map(|opt| opt.as_ref()) else {
+            return;
+        };
+        unsafe {
+            if !self.sws.is_null() {
+                (libs.sws_freeContext)(self.sws);
+                self.sws = std::ptr::null_mut();
+            }
+            if !self.pkt.is_null() {
+                (libs.av_packet_free)(&mut self.pkt.cast::<AVPacket>());
+            }
+            if !self.frame.is_null() {
+                (libs.av_frame_free)(&mut self.frame.cast::<AVFrame>());
+            }
+            if !self.io_ctx.is_null() {
+                (libs.avio_closep)(&mut self.io_ctx);
+            }
+            if !self.cc.is_null() {
+                (libs.avcodec_free_context)(&mut self.cc.cast::<AVCodecContext>());
+            }
+            if !self.fmt_ctx.is_null() {
+                (libs.avformat_free_context)(self.fmt_ctx);
+                self.fmt_ctx = std::ptr::null_mut();
+            }
+        }
     }
 }
 
 impl Drop for LibavEncoder {
     fn drop(&mut self) {
-        if let Some(Some(libs)) = FFMPEG_LIBS.get().map(|opt| opt.as_ref()) {
-            unsafe {
-                if !self.sws.is_null() {
-                    (libs.sws_freeContext)(self.sws);
-                }
-                if !self.pkt.is_null() {
-                    (libs.av_packet_free)(&mut self.pkt.cast::<AVPacket>());
-                }
-                if !self.frame.is_null() {
-                    (libs.av_frame_free)(&mut self.frame.cast::<AVFrame>());
-                }
-                if !self.io_ctx.is_null() {
-                    (libs.avio_closep)(&mut self.io_ctx);
-                }
-                if !self.cc.is_null() {
-                    (libs.avcodec_free_context)(&mut self.cc.cast::<AVCodecContext>());
-                }
-                if !self.fmt_ctx.is_null() {
-                    (libs.avformat_free_context)(self.fmt_ctx);
-                }
-            }
+        if self.released {
+            return;
         }
+        let _guard = libav_guard();
+        self.release_resources();
     }
 }
 
@@ -1488,5 +2546,175 @@ impl std::fmt::Debug for LibavEncoder {
             .field("height", &self.height)
             .field("pts", &self.pts)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod libav_encoder_tests {
+    use super::*;
+
+    fn require_libav() -> bool {
+        if !is_libav_available() {
+            panic!(
+                "FFmpeg shared libraries failed to load (check libavcodec/libavformat/libavutil)"
+            );
+        }
+        true
+    }
+
+    #[test]
+    fn libx264_encoder_opens_and_finishes_without_frames() {
+        if !require_libav() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "vadadee_libx264_open_{}.mp4",
+            std::process::id()
+        ));
+        let path_str = path.to_str().expect("temp path utf-8");
+        let enc = LibavEncoder::new(path_str, 64, 64, 12, 800, "libx264", 1)
+            .expect("LibavEncoder::new (libx264)");
+        enc.finish().expect("finish without frames");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn libx264_encoder_smoke_writes_mp4() {
+        if !require_libav() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "vadadee_libx264_smoke_{}.mp4",
+            std::process::id()
+        ));
+        let path_str = path.to_str().expect("temp path utf-8");
+        let width = 64u32;
+        let height = 64u32;
+        let fps = 12u32;
+        let frame_bytes = (width as usize) * (height as usize) * 4;
+        let rgba = vec![128u8; frame_bytes];
+
+        let mut enc = LibavEncoder::new(path_str, width, height, fps, 800, "libx264", 1)
+            .expect("LibavEncoder::new (libx264)");
+
+        for _ in 0..fps {
+            enc.write_frame(&rgba)
+                .expect("write_frame should not crash or error");
+        }
+        enc.finish().expect("finish");
+
+        let len = std::fs::metadata(&path)
+            .expect("output mp4 exists")
+            .len();
+        assert!(len > 200, "encoded mp4 too small ({len} bytes)");
+        let probed = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                path_str,
+            ])
+            .output()
+            .expect("ffprobe");
+        let dur_s: f64 = String::from_utf8_lossy(&probed.stdout)
+            .trim()
+            .parse()
+            .expect("ffprobe duration");
+        assert!(
+            dur_s >= 0.9,
+            "expected ~1s video from {fps} frames at {fps} fps, ffprobe duration={dur_s}s"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn configure_video_encoder_sets_yuv420p_pix_fmt() {
+        if !require_libav() {
+            return;
+        }
+        let _guard = libav_guard();
+        let libs = FFMPEG_LIBS
+            .get_or_init(|| try_load_ffmpeg())
+            .as_ref()
+            .expect("libs");
+        unsafe {
+            let name = CString::new("libx264").unwrap();
+            let codec = (libs.avcodec_find_encoder_by_name)(name.as_ptr());
+            assert!(!codec.is_null(), "libx264 encoder not found");
+            let cc = (libs.avcodec_alloc_context3)(codec);
+            assert!(!cc.is_null());
+            let pix = configure_video_encoder(libs, cc, 320, 180, 24, 1500)
+                .expect("configure_video_encoder");
+            assert!(pix >= 0, "pix_fmt must be valid AVPixelFormat");
+            let major = (libs.avcodec_version)() >> 16;
+            assert!(
+                codec_ctx_pix_fmt_ok(cc, major, pix),
+                "pix_fmt should be yuv420p in AVCodecContext"
+            );
+            (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
+        }
+    }
+
+    #[test]
+    fn aac_sidecar_encoder_opens() {
+        if !require_libav() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("vadadee_aac_{}.m4a", std::process::id()));
+        let sr = 44_100u32;
+        let frames = sr as usize;
+        let mut pcm = vec![0i16; frames * 2];
+        for i in 0..frames {
+            let t = i as f32 / sr as f32;
+            let v = (t * 440.0 * std::f32::consts::TAU).sin() * 0.25;
+            let s = (v * i16::MAX as f32) as i16;
+            pcm[i * 2] = s;
+            pcm[i * 2 + 1] = s;
+        }
+        write_stereo_i16_as_aac_mp4_libav(&path, &pcm, sr, 128, |_| {})
+            .expect("AAC sidecar encode");
+        let probed = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "csv=p=0",
+                path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("ffprobe");
+        let codec = String::from_utf8_lossy(&probed.stdout).trim().to_string();
+        assert_eq!(codec, "aac", "ffprobe codec_name");
+        let wav = std::env::temp_dir().join(format!("vadadee_aac_{}.wav", std::process::id()));
+        let decode = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                path.to_str().unwrap(),
+                "-f",
+                "wav",
+                wav.to_str().unwrap(),
+            ])
+            .status()
+            .expect("ffmpeg decode");
+        assert!(decode.success(), "ffmpeg should decode AAC sidecar");
+        let bytes = std::fs::read(&wav).expect("read wav");
+        let mut max_amp = 0i16;
+        for chunk in bytes[44..].chunks_exact(2) {
+            let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+            max_amp = max_amp.max(s.abs());
+        }
+        assert!(max_amp > 500, "AAC sidecar should contain audible PCM (max={max_amp})");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(wav);
     }
 }

@@ -1,5 +1,6 @@
 #![warn(clippy::all, rust_2018_idioms)]
 
+pub mod av_ui;
 pub mod animation;
 pub mod blend;
 pub mod app;
@@ -10,6 +11,11 @@ pub mod gradient_ui;
 pub mod history;
 pub mod icons;
 pub mod io;
+pub mod layer_cache;
+pub mod perf;
+pub mod shading;
+pub mod spatial_index;
+pub mod left_dock;
 pub mod render;
 pub mod text_glyph;
 pub mod theme;
@@ -17,9 +23,17 @@ pub mod tools;
 pub mod ui;
 pub mod video_decode;
 pub mod export_worker;
+pub mod export_audio;
+pub mod recorder;
 pub mod audio_extract;
+pub mod collab;
+#[cfg(not(target_os = "android"))]
+pub mod mcp;
 
 use app::VadadeeBerryApp;
+
+/// Must match `eframe::NativeOptions::multisampling` — shading WGSL pipelines use the same MSAA count as egui.
+pub const VIEWPORT_MSAA_SAMPLES: u32 = 4;
 
 fn native_options() -> eframe::NativeOptions {
     #[cfg(target_os = "android")]
@@ -28,7 +42,7 @@ fn native_options() -> eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("Vadadee Berry")
                 .with_fullscreen(true),
-            multisampling: 4,
+            multisampling: VIEWPORT_MSAA_SAMPLES as u16,
             ..Default::default()
         }
     }
@@ -39,7 +53,7 @@ fn native_options() -> eframe::NativeOptions {
                 .with_inner_size([1400.0, 900.0])
                 .with_min_inner_size([800.0, 500.0])
                 .with_title("Vadadee Berry — vector editor"),
-            multisampling: 4,
+            multisampling: VIEWPORT_MSAA_SAMPLES as u16,
             ..Default::default()
         }
     }

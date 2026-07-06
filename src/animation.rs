@@ -14,7 +14,7 @@ pub const ACTION_BAR_SLIDE_SECS: f32 = 0.48;
 /// Fixed simulation step (decoupled from wall clock).
 const ACTION_BAR_MAX_DT: f32 = 1.0 / 60.0;
 /// Max catch-up steps if the event loop was idle (prevents one-frame completion).
-const ACTION_BAR_MAX_STEPS_PER_FRAME: u32 = 3;
+const ACTION_BAR_MAX_STEPS_PER_FRAME: u32 = 8;
 
 pub struct UiAnimation {
     engine: KramaFrame<BTclasslist, BTframelist<TRES16Bits, i16>>,
@@ -66,6 +66,13 @@ pub struct UiAnimation {
     video_editor_to: f32,
     video_editor_elapsed: f32,
     pub video_editor_running: bool,
+    prev_left_dock_open: bool,
+    pub left_dock_t: f32,
+    left_dock_from: f32,
+    left_dock_to: f32,
+    left_dock_elapsed: f32,
+    pub left_dock_running: bool,
+    prev_left_dock_panel: Option<crate::left_dock::LeftDockPanel>,
 }
 
 impl Default for UiAnimation {
@@ -197,6 +204,13 @@ impl UiAnimation {
             video_editor_to: 0.0,
             video_editor_elapsed: 0.0,
             video_editor_running: false,
+            prev_left_dock_open: false,
+            left_dock_t: 0.0,
+            left_dock_from: 0.0,
+            left_dock_to: 0.0,
+            left_dock_elapsed: 0.0,
+            left_dock_running: false,
+            prev_left_dock_panel: None,
         };
         anim.play_intro();
         anim
@@ -206,6 +220,7 @@ impl UiAnimation {
         let dt_ms = (ctx.input(|i| i.stable_dt) * 1000.0).clamp(1.0, 48.0) as u16;
         self.engine
             .update_progress(TRES16Bits::from_millis(dt_ms));
+
         if !self.engine.is_animating("status_sign", ID) {
             self.status_msg_width_settled = if self.status_msg_target_in {
                 self.status_msg_width_in
@@ -315,6 +330,57 @@ impl UiAnimation {
         }
         let target = if show_video_editor { 1.0 } else { 0.0 };
         self.video_editor_t = target;
+    }
+
+    fn begin_left_dock_slide(&mut self, to: f32) {
+        self.left_dock_from = self.left_dock_t;
+        self.left_dock_to = to.clamp(0.0, 1.0);
+        self.left_dock_elapsed = 0.0;
+        self.left_dock_running = true;
+    }
+
+    pub fn advance_left_dock_slide(&mut self, ctx: &Context) {
+        if self.left_dock_running {
+            let raw_dt = ctx.input(|i| i.unstable_dt).max(0.0);
+            let steps = ((raw_dt / ACTION_BAR_MAX_DT).ceil() as u32)
+                .clamp(1, ACTION_BAR_MAX_STEPS_PER_FRAME);
+            for _ in 0..steps {
+                self.left_dock_elapsed += ACTION_BAR_MAX_DT;
+                let u = (self.left_dock_elapsed / ACTION_BAR_SLIDE_SECS).min(1.0);
+                self.left_dock_t =
+                    self.left_dock_from + (self.left_dock_to - self.left_dock_from) * u;
+                if u >= 1.0 {
+                    self.left_dock_t = self.left_dock_to;
+                    self.left_dock_running = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn sync_left_dock(&mut self, panel: Option<crate::left_dock::LeftDockPanel>) {
+        let open = panel.is_some();
+        if open != self.prev_left_dock_open {
+            self.begin_left_dock_slide(if open { 1.0 } else { 0.0 });
+            self.prev_left_dock_open = open;
+        } else if !self.left_dock_running {
+            self.left_dock_t = if open { 1.0 } else { 0.0 };
+        }
+
+        if panel != self.prev_left_dock_panel {
+            if panel.is_some() && self.prev_left_dock_panel.is_some() {
+                self.on_tab_change();
+            }
+            self.prev_left_dock_panel = panel;
+        }
+    }
+
+    pub fn left_dock_open_t(&self) -> f32 {
+        self.left_dock_t.clamp(0.0, 1.0)
+    }
+
+    pub fn left_dock_opacity(&self) -> f32 {
+        egui::emath::easing::cubic_out(self.left_dock_open_t())
     }
 
     fn begin_action_bar_slide(&mut self, to: f32) {
@@ -524,7 +590,11 @@ impl UiAnimation {
     /// True while a visible transition still needs another frame. Avoid calling
     /// `request_repaint` when this is false so the GPU can idle.
     pub fn needs_repaint(&self) -> bool {
-        if self.action_bar_running || self.timeline_running || self.video_editor_running {
+        if self.action_bar_running
+            || self.timeline_running
+            || self.video_editor_running
+            || self.left_dock_running
+        {
             return true;
         }
         const TRACKS: &[&str] = &[
@@ -712,6 +782,22 @@ impl UiAnimation {
 }
 
 /// Slide by moving the **left** edge: docked open position → one full width + gap to the right.
+/// Left dock: same slide model as [`action_bar_overlay_rect`], anchored to the toolbar's right edge.
+pub fn left_dock_panel_rect(work: Rect, card_w: f32, open_t: f32, toolbar_right: f32) -> Rect {
+    use crate::theme;
+    let inset = theme::overlay_work_rect(work);
+    let gap = theme::chrome_gap();
+    let dock_clear = theme::STATUS_BAR_HEIGHT + theme::FLOATING_ABOVE_STATUS_GAP;
+    let max_h = (inset.height() - dock_clear).max(120.0);
+    let open_left = toolbar_right + gap;
+    let t = open_t.clamp(0.0, 1.0);
+    let left = open_left - (1.0 - t) * (card_w + gap);
+    Rect::from_min_size(
+        egui::pos2(left, inset.top()),
+        egui::vec2(card_w, max_h),
+    )
+}
+
 pub fn action_bar_overlay_rect(work: Rect, card_w: f32, open_t: f32) -> Rect {
     use crate::theme;
     let inset = theme::overlay_work_rect(work);

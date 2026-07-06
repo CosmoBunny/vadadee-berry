@@ -11,9 +11,10 @@ use crate::canvas::Viewport;
 use std::collections::HashSet;
 
 use crate::document::{
-    ArcJoin, FaceRenderable, Fill, LineCap, LineJoin, Node, NodeId, NodeKind, NodeStore, Paint, PathMagic, TextStyle,
+    ArcJoin, FaceRenderable, Fill, LineCap, LineJoin, MarkerKind, Node, NodeId, NodeKind, NodeStore, Paint, PathMagic, PathMarker, TextStyle,
     regular_polygon_vertices,
 };
+use crate::document::Stroke as DocStroke;
 use crate::theme::colors;
 use crate::gradient_ui::GradientLineHandle;
 use crate::tools::ResizeHandle;
@@ -905,8 +906,8 @@ fn linear_gradient_rect_bands(
         }
 
         // colors on the iso sides (using a point on the iso gives the clamped sample)
-        let pa = (lx0 + (lx1 - lx0) * ta, ly0 + (ly1 - ly0) * ta);
-        let pb = (lx0 + (lx1 - lx0) * tb, ly0 + (ly1 - ly0) * tb);
+        let _pa = (lx0 + (lx1 - lx0) * ta, ly0 + (ly1 - ly0) * ta);
+        let _pb = (lx0 + (lx1 - lx0) * tb, ly0 + (ly1 - ly0) * tb);
         // Compute color by sampling the stops at the (clamped) parameter t for the iso line
         let paint_a = crate::document::sample_stops(stops, ta.clamp(0.0, 1.0));
         let paint_b = crate::document::sample_stops(stops, tb.clamp(0.0, 1.0));
@@ -1344,7 +1345,7 @@ pub fn draw_node(
             let center = r.center();
             let radius = r.size() * 0.5;
             let doc_bounds = (cx - rx, cy - ry, cx + rx, cy + ry);
-            let bbox_screen = Rect::from_center_size(center, radius * 2.0);
+            let _bbox_screen = Rect::from_center_size(center, radius * 2.0);
             let stroke_after_fill = stroke_w.filter(|_| {
                 !fill.is_visible() || !matches!(fill, Fill::Solid(_))
             });
@@ -1553,6 +1554,9 @@ pub fn draw_node(
             if !has_fill || !closed {
                 draw_path_stroke(painter);
             }
+
+            // Draw start/mid/end point icons (arrows, rings etc) for Path (pen) geometry
+            draw_path_markers(painter, viewport, origin, &bez, closed, &node.style.stroke);
         }
         NodeKind::Text { x, y, style } => {
             draw_text_node(
@@ -1879,6 +1883,16 @@ pub fn draw_nodes(
         } else {
             raw_node.clone()
         };
+
+        // Simple screen-space culling to reduce work for off-viewport nodes (helps with large diagrams / many small objects).
+        let b = node.bounds();
+        let tl = viewport.doc_to_screen((b.x0, b.y0), origin);
+        let br = viewport.doc_to_screen((b.x1, b.y1), origin);
+        let nr = egui::Rect::from_min_max(egui::pos2(tl.x as f32, tl.y as f32), egui::pos2(br.x as f32, br.y as f32));
+        if !painter.clip_rect().intersects(nr) {
+            continue;
+        }
+
         if let NodeKind::Group { children } = &node.kind {
             for cid in children {
                 if let Some(child) = nodes.get(*cid) {
@@ -2189,6 +2203,245 @@ pub fn draw_path_effects(
                 fonts,
                 image_textures,
             );
+        }
+    }
+}
+
+// ===== Path marker / arrow geometry drawing (for Pen paths) =====
+
+fn marker_local_points(kind: MarkerKind, size: f32) -> Vec<(f32, f32)> {
+    let h = size / 2.0;
+    match kind {
+        // Attach point at (0,0) in local space (on the line), tip forward +x
+        MarkerKind::Triangle => vec![(h, 0.0), (0.0, -h * 0.65), (0.0, h * 0.65)],
+        MarkerKind::Square => vec![(-h, -h), (h, -h), (h, h), (-h, h)],  // centered, (0,0) center ok
+        MarkerKind::HollowSquare => vec![(-h, -h), (h, -h), (h, h), (-h, h)],
+        MarkerKind::Ring => {
+            let mut v = vec![];
+            for i in 0..12 {
+                let a = (i as f32) * std::f32::consts::TAU / 12.0;
+                v.push((h * 0.88 * a.cos(), h * 0.88 * a.sin()));
+            }
+            v
+        }
+        MarkerKind::Line => vec![(0.0, -h), (0.0, h)],  // centered vertical for perp
+        MarkerKind::Arrow => vec![
+            (h, 0.0),
+            (0.0, -0.48 * h),
+            (-0.6 * h, -0.48 * h),
+            (-0.6 * h, 0.48 * h),
+            (0.0, 0.48 * h),
+        ],
+        MarkerKind::None => vec![],
+    }
+}
+
+fn transform_to_screen(local: &[(f32, f32)], rot: f32, center: Pos2) -> Vec<Pos2> {
+    let c = rot.cos();
+    let s = rot.sin();
+    local
+        .iter()
+        .map(|&(lx, ly)| {
+            let rx = lx * c - ly * s;
+            let ry = lx * s + ly * c;
+            Pos2::new(center.x + rx, center.y + ry)
+        })
+        .collect()
+}
+
+fn draw_one_marker(
+    painter: &Painter,
+    viewport: &Viewport,
+    origin: Pos2,
+    attach_x: f64,
+    attach_y: f64,
+    tangent_angle: f64,
+    m: &PathMarker,
+) {
+    if m.kind == MarkerKind::None {
+        return;
+    }
+    // size in document units, scale by zoom for screen
+    let size = (m.size as f32 * viewport.zoom).max(1.0);
+    let tangent = tangent_angle;
+
+    let base = if m.auto_rotate { tangent } else { 0.0 };
+    let rot = (base + m.rotation.to_radians()) as f32;
+    let c = rot.cos() as f64;
+    let s = rot.sin() as f64;
+
+    // Apply 2D offset in marker's local (rotated) space
+    let lo_x = m.offset[0];
+    let lo_y = m.offset[1];
+    let ax = attach_x + lo_x * c - lo_y * s;
+    let ay = attach_y + lo_x * s + lo_y * c;
+
+    let sp = viewport.doc_to_screen((ax, ay), origin);
+
+    let col = m.color.to_egui();
+
+    match m.kind {
+        MarkerKind::Triangle | MarkerKind::Square | MarkerKind::Arrow => {
+            let loc = marker_local_points(m.kind, size);
+            let tpts = transform_to_screen(&loc, rot, sp);
+            painter.add(Shape::convex_polygon(tpts, col, Stroke::NONE));
+        }
+        MarkerKind::HollowSquare => {
+            let loc = marker_local_points(m.kind, size);
+            let tpts = transform_to_screen(&loc, rot, sp);
+            painter.add(Shape::Path(PathShape {
+                points: tpts,
+                closed: true,
+                fill: Color32::TRANSPARENT,
+                stroke: PathStroke::new(size * 0.13, col),
+            }));
+        }
+        MarkerKind::Ring => {
+            let r = size * 0.42;
+            painter.add(Shape::circle_stroke(sp, r, egui::Stroke::new(size * 0.11, col)));
+        }
+        MarkerKind::Line => {
+            let loc = marker_local_points(m.kind, size);
+            let tpts = transform_to_screen(&loc, rot, sp);
+            painter.add(Shape::Path(PathShape {
+                points: tpts,
+                closed: false,
+                fill: Color32::TRANSPARENT,
+                stroke: PathStroke::new(size * 0.16, col),
+            }));
+        }
+        MarkerKind::None => {}
+    }
+}
+
+fn get_marker_placements(bez: &BezPath) -> (Option<(f64, f64, f64)>, Vec<(f64, f64, f64)>, Option<(f64, f64, f64)>) {
+    let els = bez.elements();
+    if els.is_empty() {
+        return (None, vec![], None);
+    }
+    let mut knots: Vec<(f64, f64)> = vec![];
+    let mut out_tans: Vec<f64> = vec![];  // forward (outgoing) tangent at this knot, from bezier control if curve
+    let mut prev_pt: Option<(f64, f64)> = None;
+    for el in els {
+        match el {
+            PathEl::MoveTo(p) => {
+                let pt = (p.x, p.y);
+                knots.push(pt);
+                out_tans.push(0.0); // will be set by next segment
+                prev_pt = Some(pt);
+            }
+            PathEl::LineTo(p) => {
+                let pt = (p.x, p.y);
+                if let Some((px, py)) = prev_pt {
+                    let dx = p.x - px;
+                    let dy = p.y - py;
+                    let ang = dy.atan2(dx);
+                    // set outgoing for the previous knot
+                    if let Some(last) = out_tans.last_mut() {
+                        *last = ang;
+                    }
+                }
+                knots.push(pt);
+                out_tans.push(0.0);
+                prev_pt = Some(pt);
+            }
+            PathEl::QuadTo(p1, p2) => {
+                let pt = (p2.x, p2.y);
+                if let Some((px, py)) = prev_pt {
+                    // tangent at start of quad: direction from on-curve to first control p1
+                    let dx = p1.x - px;
+                    let dy = p1.y - py;
+                    let ang = dy.atan2(dx);
+                    if let Some(last) = out_tans.last_mut() {
+                        *last = ang;
+                    }
+                }
+                knots.push(pt);
+                out_tans.push(0.0);
+                prev_pt = Some(pt);
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                let pt = (p3.x, p3.y);
+                if let Some((px, py)) = prev_pt {
+                    // tangent at start of cubic: to first control p1
+                    let dx = p1.x - px;
+                    let dy = p1.y - py;
+                    let ang = dy.atan2(dx);
+                    if let Some(last) = out_tans.last_mut() {
+                        *last = ang;
+                    }
+                }
+                knots.push(pt);
+                out_tans.push(0.0);
+                prev_pt = Some(pt);
+            }
+            PathEl::ClosePath => {}
+        }
+    }
+    let n = knots.len();
+    if n == 0 {
+        return (None, vec![], None);
+    }
+    // Fill in unset (use incoming for last, chord fallback for mids)
+    if n >= 2 {
+        // for last knot use the direction from prev segment (incoming as forward at end)
+        if out_tans[n-1] == 0.0 {
+            let (px, py) = knots[n-2];
+            let (x, y) = knots[n-1];
+            out_tans[n-1] = (y - py).atan2(x - px);
+        }
+    }
+    for i in 1..n-1 {
+        if out_tans[i] == 0.0 {
+            // fallback to chord
+            let (px, py) = knots[i-1];
+            let (nx, ny) = knots[i+1];
+            out_tans[i] = (ny - py).atan2(nx - px);
+        }
+    }
+    // for first if still unset (should have been set by first segment)
+    if n >= 2 && out_tans[0] == 0.0 {
+        let (x, y) = knots[0];
+        let (nx, ny) = knots[1];
+        out_tans[0] = (ny - y).atan2(nx - x);
+    }
+    let mut res = vec![];
+    for i in 0..n {
+        res.push((knots[i].0, knots[i].1, out_tans[i]));
+    }
+    let start = res.first().copied();
+    let end = res.last().copied();
+    let mids = if n > 2 { res[1..n-1].to_vec() } else { vec![] };
+    (start, mids, end)
+}
+
+fn draw_path_markers(
+    painter: &Painter,
+    viewport: &Viewport,
+    origin: Pos2,
+    bez: &BezPath,
+    closed: bool,
+    stroke: &DocStroke,
+) {
+    let (start, mids, end) = get_marker_placements(bez);
+    if let Some((x, y, ang)) = start {
+        let adj_ang = if stroke.start_marker.auto_rotate {
+            ang + std::f64::consts::PI  // opposite for start
+        } else {
+            ang
+        };
+        draw_one_marker(painter, viewport, origin, x, y, adj_ang, &stroke.start_marker);
+    }
+    for (x, y, ang) in mids {
+        draw_one_marker(painter, viewport, origin, x, y, ang, &stroke.mid_marker);
+    }
+    if let Some((x, y, ang)) = end {
+        let same_as_start = closed
+            && start
+                .map(|(sx, sy, _)| (sx - x).abs() < 1e-6 && (sy - y).abs() < 1e-6)
+                .unwrap_or(false);
+        if !same_as_start {
+            draw_one_marker(painter, viewport, origin, x, y, ang, &stroke.end_marker);
         }
     }
 }
@@ -2696,6 +2949,39 @@ pub fn draw_node_handles(
         }
     }
 
+    // Draw yellow corner curve controls (LPE style) for filleted corners
+    // (visible after enabling Corner curve when the point is selected)
+    // T1/T2 placed at equal D = R / tan(θ/2) from V.
+    if let NodeKind::Path { path } = &node.kind {
+        let anchors = path.anchor_positions();
+        for (&k, _f) in &path.corner_fillets {
+            if k >= anchors.len() { continue; }
+            let p = anchors[k];
+            let prev = if k > 0 { k - 1 } else if path.is_closed() && anchors.len() > 2 { anchors.len() - 1 } else { continue };
+            let pa = anchors[prev];
+            let lenp = ((p.0 - pa.0).powi(2) + (p.1 - pa.1).powi(2)).sqrt().max(1e-9);
+            let uxp = (pa.0 - p.0) / lenp;
+            let uyp = (pa.1 - p.1) / lenp;
+            let D = path.fillet_tangent_d(k);
+            let t1x = p.0 + uxp * D;
+            let t1y = p.1 + uyp * D;
+            // next leg
+            let nxt = if k + 1 < anchors.len() { k + 1 } else if path.is_closed() && anchors.len() > 2 { 0 } else { continue };
+            let pb = anchors[nxt];
+            let lenn = ((p.0 - pb.0).powi(2) + (p.1 - pb.1).powi(2)).sqrt().max(1e-9);
+            let uxn = (pb.0 - p.0) / lenn;
+            let uyn = (pb.1 - p.1) / lenn;
+            let t2x = p.0 + uxn * D;
+            let t2y = p.1 + uyn * D;
+            let y1 = viewport.doc_to_screen((t1x, t1y), origin);
+            let y2 = viewport.doc_to_screen((t2x, t2y), origin);
+            painter.circle_filled(y1, 5.0, Color32::from_rgb(255, 255, 80));
+            painter.circle_stroke(y1, 5.0, Stroke::new(1.0, Color32::BLACK));
+            painter.circle_filled(y2, 5.0, Color32::from_rgb(255, 255, 80));
+            painter.circle_stroke(y2, 5.0, Stroke::new(1.0, Color32::BLACK));
+        }
+    }
+
     if let NodeKind::Path { path } = &node.kind {
         let show_all_handles = selected_on_path.is_empty();
         let handle_indices: Vec<usize> = if show_all_handles {
@@ -2714,24 +3000,24 @@ pub fn draw_node_handles(
                     let cin = viewport.doc_to_screen(ci, origin);
                     painter.line_segment(
                         [a, cin],
-                        Stroke::new(1.5, Color32::from_rgb(255, 180, 60)),
+                        Stroke::new(1.5, Color32::from_rgb(255, 255, 80)), // yellow for curvable mid controls etc.
                     );
                     painter.rect_filled(
                         Rect::from_center_size(cin, Vec2::splat(6.0)),
                         0.0,
-                        Color32::from_rgb(255, 180, 60),
+                        Color32::from_rgb(255, 255, 80),
                     );
                 }
                 if let Some(co) = ctrl_out {
                     let cout = viewport.doc_to_screen(co, origin);
                     painter.line_segment(
                         [a, cout],
-                        Stroke::new(1.5, Color32::from_rgb(255, 180, 60)),
+                        Stroke::new(1.5, Color32::from_rgb(255, 255, 80)), // yellow for curvable mid controls etc.
                     );
                     painter.rect_filled(
                         Rect::from_center_size(cout, Vec2::splat(6.0)),
                         0.0,
-                        Color32::from_rgb(255, 180, 60),
+                        Color32::from_rgb(255, 255, 80),
                     );
                 }
             }
@@ -2769,24 +3055,40 @@ pub fn draw_node_handles(
                 Stroke::new(1.5, Color32::WHITE),
             );
         } else {
+            let is_path_point = matches!(&node.kind, NodeKind::Path { .. });
             let smooth = matches!(
                 &node.kind,
                 NodeKind::Path { path } if path.is_anchor_smooth(i)
             );
             let radius = if is_selected { 7.0 } else { 5.0 };
-            let fill = if is_selected {
-                colors::ACCENT
-            } else if smooth {
-                Color32::from_rgb(255, 180, 60)
+            if is_path_point {
+                // Explicit circle icon for path points (sharp or smooth)
+                let fill = if is_selected {
+                    colors::ACCENT
+                } else if smooth {
+                    Color32::from_rgb(255, 180, 60)
+                } else {
+                    Color32::from_rgb(200, 220, 255)
+                };
+                painter.circle_filled(s, radius, fill);
+                painter.circle_stroke(s, radius, Stroke::new(2.0, Color32::from_rgb(0, 100, 200)));
+                // inner dot for icon feel
+                painter.circle_filled(s, radius * 0.4, Color32::from_rgb(30, 60, 120));
             } else {
-                Color32::WHITE
-            };
-            painter.circle_filled(s, radius, fill);
-            painter.circle_stroke(
-                s,
-                radius,
-                Stroke::new(1.5, Color32::from_rgb(0, 120, 215)),
-            );
+                let fill = if is_selected {
+                    colors::ACCENT
+                } else if smooth {
+                    Color32::from_rgb(255, 180, 60)
+                } else {
+                    Color32::WHITE
+                };
+                painter.circle_filled(s, radius, fill);
+                painter.circle_stroke(
+                    s,
+                    radius,
+                    Stroke::new(1.5, Color32::from_rgb(0, 120, 215)),
+                );
+            }
         }
     }
 }

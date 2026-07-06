@@ -25,7 +25,7 @@ fn default_handle_mode() -> BezierHandleMode {
     BezierHandleMode::Both
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe {
     pub frame: usize,
     pub value: f64,
@@ -58,7 +58,7 @@ fn solve_u(x_target: f64, x1: f64, range: f64) -> f64 {
     (low + high) * 0.5
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KeyframeTrack {
     pub keyframes: Vec<Keyframe>,
 }
@@ -123,7 +123,7 @@ impl KeyframeTrack {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeAnimation {
     pub pos_x: KeyframeTrack,
     pub pos_y: KeyframeTrack,
@@ -177,7 +177,7 @@ impl NodeAnimation {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AnimationTimeline {
     pub nodes: std::collections::HashMap<NodeId, NodeAnimation>,
 }

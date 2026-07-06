@@ -2,7 +2,7 @@
 use egui::{Color32, Id, Key, Mesh, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 
 use crate::document::{
-    linear_angle_from_line, linear_line_spanning_bbox, set_linear_line_angle, translate_linear_line,
+    linear_angle_from_line, linear_line_spanning_bbox, translate_linear_line,
     FillKind, GradientStop, Paint, sample_stops,
 };
 
