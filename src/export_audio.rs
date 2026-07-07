@@ -29,7 +29,7 @@ pub fn export_mux_with_audio(
     }
 
     let layers = collect_export_audio_layers(project);
-    let supports_audio_mux = matches!(format, VideoFormat::Mp4 | VideoFormat::Mkv | VideoFormat::Mov);
+    let supports_audio_mux = matches!(format, VideoFormat::Mp4 | VideoFormat::Mkv | VideoFormat::Mov | VideoFormat::Webm);
 
     if layers.is_empty() || !supports_audio_mux {
         if layers.is_empty() {
@@ -90,24 +90,37 @@ pub fn export_mux_with_audio(
 }
 
 fn collect_export_audio_layers(project: &ProjectFile) -> Vec<ExportAudioLayer> {
-    project
-        .document
-        .layers
-        .iter()
-        .filter(|layer| {
-            layer.visible
-                && layer.is_renderer
-                && !layer.video_path.is_empty()
-                && matches!(layer.kind, LayerKind::AV)
-        })
-        .map(|layer| ExportAudioLayer {
-            path: layer.video_path.clone(),
-            timeline_start: layer.video_timeline_start,
-            start_offset: layer.video_start_offset,
-            play_secs: layer.timeline_play_secs(),
-            volume: layer.volume.max(0.0),
-        })
-        .collect()
+    let mut out = Vec::new();
+    for layer in &project.document.layers {
+        if !layer.visible || !layer.is_renderer || !matches!(layer.kind, LayerKind::AV) {
+            continue;
+        }
+        let mut layer_clone = layer.clone();
+        layer_clone.ensure_av_clips();
+        if !layer_clone.av_clips.is_empty() {
+            for clip in &layer_clone.av_clips {
+                if clip.media_path.is_empty() {
+                    continue;
+                }
+                out.push(ExportAudioLayer {
+                    path: clip.media_path.clone(),
+                    timeline_start: clip.video_timeline_start,
+                    start_offset: clip.video_start_offset,
+                    play_secs: clip.timeline_play_secs(),
+                    volume: layer_clone.volume.max(0.0),
+                });
+            }
+        } else if !layer_clone.video_path.is_empty() {
+            out.push(ExportAudioLayer {
+                path: layer_clone.video_path.clone(),
+                timeline_start: layer_clone.video_timeline_start,
+                start_offset: layer_clone.video_start_offset,
+                play_secs: layer_clone.timeline_play_secs(),
+                volume: layer_clone.volume.max(0.0),
+            });
+        }
+    }
+    out
 }
 
 fn pcm_has_audible_samples(pcm: &[i16]) -> bool {

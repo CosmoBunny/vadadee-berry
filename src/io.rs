@@ -293,6 +293,8 @@ pub fn document_svg_string(
                 }
             }
             crate::document::LayerKind::Shading => {}
+            crate::document::LayerKind::Flowchart => {}
+            crate::document::LayerKind::Flowchart => {}
         }
     }
     svg.push_str("</svg>\n");
@@ -418,6 +420,17 @@ pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> 
                 }
             }
             svg
+        }
+        NodeKind::FlowchartNode { cx, cy, w, h, corner_rx, .. } => {
+            format!(r#"<rect x="{}" y="{}" width="{}" height="{}" rx="{}" {fill} {stroke} opacity="{op}"/>"#, cx - w/2.0, cy - h/2.0, w, h, corner_rx)
+        }
+        NodeKind::FlowchartPath { path } => {
+            if path.points.is_empty() {
+                String::new()
+            } else {
+                let pts: Vec<String> = path.points.iter().map(|(px, py)| format!("{px},{py}")).collect();
+                format!(r#"<polyline points="{}" {fill} {stroke} opacity="{op}"/>"#, pts.join(" "))
+            }
         }
     };
     format!(r#"<g style="mix-blend-mode:{blend}">{defs}{body}</g>"#)
@@ -959,6 +972,7 @@ pub fn composite_export_frame(
     current_frame: usize,
     video_frames: &VideoFrameMap,
     scale: f32,
+    time_secs: f32,
 ) -> Option<(u32, u32, Vec<u8>)> {
     use resvg::tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
 
@@ -1032,11 +1046,144 @@ pub fn composite_export_frame(
                     resvg::render(&tree, svg_scale, &mut pixmap.as_mut());
                 }
             }
-            crate::document::LayerKind::Shading => {}
+            crate::document::LayerKind::Shading => {
+                apply_shading_passes_skia(&mut pixmap, &layer.shading_passes, time_secs);
+            }
+            crate::document::LayerKind::Flowchart => {}
         }
     }
 
     Some((pixel_w, pixel_h, pixmap.take()))
+}
+
+fn apply_shading_passes_skia(
+    pixmap: &mut resvg::tiny_skia::Pixmap,
+    passes: &[crate::document::ShadingPass],
+    time_secs: f32,
+) {
+    for pass in passes.iter().filter(|p| p.enabled) {
+        let name = pass.name.to_ascii_lowercase();
+        let is_blackhole = name.contains("blackhole") || pass.wgsl.contains("blackhole");
+        let is_starfield = name.contains("star") || name.contains("space") || pass.wgsl.contains("starfield") || pass.wgsl.contains("star");
+        
+        if is_starfield {
+            let w = pixmap.width();
+            let h = pixmap.height();
+            let aspect = (w as f32 / h as f32).max(0.25);
+
+            let t = if pass.uniforms.len() >= 1 {
+                pass.uniforms[0] + time_secs
+            } else {
+                time_secs
+            };
+
+            let data = pixmap.data_mut();
+            for y in 0..h {
+                let v = (y as f32 + 0.5) / h as f32;
+                let row_offset = y as usize * w as usize * 4;
+                for x in 0..w {
+                    let u_val = (x as f32 + 0.5) / w as f32;
+                    let rgb = crate::shading::procedural_blackhole::sample_starfield(
+                        (u_val, v),
+                        t,
+                        aspect,
+                    );
+                    let idx = row_offset + x as usize * 4;
+                    data[idx] = rgb[0];
+                    data[idx + 1] = rgb[1];
+                    data[idx + 2] = rgb[2];
+                    data[idx + 3] = 255;
+                }
+            }
+        } else if is_blackhole {
+            let w = pixmap.width() as f32;
+            let h = pixmap.height() as f32;
+            
+            let mut u = crate::shading::procedural_blackhole::BlackholeParams::default();
+            if pass.uniforms.len() >= 3 {
+                u.time = pass.uniforms[0] + time_secs;
+                u.strength = pass.uniforms[1];
+                u.disk_radius = pass.uniforms[2];
+            } else {
+                u.time = time_secs;
+            }
+            u.aspect = (w / h.max(1.0)).max(0.25);
+            
+            let cols = 160usize;
+            let rows = ((cols as f32 * h / w).ceil() as usize).clamp(90, 200);
+            let cw = w / cols as f32;
+            let ch = h / rows as f32;
+            
+            for row in 0..rows {
+                for col in 0..cols {
+                    let x0 = col as f32 * cw;
+                    let y0 = row as f32 * ch;
+                    let x1 = x0 + cw;
+                    let y1 = y0 + ch;
+                    
+                    let u0 = col as f32 / cols as f32;
+                    let v0 = row as f32 / rows as f32;
+                    let u1 = (col + 1) as f32 / cols as f32;
+                    let v1 = (row + 1) as f32 / rows as f32;
+                    
+                    let rgb = crate::shading::procedural_blackhole::sample(
+                        ((u0 + u1) * 0.5, (v0 + v1) * 0.5),
+                        &u,
+                    );
+                    
+                    if let Some(r_rect) = resvg::tiny_skia::Rect::from_ltrb(x0, y0, x1, y1) {
+                        let mut paint = resvg::tiny_skia::Paint::default();
+                        paint.set_color(resvg::tiny_skia::Color::from_rgba8(rgb[0], rgb[1], rgb[2], 255));
+                        pixmap.fill_rect(r_rect, &paint, resvg::tiny_skia::Transform::identity(), None);
+                    }
+                }
+            }
+        } else if name.contains("crt") || pass.wgsl.contains("scan") {
+            let w = pixmap.width() as usize;
+            let h = pixmap.height() as usize;
+            let data = pixmap.data_mut();
+            
+            for y in 0..h {
+                if y % 3 == 0 {
+                    let row_offset = y * w * 4;
+                    for x in 0..w {
+                        let idx = row_offset + x * 4;
+                        data[idx] = (data[idx] as f32 * 0.89) as u8;
+                        data[idx + 1] = (data[idx + 1] as f32 * 0.89) as u8;
+                        data[idx + 2] = (data[idx + 2] as f32 * 0.89) as u8;
+                    }
+                }
+            }
+            apply_vignette_pixels(pixmap, 0.35);
+        } else if name.contains("vignette") {
+            apply_vignette_pixels(pixmap, 0.65);
+        }
+    }
+}
+
+fn apply_vignette_pixels(pixmap: &mut resvg::tiny_skia::Pixmap, strength: f32) {
+    let w = pixmap.width() as usize;
+    let h = pixmap.height() as usize;
+    let cx = w as f32 * 0.5;
+    let cy = h as f32 * 0.5;
+    let radius = w.max(h) as f32 * 0.55;
+    let data = pixmap.data_mut();
+    
+    for y in 0..h {
+        let dy = y as f32 - cy;
+        let row_offset = y * w * 4;
+        for x in 0..w {
+            let dx = x as f32 - cx;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let t = dist / radius;
+            let alpha = (t * strength * 0.55).clamp(0.0, 0.85);
+            let factor = 1.0 - alpha;
+            let idx = row_offset + x * 4;
+            data[idx] = (data[idx] as f32 * factor) as u8;
+            data[idx + 1] = (data[idx + 1] as f32 * factor) as u8;
+            data[idx + 2] = (data[idx + 2] as f32 * factor) as u8;
+        }
+    }
 }
 
 #[cfg(test)]

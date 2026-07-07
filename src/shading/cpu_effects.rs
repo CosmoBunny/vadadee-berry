@@ -30,15 +30,57 @@ fn draw_shading_passes_cpu(
 ) {
     for pass in passes.iter().filter(|p| p.enabled) {
         let name = pass.name.to_ascii_lowercase();
-        if name.contains("blackhole") || pass.wgsl.contains("starfield") {
+        let is_blackhole = name.contains("blackhole") || pass.wgsl.contains("blackhole");
+        let is_starfield = name.contains("star") || name.contains("space") || pass.wgsl.contains("starfield") || pass.wgsl.contains("star");
+        
+        if is_blackhole {
             draw_blackhole_shader(painter, page_rect, time_secs, pass);
+        } else if is_starfield {
+            draw_starfield_shader(painter, page_rect, time_secs, pass);
         } else if name.contains("crt") || pass.wgsl.contains("scan") {
             draw_crt(painter, page_rect);
-        } else {
+        } else if name.contains("vignette") {
             draw_vignette(painter, page_rect, 0.65);
         }
     }
 }
+
+fn draw_starfield_shader(painter: &Painter, page: Rect, time_secs: f32, pass: &ShadingPass) {
+    let t = if pass.uniforms.len() >= 1 {
+        pass.uniforms[0] + time_secs
+    } else {
+        time_secs
+    };
+    let aspect = (page.width() / page.height().max(1.0)).max(0.25);
+
+    let cols: usize = 160;
+    let rows: usize = ((cols as f32 * page.height() / page.width()).ceil() as usize).clamp(90, 200);
+    let cw = page.width() / cols as f32;
+    let ch = page.height() / rows as f32;
+
+    let mut mesh = Mesh::default();
+    for row in 0..rows {
+        for col in 0..cols {
+            let x0 = page.left() + col as f32 * cw;
+            let y0 = page.top() + row as f32 * ch;
+            let x1 = x0 + cw;
+            let y1 = y0 + ch;
+            let u0 = col as f32 / cols as f32;
+            let v0 = row as f32 / rows as f32;
+            let u1 = (col + 1) as f32 / cols as f32;
+            let v1 = (row + 1) as f32 / rows as f32;
+            let rgb = crate::shading::procedural_blackhole::sample_starfield(
+                ((u0 + u1) * 0.5, (v0 + v1) * 0.5),
+                t,
+                aspect,
+            );
+            let color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+            append_quad(&mut mesh, x0, y0, x1, y1, color);
+        }
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
 
 fn draw_blackhole_shader(painter: &Painter, page: Rect, time_secs: f32, pass: &ShadingPass) {
     let mut u = BlackholeParams::default();

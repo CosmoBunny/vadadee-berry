@@ -5,6 +5,7 @@ mod animation;
 mod av_clip;
 mod music;
 mod shading;
+pub mod flowchart;
 
 pub use av_clip::*;
 pub use node::*;
@@ -80,6 +81,8 @@ pub enum LayerKind {
     AV,
     /// WGSL post-process passes composited over the canvas.
     Shading,
+    /// Dynamic flowchart with nodes and orthogonal paths.
+    Flowchart,
 }
 
 impl Default for LayerKind {
@@ -282,6 +285,40 @@ impl Layer {
         }
     }
 
+    pub fn new_flowchart_layer(id: Uuid, name: String) -> Self {
+        Self {
+            id,
+            name,
+            visible: true,
+            locked: false,
+            nodes: vec![],
+            kind: LayerKind::Flowchart,
+            video_path: String::new(),
+            volume: 1.0,
+            is_renderer: true,
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            width: A4_WIDTH_PX as f32,
+            height: A4_HEIGHT_PX as f32,
+            aspect_ratio_locked: true,
+            hue: 0.0,
+            saturation: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            eq_bass: 0.0,
+            eq_mid: 0.0,
+            eq_treble: 0.0,
+            video_start_offset: 0.0,
+            video_play_length: 3600.0,
+            video_timeline_start: 0.0,
+            media_source_duration: None,
+            av_clips: Vec::new(),
+            music_clips: Vec::new(),
+            shading_passes: Vec::new(),
+        }
+    }
+
     /// Migrate legacy single-clip fields into `av_clips` (idempotent).
     pub fn ensure_av_clips(&mut self) {
         if self.kind != LayerKind::AV || !self.av_clips.is_empty() {
@@ -463,6 +500,12 @@ impl Document {
 
     pub fn add_shading_layer(&mut self, name: impl Into<String>) -> usize {
         let layer = Layer::new_shading_layer(Uuid::new_v4(), name.into());
+        self.layers.push(layer);
+        self.layers.len() - 1
+    }
+
+    pub fn add_flowchart_layer(&mut self, name: impl Into<String>) -> usize {
+        let layer = Layer::new_flowchart_layer(Uuid::new_v4(), name.into());
         self.layers.push(layer);
         self.layers.len() - 1
     }

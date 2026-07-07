@@ -2,7 +2,10 @@
 name = "vadadee-berry"
 version = "0.1.0"
 edition = "2024"
-description = "Vadadee Berry — vector graphics editor in Rust (egui + wgpu)"
+description = "Creative tool combining vector graphics, video timeline, shaders, image editing, flowcharts and music sequencer — GPU-accelerated, built with egui and wgpu"
+authors = ["CosmoBunny", "ANGSUDO"]
+keywords = ["graphics", "video", "animation", "shader", "egui"]
+categories = ["graphics", "multimedia", "gui"]
 license = "MIT"
 readme = "README.md"
 
@@ -49,7 +52,7 @@ indexmap = { version = "2.11.4", features = ["serde"] }
 rustc-hash = "2.1.1"
 fontdb = "0.23.0"
 ttf-parser = "0.25.1"
-kramaframe = { path = "../kramaframe" }
+kramaframe = "0.2.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 geo = "0.29"
 base64 = "0.22"
@@ -59,11 +62,11 @@ symphonia = { version = "0.5.5", default-features = false, features = ["aac", "f
 hound = "3.5.1"
 rayon = "1.10"
 
+# ── Desktop (non-Android) shared deps ─────────────────────────────────────────
 [target.'cfg(not(target_os = "android"))'.dependencies]
-eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "wayland", "x11"] }
 env_logger = "0.11.8"
 rfd = "0.15.4"
-arboard = { version = "3", features = ["wayland-data-control", "image-data"] }
+arboard = { version = "3", features = ["image-data"] }
 device_query = "4.0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tokio-tungstenite = { version = "0.23", features = ["connect"] }
@@ -71,6 +74,15 @@ futures-util = "0.3"
 aes-gcm = "0.10"
 rand = "0.8"
 sha2 = "0.10"
+
+# ── Linux-only: Wayland / X11 window backends ──────────────────────────────────
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "wayland", "x11"] }
+arboard = { version = "3", features = ["wayland-data-control"] }
+
+# ── macOS / Windows: no Wayland ────────────────────────────────────────────────
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+eframe = { version = "0.34.3", default-features = false, features = ["accesskit"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { version = "0.34.3", default-features = false, features = ["android-game-activity"] }

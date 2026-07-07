@@ -106,7 +106,10 @@ impl ColorAdjust {
 }
 
 struct ExportVideoLayer {
+    /// The clip's own UUID (used as key in video_frames).
     id: uuid::Uuid,
+    /// The layer this clip belongs to (used as composite key in VideoFrameMap).
+    layer_id: uuid::Uuid,
     path: String,
     timeline_start: f32,
     start_offset: f32,
@@ -223,6 +226,11 @@ impl<'a> ExportSession<'a> {
         self.video_frames.clear();
         for layer in &self.video_layers {
             self.check_cancel()?;
+            // Skip if this clip isn't active at the current timeline position.
+            let timeline_end = layer.timeline_start + layer.play_secs;
+            if timeline_sec < layer.timeline_start || timeline_sec >= timeline_end {
+                continue;
+            }
             let elapsed_time = (timeline_sec - layer.timeline_start)
                 .max(0.0)
                 .min(layer.play_secs);
@@ -247,8 +255,9 @@ impl<'a> ExportSession<'a> {
                         rgba = img.into_raw();
                     }
                 }
+                // Key by layer_id so composite_export_frame can find the frame.
                 self.video_frames.insert(
-                    layer.id,
+                    layer.layer_id,
                     VideoLayerBuffer {
                         width: w,
                         height: h,
@@ -311,6 +320,7 @@ impl<'a> ExportSession<'a> {
                 anim_frame,
                 &self.video_frames,
                 self.scale,
+                timeline_sec,
             )
             .ok_or_else(|| "Frame rasterize failed".to_string())?;
 
@@ -388,30 +398,50 @@ fn run_export(
 }
 
 fn collect_export_video_layers(project: &ProjectFile) -> Vec<ExportVideoLayer> {
-    project
-        .document
-        .layers
-        .iter()
-        .filter(|layer| {
-            layer.visible
-                && layer.is_renderer
-                && layer.kind == crate::document::LayerKind::AV
-                && !layer.video_path.is_empty()
-        })
-        .map(|layer| ExportVideoLayer {
-            id: layer.id,
-            path: layer.video_path.clone(),
-            timeline_start: layer.video_timeline_start,
-            start_offset: layer.video_start_offset,
-            play_secs: layer.timeline_play_secs(),
-            color: ColorAdjust {
-                hue: layer.hue,
-                saturation: layer.saturation,
-                brightness: layer.brightness,
-                contrast: layer.contrast,
-            },
-        })
-        .collect()
+    let mut out = Vec::new();
+    for layer in &project.document.layers {
+        if !layer.visible
+            || !layer.is_renderer
+            || layer.kind != crate::document::LayerKind::AV
+        {
+            continue;
+        }
+        let mut layer_clone = layer.clone();
+        layer_clone.ensure_av_clips();
+        let color = ColorAdjust {
+            hue: layer_clone.hue,
+            saturation: layer_clone.saturation,
+            brightness: layer_clone.brightness,
+            contrast: layer_clone.contrast,
+        };
+        if !layer_clone.av_clips.is_empty() {
+            for clip in &layer_clone.av_clips {
+                if clip.media_path.is_empty() || clip.is_audio_only() {
+                    continue;
+                }
+                out.push(ExportVideoLayer {
+                    id: clip.id,
+                    layer_id: layer_clone.id,
+                    path: clip.media_path.clone(),
+                    timeline_start: clip.video_timeline_start,
+                    start_offset: clip.video_start_offset,
+                    play_secs: clip.timeline_play_secs(),
+                    color: color.clone(),
+                });
+            }
+        } else if !layer_clone.video_path.is_empty() {
+            out.push(ExportVideoLayer {
+                id: layer_clone.id,
+                layer_id: layer_clone.id,
+                path: layer_clone.video_path.clone(),
+                timeline_start: layer_clone.video_timeline_start,
+                start_offset: layer_clone.video_start_offset,
+                play_secs: layer_clone.timeline_play_secs(),
+                color,
+            });
+        }
+    }
+    out
 }
 
 fn decode_layer_frame_rgba(

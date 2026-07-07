@@ -95,6 +95,10 @@ pub struct SnapGuide {
 pub struct VadadeeBerryApp {
     pub live_snap_guides: Vec<SnapGuide>,
     pub snap_magnet: bool,
+    /// Pixel-art editing: nearest-neighbor feel, visible cell grid on canvas.
+    pub pixel_art_mode: bool,
+    /// Document units per pixel cell (e.g. 1.0 = one doc unit per pixel at export scale).
+    pub pixel_cell_size: f32,
     pub anim_current_frame: usize,
     pub anim_is_playing: bool,
     pub anim_keyframing_mode: bool,
@@ -382,7 +386,9 @@ pub struct VideoLayerState {
     /// Sender for commands to the decode thread.
     pub tx_cmd: std::sync::mpsc::Sender<VideoCommand>,
     /// Receiver for completed frame decodes.
-    pub rx_frame: std::sync::mpsc::Receiver<(usize, u32, u32, Vec<u8>)>,
+    pub rx_frame: std::sync::mpsc::Receiver<(usize, usize, u32, u32, Vec<u8>)>,
+    /// Source frame index of the displayed texture.
+    pub cached_source_frame: Option<usize>,
     /// The frame we currently requested from the background thread.
     pub requested_frame: Option<usize>,
     /// Whether libav sequential decode is active for this layer.
@@ -558,6 +564,8 @@ impl VadadeeBerryApp {
         let app = Self {
             live_snap_guides: Vec::new(),
             snap_magnet: true,
+            pixel_art_mode: false,
+            pixel_cell_size: 1.0,
             anim_current_frame: 0,
             anim_is_playing: false,
             anim_keyframing_mode: false,
@@ -1213,6 +1221,7 @@ impl VadadeeBerryApp {
             self.clear_transient_tool_state();
             self.status_message = "Undo".into();
             self.sync_inspector_from_selection();
+            self.sync_flowchart_paths_if_active_layer();
         }
     }
 
@@ -1222,6 +1231,7 @@ impl VadadeeBerryApp {
             self.clear_transient_tool_state();
             self.status_message = "Redo".into();
             self.sync_inspector_from_selection();
+            self.sync_flowchart_paths_if_active_layer();
         }
     }
 
@@ -1797,6 +1807,71 @@ impl VadadeeBerryApp {
         );
     }
 
+    pub fn set_flowchart_node_label(
+        &mut self,
+        id: crate::document::NodeId,
+        label: String,
+        label_font_size: f64,
+        label_align: crate::document::TextAlign,
+        label_font_family: String,
+        label_bold: bool,
+        label_italic: bool,
+    ) {
+        let Some(before) = self.project.nodes.get(id).cloned() else {
+            return;
+        };
+        let mut after = before.clone();
+        if let crate::document::NodeKind::FlowchartNode {
+            label: l,
+            label_font_size: fs,
+            label_align: al,
+            label_font_family: fam,
+            label_bold: b,
+            label_italic: i,
+            ..
+        } = &mut after.kind
+        {
+            *l = label;
+            *fs = label_font_size;
+            *al = label_align;
+            *fam = label_font_family;
+            *b = label_bold;
+            *i = label_italic;
+        } else {
+            return;
+        }
+        if before != after {
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchNode { id, before, after },
+            );
+        }
+    }
+
+    pub fn set_flowchart_path_props(
+        &mut self,
+        id: crate::document::NodeId,
+        corner_radius: f64,
+        endpoint_marker_size: f32,
+    ) {
+        let Some(before) = self.project.nodes.get(id).cloned() else {
+            return;
+        };
+        let mut after = before.clone();
+        if let crate::document::NodeKind::FlowchartPath { path } = &mut after.kind {
+            path.corner_radius = corner_radius;
+            path.endpoint_marker_size = endpoint_marker_size;
+        } else {
+            return;
+        }
+        if before != after {
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchNode { id, before, after },
+            );
+        }
+    }
+
     pub fn set_document_title(&mut self, title: String) {
         let before = snapshot_document(&self.project.document);
         let mut after = before.clone();
@@ -2207,6 +2282,30 @@ impl VadadeeBerryApp {
 
     pub fn add_shading_layer(&mut self, name: &str) {
         self.add_shading_layer_with_preset(name, "blackhole");
+    }
+
+    pub fn add_flowchart_layer(&mut self, name: &str) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let idx = after.add_flowchart_layer(name);
+        after.active_layer_index = idx;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+    }
+
+    fn rebalance_active_flowchart_layer_if_any(&mut self) {
+        let doc = &self.project.document;
+        if let Some(layer) = doc.layers.get(doc.active_layer_index) {
+            if layer.kind == crate::document::LayerKind::Flowchart {
+                let ids: Vec<crate::document::NodeId> = layer.nodes.clone();
+                crate::document::flowchart::rebalance_flowchart_edge_anchors(
+                    &mut self.project.nodes,
+                    &ids,
+                );
+            }
+        }
     }
 
     pub fn add_shading_layer_with_preset(&mut self, name: &str, preset: &str) {
@@ -3947,6 +4046,7 @@ impl VadadeeBerryApp {
             },
         );
         self.selection.clear();
+        self.sync_flowchart_paths_if_active_layer();
     }
 
     fn insert_node(&mut self, node: Node) {
@@ -3955,6 +4055,8 @@ impl VadadeeBerryApp {
             .push(&mut self.project, ProjectEdit::InsertNode { node });
         self.selection = vec![id];
         self.sync_inspector_from_selection();
+        // Ensure flowchart connectors re-route + slots rebalanced when new nodes/paths added
+        self.rebalance_active_flowchart_layer_if_any();
     }
 
     /// Bulk insert many nodes as a *single* history entry.
@@ -4065,6 +4167,8 @@ impl VadadeeBerryApp {
                 node.set_bounds(kurbo::Rect::new(ox + dx, oy + dy, ox + dx + w, oy + dy + h));
             }
         }
+        // Lively update attached flowchart lines during bulk node drag preview
+        self.sync_flowchart_paths_if_active_layer();
     }
 
     fn revert_bulk_move_preview(&mut self) {
@@ -4082,6 +4186,8 @@ impl VadadeeBerryApp {
                 node.set_bounds(kurbo::Rect::new(ox, oy, ox + w, oy + h));
             }
         }
+        // Restore connector routes based on reverted node positions
+        self.sync_flowchart_paths_if_active_layer();
     }
 
     fn commit_bulk_drag(&mut self, dx: f64, dy: f64) {
@@ -4116,6 +4222,7 @@ impl VadadeeBerryApp {
                 ProjectEdit::PatchNodes { patches },
             );
         }
+        self.sync_flowchart_paths_if_active_layer();
     }
 
     pub fn split_active_av_clip_at_playhead(&mut self) {
@@ -4295,7 +4402,7 @@ impl VadadeeBerryApp {
 
 fn run_video_decode_thread(
     rx_cmd: std::sync::mpsc::Receiver<VideoCommand>,
-    tx_frame: std::sync::mpsc::Sender<(usize, u32, u32, Vec<u8>)>,
+    tx_frame: std::sync::mpsc::Sender<(usize, usize, u32, u32, Vec<u8>)>,
 ) {
     let mut current_path: Option<String> = None;
     let mut libav_stream: Option<crate::video_decode::VideoStream> = None;
@@ -4341,11 +4448,11 @@ fn run_video_decode_thread(
                     None
                 };
                 if let Some((w, h, rgba)) = decoded {
-                    let _ = tx_frame.send((timeline_frame, w, h, rgba));
+                    let _ = tx_frame.send((timeline_frame, source_frame, w, h, rgba));
                 } else if let Some((w, h, rgba)) =
                     crate::video_decode::decode_frame(&path, source_frame, fps)
                 {
-                    let _ = tx_frame.send((timeline_frame, w, h, rgba));
+                    let _ = tx_frame.send((timeline_frame, source_frame, w, h, rgba));
                 }
             }
         }
@@ -4411,6 +4518,7 @@ fn run_video_decode_thread(
                 VideoLayerState {
                     texture: None,
                     cached_frame: None,
+                    cached_source_frame: None,
                     tx_cmd,
                     rx_frame,
                     requested_frame: None,
@@ -4424,7 +4532,7 @@ fn run_video_decode_thread(
                 latest_frame = Some(data);
             }
 
-            if let Some((decoded_frame, w, h, mut rgba)) = latest_frame {
+            if let Some((decoded_frame, decoded_source_frame, w, h, mut rgba)) = latest_frame {
                 if *hue != 0.0 || *sat != 1.0 || *bright != 1.0 || *contrast != 1.0 {
                     let mut img = image::RgbaImage::from_raw(w, h, rgba).unwrap_or_default();
                     apply_color_controls(&mut img, *hue, *sat, *bright, *contrast);
@@ -4444,6 +4552,7 @@ fn run_video_decode_thread(
                 });
                 state.texture = Some(handle);
                 state.cached_frame = Some(decoded_frame);
+                state.cached_source_frame = Some(decoded_source_frame);
                 state.requested_frame = None;
                 ctx.request_repaint();
             }
@@ -4458,7 +4567,11 @@ fn run_video_decode_thread(
             let source_time = start_offset + elapsed_time;
             let source_frame_idx = (source_time * fps) as usize;
 
-            let already_cached = state.cached_frame == Some(current_frame);
+            let mut already_cached = state.cached_frame == Some(current_frame);
+            if !already_cached && state.cached_source_frame == Some(source_frame_idx) {
+                state.cached_frame = Some(current_frame);
+                already_cached = true;
+            }
             let already_requested = state.requested_frame == Some(current_frame);
             
             let now = ctx.input(|i| i.time);
@@ -4484,6 +4597,51 @@ fn run_video_decode_thread(
                 state.stream_active = self.anim_is_playing;
                 state.last_req_time = Some(now);
             }
+        }
+
+        if self.anim_current_frame % 300 == 0 {
+            self.cleanup_unused_audio_caches();
+        }
+    }
+
+    pub fn cleanup_unused_audio_caches(&mut self) {
+        let mut active_source_paths = std::collections::HashSet::new();
+        for layer in &self.project.document.layers {
+            if layer.kind == crate::document::LayerKind::AV {
+                let mut layer_clone = layer.clone();
+                layer_clone.ensure_av_clips();
+                for clip in &layer_clone.av_clips {
+                    if !clip.media_path.is_empty() {
+                        active_source_paths.insert(clip.media_path.clone());
+                    }
+                }
+                if !layer.video_path.is_empty() {
+                    active_source_paths.insert(layer.video_path.clone());
+                }
+            }
+        }
+
+        let mut active_wav_paths = std::collections::HashSet::new();
+        if let Ok(mut status_map) = self.audio_extract_status.lock() {
+            status_map.retain(|source_path, status| {
+                let keep = active_source_paths.contains(source_path);
+                if keep {
+                    if let AudioExtractStatus::Ready(wav_path) = status {
+                        active_wav_paths.insert(wav_path.to_string_lossy().to_string());
+                    }
+                } else {
+                    if let AudioExtractStatus::Ready(wav_path) = status {
+                        let _ = std::fs::remove_file(wav_path);
+                    }
+                }
+                keep
+            });
+        }
+
+        if let Ok(mut pcm_cache) = self.audio_pcm_cache.lock() {
+            pcm_cache.retain(|key, _| {
+                active_source_paths.contains(key) || active_wav_paths.contains(key)
+            });
         }
     }
 
@@ -4632,6 +4790,23 @@ fn run_video_decode_thread(
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, theme::colors::CANVAS_BG);
             render::draw_grid(&painter, &self.viewport, origin, page);
+            if self.pixel_art_mode {
+                let cell = self.pixel_cell_size as f64;
+                let mut x = (page.min.x as f64 / cell).floor() * cell;
+                while x < page.max.x as f64 {
+                    let p1 = self.viewport.doc_to_screen((x, page.min.y as f64), origin);
+                    let p2 = self.viewport.doc_to_screen((x, page.max.y as f64), origin);
+                    painter.line_segment([p1, p2], egui::Stroke::new(0.5, egui::Color32::from_rgb(80, 80, 80)));
+                    x += cell;
+                }
+                let mut y = (page.min.y as f64 / cell).floor() * cell;
+                while y < page.max.y as f64 {
+                    let p1 = self.viewport.doc_to_screen((page.min.x as f64, y), origin);
+                    let p2 = self.viewport.doc_to_screen((page.max.x as f64, y), origin);
+                    painter.line_segment([p1, p2], egui::Stroke::new(0.5, egui::Color32::from_rgb(80, 80, 80)));
+                    y += cell;
+                }
+            }
             render::draw_page_shadow(&painter, page, self.project.document.page_color_egui());
 
             let order = self.draw_order_cached().to_vec();
@@ -4874,42 +5049,57 @@ fn run_video_decode_thread(
                         }
                     }
                     crate::document::LayerKind::Shading => {
-                        if !layer.shading_passes.is_empty() {
-                            let page = self.viewport.page_rect(
-                                origin,
-                                self.project.document.width as f32,
-                                self.project.document.height as f32,
-                            );
-                            let shade_time = ctx.input(|i| i.time) as f32;
-                            let gpu = self
-                                .gpu_shading
-                                .then(|| self.wgpu_render.as_ref())
-                                .flatten();
-                            if let Some(rs) = gpu {
-                                if crate::shading::shading_passes_need_input(&layer.shading_passes) {
-                                    let view = io::default_document_view(&self.project);
-                                    if let Some((w, h, rgba)) = io::rasterize_document_view(
-                                        &self.project,
-                                        view,
-                                        50.0,
-                                        self.anim_current_frame,
-                                        &std::collections::HashMap::new(),
-                                    ) {
-                                        crate::shading::queue_shading_input(rs, w, h, rgba);
-                                    }
+                        let shade_time = ctx.input(|i| i.time) as f32;
+                        let gpu = self.gpu_shading.then(|| self.wgpu_render.as_ref()).flatten();
+                        if let Some(rs) = gpu {
+                            if crate::shading::shading_passes_need_input(&layer.shading_passes) {
+                                let view = io::default_document_view(&self.project);
+                                if let Some((w, h, rgba)) = io::rasterize_document_view(
+                                    &self.project,
+                                    view,
+                                    50.0,
+                                    self.anim_current_frame,
+                                    &std::collections::HashMap::new(),
+                                ) {
+                                    crate::shading::queue_shading_input(rs, w, h, rgba);
                                 }
                             }
-                            crate::shading::draw_shading_passes(
-                                &painter,
-                                page,
-                                &layer.shading_passes,
-                                shade_time,
-                                gpu,
-                            );
-                            if layer.shading_passes.iter().any(|p| p.enabled) {
-                                ctx.request_repaint();
-                            }
                         }
+                        crate::shading::draw_shading_passes(
+                            &painter,
+                            page,
+                            &layer.shading_passes,
+                            shade_time,
+                            gpu,
+                        );
+                        if layer.shading_passes.iter().any(|p| p.enabled) {
+                            ctx.request_repaint();
+                        }
+                    }
+                    crate::document::LayerKind::Flowchart => {
+                        // Draw flowchart using nodes (rounded rects for nodes, paths for lines)
+                        let layer_set: std::collections::HashSet<NodeId> =
+                            layer.nodes.iter().copied().collect();
+                        let layer_draw_order: Vec<NodeId> = draw_order
+                            .iter()
+                            .copied()
+                            .filter(|id| layer_set.contains(id))
+                            .collect();
+                        crate::render::draw_nodes(
+                            &painter,
+                            &self.project.nodes,
+                            &layer_draw_order,
+                            &self.viewport,
+                            origin,
+                            self.project.document.width as f32,
+                            self.project.document.height as f32,
+                            &self.selection,
+                            &hidden_sources,
+                            &loft_paths,
+                            &self.fonts,
+                            &self.image_textures,
+                        );
+                        // Flowchart uses orthogonal routed paths via FlowchartPathData + rounded render
                     }
                 }
             }
@@ -5096,6 +5286,41 @@ fn run_video_decode_thread(
                 }
             }
 
+            let is_flowchart_layer = self.project.document.layers
+                .get(self.project.document.active_layer_index)
+                .map_or(false, |l| l.kind == crate::document::LayerKind::Flowchart);
+
+            if is_flowchart_layer && (
+                self.tools.active == ToolKind::Line
+                || self.tools.active == ToolKind::Node
+                || self.tools.drag_shape.as_ref().map_or(false, |d| d.kind == Some(ToolKind::Line))
+                || self.tools.select.node_drag_active
+            ) {
+                let active_idx = self.project.document.active_layer_index;
+                if let Some(layer) = self.project.document.layers.get(active_idx) {
+                    let store = &self.project.nodes;
+                    let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 215));
+                    let fill_color = egui::Color32::from_rgb(220, 240, 255);
+                    for &nid in &layer.nodes {
+                        if let Some(nd) = store.get(nid) {
+                            if let Some(geom) = crate::document::flowchart::node_as_flowchart_geom(&nd.kind) {
+                                let sides = [
+                                    crate::document::flowchart::FlowchartAnchor::edge(crate::document::flowchart::FlowchartEdgeSide::Top, 0, 1),
+                                    crate::document::flowchart::FlowchartAnchor::edge(crate::document::flowchart::FlowchartEdgeSide::Bottom, 0, 1),
+                                    crate::document::flowchart::FlowchartAnchor::edge(crate::document::flowchart::FlowchartEdgeSide::Left, 0, 1),
+                                    crate::document::flowchart::FlowchartAnchor::edge(crate::document::flowchart::FlowchartEdgeSide::Right, 0, 1),
+                                ];
+                                for anc in sides {
+                                    let doc_pos = geom.anchor_position(anc);
+                                    let screen_pos = self.viewport.doc_to_screen(doc_pos, origin);
+                                    painter.circle(screen_pos, 4.0, fill_color, stroke);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if self.action_tab == ui::ActionTab::ColorStroke && self.selection.len() == 1 {
                 if let Some(id) = self.selection.first() {
                     if let Some(node) = self.project.nodes.get(*id) {
@@ -5178,13 +5403,78 @@ fn run_video_decode_thread(
                         );
                     }
                     Some(ToolKind::Line) => {
-                        render::draw_preview_line(
-                            &painter,
-                            &self.viewport,
-                            origin,
-                            drag.origin_doc,
-                            drag.current_doc,
-                        );
+                        let is_flowchart = self.project.document.layers
+                            .get(self.project.document.active_layer_index)
+                            .map_or(false, |l| l.kind == crate::document::LayerKind::Flowchart);
+                        if is_flowchart {
+                            let origin_pt = drag.origin_doc;
+                            let current_pt = drag.current_doc;
+                            let active_idx = self.project.document.active_layer_index;
+                            if let Some(layer) = self.project.document.layers.get(active_idx) {
+                                let store = &self.project.nodes;
+                                let anchor_slop = 80.0f64;
+                                let mut best_start_d = anchor_slop;
+                                let mut best_end_d = anchor_slop;
+                                let mut start_node = None;
+                                let mut start_anchor = None;
+                                let mut end_node = None;
+                                let mut end_anchor = None;
+                                let mut points = vec![origin_pt, current_pt];
+
+                                for &nid in &layer.nodes {
+                                    if let Some(nd) = store.get(nid) {
+                                        if let Some(geom) = crate::document::flowchart::node_as_flowchart_geom(&nd.kind) {
+                                            // For start
+                                            let anc_s = crate::document::flowchart::snap_anchor_for_point(&geom, origin_pt);
+                                            let ap_s = geom.anchor_position(anc_s);
+                                            let ds = (ap_s.0 - origin_pt.0).hypot(ap_s.1 - origin_pt.1);
+                                            if ds < best_start_d {
+                                                start_node = Some(nid);
+                                                start_anchor = Some(anc_s);
+                                                points[0] = ap_s;
+                                                best_start_d = ds;
+                                            }
+
+                                            // For end
+                                            let anc_e = crate::document::flowchart::snap_anchor_for_point(&geom, current_pt);
+                                            let ap_e = geom.anchor_position(anc_e);
+                                            let de = (ap_e.0 - current_pt.0).hypot(ap_e.1 - current_pt.1);
+                                            if de < best_end_d {
+                                                end_node = Some(nid);
+                                                end_anchor = Some(anc_e);
+                                                points[1] = ap_e;
+                                                best_end_d = de;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let mut path_data = crate::document::flowchart::FlowchartPathData {
+                                    points,
+                                    start_node,
+                                    start_anchor,
+                                    end_node,
+                                    end_anchor,
+                                    endpoint_marker_size: 12.0,
+                                    corner_radius: 12.0,
+                                };
+
+                                let exclude: Vec<_> = [path_data.start_node, path_data.end_node].iter().filter_map(|x| *x).collect();
+                                let obstacles = crate::document::flowchart::flowchart_routing_obstacles(store, &layer.nodes, &exclude);
+                                crate::document::flowchart::sync_flowchart_path_endpoints(&mut path_data, store, &obstacles);
+
+                                let bez = crate::document::flowchart::rounded_orthogonal_bez(&path_data.points, path_data.corner_radius);
+                                render::draw_preview_bezier(&painter, &self.viewport, origin, &bez);
+                            }
+                        } else {
+                            render::draw_preview_line(
+                                &painter,
+                                &self.viewport,
+                                origin,
+                                drag.origin_doc,
+                                drag.current_doc,
+                            );
+                        }
                     }
                     Some(ToolKind::Polygon) => {
                         let (x, y, w, h) =
@@ -5548,6 +5838,43 @@ fn run_video_decode_thread(
         self.tools.select.node_drag_origin = None;
         self.tools.select.node_drag_active = false;
         self.tools.select.mid_curve_drag = None;
+        self.sync_flowchart_paths_if_active_layer();
+    }
+
+    fn sync_flowchart_paths_if_active_layer(&mut self) {
+        let doc = &self.project.document;
+        if let Some(layer) = doc.layers.get(doc.active_layer_index) {
+            if layer.kind != crate::document::LayerKind::Flowchart {
+                return;
+            }
+            let layer_ids = layer.nodes.clone();
+            let obstacles = {
+                let store = &self.project.nodes;
+                crate::document::flowchart::flowchart_routing_obstacles(store, &layer_ids, &[])
+            };
+            let store = &mut self.project.nodes;
+            for &nid in &layer_ids {
+                let path_data = if let Some(node) = store.get(nid) {
+                    if let crate::document::NodeKind::FlowchartPath { path } = &node.kind {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(mut p) = path_data {
+                    crate::document::flowchart::sync_flowchart_path_endpoints(&mut p, store, &obstacles);
+                    if let Some(node) = store.get_mut(nid) {
+                        if let crate::document::NodeKind::FlowchartPath { path } = &mut node.kind {
+                            *path = p;
+                        }
+                    }
+                }
+            }
+            // also rebalance slots after possible endpoint moves
+            crate::document::flowchart::rebalance_flowchart_edge_anchors(store, &layer_ids);
+        }
     }
 
     fn update_clip_mask_textures(&mut self, ctx: &egui::Context) {
@@ -7886,6 +8213,8 @@ fn run_video_decode_thread(
                                         node.translate(snapped_dx, snapped_dy);
                                     }
                                 }
+                                // Lively update attached flowchart connectors while dragging nodes
+                                self.sync_flowchart_paths_if_active_layer();
                             }
                         }
                         self.tools.select.last_doc = doc;
@@ -8023,6 +8352,8 @@ fn run_video_decode_thread(
                                     }
                                 }
                             }
+                            // Restore any flowchart connector routes
+                            self.sync_flowchart_paths_if_active_layer();
                             if self.selection.len() == 1 && self.tools.select.clicked_already_selected {
                                 self.tools.select.select_rotation_mode = !self.tools.select.select_rotation_mode;
                             }
@@ -8212,6 +8543,10 @@ fn run_video_decode_thread(
 
     pub fn snap_cursor(&mut self, doc: (f64, f64)) -> (f64, f64) {
         if !self.snap_magnet {
+            if self.pixel_art_mode {
+                let cell = self.pixel_cell_size as f64;
+                return ((doc.0 / cell).round() * cell, (doc.1 / cell).round() * cell);
+            }
             return doc;
         }
         let mut snapped = doc;
@@ -8263,6 +8598,12 @@ fn run_video_decode_thread(
                 end: (snapped.0, tpt.1),
                 is_tangent: false,
             });
+        }
+
+        if self.pixel_art_mode {
+            let cell = self.pixel_cell_size as f64;
+            snapped.0 = (snapped.0 / cell).round() * cell;
+            snapped.1 = (snapped.1 / cell).round() * cell;
         }
 
         snapped
@@ -8560,19 +8901,46 @@ fn run_video_decode_thread(
                     return;
                 };
 
+                let is_flowchart = self.project.document.layers
+                    .get(self.project.document.active_layer_index)
+                    .map_or(false, |l| l.kind == crate::document::LayerKind::Flowchart);
+
                 let node = match kind {
                     ToolKind::Rectangle => {
                         let (x, y, w, h) = tools::normalize_rect(origin, current);
                         if w <= 2.0 || h <= 2.0 {
                             return;
                         }
-                        self.styled_shape_node(Node::rect(
-                            x,
-                            y,
-                            w,
-                            h,
-                            self.build_ui_fill(),
-                        ))
+                        if is_flowchart {
+                            let corner_rx = (w.min(h) * 0.22).clamp(8.0, 48.0);
+                            let mut n = Node::new(
+                                crate::document::NodeKind::FlowchartNode {
+                                    cx: x + w / 2.0,
+                                    cy: y + h / 2.0,
+                                    w,
+                                    h,
+                                    corner_rx,
+                                    label: String::new(),
+                                    label_font_size: 14.0,
+                                    label_align: crate::document::TextAlign::Center,
+                                    label_font_family: "Noto Sans".to_string(),
+                                    label_bold: false,
+                                    label_italic: false,
+                                },
+                                "Flowchart Node",
+                            );
+                            n.style.fill = self.build_ui_fill();
+                            n.style.stroke = self.build_ui_stroke();
+                            n
+                        } else {
+                            self.styled_shape_node(Node::rect(
+                                x,
+                                y,
+                                w,
+                                h,
+                                self.build_ui_fill(),
+                            ))
+                        }
                     }
                     ToolKind::Circle => {
                         let (x, y, w, h) = tools::normalize_rect(origin, current);
@@ -8627,7 +8995,61 @@ fn run_video_decode_thread(
                             stroke.width = 1.0;
                             stroke.style = Fill::Solid(Paint::from_hex(0x1a1f2e, 1.0));
                         }
-                        Node::line(origin.0, origin.1, current.0, current.1, stroke)
+                        if is_flowchart {
+                            let mut n = crate::document::flowchart::new_flowchart_path(vec![origin, current]);
+                            // Snap endpoints to nearest flowchart nodes + anchors (using dist to the anchor itself),
+                            // then route orthogonally. This makes "click near a node edge" attach reliably.
+                            if let crate::document::NodeKind::FlowchartPath { path } = &mut n.kind {
+                                let active_idx = self.project.document.active_layer_index;
+                                if let Some(layer) = self.project.document.layers.get(active_idx) {
+                                    let store = &self.project.nodes;
+                                    // Use slop in doc units (forgiving when ending drag near a node port/edge)
+                                    let anchor_slop = 80.0f64;
+                                    let mut best_start_d = anchor_slop;
+                                    let mut best_end_d = anchor_slop;
+
+                                    for &nid in &layer.nodes {
+                                        if let Some(nd) = store.get(nid) {
+                                            if let Some(geom) = crate::document::flowchart::node_as_flowchart_geom(&nd.kind) {
+                                                // For start
+                                                let anc_s = crate::document::flowchart::snap_anchor_for_point(&geom, origin);
+                                                let ap_s = geom.anchor_position(anc_s);
+                                                let ds = (ap_s.0 - origin.0).hypot(ap_s.1 - origin.1);
+                                                if ds < best_start_d {
+                                                    path.start_node = Some(nid);
+                                                    path.start_anchor = Some(anc_s);
+                                                    if let Some(p0) = path.points.first_mut() {
+                                                        *p0 = ap_s;
+                                                    }
+                                                    best_start_d = ds;
+                                                }
+
+                                                // For end
+                                                let anc_e = crate::document::flowchart::snap_anchor_for_point(&geom, current);
+                                                let ap_e = geom.anchor_position(anc_e);
+                                                let de = (ap_e.0 - current.0).hypot(ap_e.1 - current.1);
+                                                if de < best_end_d {
+                                                    path.end_node = Some(nid);
+                                                    path.end_anchor = Some(anc_e);
+                                                    if let Some(p1) = path.points.last_mut() {
+                                                        *p1 = ap_e;
+                                                    }
+                                                    best_end_d = de;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let exclude: Vec<_> = [path.start_node, path.end_node].iter().filter_map(|x| *x).collect();
+                                    let obstacles = crate::document::flowchart::flowchart_routing_obstacles(store, &layer.nodes, &exclude);
+                                    crate::document::flowchart::sync_flowchart_path_endpoints(path, store, &obstacles);
+                                }
+                            }
+                            n.style.stroke = stroke;
+                            n.name = "Flowchart Connector".into();
+                            n
+                        } else {
+                            Node::line(origin.0, origin.1, current.0, current.1, stroke)
+                        }
                     }
                     ToolKind::Arc => {
                         let (x, y, w, h) = tools::normalize_rect(origin, current);
@@ -8654,6 +9076,7 @@ fn run_video_decode_thread(
                     _ => return,
                 };
                 self.insert_node(node);
+                self.rebalance_active_flowchart_layer_if_any();
             }
         }
     }
@@ -9489,9 +9912,89 @@ fn run_video_decode_thread(
                         }
                     } else if let Some(node) = self.project.nodes.get_mut(id) {
                         node.apply_path_edit_target(target, use_doc.0, use_doc.1);
-                        // Equidistance for yellows (T1/T2) is now always enforced mathematically via R + D = R / tan(θ/2) in apply + fillet_tangent_d.
-                        // If holding CTRL we can skip grid snap (handled above for mids) for fine control.
                         self.tools.select.last_doc = use_doc;
+                    }
+
+                    let is_flowchart_path = self.project.nodes.get(id).map_or(false, |n| matches!(n.kind, NodeKind::FlowchartPath { .. }));
+                    if is_flowchart_path {
+                        let active_idx = self.project.document.active_layer_index;
+                        if let Some(layer) = self.project.document.layers.get(active_idx) {
+                            let mut snap_start_node = None;
+                            let mut snap_start_anchor = None;
+                            let mut snap_start_pt = None;
+                            
+                            let mut snap_end_node = None;
+                            let mut snap_end_anchor = None;
+                            let mut snap_end_pt = None;
+                            
+                            if let Some(node) = self.project.nodes.get(id) {
+                                if let NodeKind::FlowchartPath { path } = &node.kind {
+                                    if let PathEditTarget::Anchor(idx) = target {
+                                        let store = &self.project.nodes;
+                                        let anchor_slop = 24.0f64;
+                                        
+                                        if idx == 0 {
+                                            let mut best_start_d = anchor_slop;
+                                            for &nid in &layer.nodes {
+                                                if nid == id { continue; }
+                                                if let Some(nd) = store.get(nid) {
+                                                    if let Some(geom) = crate::document::flowchart::node_as_flowchart_geom(&nd.kind) {
+                                                        let anc_s = crate::document::flowchart::snap_anchor_for_point(&geom, path.points[0]);
+                                                        let ap_s = geom.anchor_position(anc_s);
+                                                        let ds = (ap_s.0 - path.points[0].0).hypot(ap_s.1 - path.points[0].1);
+                                                        if ds < best_start_d {
+                                                            snap_start_node = Some(nid);
+                                                            snap_start_anchor = Some(anc_s);
+                                                            snap_start_pt = Some(ap_s);
+                                                            best_start_d = ds;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else if idx == path.points.len() - 1 {
+                                            let mut best_end_d = anchor_slop;
+                                            for &nid in &layer.nodes {
+                                                if nid == id { continue; }
+                                                if let Some(nd) = store.get(nid) {
+                                                    if let Some(geom) = crate::document::flowchart::node_as_flowchart_geom(&nd.kind) {
+                                                        let anc_e = crate::document::flowchart::snap_anchor_for_point(&geom, path.points[idx]);
+                                                        let ap_e = geom.anchor_position(anc_e);
+                                                        let de = (ap_e.0 - path.points[idx].0).hypot(ap_e.1 - path.points[idx].1);
+                                                        if de < best_end_d {
+                                                            snap_end_node = Some(nid);
+                                                            snap_end_anchor = Some(anc_e);
+                                                            snap_end_pt = Some(ap_e);
+                                                            best_end_d = de;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if let Some(node) = self.project.nodes.get_mut(id) {
+                                if let NodeKind::FlowchartPath { path } = &mut node.kind {
+                                    if let PathEditTarget::Anchor(idx) = target {
+                                        if idx == 0 {
+                                            path.start_node = snap_start_node;
+                                            path.start_anchor = snap_start_anchor;
+                                            if let Some(pt) = snap_start_pt {
+                                                path.points[0] = pt;
+                                            }
+                                        } else if idx == path.points.len() - 1 {
+                                            path.end_node = snap_end_node;
+                                            path.end_anchor = snap_end_anchor;
+                                            if let Some(pt) = snap_end_pt {
+                                                path.points[idx] = pt;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            self.sync_flowchart_paths_if_active_layer();
+                        }
                     }
                 }
             }
@@ -9504,6 +10007,8 @@ fn run_video_decode_thread(
             crate::document::NodeKind::Ellipse { .. } => "ellipse",
             crate::document::NodeKind::Polygon { .. } => "polygon",
             crate::document::NodeKind::Path { .. } => "path",
+            crate::document::NodeKind::FlowchartPath { .. } => "flowchart_path",
+            crate::document::NodeKind::FlowchartNode { .. } => "flowchart_node",
             crate::document::NodeKind::Text { .. } => "text",
             crate::document::NodeKind::Group { .. } => "group",
             crate::document::NodeKind::Image { .. } => "image",
@@ -10724,6 +11229,8 @@ fn run_video_decode_thread(
                         NodeKind::Ellipse { .. } => "ellipse",
                         NodeKind::Text { .. } => "text",
                         NodeKind::Path { .. } => "path",
+                        NodeKind::FlowchartPath { .. } => "flowchart_path",
+                        NodeKind::FlowchartNode { .. } => "flowchart_node",
                         NodeKind::Polygon { .. } => "polygon",
                         NodeKind::Image { .. } => "image",
                         NodeKind::Group { .. } => "group",
@@ -11380,6 +11887,8 @@ mod tests {
             Self {
                 live_snap_guides: Vec::new(),
                 snap_magnet: true,
+            pixel_art_mode: false,
+            pixel_cell_size: 1.0,
                 anim_current_frame: 0,
                 anim_is_playing: false,
                 anim_keyframing_mode: false,
@@ -11705,8 +12214,8 @@ fn spawn_video_audio_extract(
 
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             path_clone.hash(&mut hasher);
-            let out_mp3 =
-                std::env::temp_dir().join(format!("vadadee_audio_{:016x}.mp3", hasher.finish()));
+            let out_wav =
+                std::env::temp_dir().join(format!("vadadee_audio_{:016x}.wav", hasher.finish()));
 
             let path_key = path_clone.clone();
             let report: crate::audio_extract::ExtractProgress = std::sync::Arc::new(move |p| {
@@ -11720,9 +12229,9 @@ fn spawn_video_audio_extract(
                 }
             });
 
-            let result = crate::audio_extract::extract_audio_to_mp3(
+            let result = crate::audio_extract::extract_audio_to_wav(
                 std::path::Path::new(&path_clone),
-                &out_mp3,
+                &out_wav,
                 report,
             );
 

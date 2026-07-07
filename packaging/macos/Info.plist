@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Identity -->
+    <key>CFBundleName</key>
+    <string>Vadadee Berry</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>Vadadee Berry</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>com.vadadee.berry</string>
+
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+
+    <!-- Type / role -->
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleSignature</key>
+    <string>????</string>
+
+    <!-- Entry point -->
+    <key>CFBundleExecutable</key>
+    <string>vadadee-berry</string>
+
+    <!-- Icon (Resources/AppIcon.icns) -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+
+    <!-- macOS 11+ (Apple Silicon) -->
+    <key>LSMinimumSystemVersion</key>
+    <string>11.3</string>
+
+    <!-- Document types / UTIs this app can open -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Vadadee Berry Project</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>vadadee-berry</string>
+            </array>
+            <key>CFBundleTypeIconFile</key>
+            <string>AppIcon</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+        </dict>
+    </array>
+
+    <!-- UI behaviour -->
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+
+    <!-- Entitlements / privacy -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Vadadee Berry uses the microphone for audio recording features.</string>
+
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Vadadee Berry uses Apple Events for automation.</string>
+</dict>
+</plist>

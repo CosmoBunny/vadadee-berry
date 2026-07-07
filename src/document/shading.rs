@@ -62,4 +62,17 @@ impl ShadingPass {
         p.uniforms = vec![0.0, 0.95, 0.22];
         p
     }
+
+    /// Pure twinkling starfield (no GPU WGSL required — CPU-rendered by name match).
+    pub fn starfield_preset() -> Self {
+        let mut p = Self::new_preset(
+            "Starfield",
+            // Minimal stub so `pass.wgsl` is non-empty; the CPU path detects the name.
+            "// Starfield — rendered via CPU starfield path.".to_string(),
+        );
+        // uniforms[0]: time offset (seconds). Useful for animation offset.
+        p.uniforms = vec![0.0];
+        p.stack = ShadingStack::Behind;
+        p
+    }
 }

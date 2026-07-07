@@ -1,10 +1,9 @@
 # Rust
 /target/
 
-# Android / Gradle
+# Android / Gradle app directory and build artifacts
+/app/
 .gradle/
-app/build/
-app/.cxx/
 local.properties
 *.apk
 *.aab
@@ -15,13 +14,13 @@ app/src/main/jniLibs/**/*.so
 # Editor project files (MCP save/load)
 *.vadadee-berry.json
 
-# MCP / script generated assets (keep source art if you add it under assets/)
+# MCP / script generated assets
 /mcp_output/
 *_preview.png
 __pycache__/
 *.pyc
 
-# Ad-hoc generated images from create_*.py MCP scripts
+# Ad-hoc generated images
 pixelated_blackhole*.png
 bunnygirl*.png
 vadadee_berry_logo*.png
@@ -34,3 +33,9 @@ ragebait_story*.png
 .grok-logo-preview.png
 output.svg
 animation.mp4
+
+# Scripts directory
+/scripts/
+
+# Distribution artifacts
+/dist/

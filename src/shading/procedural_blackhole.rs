@@ -135,3 +135,17 @@ pub fn sample(uv: (f32, f32), u: &BlackholeParams) -> [u8; 3] {
         (sky[2].clamp(0.0, 1.0) * 255.0) as u8,
     ]
 }
+
+/// Pure starfield renderer — no gravitational distortion, just twinkling stars.
+/// `uv` is 0..1 (origin top-left), `time_secs` drives the twinkle animation.
+/// `aspect` keeps star-grid cells square on non-square pages (page_w / page_h).
+pub fn sample_starfield(uv: (f32, f32), time_secs: f32, aspect: f32) -> [u8; 3] {
+    // Undo aspect so the cell grid covers the page without stretching.
+    let u_scaled = uv.0 * aspect.max(0.25);
+    let rgb = stars((u_scaled, uv.1), time_secs);
+    [
+        (rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
+    ]
+}

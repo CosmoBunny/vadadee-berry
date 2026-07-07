@@ -2493,6 +2493,8 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 [[package]]
 name = "kramaframe"
 version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e84b18aec6c4cdc9ee7d1028f8dbf15333608aca63fac4a2172ba4f298bc3e3c"
 dependencies = [
  "libm",
 ]

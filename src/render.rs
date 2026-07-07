@@ -1558,6 +1558,101 @@ pub fn draw_node(
             // Draw start/mid/end point icons (arrows, rings etc) for Path (pen) geometry
             draw_path_markers(painter, viewport, origin, &bez, closed, &node.style.stroke);
         }
+        NodeKind::FlowchartNode { cx, cy, w, h, corner_rx, .. } => {
+            let x = cx - w / 2.0;
+            let y = cy - h / 2.0;
+            let rx = *corner_rx;
+            let tl = viewport.doc_to_screen((x, y), origin);
+            let br = viewport.doc_to_screen((x + w, y + h), origin);
+            let r = Rect::from_min_max(tl, br);
+            let corner_screen = ((rx as f32) * viewport.zoom)
+                .min(r.width() / 2.0)
+                .min(r.height() / 2.0);
+            let has_fill = fill.is_visible();
+            let c_stroke = sample_fill_at(stroke_style, opacity, 0.5, 0.5);
+            let c_fill = sample_fill_at(fill, opacity, 0.5, 0.5);
+            // Use kurbo for rounded rect
+            let kurbo_r = kurbo::Rect::new(x, y, x + w, y + h);
+            if has_fill {
+                let egui_c = egui::Color32::from(c_fill);
+                if corner_screen > 0.1 {
+                    painter.rect_filled(r, corner_screen, egui_c);
+                } else {
+                    painter.rect_filled(r, 0.0, egui_c);
+                }
+            }
+            if let Some(sw) = stroke_w {
+                let egui_c = egui::Color32::from(c_stroke);
+                if corner_screen > 0.1 {
+                    painter.rect_stroke(r, corner_screen, egui::Stroke::new(sw, egui_c), egui::StrokeKind::Middle);
+                } else {
+                    painter.rect_stroke(r, 0.0, egui::Stroke::new(sw, egui_c), egui::StrokeKind::Middle);
+                }
+            }
+            if let crate::document::NodeKind::FlowchartNode {
+                label,
+                label_font_size,
+                label_align,
+                label_font_family,
+                label_bold,
+                label_italic,
+                ..
+            } = &node.kind
+            {
+                if !label.is_empty() {
+                    let size = (*label_font_size as f32 * viewport.zoom).max(6.0);
+                    let family = egui::FontFamily::Name(label_font_family.as_str().into());
+                    let font_id = egui::FontId::new(size, family);
+                    let align2 = match label_align {
+                        crate::document::TextAlign::Left => egui::Align2::LEFT_CENTER,
+                        crate::document::TextAlign::Center => egui::Align2::CENTER_CENTER,
+                        crate::document::TextAlign::Right => egui::Align2::RIGHT_CENTER,
+                    };
+                    let text_color = c_stroke; // use stroke color for label visibility on fill
+
+                    if *label_bold || *label_italic {
+                        let mut job = egui::text::LayoutJob::default();
+                        let mut fmt = egui::TextFormat::simple(font_id, text_color);
+                        fmt.italics = *label_italic;
+                        // Bold relies on the font family registration / fallback in egui context
+                        job.append(label, 0.0, fmt);
+                        let galley = painter.layout_job(job);
+                        let galley_rect = egui::Rect::from_center_size(r.center(), galley.size());
+                        let pos = align2.align_size_within_rect(galley.size(), galley_rect).min;
+                        painter.galley(pos, galley, text_color);
+                    } else {
+                        painter.text(r.center(), align2, label, font_id, text_color);
+                    }
+                }
+            }
+        }
+        NodeKind::FlowchartPath { path: fp } => {
+            if fp.points.len() < 2 { return; }
+            let bez = crate::document::flowchart::rounded_orthogonal_bez(&fp.points, fp.corner_radius);
+            let c = sample_fill_at(stroke_style, opacity, 0.5, 0.5);
+            if let Some(sw) = stroke_w {
+                draw_solid_bez_stroke(painter, &bez, viewport, origin, sw, c, stroke_join, stroke_cap, false);
+            }
+            let ms = fp.endpoint_marker_size as f32;
+            if ms > 0.0 {
+                // Markers are doc-independent screen px size; convert ends to screen space
+                let start_screen = viewport.doc_to_screen(fp.points[0], origin);
+                let last = *fp.points.last().unwrap_or(&fp.points[0]);
+                let end_screen = viewport.doc_to_screen(last, origin);
+                let size = egui::vec2(ms, ms);
+
+                // from (start): hollow square (stroke only) to indicate origin
+                {
+                    let r = egui::Rect::from_center_size(start_screen, size);
+                    painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5, c), egui::StrokeKind::Middle);
+                }
+                // to (end): solid filled square to indicate target
+                {
+                    let r = egui::Rect::from_center_size(end_screen, size);
+                    painter.rect_filled(r, 0.0, c);
+                }
+            }
+        }
         NodeKind::Text { x, y, style } => {
             draw_text_node(
                 painter,
@@ -2789,6 +2884,68 @@ pub fn draw_preview_line(
     painter.add(Shape::line(pts.to_vec(), Stroke::new(2.0, Color32::from_rgb(0, 120, 215))));
     for p in pts {
         painter.circle_filled(p, 4.0, Color32::from_rgb(0, 120, 215));
+    }
+}
+
+pub fn draw_preview_bezier(
+    painter: &Painter,
+    viewport: &Viewport,
+    origin: Pos2,
+    bez: &kurbo::BezPath,
+) {
+    let stroke = Stroke::new(2.5, Color32::from_rgb(0, 120, 215));
+    let mut last_pt = None;
+    for elem in bez.elements() {
+        match elem {
+            kurbo::PathEl::MoveTo(p) => {
+                last_pt = Some(p);
+            }
+            kurbo::PathEl::LineTo(p) => {
+                if let Some(prev) = last_pt {
+                    let s_prev = viewport.doc_to_screen((prev.x, prev.y), origin);
+                    let s_curr = viewport.doc_to_screen((p.x, p.y), origin);
+                    painter.line_segment([s_prev, s_curr], stroke);
+                }
+                last_pt = Some(p);
+            }
+            kurbo::PathEl::QuadTo(p1, p2) => {
+                if let Some(prev) = last_pt {
+                    let s_prev = viewport.doc_to_screen((prev.x, prev.y), origin);
+                    let s_p1 = viewport.doc_to_screen((p1.x, p1.y), origin);
+                    let s_p2 = viewport.doc_to_screen((p2.x, p2.y), origin);
+                    let mut prev_t = s_prev;
+                    for step in 1..=8 {
+                        let t = step as f32 / 8.0;
+                        let x = (1.0 - t).powi(2) * s_prev.x + 2.0 * (1.0 - t) * t * s_p1.x + t.powi(2) * s_p2.x;
+                        let y = (1.0 - t).powi(2) * s_prev.y + 2.0 * (1.0 - t) * t * s_p1.y + t.powi(2) * s_p2.y;
+                        let curr_t = Pos2::new(x, y);
+                        painter.line_segment([prev_t, curr_t], stroke);
+                        prev_t = curr_t;
+                    }
+                }
+                last_pt = Some(p2);
+            }
+            kurbo::PathEl::CurveTo(p1, p2, p3) => {
+                if let Some(prev) = last_pt {
+                    let s_prev = viewport.doc_to_screen((prev.x, prev.y), origin);
+                    let s_p1 = viewport.doc_to_screen((p1.x, p1.y), origin);
+                    let s_p2 = viewport.doc_to_screen((p2.x, p2.y), origin);
+                    let s_p3 = viewport.doc_to_screen((p3.x, p3.y), origin);
+                    let mut prev_t = s_prev;
+                    for step in 1..=12 {
+                        let t = step as f32 / 12.0;
+                        let mt = 1.0 - t;
+                        let x = mt.powi(3) * s_prev.x + 3.0 * mt.powi(2) * t * s_p1.x + 3.0 * mt * t.powi(2) * s_p2.x + t.powi(3) * s_p3.x;
+                        let y = mt.powi(3) * s_prev.y + 3.0 * mt.powi(2) * t * s_p1.y + 3.0 * mt * t.powi(2) * s_p2.y + t.powi(3) * s_p3.y;
+                        let curr_t = Pos2::new(x, y);
+                        painter.line_segment([prev_t, curr_t], stroke);
+                        prev_t = curr_t;
+                    }
+                }
+                last_pt = Some(p3);
+            }
+            kurbo::PathEl::ClosePath => {}
+        }
     }
 }
 

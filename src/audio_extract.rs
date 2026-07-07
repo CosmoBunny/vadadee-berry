@@ -188,8 +188,8 @@ pub fn prepare_samples_at_offset(
     })
 }
 
-/// Decode video/container audio to a stereo MP3 (symphonia → libav decode → libmp3lame).
-pub fn extract_audio_to_mp3(
+/// Decode video/container audio directly to a lossless WAV file (perfect quality, zero compression artifacts).
+pub fn extract_audio_to_wav(
     input: &Path,
     output: &Path,
     report: ExtractProgress,
@@ -204,25 +204,10 @@ pub fn extract_audio_to_mp3(
         }
     };
     report(0.86);
-    match crate::video_decode::write_stereo_i16_as_mp3_libav(
-        output,
-        &stereo.samples,
-        stereo.sample_rate,
-        192,
-        |p| report(0.86 + p * 0.13),
-    ) {
-        Ok(()) => {
-            report(1.0);
-            Ok(output.to_path_buf())
-        }
-        Err(e) => {
-            log::warn!("[audio] MP3 encode failed ({}), writing stereo WAV fallback", e);
-            let wav = output.with_extension("wav");
-            write_wav(&wav, &stereo.samples, stereo.sample_rate, OUT_CHANNELS)?;
-            report(1.0);
-            Ok(wav)
-        }
-    }
+    let wav_path = output.with_extension("wav");
+    write_wav(&wav_path, &stereo.samples, stereo.sample_rate, OUT_CHANNELS)?;
+    report(1.0);
+    Ok(wav_path)
 }
 
 pub struct StereoPcmI16 {

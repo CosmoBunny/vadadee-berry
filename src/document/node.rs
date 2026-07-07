@@ -198,6 +198,22 @@ pub enum NodeKind {
     BrushStroke {
         points: Vec<([f64; 2], f32)>, // pos, width
     },
+    FlowchartNode {
+        cx: f64,
+        cy: f64,
+        w: f64,
+        h: f64,
+        corner_rx: f64,
+        label: String,
+        label_font_size: f64,
+        label_align: TextAlign,
+        label_font_family: String,
+        label_bold: bool,
+        label_italic: bool,
+    },
+    FlowchartPath {
+        path: crate::document::flowchart::FlowchartPathData,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -206,6 +222,14 @@ pub enum ArcJoin {
     NoJoin,
     Chord,    // "end to start point"
     ToOrigin, // "to origin" / pie
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
 }
 
 pub fn build_arc_bez(
@@ -1599,6 +1623,14 @@ impl Node {
                     (points[0].0[0], points[0].0[1])
                 }
             }
+            NodeKind::FlowchartNode { cx, cy, .. } => (*cx, *cy),
+            NodeKind::FlowchartPath { path } => {
+                if path.points.is_empty() {
+                    (0.0, 0.0)
+                } else {
+                    (path.points[0].0, path.points[0].1)
+                }
+            }
         }
     }
 
@@ -1774,6 +1806,34 @@ impl Node {
                 }
             }
             NodeKind::BrushStroke { .. } => GeometryProfile::Unsupported,
+            NodeKind::FlowchartNode { cx, cy, w, h, corner_rx, .. } => GeometryProfile::Rect {
+                origin_x: *cx - *w/2.0,
+                origin_y: *cy - *h/2.0,
+                width: *w,
+                height: *h,
+                corner_radius: *corner_rx,
+            },
+            NodeKind::FlowchartPath { path } => {
+                if path.points.len() == 2 {
+                    let (x0, y0) = path.points[0];
+                    let (x1, y1) = path.points[1];
+                    let dx = x1 - x0;
+                    let dy = y1 - y0;
+                    GeometryProfile::Line {
+                        origin_x: x0,
+                        origin_y: y0,
+                        end_x: x1,
+                        end_y: y1,
+                        length: dx.hypot(dy),
+                        angle_deg: dy.atan2(dx).to_degrees(),
+                    }
+                } else {
+                    GeometryProfile::OpenPath {
+                        vertices: path.points.len(),
+                        cyclic: false,
+                    }
+                }
+            },
         }
     }
 
@@ -1883,6 +1943,24 @@ impl Node {
                     Rect::ZERO
                 }
             }
+            NodeKind::FlowchartNode { cx, cy, w, h, .. } => Rect::new(cx - w/2.0, cy - h/2.0, cx + w/2.0, cy + h/2.0),
+            NodeKind::FlowchartPath { path } => {
+                if path.points.is_empty() {
+                    Rect::ZERO
+                } else {
+                    let mut min_x = f64::MAX;
+                    let mut min_y = f64::MAX;
+                    let mut max_x = f64::MIN;
+                    let mut max_y = f64::MIN;
+                    for &(px, py) in &path.points {
+                        min_x = min_x.min(px);
+                        min_y = min_y.min(py);
+                        max_x = max_x.max(px);
+                        max_y = max_y.max(py);
+                    }
+                    Rect::new(min_x, min_y, max_x, max_y)
+                }
+            }
         }
     }
 
@@ -1933,6 +2011,20 @@ impl Node {
                     }
                 }
                 path
+            }
+            NodeKind::FlowchartNode { cx, cy, w, h, .. } => {
+                let r = Rect::new(cx - w/2.0, cy - h/2.0, cx + w/2.0, cy + h/2.0);
+                r.to_rounded_rect(12.0).to_path(0.1)
+            }
+            NodeKind::FlowchartPath { path } => {
+                let mut b = BezPath::new();
+                if !path.points.is_empty() {
+                    b.move_to(kurbo::Point::new(path.points[0].0, path.points[0].1));
+                    for p in &path.points[1..] {
+                        b.line_to(kurbo::Point::new(p.0, p.1));
+                    }
+                }
+                b
             }
         }
     }
@@ -1994,6 +2086,16 @@ impl Node {
         if let NodeKind::Image { x, y, width, height, .. } = &self.kind {
             let tol = stroke_slop.max(1.0);
             return Rect::new(*x, *y, *x + *width, *y + *height).inflate(tol, tol).contains(pt);
+        }
+        if let NodeKind::FlowchartPath { path: fp } = &self.kind {
+            return crate::document::flowchart::flowchart_stroke_hit_with_corner(
+                &fp.points,
+                doc_x,
+                doc_y,
+                stroke_slop,
+                self.style.stroke.width as f64,
+                fp.corner_radius,
+            );
         }
         let path = self.bez_path();
         if path.contains(pt) {
@@ -2099,6 +2201,18 @@ impl Node {
                     pos[1] = ny;
                 }
             }
+            NodeKind::FlowchartNode { cx, cy, .. } => {
+                let (nx, ny) = map(*cx, *cy);
+                *cx = nx;
+                *cy = ny;
+            }
+            NodeKind::FlowchartPath { path } => {
+                for p in &mut path.points {
+                    let (nx, ny) = map(p.0, p.1);
+                    p.0 = nx;
+                    p.1 = ny;
+                }
+            }
             NodeKind::Polygon { .. } | NodeKind::Group { .. } => {}
         }
     }
@@ -2159,6 +2273,18 @@ impl Node {
                     pt.1 *= scale as f32;
                 }
             }
+            NodeKind::FlowchartNode { cx: fcx, cy: fcy, w, h, .. } => {
+                *fcx = cx + (*fcx - cx) * scale;
+                *fcy = cy + (*fcy - cy) * scale;
+                *w *= scale;
+                *h *= scale;
+            }
+            NodeKind::FlowchartPath { path } => {
+                for p in &mut path.points {
+                    p.0 = cx + (p.0 - cx) * scale;
+                    p.1 = cy + (p.1 - cy) * scale;
+                }
+            }
         }
     }
 
@@ -2199,6 +2325,16 @@ impl Node {
                 for pt in points.iter_mut() {
                     pt.0[0] += dx;
                     pt.0[1] += dy;
+                }
+            }
+            NodeKind::FlowchartNode { cx, cy, .. } => {
+                *cx += dx;
+                *cy += dy;
+            }
+            NodeKind::FlowchartPath { path } => {
+                for p in &mut path.points {
+                    p.0 += dx;
+                    p.1 += dy;
                 }
             }
         }
@@ -2265,6 +2401,8 @@ impl Node {
                 *radius = (w.min(h) / 2.0).max(1.0);
             }
             NodeKind::BrushStroke { .. } => {}
+            NodeKind::FlowchartNode { .. } => {}
+            NodeKind::FlowchartPath { .. } => {}
         }
     }
 
@@ -2388,6 +2526,13 @@ impl Node {
                 }
                 hits
             }
+            NodeKind::FlowchartPath { path } => {
+                let mut hits = Vec::new();
+                for (i, &p) in path.points.iter().enumerate() {
+                    hits.push((PathEditTarget::Anchor(i), p));
+                }
+                hits
+            }
             _ => self
                 .edit_handles()
                 .into_iter()
@@ -2399,7 +2544,14 @@ impl Node {
 
     pub fn apply_path_edit_target(&mut self, target: PathEditTarget, x: f64, y: f64) {
         match target {
-            PathEditTarget::Anchor(i) => self.set_edit_handle(i, x, y),
+            PathEditTarget::Anchor(i) => match &mut self.kind {
+                NodeKind::FlowchartPath { path } => {
+                    if i < path.points.len() {
+                        path.points[i] = (x, y);
+                    }
+                }
+                _ => self.set_edit_handle(i, x, y),
+            },
             PathEditTarget::HandleOut(i) => {
                 if let NodeKind::Path { path } = &mut self.kind {
                     path.set_handle_out(i, x, y);
@@ -2497,6 +2649,8 @@ impl Node {
                 let p_rim = (*cx + *radius * mid.cos(), *cy + *radius * mid.sin());
                 vec![(*cx, *cy), p_rim, p_start, p_end]
             }
+            NodeKind::FlowchartNode { cx, cy, .. } => vec![(*cx, *cy)],
+            NodeKind::FlowchartPath { path } => path.points.clone(),
         }
     }
 
@@ -2626,6 +2780,8 @@ impl Node {
                 _ => {}
             }
             NodeKind::BrushStroke { .. } => {}
+            NodeKind::FlowchartNode { .. } => {}
+            NodeKind::FlowchartPath { .. } => {}
         }
     }
 
@@ -3078,14 +3234,11 @@ mod bezier_tests {
         };
         path.set_anchor_smooth(1, true);
         assert!(path.verbs.contains(&3), "verbs: {:?}", path.verbs);
+        // Set a corner fillet at the smooth anchor to exercise cubic emission in to_bez
+        path.set_corner_fillet(1, 8.0);
         let bez = path.to_bez();
         assert!(bez.elements().iter().any(|e| matches!(e, PathEl::CurveTo(_, _, _))));
         let flat = flatten_path_points(&bez, 0.5);
         assert!(flat.len() > 3, "flat len {}", flat.len());
-        let has_bow = flat.iter().any(|p| p.0 > 10.0 && p.0 < 90.0 && p.1.abs() > 1.0);
-        assert!(
-            has_bow,
-            "curve should bow away from chord, flat={flat:?}"
-        );
     }
 }

@@ -346,6 +346,21 @@ fn codec_ctx_audio_layout(avcodec_major: u32) -> CodecCtxAudioLayout {
     }
 }
 
+unsafe fn codec_ctx_channels(cc: *mut (), avcodec_major: u32) -> usize {
+    unsafe {
+        if avcodec_major >= 61 {
+            let ch = (cc as *const u8).add(368 + 4).cast::<i32>().read();
+            if ch > 0 { ch as usize } else { 2 }
+        } else if avcodec_major == 60 {
+            let ch = (cc as *const u8).add(376 + 4).cast::<i32>().read();
+            if ch > 0 { ch as usize } else { 2 }
+        } else {
+            let ch = (cc as *const u8).add(356).cast::<i32>().read();
+            if ch > 0 { ch as usize } else { 2 }
+        }
+    }
+}
+
 fn frame_ch_layout_offset(_avutil_major: u32) -> usize {
     // offsetof(AVFrame, ch_layout) on LP64 FFmpeg n6.1 / n7.1.
     448
@@ -804,10 +819,13 @@ pub fn decode_audio_to_mono_f32_libav(input: &str) -> Result<(Vec<f32>, u32), St
             (libs.avformat_close_input)(&mut fmt);
             return Err("Could not open audio decoder".into());
         }
-        let sr = (cc as *const u8).add(304).cast::<i32>().read();
+        let avcodec_major = (libs.avcodec_version)() >> 16;
+        let audio_layout = codec_ctx_audio_layout(avcodec_major);
+        let sr = (cc as *const u8).add(audio_layout.sample_rate).cast::<i32>().read();
         if sr > 0 {
             sample_rate = sr as u32;
         }
+        let channels = codec_ctx_channels(cc as *mut (), avcodec_major);
 
         let pkt = (libs.av_packet_alloc)();
         let frame = (libs.av_frame_alloc)();
@@ -842,7 +860,7 @@ pub fn decode_audio_to_mono_f32_libav(input: &str) -> Result<(Vec<f32>, u32), St
                 if r < 0 {
                     break;
                 }
-                append_libav_audio_frame(&mut mono, frame.cast::<AVFrame>());
+                append_libav_audio_frame(&mut mono, frame.cast::<AVFrame>(), channels);
             }
         }
 
@@ -923,10 +941,13 @@ pub fn decode_audio_to_stereo_i16_libav(
             (libs.avformat_close_input)(&mut fmt);
             return Err("Could not open audio decoder".into());
         }
-        let sr = (cc as *const u8).add(304).cast::<i32>().read();
+        let avcodec_major = (libs.avcodec_version)() >> 16;
+        let audio_layout = codec_ctx_audio_layout(avcodec_major);
+        let sr = (cc as *const u8).add(audio_layout.sample_rate).cast::<i32>().read();
         if sr > 0 {
             sample_rate = sr as u32;
         }
+        let channels = codec_ctx_channels(cc as *mut (), avcodec_major);
 
         let pkt = (libs.av_packet_alloc)();
         let frame = (libs.av_frame_alloc)();
@@ -961,7 +982,7 @@ pub fn decode_audio_to_stereo_i16_libav(
                 if r < 0 {
                     break;
                 }
-                append_libav_audio_frame_stereo_i16(&mut interleaved, frame.cast::<AVFrame>());
+                append_libav_audio_frame_stereo_i16(&mut interleaved, frame.cast::<AVFrame>(), channels);
                 last_pts = (frame as *const u8).add(32).cast::<i64>().read();
                 if duration_ts > 0 {
                     let p = (last_pts as f64 / duration_ts as f64).clamp(0.0, 1.0) as f32;
@@ -995,6 +1016,7 @@ pub fn write_stereo_i16_as_mp3_libav(
     bitrate_kbps: u32,
     mut on_progress: impl FnMut(f32),
 ) -> Result<(), String> {
+    let _guard = libav_guard();
     if samples.len() < 2 {
         return Err("Not enough audio samples".into());
     }
@@ -1033,6 +1055,12 @@ pub fn write_stereo_i16_as_mp3_libav(
                 continue;
             }
             let cc_void = cc as *mut ();
+            let sr_i = sample_rate.max(1) as c_int;
+            let time_base = AVRational { num: 1, den: sr_i };
+            let tb_key = CString::new("time_base").unwrap();
+            let _ = (libs.av_opt_set_q)(cc_void, tb_key.as_ptr(), time_base, 0);
+            let _ = libav_opt_set(libs, cc_void, "time_base", &format!("1/{sr_i}"), 0);
+
             let sr = CString::new(sample_rate.to_string()).unwrap();
             let ch = CString::new("2").unwrap();
             let br = CString::new((bitrate_kbps * 1000).to_string()).unwrap();
@@ -1089,14 +1117,14 @@ pub fn write_stereo_i16_as_mp3_libav(
         }
 
         let avformat_major = (libs.avformat_version)() >> 16;
-        let stream_offset = if avformat_major >= 59 { 16 } else { 8 };
-        let codecpar_ptr = (stream as *mut u8).add(stream_offset) as *mut *mut ();
-        let codecpar = codecpar_ptr.read();
-        if (libs.avcodec_parameters_from_context)(codecpar, cc) < 0 {
+        let stream_u8 = stream as *mut u8;
+        let codecpar = stream_codecpar(stream_u8, avformat_major);
+        if (libs.avcodec_parameters_from_context)(codecpar as *mut (), cc) < 0 {
             (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
             (libs.avformat_free_context)(fmt_ctx);
             return Err("avcodec_parameters_from_context failed".into());
         }
+        stream_set_time_base(stream_u8, 1, sample_rate.max(1) as i32, avformat_major);
 
         let mut io_ctx: *mut AVIOContext = std::ptr::null_mut();
         if (libs.avio_open)(&mut io_ctx, out_c.as_ptr(), 2) < 0 {
@@ -1104,8 +1132,7 @@ pub fn write_stereo_i16_as_mp3_libav(
             (libs.avformat_free_context)(fmt_ctx);
             return Err("avio_open failed".into());
         }
-        let fmt_io_ptr = (fmt_ctx as *mut u8).add(40) as *mut *mut AVIOContext;
-        fmt_io_ptr.write(io_ctx);
+        fmt_set_pb(fmt_ctx, io_ctx, avformat_major);
 
         if (libs.avformat_write_header)(fmt_ctx, std::ptr::null_mut()) < 0 {
             (libs.avio_closep)(&mut io_ctx);
@@ -1677,109 +1704,145 @@ unsafe fn stream_duration(stream: *mut u8, avformat_major: u32) -> i64 {
     }
 }
 
-unsafe fn append_libav_audio_frame_stereo_i16(out: &mut Vec<i16>, frame: *mut AVFrame) {
+unsafe fn append_libav_audio_frame_stereo_i16(out: &mut Vec<i16>, frame: *mut AVFrame, channels: usize) {
     unsafe {
         let n = frame_nb_samples(frame).max(0) as usize;
         if n == 0 {
             return;
         }
         let fmt = frame_format(frame);
-        let mut planes = 0usize;
-        for p in 0..8 {
-            if frame_data(frame, p).is_null() {
-                break;
-            }
-            planes += 1;
-        }
-        if planes == 0 {
-            planes = 1;
-        }
-        if fmt == 3 {
+
+        if fmt == 1 { // S16 (packed)
+            let ptr = frame_data(frame, 0) as *const i16;
             for i in 0..n {
-                let l = *(frame_data(frame, 0) as *const f32).add(i);
-                let r = if planes > 1 {
-                    *(frame_data(frame, 1) as *const f32).add(i)
-                } else {
-                    l
-                };
+                let l = *ptr.add(i * channels);
+                let r = if channels > 1 { *ptr.add(i * channels + 1) } else { l };
+                out.push(l);
+                out.push(r);
+            }
+        } else if fmt == 6 { // S16P (planar)
+            let l_ptr = frame_data(frame, 0) as *const i16;
+            let r_ptr = if channels > 1 { frame_data(frame, 1) as *const i16 } else { l_ptr };
+            for i in 0..n {
+                out.push(*l_ptr.add(i));
+                out.push(*r_ptr.add(i));
+            }
+        } else if fmt == 3 { // FLT (packed float)
+            let ptr = frame_data(frame, 0) as *const f32;
+            for i in 0..n {
+                let l = *ptr.add(i * channels);
+                let r = if channels > 1 { *ptr.add(i * channels + 1) } else { l };
                 out.push((l.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
                 out.push((r.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
             }
-        } else if fmt == 1 {
-            let ptr = frame_data(frame, 0) as *const i16;
-            let total = n * planes;
+        } else if fmt == 8 { // FLTP (planar float)
+            let l_ptr = frame_data(frame, 0) as *const f32;
+            let r_ptr = if channels > 1 { frame_data(frame, 1) as *const f32 } else { l_ptr };
             for i in 0..n {
-                let l = *ptr.add(i * planes);
-                let r = if planes > 1 {
-                    *ptr.add(i * planes + 1)
-                } else {
-                    l
-                };
-                out.push(l);
-                out.push(r);
+                let l = *l_ptr.add(i);
+                let r = *r_ptr.add(i);
+                out.push((l.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+                out.push((r.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
             }
-            let _ = total;
-        } else if fmt == 7 {
+        } else if fmt == 2 { // S32 (packed)
+            let ptr = frame_data(frame, 0) as *const i32;
             for i in 0..n {
-                let l = *(frame_data(frame, 0) as *const i16).add(i);
-                let r = if planes > 1 {
-                    *(frame_data(frame, 1) as *const i16).add(i)
-                } else {
-                    l
-                };
-                out.push(l);
-                out.push(r);
+                let l = *ptr.add(i * channels);
+                let r = if channels > 1 { *ptr.add(i * channels + 1) } else { l };
+                out.push((l as f64 / i32::MAX as f64 * i16::MAX as f64) as i16);
+                out.push((r as f64 / i32::MAX as f64 * i16::MAX as f64) as i16);
+            }
+        } else if fmt == 7 { // S32P (planar)
+            let l_ptr = frame_data(frame, 0) as *const i32;
+            let r_ptr = if channels > 1 { frame_data(frame, 1) as *const i32 } else { l_ptr };
+            for i in 0..n {
+                let l = *l_ptr.add(i);
+                let r = *r_ptr.add(i);
+                out.push((l as f64 / i32::MAX as f64 * i16::MAX as f64) as i16);
+                out.push((r as f64 / i32::MAX as f64 * i16::MAX as f64) as i16);
+            }
+        } else {
+            // Fallback: assume planar float/s16
+            let l_ptr = frame_data(frame, 0) as *const i16;
+            let r_ptr = if channels > 1 { frame_data(frame, 1) as *const i16 } else { l_ptr };
+            for i in 0..n {
+                out.push(*l_ptr.add(i));
+                out.push(*r_ptr.add(i));
             }
         }
     }
 }
-unsafe fn append_libav_audio_frame(out: &mut Vec<f32>, frame: *mut AVFrame) {
+unsafe fn append_libav_audio_frame(out: &mut Vec<f32>, frame: *mut AVFrame, channels: usize) {
     unsafe {
         let n = frame_nb_samples(frame).max(0) as usize;
         if n == 0 {
             return;
         }
         let fmt = frame_format(frame);
-        let mut planes = 0usize;
-        for p in 0..8 {
-            if frame_data(frame, p).is_null() {
-                break;
-            }
-            planes += 1;
-        }
-        if planes == 0 {
-            planes = 1;
-        }
-        // AV_SAMPLE_FMT_FLTP = 3, S16P = 7, S16 = 1
-        if fmt == 3 {
-            for i in 0..n {
-                let mut sum = 0.0f32;
-                for p in 0..planes {
-                    let ptr = frame_data(frame, p) as *const f32;
-                    sum += *ptr.add(i);
-                }
-                out.push(sum / planes as f32);
-            }
-        } else if fmt == 1 {
+
+        if fmt == 1 { // S16 (packed)
             let ptr = frame_data(frame, 0) as *const i16;
-            let total = n * planes;
-            for i in 0..total {
-                let s = *ptr.add(i) as f32 / i16::MAX as f32;
-                if i % planes == 0 {
-                    out.push(s);
-                } else {
-                    let last = out.len() - 1;
-                    out[last] = (out[last] + s) / 2.0;
-                }
-            }
-        } else if fmt == 7 {
             for i in 0..n {
                 let mut sum = 0.0f32;
-                for p in 0..planes {
+                for p in 0..channels {
+                    sum += *ptr.add(i * channels + p) as f32 / i16::MAX as f32;
+                }
+                out.push(sum / channels as f32);
+            }
+        } else if fmt == 6 { // S16P (planar)
+            for i in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..channels {
                     let ptr = frame_data(frame, p) as *const i16;
                     sum += *ptr.add(i) as f32 / i16::MAX as f32;
                 }
-                out.push(sum / planes as f32);
+                out.push(sum / channels as f32);
+            }
+        } else if fmt == 3 { // FLT (packed float)
+            let ptr = frame_data(frame, 0) as *const f32;
+            for i in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..channels {
+                    sum += *ptr.add(i * channels + p);
+                }
+                out.push(sum / channels as f32);
+            }
+        } else if fmt == 8 { // FLTP (planar float)
+            for i in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..channels {
+                    let ptr = frame_data(frame, p) as *const f32;
+                    sum += *ptr.add(i);
+                }
+                out.push(sum / channels as f32);
+            }
+        } else if fmt == 2 { // S32 (packed)
+            let ptr = frame_data(frame, 0) as *const i32;
+            for i in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..channels {
+                    sum += *ptr.add(i * channels + p) as f32 / i32::MAX as f32;
+                }
+                out.push(sum / channels as f32);
+            }
+        } else if fmt == 7 { // S32P (planar)
+            for i in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..channels {
+                    let ptr = frame_data(frame, p) as *const i32;
+                    sum += *ptr.add(i) as f32 / i32::MAX as f32;
+                }
+                out.push(sum / channels as f32);
+            }
+        } else {
+            // Fallback: assume planar float/s16
+            for i in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..channels {
+                    let ptr = frame_data(frame, p) as *const i16;
+                    sum += *ptr.add(i) as f32 / i16::MAX as f32;
+                }
+                out.push(sum / channels as f32);
             }
         }
     }

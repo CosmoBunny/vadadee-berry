@@ -317,6 +317,10 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ui.checkbox(&mut app.viewport.show_grid, "Show grid");
                     ui.checkbox(&mut app.viewport.snap_grid, "Snap to grid");
                     ui.checkbox(&mut app.snap_magnet, "Magnetic snap");
+                    ui.checkbox(&mut app.pixel_art_mode, "Pixel art mode");
+                    if app.pixel_art_mode {
+                        ui.add(egui::Slider::new(&mut app.pixel_cell_size, 0.5..=10.0).text("Cell size"));
+                    }
                     ui.separator();
                     ui.checkbox(&mut app.gpu_shading, "GPU shading (WGSL)")
                         .on_hover_text(
@@ -403,7 +407,12 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
 
     let is_video_or_audio_layer = app.project.document.active_layer()
         .map_or(false, |l| l.kind == crate::document::LayerKind::AV);
+    let is_flowchart_layer = app.project.document.active_layer()
+        .map_or(false, |l| l.kind == crate::document::LayerKind::Flowchart);
     if is_video_or_audio_layer && app.tools.active != ToolKind::Select && app.tools.active != ToolKind::Eyedropper {
+        app.tools.active = ToolKind::Select;
+    }
+    if is_flowchart_layer && matches!(app.tools.active, ToolKind::Text | ToolKind::Brush | ToolKind::Pen) {
         app.tools.active = ToolKind::Select;
     }
 
@@ -411,6 +420,14 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     let tools = if is_video_or_audio_layer {
         vec![
             ToolKind::Select,
+            ToolKind::Eyedropper,
+        ]
+    } else if is_flowchart_layer {
+        vec![
+            ToolKind::Select,
+            ToolKind::Node,
+            ToolKind::Rectangle,
+            ToolKind::Line,
             ToolKind::Eyedropper,
         ]
     } else {
@@ -2806,6 +2823,11 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             app.add_shading_layer(&format!("Shading {n}"));
             ui.close();
         }
+        if ui.button("⎈ Flowchart Layer").clicked() {
+            let n = app.project.document.layers.len() + 1;
+            app.add_flowchart_layer(&format!("Flowchart {n}"));
+            ui.close();
+        }
         #[cfg(not(target_os = "android"))]
         {
             if ui.button("AV Layer (from file…)").clicked() {
@@ -2848,6 +2870,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 crate::document::LayerKind::AV => icons::VIDEO,
                 crate::document::LayerKind::Image => "🖼",
                 crate::document::LayerKind::Shading => icons::SHADING,
+                crate::document::LayerKind::Flowchart => "⎈",
             };
             ui.label(RichText::new(icon).font(nerd_font_id(13.0)));
             let name_w = (ui.available_width() - 28.0).max(48.0);
@@ -2900,6 +2923,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     crate::document::LayerKind::Image => "🖼 Image".to_owned(),
                     crate::document::LayerKind::AV => format!("{} AV", icons::VIDEO),
                     crate::document::LayerKind::Shading => format!("{} Shading", icons::SHADING),
+                    crate::document::LayerKind::Flowchart => "⎈ Flowchart".into(),
                 };
                 egui::ComboBox::from_id_salt("layer_kind_combo")
                     .selected_text(RichText::new(current_label).font(nerd_font_id(12.0)))
@@ -2908,6 +2932,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         ui.selectable_value(&mut l.kind, crate::document::LayerKind::Image, RichText::new("🖼 Image").font(nerd_font_id(12.0)));
                         ui.selectable_value(&mut l.kind, crate::document::LayerKind::AV, RichText::new(format!("{} AV Layer", icons::VIDEO)).font(nerd_font_id(12.0)));
                         ui.selectable_value(&mut l.kind, crate::document::LayerKind::Shading, RichText::new(format!("{} Shading", icons::SHADING)).font(nerd_font_id(12.0)));
+                        ui.selectable_value(&mut l.kind, crate::document::LayerKind::Flowchart, RichText::new("⎈ Flowchart").font(nerd_font_id(12.0)));
                     });
             });
 
@@ -2923,7 +2948,9 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     if ui.button("Blackhole").clicked() {
                         l.shading_passes.push(crate::document::ShadingPass::blackhole_preset());
                     }
-
+                    if ui.button("Starfield").clicked() {
+                        l.shading_passes.push(crate::document::ShadingPass::starfield_preset());
+                    }
                 });
                 if !l.shading_passes.is_empty() {
                     app.ui_shading_pass_sel = app.ui_shading_pass_sel.min(l.shading_passes.len() - 1);
@@ -3052,6 +3079,9 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         match layer_kind {
             crate::document::LayerKind::Shading => {
                 ui.label(RichText::new(format!("{} Shading passes (WGSL)", icons::SHADING)).font(nerd_font_id(12.0)));
+            }
+            crate::document::LayerKind::Flowchart => {
+                ui.label(RichText::new("⎈ Flowchart").font(nerd_font_id(12.0)));
             }
             crate::document::LayerKind::AV => {
                 ui.label(RichText::new(format!("{} {}", icons::VIDEO, truncate_name(&layer_name))).small().weak());
@@ -3880,6 +3910,66 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             if matches!(&node.kind, NodeKind::Path { .. }) {
                 path_markers_geometry_ui(app, ui);
                 ui.add_space(8.0);
+            }
+            // Use tight scopes so immutable node borrows end before any &mut app.set calls
+            {
+                let id = app.selection[0];
+                if let Some(node) = app.project.nodes.get(id) {
+                    if matches!(&node.kind, NodeKind::FlowchartPath { .. }) {
+                        if let NodeKind::FlowchartPath { path } = &node.kind {
+                            let mut cr = path.corner_radius;
+                            let mut ms = path.endpoint_marker_size;
+                            let mut changed = false;
+                            ui.separator();
+                            ui.label(RichText::new("Flowchart Connector").strong().small());
+                            theme::constraint_block(ui, |ui| {
+                                changed |= ui.add(egui::Slider::new(&mut cr, 0.0..=48.0).text("Corner radius (curviness)")).changed();
+                                changed |= ui.add(egui::Slider::new(&mut ms, 0.0..=24.0).text("Endpoint marker size")).changed();
+                            });
+                            if changed {
+                                app.set_flowchart_path_props(id, cr, ms);
+                            }
+                        }
+                    }
+                }
+            }
+            ui.add_space(4.0);
+            {
+                let id = app.selection[0];
+                if let Some(node) = app.project.nodes.get(id) {
+                    if matches!(&node.kind, NodeKind::FlowchartNode { .. }) {
+                        if let NodeKind::FlowchartNode { label, label_font_size, label_align, label_font_family, label_bold, label_italic, .. } = &node.kind {
+                            let mut new_label = label.clone();
+                            let mut new_fs = *label_font_size;
+                            let mut new_al = *label_align;
+                            let mut new_fam = label_font_family.clone();
+                            let mut new_b = *label_bold;
+                            let mut new_i = *label_italic;
+                            let mut changed = false;
+
+                            ui.separator();
+                            ui.label(RichText::new("Label").strong().small());
+                            changed |= ui.text_edit_singleline(&mut new_label).changed();
+                            theme::constraint_block(ui, |ui| {
+                                changed |= ui.add(egui::Slider::new(&mut new_fs, 6.0..=64.0).text("Font size")).changed();
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Align:");
+                                if ui.selectable_label(matches!(new_al, crate::document::TextAlign::Left), "Left").clicked() { new_al = crate::document::TextAlign::Left; changed=true; }
+                                if ui.selectable_label(matches!(new_al, crate::document::TextAlign::Center), "Center").clicked() { new_al = crate::document::TextAlign::Center; changed=true; }
+                                if ui.selectable_label(matches!(new_al, crate::document::TextAlign::Right), "Right").clicked() { new_al = crate::document::TextAlign::Right; changed=true; }
+                            });
+                            changed |= ui.text_edit_singleline(&mut new_fam).changed();
+                            ui.horizontal(|ui| {
+                                changed |= ui.checkbox(&mut new_b, "Bold").changed();
+                                changed |= ui.checkbox(&mut new_i, "Italic").changed();
+                            });
+                            if changed {
+                                app.set_flowchart_node_label(id, new_label, new_fs, new_al, new_fam, new_b, new_i);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -4909,6 +4999,8 @@ fn node_icon(kind: &NodeKind) -> &'static str {
         NodeKind::Image { .. } => icons::OBJECT,
         NodeKind::Arc { .. } => icons::ARC,
         NodeKind::BrushStroke { .. } => icons::BRUSH,
+        NodeKind::FlowchartNode { .. } => icons::RECT,
+        NodeKind::FlowchartPath { .. } => icons::LINE,
     }
 }
 
