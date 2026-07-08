@@ -3268,22 +3268,31 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         app.show_shader_editor_window = Some(l.id);
                     }
                 });
-                let text_edit_response = ui.add(
-                    egui::TextEdit::multiline(&mut pass.wgsl)
-                        .id(egui::Id::new("sidebar_shader_editor_text"))
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(8)
-                        .font(egui::TextStyle::Monospace),
-                );
+                let mut text_edit_response = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_shader_scroll")
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(&mut pass.wgsl)
+                                .id(egui::Id::new("sidebar_shader_editor_text"))
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(8)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        text_edit_response = Some(resp);
+                    });
 
-                if text_edit_response.changed() {
-                    if pass.name != "Custom" {
-                        pass.name = "Custom".to_string();
-                    }
-                    if pass.hot_reload {
-                        pass.compiled_wgsl = Some(pass.wgsl.clone());
-                        if let Ok(mut err_lock) = pass.compile_error.lock() {
-                            *err_lock = None;
+                if let Some(resp) = text_edit_response {
+                    if resp.changed() {
+                        if pass.name != "Custom" {
+                            pass.name = "Custom".to_string();
+                        }
+                        if pass.hot_reload {
+                            pass.compiled_wgsl = Some(pass.wgsl.clone());
+                            if let Ok(mut err_lock) = pass.compile_error.lock() {
+                                *err_lock = None;
+                            }
                         }
                     }
                 }
