@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rustc_hash::FxHashMap;
@@ -65,12 +65,13 @@ pub fn spawn_export_worker(
     cancel: Arc<AtomicBool>,
     tx: Sender<ExportWorkerEvent>,
     wgpu_render: Option<egui_wgpu::RenderState>,
+    renderer_reclaim: Arc<Mutex<Vec<egui_wgpu::Renderer>>>,
 ) {
     let tx_fail = tx.clone();
     match std::thread::Builder::new()
         .name("vadadee-video-export".into())
         .spawn(move || {
-            if let Err(e) = run_export(&mut project, &config, &cancel, &tx, wgpu_render) {
+            if let Err(e) = run_export(&mut project, &config, &cancel, &tx, wgpu_render, renderer_reclaim) {
                 let _ = tx.send(ExportWorkerEvent::Finished {
                     success: false,
                     message: e,
@@ -139,6 +140,8 @@ struct ExportSession<'a> {
     export_ctx: egui::Context,
     wgpu_render: Option<egui_wgpu::RenderState>,
     offscreen_renderer: Option<egui_wgpu::Renderer>,
+    /// Renderers are sent back to the main thread for safe GPU teardown.
+    renderer_reclaim: Arc<Mutex<Vec<egui_wgpu::Renderer>>>,
 }
 
 impl<'a> ExportSession<'a> {
@@ -148,6 +151,7 @@ impl<'a> ExportSession<'a> {
         cancel: &'a AtomicBool,
         tx: &'a Sender<ExportWorkerEvent>,
         wgpu_render: Option<egui_wgpu::RenderState>,
+        renderer_reclaim: Arc<Mutex<Vec<egui_wgpu::Renderer>>>,
     ) -> Self {
         let scale = (config.resolution_pct as f32 / 100.0).max(0.1);
         let vcodec = match config.format {
@@ -190,6 +194,7 @@ impl<'a> ExportSession<'a> {
             export_ctx,
             wgpu_render,
             offscreen_renderer,
+            renderer_reclaim,
         }
     }
 
@@ -439,14 +444,29 @@ fn run_export(
     cancel: &AtomicBool,
     tx: &Sender<ExportWorkerEvent>,
     wgpu_render: Option<egui_wgpu::RenderState>,
+    renderer_reclaim: Arc<Mutex<Vec<egui_wgpu::Renderer>>>,
 ) -> Result<(), String> {
-    let mut session = ExportSession::new(project, config, cancel, tx, wgpu_render);
+    let mut session = ExportSession::new(project, config, cancel, tx, wgpu_render, renderer_reclaim);
     if let Err(e) = session.prepare().and_then(|_| session.encode_all_frames()) {
+        // Reclaim the offscreen renderer BEFORE the session is dropped, so GPU
+        // pipeline teardown happens on the main thread rather than here.
+        if let Some(r) = session.offscreen_renderer.take() {
+            if let Ok(mut q) = session.renderer_reclaim.lock() {
+                q.push(r);
+            }
+        }
         if e == "Cancelled." {
             session.abort();
             return Ok(());
         }
         return Err(e);
+    }
+
+    // Reclaim before finalize so the Renderer is already gone when we exit.
+    if let Some(r) = session.offscreen_renderer.take() {
+        if let Ok(mut q) = session.renderer_reclaim.lock() {
+            q.push(r);
+        }
     }
 
     let success = session.finalize()?;

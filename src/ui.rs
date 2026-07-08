@@ -1690,30 +1690,128 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
         .id(egui::Id::new("video_progress_dlg"))
         .collapsible(false)
         .resizable(false)
-        .default_width(340.0)
+        .default_width(380.0)
         .show(ctx, |ui| {
-            ui.label(
-                RichText::new(&app.video_export.status_msg)
-                    .color(colors::TEXT_MUTED)
-                    .italics(),
-            );
-            ui.add_space(8.0);
-            let pb = egui::ProgressBar::new(prog)
-                .show_percentage()
-                .animate(app.video_export.rendering)
-                .desired_width(ui.available_width());
-            ui.add(pb);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if app.video_export.rendering {
-                    if ui.button("Cancel").clicked() {
-                        app.cancel_video_export();
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(&app.video_export.status_msg)
+                        .color(colors::TEXT_MUTED)
+                        .italics(),
+                );
+                ui.add_space(6.0);
+                
+                let pb = egui::ProgressBar::new(prog)
+                    .show_percentage()
+                    .animate(app.video_export.rendering)
+                    .desired_width(ui.available_width());
+                ui.add(pb);
+                ui.add_space(10.0);
+
+                // --- Funny Dialog/Joke Section ---
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("🤖 System Status & Dialogue:")
+                                .color(colors::TEXT)
+                                .strong()
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!("\"{}\"", app.video_export.current_joke))
+                                .color(colors::ACCENT)
+                                .italics()
+                        );
+                    });
+                });
+                ui.add_space(10.0);
+
+                // --- Suffering Metrics Panel ---
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("🔥 System Suffering Monitor:")
+                                .color(colors::TEXT)
+                                .strong()
+                        );
+                        ui.add_space(6.0);
+
+                        egui::Grid::new("suffering_metrics_grid")
+                            .num_columns(2)
+                            .spacing([20.0, 6.0])
+                            .show(ui, |ui| {
+                                // CPU Temperature and Usage
+                                ui.label(RichText::new("CPU Suffering:").color(colors::TEXT_MUTED));
+                                let cpu_temp_color = if app.video_export.sys_stats.cpu_temp > 80.0 {
+                                    egui::Color32::from_rgb(255, 100, 100)
+                                } else if app.video_export.sys_stats.cpu_temp > 65.0 {
+                                    egui::Color32::from_rgb(255, 180, 100)
+                                } else {
+                                    colors::TEXT
+                                };
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{:.1}% ({:.1}°C)",
+                                        app.video_export.sys_stats.cpu_usage,
+                                        app.video_export.sys_stats.cpu_temp
+                                    ))
+                                    .color(cpu_temp_color)
+                                    .strong(),
+                                );
+                                ui.end_row();
+
+                                // GPU Usage
+                                ui.label(RichText::new("GPU Suffering:").color(colors::TEXT_MUTED));
+                                let gpu_color = if app.video_export.sys_stats.gpu_usage > 80.0 {
+                                    egui::Color32::from_rgb(255, 100, 100)
+                                } else {
+                                    colors::TEXT
+                                };
+                                ui.label(
+                                    RichText::new(format!("{:.1}%", app.video_export.sys_stats.gpu_usage))
+                                        .color(gpu_color)
+                                        .strong(),
+                                );
+                                ui.end_row();
+
+                                // RAM Consumption (App and System)
+                                ui.label(RichText::new("RAM Consumed:").color(colors::TEXT_MUTED));
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{:.1} MB (System: {:.1} / {:.1} GB)",
+                                        app.video_export.sys_stats.ram_rss_mb,
+                                        app.video_export.sys_stats.ram_sys_used_gb,
+                                        app.video_export.sys_stats.ram_sys_total_gb
+                                    ))
+                                    .color(colors::TEXT)
+                                    .strong(),
+                                );
+                                ui.end_row();
+
+                                // Speed / Performance
+                                ui.label(RichText::new("Export Speed:").color(colors::TEXT_MUTED));
+                                let speed_text = if app.video_export.sec_per_frame > 0.0 {
+                                    format!("{:.2} s/frame ({:.1} fps)", app.video_export.sec_per_frame, 1.0 / app.video_export.sec_per_frame)
+                                } else {
+                                    "Measuring...".to_string()
+                                };
+                                ui.label(RichText::new(speed_text).color(colors::TEXT).strong());
+                                ui.end_row();
+                            });
+                    });
+                });
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if app.video_export.rendering {
+                        if ui.button("Cancel").clicked() {
+                            app.cancel_video_export();
+                            app.video_export.progress_visible = false;
+                        }
+                    }
+                    if ui.button("Hide").clicked() {
                         app.video_export.progress_visible = false;
                     }
-                }
-                if ui.button("Hide").clicked() {
-                    app.video_export.progress_visible = false;
-                }
+                });
             });
         });
 }

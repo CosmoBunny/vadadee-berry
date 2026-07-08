@@ -223,6 +223,7 @@ pub struct VadadeeBerryApp {
     on_page_text_before: Option<Node>,
     on_page_text_newly_created: bool,
     pub cursor_doc: Option<(f64, f64)>,
+    pub canvas_focused: bool,
     pub action_bar_open: bool,
     pub action_bar_width: f32,
     pub action_tab: ui::ActionTab,
@@ -462,7 +463,6 @@ impl VideoFormat {
 }
 
 /// All render-to-video settings plus live progress state.
-#[derive(Debug)]
 pub struct VideoExportState {
     pub backend: VideoBackend,
     pub fps: u32,
@@ -488,10 +488,87 @@ pub struct VideoExportState {
     pub export_start_time: Option<std::time::Instant>,
     export_rx: Option<std::sync::mpsc::Receiver<crate::export_worker::ExportWorkerEvent>>,
     export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+
+    // System stats and Jokes fields:
+    pub sys_stats: crate::sys_stats::SysStats,
+    pub last_stats_update: std::time::Instant,
+    pub last_joke_update: std::time::Instant,
+    pub joke_rules: Vec<crate::sys_stats::JokeRule>,
+    pub current_joke: String,
+    pub sec_per_frame: f32,
+    pub last_frame_time: Option<std::time::Instant>,
+    pub renderer_reclaim: std::sync::Arc<std::sync::Mutex<Vec<egui_wgpu::Renderer>>>,
+}
+
+impl std::fmt::Debug for VideoExportState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoExportState")
+            .field("backend", &self.backend)
+            .field("fps", &self.fps)
+            .field("resolution_pct", &self.resolution_pct)
+            .field("bitrate_kbps", &self.bitrate_kbps)
+            .field("format", &self.format)
+            .field("progress", &self.progress)
+            .field("progress_visible", &self.progress_visible)
+            .field("rendering", &self.rendering)
+            .field("status_msg", &self.status_msg)
+            .field("frame_done", &self.frame_done)
+            .field("total_frames", &self.total_frames)
+            .field("export_duration_secs", &self.export_duration_secs)
+            .field("restore_anim_frame", &self.restore_anim_frame)
+            .field("frames_dir", &self.frames_dir)
+            .field("output_path", &self.output_path)
+            .field("power_level", &self.power_level)
+            .field("export_start_time", &self.export_start_time)
+            .finish()
+    }
 }
 
 impl Default for VideoExportState {
     fn default() -> Self {
+        let mut rules = Vec::new();
+        if let Ok(content) = std::fs::read_to_string("jokes_export.txt") {
+            rules = crate::sys_stats::parse_jokes(&content);
+        }
+        if rules.is_empty() {
+            rules = crate::sys_stats::parse_jokes(
+                // ── Platform-independent jokes (no prefix) ──────────────────
+                "[CPU > 85]\nYour CPU is working harder than a developer on a deadline.\n\
+                 [CPU > 85]\nThe CPU is so hot, you could fry an egg on it.\n\
+                 [CPU > 85]\nCPU became BBQ. Just cook food there and save the gas bill.\n\
+                 [CPU < 2]\nCPU usage is basically 0%... did the export even start?\n\
+                 [SEC_PER_FRAME > 2]\nThis frame took longer than a government project.\n\
+                 [SEC_PER_FRAME > 1]\nAt this speed, a flipbook would be faster.\n\
+                 [RAM > 16]\nRAM eating competition — and your device is winning gold.\n\
+                 [RAM < 2]\nWhere is the RAM? Are you exporting on a potato?\n\
+                 [CPU_TEMP > 90]\nTemperature warning: things are getting spicy in there.\n\
+                 [CPU_TEMP > 75]\nYour CPU temp is higher than my motivation on Monday.\n\
+                 \
+                 # ── Desktop-only jokes ──────────────────────────────────────
+                 [DESKTOP CPU > 80]\nYour PC sounds like a jet engine. Ready for takeoff?\n\
+                 [DESKTOP CPU < 2]\nDid you accidentally place your PC in Antarctica?\n\
+                 [DESKTOP SEC_PER_FRAME > 1]\nEven my grandma\'s old PC could export this faster.\n\
+                 [DESKTOP RAM < 2]\nBro, you\'re exporting video with less RAM than a smart fridge.\n\
+                 [DESKTOP RAM > 32]\nThat\'s a lot of RAM. Your PC could run the whole country.\n\
+                 \
+                 # ── Mobile-only jokes ───────────────────────────────────────
+                 [MOBILE CPU > 80]\nYour phone is hotter than the sun right now. Poor little guy.\n\
+                 [MOBILE CPU > 80]\nPhone CPU on max load — hope you\'re not using the camera too.\n\
+                 [MOBILE CPU < 2]\nCPU at 0% on mobile? The app might be asleep at the wheel.\n\
+                 [MOBILE SEC_PER_FRAME > 1]\nExporting video on a phone? Brave soul. Truly brave.\n\
+                 [MOBILE SEC_PER_FRAME > 2]\nMaybe send the project to a PC... just a friendly suggestion.\n\
+                 [MOBILE RAM < 2]\nYour phone is basically begging you to close some apps.\n\
+                 [MOBILE RAM > 8]\nWow, 8 GB RAM on a phone. Overkill, but we love it.\n\
+                 [MOBILE CPU_TEMP > 45]\nPhone getting warm... your pocket is a sauna now.\n\
+                 \
+                 # ── Fallback (DEFAULT applies everywhere) ───────────────────
+                 [DEFAULT]\nStill rendering... go touch some grass.\n\
+                 [DEFAULT]\nExporting... perfect time to hydrate.\n\
+                 [DEFAULT]\nPatience is a virtue. You\'re basically a saint right now.\n\
+                 [DEFAULT]\nStill going... you\'ve earned a snack break."
+            );
+        }
+
         Self {
             backend: VideoBackend::Ffmpeg,
             fps: 30,
@@ -512,6 +589,15 @@ impl Default for VideoExportState {
             export_start_time: None,
             export_rx: None,
             export_cancel: None,
+
+            sys_stats: crate::sys_stats::SysStats::new(),
+            last_stats_update: std::time::Instant::now(),
+            last_joke_update: std::time::Instant::now(),
+            joke_rules: rules,
+            current_joke: "Still exporting... Go grab a coffee, or maybe grow a tree.".to_string(),
+            sec_per_frame: 0.0,
+            last_frame_time: None,
+            renderer_reclaim: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -792,6 +878,7 @@ impl VadadeeBerryApp {
             cached_draw_order: Vec::new(),
             cached_draw_order_revision: u64::MAX,
             audio_output_warned: false,
+            canvas_focused: false,
         };
         if let Some(rs) = &app.wgpu_render {
             crate::shading::init_callback_resources(rs, crate::VIEWPORT_MSAA_SAMPLES);
@@ -872,10 +959,14 @@ impl VadadeeBerryApp {
     }
 
     fn update_cursor_doc_from_pointer(&mut self, ctx: &egui::Context, response: &egui::Response) {
-        let pointer = response
-            .hover_pos()
-            .or_else(|| response.interact_pointer_pos())
-            .or_else(|| ctx.input(|i| i.pointer.hover_pos()));
+        let pointer = if response.hovered() || response.dragged() {
+            response
+                .hover_pos()
+                .or_else(|| response.interact_pointer_pos())
+                .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
+        } else {
+            None
+        };
         let pointer = pointer.and_then(|pos| {
             self.canvas_screen_rect
                 .filter(|r| r.contains(pos))
@@ -892,6 +983,10 @@ impl VadadeeBerryApp {
             }
             None => {}
         }
+    }
+
+    pub fn canvas_has_active_focus(&self) -> bool {
+        self.cursor_doc.is_some() || self.canvas_focused
     }
 
     /// Pan/zoom so a collaborator's document point is centered on the canvas.
@@ -2689,6 +2784,7 @@ impl VadadeeBerryApp {
             cancel.clone(),
             tx,
             self.wgpu_render.clone(),
+            self.video_export.renderer_reclaim.clone(),
         );
 
         self.video_export.restore_anim_frame = restore;
@@ -2706,6 +2802,24 @@ impl VadadeeBerryApp {
             total_frames, self.video_export.fps, self.video_export.resolution_pct
         );
         self.status_message = "Video export started (background)".into();
+
+        // Initialize joke and system stats:
+        self.video_export.last_frame_time = Some(std::time::Instant::now());
+        self.video_export.sec_per_frame = 0.0;
+        self.video_export.last_joke_update = std::time::Instant::now();
+        self.video_export.last_stats_update = std::time::Instant::now();
+        self.video_export.sys_stats.update();
+        let seed = std::time::Instant::now().elapsed().as_nanos() as u64;
+        let is_mobile = cfg!(target_os = "android");
+        self.video_export.current_joke = crate::sys_stats::choose_joke(
+            &self.video_export.joke_rules,
+            self.video_export.sys_stats.cpu_usage,
+            self.video_export.sys_stats.ram_sys_used_gb,
+            self.video_export.sec_per_frame,
+            self.video_export.sys_stats.cpu_temp,
+            seed,
+            is_mobile,
+        );
     }
 
     pub fn cancel_video_export(&mut self) {
@@ -2764,6 +2878,15 @@ impl VadadeeBerryApp {
                     message,
                     ..
                 } => {
+                    let now = std::time::Instant::now();
+                    if let Some(last) = self.video_export.last_frame_time {
+                        let diff_frames = frame_done.saturating_sub(self.video_export.frame_done);
+                        if diff_frames > 0 {
+                            self.video_export.sec_per_frame = now.duration_since(last).as_secs_f32() / diff_frames as f32;
+                        }
+                    }
+                    self.video_export.last_frame_time = Some(now);
+
                     self.video_export.frame_done = frame_done;
                     self.video_export.total_frames = total;
                     self.video_export.progress =
@@ -2775,8 +2898,38 @@ impl VadadeeBerryApp {
                 }
             }
         }
+
+        // Periodic updates:
+        let now = std::time::Instant::now();
+        if now.duration_since(self.video_export.last_stats_update) >= std::time::Duration::from_secs(1) {
+            self.video_export.sys_stats.update();
+            self.video_export.last_stats_update = now;
+            ctx.request_repaint();
+        }
+
+        if now.duration_since(self.video_export.last_joke_update) >= std::time::Duration::from_secs(10) {
+            let seed = now.elapsed().as_nanos() as u64;
+            let is_mobile = cfg!(target_os = "android");
+            self.video_export.current_joke = crate::sys_stats::choose_joke(
+                &self.video_export.joke_rules,
+                self.video_export.sys_stats.cpu_usage,
+                self.video_export.sys_stats.ram_sys_used_gb,
+                self.video_export.sec_per_frame,
+                self.video_export.sys_stats.cpu_temp,
+                seed,
+                is_mobile,
+            );
+            self.video_export.last_joke_update = now;
+            ctx.request_repaint();
+        }
+
         if let Some((success, message)) = done {
+            // Drain any renderers the export thread shipped back for safe GPU teardown.
+            if let Ok(mut q) = self.video_export.renderer_reclaim.lock() {
+                q.clear(); // drops here, on the main GL-context thread
+            }
             let cancelled = !success && message.contains("Cancelled");
+
             if success {
                 self.video_export.progress = Some(1.0);
                 self.video_export.status_msg = message.clone();
@@ -3438,8 +3591,7 @@ impl VadadeeBerryApp {
     /// the key event actually arrived).
     /// Returns `true` when paste was triggered from an egui input event this frame.
     pub fn handle_object_clipboard_shortcuts(&mut self, ctx: &Context) -> bool {
-        if self.object_clipboard_blocked(ctx) {
-            log::debug!("CLIPBOARD: blocked (on_page_text_edit or wants_keyboard_input)");
+        if self.object_clipboard_blocked(ctx) || !self.canvas_has_active_focus() {
             return false;
         }
 
@@ -4733,6 +4885,11 @@ fn run_video_decode_thread(
         let origin = rect.min;
         self.canvas_screen_rect = Some(rect);
         self.canvas_origin = origin;
+
+        if response.clicked() || response.drag_started() {
+            ui.ctx().memory_mut(|mem| mem.request_focus(response.id));
+        }
+        self.canvas_focused = ui.ctx().memory(|mem| mem.has_focus(response.id));
 
         // Handle dropped files (png/jpeg/project) -> create Image node or load project
         let drops: Vec<_> = ui.input(|i| i.raw.dropped_files.clone());

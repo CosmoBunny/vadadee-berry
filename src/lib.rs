@@ -27,6 +27,7 @@ pub mod export_audio;
 pub mod recorder;
 pub mod audio_extract;
 pub mod collab;
+pub mod sys_stats;
 #[cfg(not(target_os = "android"))]
 pub mod mcp;
 
