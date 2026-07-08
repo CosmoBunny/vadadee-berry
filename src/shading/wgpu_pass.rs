@@ -43,7 +43,7 @@ pub struct ShadingGpuResources {
     uniform_buffer: wgpu::Buffer,
     input_texture: wgpu::Texture,
     input_view: wgpu::TextureView,
-    pipelines: HashMap<u64, Arc<CompiledShadingPipeline>>,
+    pipelines: HashMap<u64, Result<Arc<CompiledShadingPipeline>, String>>,
     pending_input: Option<(u32, u32, Vec<u8>)>,
 }
 
@@ -269,14 +269,13 @@ impl ShadingGpuResources {
     ) -> Result<Arc<CompiledShadingPipeline>, String> {
         let compose = wgsl_needs_compose(wgsl);
         let key = source_key(wgsl, compose);
-        if let Some(p) = self.pipelines.get(&key) {
-            return Ok(Arc::clone(p));
+        if let Some(res) = self.pipelines.get(&key) {
+            return res.clone();
         }
-        let compiled =
-            compile_pipeline(device, self.target_format, self.msaa_samples, wgsl, compose)?;
-        let arc = Arc::new(compiled);
-        self.pipelines.insert(key, Arc::clone(&arc));
-        Ok(arc)
+        let result = compile_pipeline(device, self.target_format, self.msaa_samples, wgsl, compose)
+            .map(Arc::new);
+        self.pipelines.insert(key, result.clone());
+        result
     }
 
     fn upload_input(&mut self, queue: &wgpu::Queue) {
@@ -413,7 +412,7 @@ impl CallbackTrait for ShadingPaintCallback {
             return;
         };
         let key = source_key(&self.wgsl, wgsl_needs_compose(&self.wgsl));
-        let Some(pipeline) = gpu.pipelines.get(&key) else {
+        let Some(Ok(pipeline)) = gpu.pipelines.get(&key) else {
             return;
         };
         let bind_group = gpu.bind_group(&pipeline.bind_group_layout, pipeline.compose);
