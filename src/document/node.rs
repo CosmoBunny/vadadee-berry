@@ -1057,69 +1057,90 @@ impl PathData {
         let closed = self.is_closed();
         let mut bez = BezPath::new();
         bez.move_to((anchors[0].0, anchors[0].1));
+        
+        let smooth: Vec<bool> = (0..n)
+            .map(|i| self.is_anchor_smooth(i))
+            .collect();
+            
         let seg_count = if closed { n } else { n.saturating_sub(1) };
         for i in 0..seg_count {
             let j = (i + 1) % n;
             let p0 = anchors[i];
             let p1 = anchors[j];
-            // Use D computed from radius via D = R / tan(θ/2) so T's are always equidistant.
-            let start_d = self.fillet_tangent_d(i);
-            let end_d = self.fillet_tangent_d(j);
-            let dx = p1.0 - p0.0;
-            let dy = p1.1 - p0.1;
-            let len = dx.hypot(dy).max(1e-9);
-            let ux = dx / len;
-            let uy = dy / len;
-            let t_start = (p0.0 + ux * start_d, p0.1 + uy * start_d);
-            let t_end = (p1.0 - ux * end_d, p1.1 - uy * end_d);
-            bez.line_to(t_start);
-            bez.line_to(t_end);
-            if self.has_corner_fillet(j) {
-                // Respect original closed state; do not assume wrap for open paths.
-                let next = if j + 1 < n {
-                    j + 1
-                } else if closed {
-                    0
-                } else {
-                    continue; // no outgoing leg on open path end; skip invalid fillet arc
-                };
-                let p2 = anchors[next];
-                let d_out = self.fillet_tangent_d(j);
-                let dxo = p2.0 - p1.0;
-                let dyo = p2.1 - p1.1;
-                let leno = dxo.hypot(dyo).max(1e-9);
-                let uxo = dxo / leno;
-                let uyo = dyo / leno;
-                // Ensure T1 and T2 are placed at exact equal distance D from V (per formula) BEFORE computing Bezier controls.
-                let D = end_d; // guaranteed equal to d_out by fillet_tangent_d using same R+θ
-                let t1 = (p1.0 - ux * D, p1.1 - uy * D);
-                let t2 = (p1.0 + uxo * D, p1.1 + uyo * D);
-                // Interior angle θ between the two line segments at V.
-                let va_x = p0.0 - p1.0;
-                let va_y = p0.1 - p1.1;
-                let vc_x = p2.0 - p1.0;
-                let vc_y = p2.1 - p1.1;
-                let ma = (va_x * va_x + va_y * va_y).sqrt().max(1e-9);
-                let mc = (vc_x * vc_x + vc_y * vc_y).sqrt().max(1e-9);
-                let cos_theta = ((va_x * vc_x + va_y * vc_y) / (ma * mc)).clamp(-1.0, 1.0);
-                let theta = cos_theta.acos();
-                let alpha = std::f64::consts::PI - theta;
-                // R from storage (or equivalently R = D * tan(θ/2))
-                let R = self.corner_fillets.get(&j).map_or(0.0, |f| f.radius);
-                let d = R * (4.0 / 3.0) * (alpha / 4.0).tan().max(0.0);
-                // C1 from T1 toward V
-                let v1x = p1.0 - t1.0;
-                let v1y = p1.1 - t1.1;
-                let l1 = (v1x * v1x + v1y * v1y).sqrt().max(1e-9);
-                let c1x = t1.0 + (v1x / l1) * d;
-                let c1y = t1.1 + (v1y / l1) * d;
-                // C2 from T2 toward V
-                let v2x = p1.0 - t2.0;
-                let v2y = p1.1 - t2.1;
-                let l2 = (v2x * v2x + v2y * v2y).sqrt().max(1e-9);
-                let c2x = t2.0 + (v2x / l2) * d;
-                let c2y = t2.1 + (v2y / l2) * d;
-                bez.curve_to((c1x, c1y), (c2x, c2y), (t2.0, t2.1));
+            
+            if smooth[i] || smooth[j] {
+                let (c1, c2) = segment_controls(
+                    &anchors,
+                    i,
+                    j,
+                    closed,
+                    smooth[i],
+                    smooth[j],
+                    &self.handle_out_offset,
+                    &self.handle_in_offset,
+                    &self.handle_modes,
+                );
+                bez.curve_to((c1.0, c1.1), (c2.0, c2.1), (p1.0, p1.1));
+            } else {
+                // Use D computed from radius via D = R / tan(θ/2) so T's are always equidistant.
+                let start_d = self.fillet_tangent_d(i);
+                let end_d = self.fillet_tangent_d(j);
+                let dx = p1.0 - p0.0;
+                let dy = p1.1 - p0.1;
+                let len = dx.hypot(dy).max(1e-9);
+                let ux = dx / len;
+                let uy = dy / len;
+                let t_start = (p0.0 + ux * start_d, p0.1 + uy * start_d);
+                let t_end = (p1.0 - ux * end_d, p1.1 - uy * end_d);
+                bez.line_to(t_start);
+                bez.line_to(t_end);
+                if self.has_corner_fillet(j) {
+                    // Respect original closed state; do not assume wrap for open paths.
+                    let next = if j + 1 < n {
+                        j + 1
+                    } else if closed {
+                        0
+                    } else {
+                        continue; // no outgoing leg on open path end; skip invalid fillet arc
+                    };
+                    let p2 = anchors[next];
+                    let d_out = self.fillet_tangent_d(j);
+                    let dxo = p2.0 - p1.0;
+                    let dyo = p2.1 - p1.1;
+                    let leno = dxo.hypot(dyo).max(1e-9);
+                    let uxo = dxo / leno;
+                    let uyo = dyo / leno;
+                    // Ensure T1 and T2 are placed at exact equal distance D from V (per formula) BEFORE computing Bezier controls.
+                    let D = end_d; // guaranteed equal to d_out by fillet_tangent_d using same R+θ
+                    let t1 = (p1.0 - ux * D, p1.1 - uy * D);
+                    let t2 = (p1.0 + uxo * D, p1.1 + uyo * D);
+                    // Interior angle θ between the two line segments at V.
+                    let va_x = p0.0 - p1.0;
+                    let va_y = p0.1 - p1.1;
+                    let vc_x = p2.0 - p1.0;
+                    let vc_y = p2.1 - p1.1;
+                    let ma = (va_x * va_x + va_y * va_y).sqrt().max(1e-9);
+                    let mc = (vc_x * vc_x + vc_y * vc_y).sqrt().max(1e-9);
+                    let cos_theta = ((va_x * vc_x + va_y * vc_y) / (ma * mc)).clamp(-1.0, 1.0);
+                    let theta = cos_theta.acos();
+                    let alpha = std::f64::consts::PI - theta;
+                    // R from storage (or equivalently R = D * tan(θ/2))
+                    let R = self.corner_fillets.get(&j).map_or(0.0, |f| f.radius);
+                    let d = R * (4.0 / 3.0) * (alpha / 4.0).tan().max(0.0);
+                    // C1 from T1 toward V
+                    let v1x = p1.0 - t1.0;
+                    let v1y = p1.1 - t1.1;
+                    let l1 = (v1x * v1x + v1y * v1y).sqrt().max(1e-9);
+                    let c1x = t1.0 + (v1x / l1) * d;
+                    let c1y = t1.1 + (v1y / l1) * d;
+                    // C2 from T2 toward V
+                    let v2x = p1.0 - t2.0;
+                    let v2y = p1.1 - t2.1;
+                    let l2 = (v2x * v2x + v2y * v2y).sqrt().max(1e-9);
+                    let c2x = t2.0 + (v2x / l2) * d;
+                    let c2y = t2.1 + (v2y / l2) * d;
+                    bez.curve_to((c1x, c1y), (c2x, c2y), (t2.0, t2.1));
+                }
             }
         }
         if closed {
@@ -2789,7 +2810,7 @@ impl Node {
         let mut v = match &self.kind {
             NodeKind::Rect { w, h, rx, .. } => vec![*w, *h, *rx],
             NodeKind::Ellipse { rx, ry, .. } => vec![*rx, *ry],
-            NodeKind::Polygon { r, sides, .. } => vec![*r, *sides as f64],
+            NodeKind::Polygon { r, sides, rotation_rad, .. } => vec![*r, *sides as f64, *rotation_rad],
             NodeKind::Arc { radius, start_angle_rad, sweep_angle_rad, .. } => vec![*radius, *start_angle_rad, *sweep_angle_rad],
             NodeKind::Path { path } => {
                 let mut pv = Vec::new();
@@ -2864,7 +2885,7 @@ impl Node {
         let base_len = match &self.kind {
             NodeKind::Rect { .. } => 3,
             NodeKind::Ellipse { .. } => 2,
-            NodeKind::Polygon { .. } => 2,
+            NodeKind::Polygon { .. } => 3,
             NodeKind::Arc { .. } => 3,
             NodeKind::Path { path } => path.anchor_positions().len() * 6,
             NodeKind::BrushStroke { points } => points.len() * 3,
@@ -2884,10 +2905,11 @@ impl Node {
                     *ry = floats[1];
                 }
             }
-            NodeKind::Polygon { r, sides, .. } => {
-                if floats.len() >= 2 {
+            NodeKind::Polygon { r, sides, rotation_rad, .. } => {
+                if floats.len() >= 3 {
                     *r = floats[0];
                     *sides = (floats[1].round() as u32).max(3);
+                    *rotation_rad = floats[2];
                 }
             }
             NodeKind::Arc { radius, start_angle_rad, sweep_angle_rad, .. } => {

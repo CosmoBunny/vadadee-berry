@@ -4041,7 +4041,7 @@ impl VadadeeBerryApp {
         let base_len = match &node.kind {
             NodeKind::Rect { .. } => 3,
             NodeKind::Ellipse { .. } => 2,
-            NodeKind::Polygon { .. } => 2,
+            NodeKind::Polygon { .. } => 3,
             NodeKind::Arc { .. } => 3,
             NodeKind::Path { path } => path.anchor_positions().len() * 6,
             NodeKind::BrushStroke { points } => points.len() * 3,
@@ -4063,6 +4063,7 @@ impl VadadeeBerryApp {
                 NodeKind::Polygon { .. } => match idx {
                     0 => "Radius".to_string(),
                     1 => "Sides".to_string(),
+                    2 => "Rotation".to_string(),
                     _ => format!("Geom {}", idx),
                 },
                 NodeKind::Arc { .. } => match idx {

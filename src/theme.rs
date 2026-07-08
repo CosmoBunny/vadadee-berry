@@ -18,6 +18,7 @@ pub mod colors {
     pub const ACCENT: Color32 = Color32::from_rgb(99, 130, 255);
     pub const ACCENT_DIM: Color32 = Color32::from_rgb(60, 78, 160);
     pub const SUCCESS: Color32 = Color32::from_rgb(72, 199, 142);
+    pub const ALERT: Color32 = Color32::from_rgb(255, 95, 110);
     pub const CANVAS_BG: Color32 = Color32::from_rgb(12, 14, 18);
     pub const SELECTION: Color32 = Color32::from_rgb(99, 130, 255);
     pub const POWERLINE_A: Color32 = Color32::from_rgb(99, 130, 255);

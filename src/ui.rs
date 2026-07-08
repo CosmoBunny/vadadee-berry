@@ -4375,9 +4375,14 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             ui.label(
                 RichText::new(format!("{} points selected", points_on.len())).strong(),
             );
-            if ui.button("Smooth selected points").clicked() {
-                app.smooth_selected_path_points();
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Smooth selected points").clicked() {
+                    app.smooth_selected_path_points();
+                }
+                if ui.button(RichText::new("Delete selected points").color(colors::ALERT)).clicked() {
+                    app.remove_selected_path_points();
+                }
+            });
             ui.separator();
         } else if let Some(point_idx) = points_on.first().copied() {
             let smooth = app
@@ -4770,6 +4775,14 @@ fn path_point_bezier_panel(
                 app.set_path_anchor_smooth(id, point_idx, true);
             }
         });
+        ui.add_space(4.0);
+        if ui
+            .button(RichText::new(format!("{} Delete Point", icons::DELETE)).font(nerd_font_id(14.0)).color(colors::ALERT))
+            .on_hover_text("Delete this point")
+            .clicked()
+        {
+            app.remove_selected_path_points();
+        }
         if smooth {
             ui.label(
                 RichText::new("Handle mode")
@@ -7370,6 +7383,9 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     if ui.button("Smooth selected").clicked() {
                         app.smooth_selected_path_points();
                     }
+                    if ui.button(RichText::new("Delete selected").color(colors::ALERT)).clicked() {
+                        app.remove_selected_path_points();
+                    }
                 });
             } else if let Some((pid, point_idx)) = multi.first().copied() {
                 let smooth = app
@@ -7580,6 +7596,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 NodeKind::Polygon { .. } => vec![
                     ("Radius".to_string(), 0.0, 10000.0, 1.0),
                     ("Sides".to_string(), 3.0, 100.0, 1.0),
+                    ("Rotation (deg)".to_string(), -360.0, 360.0, 1.0),
                 ],
                 NodeKind::Arc { .. } => vec![
                     ("Radius".to_string(), 0.0, 10000.0, 1.0),
@@ -7662,7 +7679,9 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         (format!("Property {}", i), -10000.0, 10000.0, 1.0)
                     };
 
-                    let is_arc_angle = is_arc && (i == 1 || i == 2);
+                    let is_polygon = app.project.nodes.get(id).map_or(false, |n| matches!(n.kind, NodeKind::Polygon { .. }));
+                    let is_angle = (is_arc && (i == 1 || i == 2))
+                        || (is_polygon && i == 2);
 
                     if let Some(node) = app.project.nodes.get(id) {
                         if matches!(&node.kind, NodeKind::Path { .. }) {
@@ -7678,8 +7697,8 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 };
                                 let mut t1 = entry.geom_tracks[i].clone();
                                 let mut t2 = if i + 1 < entry.geom_tracks.len() { entry.geom_tracks[i + 1].clone() } else { crate::app::KeyframeTrack::default() };
-                                let current1 = if is_arc_angle { geom_floats[i].to_degrees() } else { geom_floats[i] };
-                                let current2 = if i + 1 < geom_floats.len() { if is_arc_angle { geom_floats[i + 1].to_degrees() } else { geom_floats[i + 1] } } else { 0.0 };
+                                let current1 = if is_angle { geom_floats[i].to_degrees() } else { geom_floats[i] };
+                                let current2 = if i + 1 < geom_floats.len() { if is_angle { geom_floats[i + 1].to_degrees() } else { geom_floats[i + 1] } } else { 0.0 };
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(base_label).strong());
                                     ui.add_space(10.0);
@@ -7692,7 +7711,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                         t1.insert(frame, v1);
                                         entry_changed = true;
                                         if let Some(v) = Some(v1) {
-                                            let rv = if is_arc_angle { v.to_radians() } else { v };
+                                            let rv = if is_angle { v.to_radians() } else { v };
                                             geom_floats[i] = rv;
                                             app.set_node_geom_floats(id, &geom_floats);
                                         }
@@ -7719,7 +7738,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                         entry_changed = true;
                                         if let Some(v) = Some(v2) {
                                             if i + 1 < geom_floats.len() {
-                                                let rv = if is_arc_angle { v.to_radians() } else { v };
+                                                let rv = if is_angle { v.to_radians() } else { v };
                                                 geom_floats[i + 1] = rv;
                                                 app.set_node_geom_floats(id, &geom_floats);
                                             }
@@ -7751,14 +7770,14 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     let mut track_geom = entry.geom_tracks[i].clone();
                     
                     // Adjust defaults/values for radian <-> degree conversion
-                    let current_val = if is_arc_angle {
+                    let current_val = if is_angle {
                         geom_floats[i].to_degrees()
                     } else {
                         geom_floats[i]
                     };
 
                     // In order to use render_prop_row correctly, we convert values in track_geom to degrees temporarily if it's an angle track
-                    if is_arc_angle {
+                    if is_angle {
                         for kf in &mut track_geom.keyframes {
                             kf.value = kf.value.to_degrees();
                         }
@@ -7776,7 +7795,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
                     if changed_geom {
                         // If value changed or deleted, convert back to radians if necessary
-                        if is_arc_angle {
+                        if is_angle {
                             for kf in &mut track_geom.keyframes {
                                 kf.value = kf.value.to_radians();
                             }
@@ -7785,7 +7804,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         entry_changed = true;
 
                         if let Some(vg) = val_geom {
-                            let rad_vg = if is_arc_angle { vg.to_radians() } else { vg };
+                            let rad_vg = if is_angle { vg.to_radians() } else { vg };
                             geom_floats[i] = rad_vg;
                             app.set_node_geom_floats(id, &geom_floats);
                         }
