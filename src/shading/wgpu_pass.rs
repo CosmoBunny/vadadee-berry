@@ -211,7 +211,7 @@ fn compile_pipeline(
 }
 
 impl ShadingGpuResources {
-    fn new(device: wgpu::Device, target_format: wgpu::TextureFormat, msaa_samples: u32) -> Self {
+    pub fn new(device: wgpu::Device, target_format: wgpu::TextureFormat, msaa_samples: u32) -> Self {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shading_input_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -419,11 +419,12 @@ impl CallbackTrait for ShadingPaintCallback {
             0.0,
             1.0,
         );
+        let clip = info.clip_rect_in_pixels();
         render_pass.set_scissor_rect(
-            vp.left_px.max(0) as u32,
-            vp.top_px.max(0) as u32,
-            vp.width_px.max(0) as u32,
-            vp.height_px.max(0) as u32,
+            clip.left_px.max(0) as u32,
+            clip.top_px.max(0) as u32,
+            clip.width_px.max(0) as u32,
+            clip.height_px.max(0) as u32,
         );
         render_pass.set_pipeline(&pipeline.pipeline);
         render_pass.set_bind_group(0, &bind_group, &[]);

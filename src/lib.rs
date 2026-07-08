@@ -72,6 +72,9 @@ fn init_logging() {
             .filter_module("egui_winit::clipboard", log::LevelFilter::Off)
             .filter_module("symphonia_format_isomp4", log::LevelFilter::Off)
             .filter_module("symphonia_bundle", log::LevelFilter::Off)
+            // usvg spams WARN for every SVG text element using a font not in its DB;
+            // our canvas handles font loading separately so this is always safe to mute.
+            .filter_module("usvg::parser::text", log::LevelFilter::Off)
             .try_init();
     }
 }

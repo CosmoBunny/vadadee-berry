@@ -16,6 +16,8 @@ use crate::io::{self, VideoFrameMap, VideoLayerBuffer};
 use crate::recorder::{Frame, RecorderConfig, SyncRecorder};
 use crate::video_decode::VideoStream;
 
+use egui::Context;
+
 /// How often progress events are emitted (frames).
 const PROGRESS_EVERY_N_FRAMES: usize = 1;
 
@@ -62,12 +64,13 @@ pub fn spawn_export_worker(
     config: ExportJobConfig,
     cancel: Arc<AtomicBool>,
     tx: Sender<ExportWorkerEvent>,
+    wgpu_render: Option<egui_wgpu::RenderState>,
 ) {
     let tx_fail = tx.clone();
     match std::thread::Builder::new()
         .name("vadadee-video-export".into())
         .spawn(move || {
-            if let Err(e) = run_export(&mut project, &config, &cancel, &tx) {
+            if let Err(e) = run_export(&mut project, &config, &cancel, &tx, wgpu_render) {
                 let _ = tx.send(ExportWorkerEvent::Finished {
                     success: false,
                     message: e,
@@ -133,6 +136,9 @@ struct ExportSession<'a> {
     video_streams: FxHashMap<String, VideoStream>,
     video_frames: VideoFrameMap,
     recorder: Option<SyncRecorder>,
+    export_ctx: egui::Context,
+    wgpu_render: Option<egui_wgpu::RenderState>,
+    offscreen_renderer: Option<egui_wgpu::Renderer>,
 }
 
 impl<'a> ExportSession<'a> {
@@ -141,6 +147,7 @@ impl<'a> ExportSession<'a> {
         config: &'a ExportJobConfig,
         cancel: &'a AtomicBool,
         tx: &'a Sender<ExportWorkerEvent>,
+        wgpu_render: Option<egui_wgpu::RenderState>,
     ) -> Self {
         let scale = (config.resolution_pct as f32 / 100.0).max(0.1);
         let vcodec = match config.format {
@@ -149,6 +156,21 @@ impl<'a> ExportSession<'a> {
             _ => "libx264",
         };
         let video_layers = collect_export_video_layers(project);
+        let export_ctx = egui::Context::default();
+        let offscreen_renderer = wgpu_render.as_ref().map(|rs| {
+            let mut r = egui_wgpu::Renderer::new(
+                &rs.device,
+                wgpu::TextureFormat::Rgba8Unorm,
+                egui_wgpu::RendererOptions::default(),
+            );
+            let shading_res = crate::shading::wgpu_pass::ShadingGpuResources::new(
+                rs.device.clone(),
+                wgpu::TextureFormat::Rgba8Unorm,
+                1,
+            );
+            r.callback_resources.insert(shading_res);
+            r
+        });
         Self {
             project,
             config,
@@ -165,6 +187,9 @@ impl<'a> ExportSession<'a> {
             video_streams: FxHashMap::default(),
             video_frames: VideoFrameMap::default(),
             recorder: None,
+            export_ctx,
+            wgpu_render,
+            offscreen_renderer,
         }
     }
 
@@ -315,14 +340,49 @@ impl<'a> ExportSession<'a> {
 
             self.decode_video_layers(timeline_sec)?;
 
-            let (w, h, rgba) = io::composite_export_frame(
-                self.project,
-                anim_frame,
-                &self.video_frames,
-                self.scale,
-                timeline_sec,
-            )
-            .ok_or_else(|| "Frame rasterize failed".to_string())?;
+            let (w, h, rgba) = if let Some(render_state) = self.wgpu_render.clone() {
+                let doc_w = self.project.document.width;
+                let doc_h = self.project.document.height;
+                let mut pixel_w = (doc_w as f32 * self.scale).round() as u32;
+                let mut pixel_h = (doc_h as f32 * self.scale).round() as u32;
+                if pixel_w % 2 != 0 {
+                    pixel_w = pixel_w.saturating_sub(1);
+                }
+                if pixel_h % 2 != 0 {
+                    pixel_h = pixel_h.saturating_sub(1);
+                }
+                if pixel_w == 0 || pixel_h == 0 {
+                    return Err("Zero width or height for export".to_string());
+                }
+
+                if let Some(buf) = self.rasterize_frame_offscreen_gpu(
+                    &render_state,
+                    anim_frame,
+                    timeline_sec,
+                    pixel_w,
+                    pixel_h,
+                ) {
+                    (pixel_w, pixel_h, buf)
+                } else {
+                    io::composite_export_frame(
+                        self.project,
+                        anim_frame,
+                        &self.video_frames,
+                        self.scale,
+                        timeline_sec,
+                    )
+                    .ok_or_else(|| "Frame rasterize failed".to_string())?
+                }
+            } else {
+                io::composite_export_frame(
+                    self.project,
+                    anim_frame,
+                    &self.video_frames,
+                    self.scale,
+                    timeline_sec,
+                )
+                .ok_or_else(|| "Frame rasterize failed".to_string())?
+            };
 
             self.ensure_encoder(w, h)?;
             self.stream_frame(w, h, rgba)?;
@@ -346,7 +406,8 @@ impl<'a> ExportSession<'a> {
 
         let duration_secs =
             self.config.total_frames as f32 / self.config.fps.max(1) as f32;
-        let success = if self.temp_video.exists() {
+        // Evaluate mux result before cleanup so work_dir is always removed.
+        let mux_result = if self.temp_video.exists() {
             crate::export_audio::export_mux_with_audio(
                 self.project,
                 &self.temp_video,
@@ -354,12 +415,12 @@ impl<'a> ExportSession<'a> {
                 &self.config.work_dir,
                 duration_secs,
                 self.config.format,
-            )?
+            )
         } else {
-            false
+            Ok(false)
         };
-        let _ = std::fs::remove_dir_all(&self.config.work_dir);
-        Ok(success)
+        let _ = std::fs::remove_dir_all(&self.config.work_dir); // always clean up
+        Ok(mux_result?)
     }
 
     fn abort(&mut self) {
@@ -377,8 +438,9 @@ fn run_export(
     config: &ExportJobConfig,
     cancel: &AtomicBool,
     tx: &Sender<ExportWorkerEvent>,
+    wgpu_render: Option<egui_wgpu::RenderState>,
 ) -> Result<(), String> {
-    let mut session = ExportSession::new(project, config, cancel, tx);
+    let mut session = ExportSession::new(project, config, cancel, tx, wgpu_render);
     if let Err(e) = session.prepare().and_then(|_| session.encode_all_frames()) {
         if e == "Cancelled." {
             session.abort();
@@ -783,4 +845,372 @@ pub fn set_node_geom_floats_project(project: &mut ProjectFile, id: NodeId, float
             }
         }
     }
+}
+
+impl<'a> ExportSession<'a> {
+    fn rasterize_frame_offscreen_gpu(
+        &mut self,
+        render_state: &egui_wgpu::RenderState,
+        current_frame: usize,
+        time_secs: f32,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u8>> {
+        use egui_wgpu::wgpu;
+
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, height as f32)));
+
+        let mut image_textures = std::collections::HashMap::new();
+        for (layer_id, buf) in &self.video_frames {
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [buf.width as usize, buf.height as usize],
+                &buf.rgba,
+            );
+            let handle = self.export_ctx.load_texture(
+                format!("export-av-layer-{}", layer_id),
+                color_image,
+                egui::TextureOptions::default(),
+            );
+            image_textures.insert(*layer_id, handle);
+        }
+
+        for (&id, node) in &self.project.nodes.map {
+            if let crate::document::NodeKind::Image { bytes, .. } = &node.kind {
+                if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                    let rgba = dyn_img.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    let pixels = rgba.into_raw();
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+                    let handle = self.export_ctx.load_texture(
+                        format!("export-node-img-{}", id),
+                        color_image,
+                        egui::TextureOptions::default(),
+                    );
+                    image_textures.insert(id, handle);
+                }
+            }
+        }
+
+        let origin = egui::Pos2::ZERO;
+        let viewport = crate::canvas::Viewport {
+            pan: egui::Vec2::ZERO,
+            zoom: self.scale,
+            show_grid: false,
+            snap_grid: false,
+            grid_step: 20.0,
+        };
+
+        let draw_order = self.project.document.ordered_node_ids();
+        let hidden_sources = std::collections::HashSet::new();
+        let loft_paths = std::collections::HashSet::new();
+        let fonts = crate::fonts::FontRegistry::new();
+
+        let output = self.export_ctx.run(input, |ctx| {
+            let clip_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, height as f32));
+            let painter = egui::Painter::new(
+                ctx.clone(),
+                egui::LayerId::background(),
+                clip_rect,
+            );
+
+            let bg_color = egui::Color32::from_rgba_unmultiplied(
+                (self.project.document.page_color[0] * 255.0) as u8,
+                (self.project.document.page_color[1] * 255.0) as u8,
+                (self.project.document.page_color[2] * 255.0) as u8,
+                (self.project.document.page_color[3] * 255.0) as u8,
+            );
+            painter.rect_filled(clip_rect, 0.0, bg_color);
+
+            for layer in &self.project.document.layers {
+                if !layer.visible || !layer.is_renderer {
+                    continue;
+                }
+                match layer.kind {
+                    crate::document::LayerKind::Image | crate::document::LayerKind::Flowchart => {
+                        let layer_set: std::collections::HashSet<uuid::Uuid> = layer.nodes.iter().copied().collect();
+                        let layer_draw_order: Vec<uuid::Uuid> = draw_order
+                            .iter()
+                            .copied()
+                            .filter(|id| layer_set.contains(id))
+                            .collect();
+                        crate::render::draw_nodes(
+                            &painter,
+                            &self.project.nodes,
+                            &layer_draw_order,
+                            &viewport,
+                            origin,
+                            self.project.document.width as f32,
+                            self.project.document.height as f32,
+                            &[],
+                            &hidden_sources,
+                            &loft_paths,
+                            &fonts,
+                            &image_textures,
+                        );
+                    }
+                    crate::document::LayerKind::AV => {
+                        if let Some(tex) = image_textures.get(&layer.id) {
+                            let mut dx = layer.x as f64;
+                            let mut dy = layer.y as f64;
+                            let mut rot = layer.rotation as f64;
+                            let mut opacity = 1.0f32;
+                            if let Some(track) = self.project.anim_timeline.nodes.get(&layer.id) {
+                                if let Some(o) = track.opacity.interpolate(current_frame) {
+                                    opacity = o as f32;
+                                }
+                                if let Some(x) = track.pos_x.interpolate(current_frame) {
+                                    dx = x;
+                                }
+                                if let Some(y) = track.pos_y.interpolate(current_frame) {
+                                    dy = y;
+                                }
+                                if let Some(r) = track.rotation.interpolate(current_frame) {
+                                    rot = r;
+                                }
+                            }
+                            let tex_w = tex.size()[0] as f32;
+                            let tex_h = tex.size()[1] as f32;
+                            let aspect = if tex_h > 0.0 { tex_w / tex_h } else { 1.0 };
+                            let mut w = layer.width;
+                            let mut h = layer.height;
+                            if layer.aspect_ratio_locked {
+                                if w / h > aspect {
+                                    w = h * aspect;
+                                } else {
+                                    h = w / aspect;
+                                }
+                            }
+                            let tl = viewport.doc_to_screen((dx, dy), origin);
+                            let br = viewport.doc_to_screen((dx + w as f64, dy + h as f64), origin);
+                            let rect = egui::Rect::from_min_max(tl, br);
+                            let rot_rad = (rot as f32).to_radians();
+                            paint_rotated_image(&painter, tex.id(), rect, rot_rad, opacity);
+                        }
+                    }
+                    crate::document::LayerKind::Shading => {
+                        let page_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(self.project.document.width as f32 * self.scale, self.project.document.height as f32 * self.scale));
+                        crate::shading::draw_shading_passes(
+                            &painter,
+                            page_rect,
+                            &layer.shading_passes,
+                            time_secs,
+                            Some(render_state),
+                        );
+                    }
+                }
+            }
+
+            crate::render::draw_path_effects(
+                &painter,
+                &self.project.nodes,
+                &self.project.document.path_effects,
+                &viewport,
+                origin,
+                &fonts,
+                &image_textures,
+                &[],
+            );
+            crate::render::draw_tiling_effects(
+                &painter,
+                &self.project.nodes,
+                &self.project.document.tiling_effects,
+                &viewport,
+                origin,
+                &fonts,
+                &image_textures,
+                &[],
+            );
+            crate::render::draw_circular_effects(
+                &painter,
+                &self.project.nodes,
+                &self.project.document.circular_effects,
+                &viewport,
+                origin,
+                &fonts,
+                &image_textures,
+                &[],
+            );
+            crate::render::draw_clip_mask_effects(
+                &painter,
+                &self.project.nodes,
+                &self.project.document.clip_masks,
+                &viewport,
+                origin,
+                &fonts,
+                &image_textures,
+                &[],
+            );
+        });
+
+        let device = &render_state.device;
+        let queue = &render_state.queue;
+
+        let offscreen_renderer = self.offscreen_renderer.as_mut()?;
+
+        for (id, image_delta) in output.textures_delta.set {
+            offscreen_renderer.update_texture(device, queue, id, &image_delta);
+        }
+
+        let clipped_primitives = self.export_ctx.tessellate(output.shapes, 1.0);
+
+        let texture_desc = wgpu::TextureDescriptor {
+            label: Some("egui_export_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        };
+        let texture = device.create_texture(&texture_desc);
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [width, height],
+            pixels_per_point: 1.0,
+        };
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("egui_export_encoder"),
+        });
+
+        let command_buffers = offscreen_renderer.update_buffers(
+            device,
+            queue,
+            &mut encoder,
+            &clipped_primitives,
+            &screen_descriptor,
+        );
+        queue.submit(command_buffers);
+
+        {
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui_export_render_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &texture_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            let mut static_render_pass = render_pass.forget_lifetime();
+            offscreen_renderer.render(&mut static_render_pass, &clipped_primitives, &screen_descriptor);
+            drop(static_render_pass);
+        }
+
+        let row_bytes = width * 4;
+        let aligned_row_bytes = (row_bytes + 255) & !255;
+        let buffer_size = (aligned_row_bytes * height) as u64;
+
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("egui_export_readback_buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(aligned_row_bytes),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        queue.submit(Some(encoder.finish()));
+
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        let buffer_slice = readback_buffer.slice(..);
+        buffer_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = res_tx.send(res);
+        });
+
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+
+        if let Ok(Ok(())) = res_rx.recv() {
+            let data = buffer_slice.get_mapped_range();
+            let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+            for row in 0..height {
+                let start = (row * aligned_row_bytes) as usize;
+                let end = start + (width * 4) as usize;
+                rgba.extend_from_slice(&data[start..end]);
+            }
+            drop(data);
+            readback_buffer.unmap();
+
+            for id in output.textures_delta.free {
+                offscreen_renderer.free_texture(&id);
+            }
+
+            Some(rgba)
+        } else {
+            None
+        }
+    }
+}
+
+fn paint_rotated_image(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    rect: egui::Rect,
+    rotation_rad: f32,
+    opacity: f32,
+) {
+    let mut mesh = egui::Mesh::with_texture(texture_id);
+    let color = egui::Color32::WHITE.gamma_multiply(opacity);
+    let mut points = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    if rotation_rad != 0.0 {
+        let center = rect.center();
+        let cos = rotation_rad.cos();
+        let sin = rotation_rad.sin();
+        for pt in &mut points {
+            let d = *pt - center;
+            let rx = d.x * cos - d.y * sin;
+            let ry = d.x * sin + d.y * cos;
+            *pt = center + egui::vec2(rx, ry);
+        }
+    }
+    mesh.vertices.push(egui::epaint::Vertex { pos: points[0], uv: egui::pos2(0.0, 0.0), color });
+    mesh.vertices.push(egui::epaint::Vertex { pos: points[1], uv: egui::pos2(1.0, 0.0), color });
+    mesh.vertices.push(egui::epaint::Vertex { pos: points[2], uv: egui::pos2(1.0, 1.0), color });
+    mesh.vertices.push(egui::epaint::Vertex { pos: points[3], uv: egui::pos2(0.0, 1.0), color });
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
 }

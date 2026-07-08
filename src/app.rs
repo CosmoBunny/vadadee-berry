@@ -2627,7 +2627,7 @@ impl VadadeeBerryApp {
         }
     }
 
-    pub fn request_video_export(&mut self) {
+    pub fn request_video_export(&mut self, ctx: egui::Context) {
         #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
         {
             let ext = self.video_export.format.extension();
@@ -2636,7 +2636,7 @@ impl VadadeeBerryApp {
                 .add_filter("Video", &[ext])
                 .save_file()
             {
-                self.begin_video_export(path);
+                self.begin_video_export(path, ctx);
             }
         }
         #[cfg(any(target_arch = "wasm32", target_os = "android"))]
@@ -2645,7 +2645,7 @@ impl VadadeeBerryApp {
         }
     }
 
-    pub fn begin_video_export(&mut self, output: std::path::PathBuf) {
+    pub fn begin_video_export(&mut self, output: std::path::PathBuf, ctx: egui::Context) {
         // Refresh media caps only; do not reset user Play Duration (e.g. 10s trim).
         self.sync_stale_media_layer_durations();
         let content_max_frame = self.get_max_animation_frame();
@@ -2688,6 +2688,7 @@ impl VadadeeBerryApp {
             job,
             cancel.clone(),
             tx,
+            self.wgpu_render.clone(),
         );
 
         self.video_export.restore_anim_frame = restore;
@@ -3567,6 +3568,10 @@ impl VadadeeBerryApp {
     /// Event::Paste or Key::V reaches egui. Poll the physical hotkey as a fallback.
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
     fn handle_paste_hotkey_fallback(&mut self, ctx: &Context, events_handled_paste: bool) {
+        if !ctx.input(|i| i.focused) {
+            return;
+        }
+
         use device_query::{DeviceQuery, DeviceState, Keycode};
 
         let keys = DeviceState::new().get_keys();

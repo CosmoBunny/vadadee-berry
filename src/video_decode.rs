@@ -324,7 +324,7 @@ const AV_CH_LAYOUT_STEREO: u64 = 3;
 fn codec_ctx_ch_layout_offset(avcodec_major: u32) -> Option<usize> {
     // LP64 offsetof(AVCodecContext.ch_layout); major 60 validated on libavcodec 60.x.
     match avcodec_major {
-        60 => Some(376),
+        60 => Some(912),
         61..=62 => Some(368),
         _ => None,
     }
@@ -352,7 +352,7 @@ unsafe fn codec_ctx_channels(cc: *mut (), avcodec_major: u32) -> usize {
             let ch = (cc as *const u8).add(368 + 4).cast::<i32>().read();
             if ch > 0 { ch as usize } else { 2 }
         } else if avcodec_major == 60 {
-            let ch = (cc as *const u8).add(376 + 4).cast::<i32>().read();
+            let ch = (cc as *const u8).add(912 + 4).cast::<i32>().read();
             if ch > 0 { ch as usize } else { 2 }
         } else {
             let ch = (cc as *const u8).add(356).cast::<i32>().read();

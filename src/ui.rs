@@ -1674,7 +1674,7 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             .min_size(egui::vec2(ui.available_width() - 8.0, 28.0)),
         );
         if export_btn.clicked() {
-            app.request_video_export();
+            app.request_video_export(ui.ctx().clone());
         }
     });
 }

@@ -67,12 +67,18 @@ pub fn export_mux_with_audio(
         pcm.len() / 2,
         EXPORT_SAMPLE_RATE
     );
+
+    // If the mix came out silent, warn but still produce a valid video-only file
+    // instead of aborting the export entirely.
     if pcm.is_empty() || !pcm_has_audible_samples(&pcm) {
-        return Err(format!(
-            "Export audio failed: mixed audio is silent (peak {mix_peak}). \
-             Move the audio/video clip so it overlaps 0..{duration_secs:.2}s on the timeline, \
-             check volume, Export Renderer Layer, and media path."
-        ));
+        log::warn!(
+            "export audio: mixed PCM is silent (peak {mix_peak}) — exporting video without audio. \
+             Check that audio clips overlap 0..{duration_secs:.2}s on the timeline, \
+             volume > 0, and the layer is an AV renderer layer."
+        );
+        std::fs::copy(temp_video, output_path)
+            .map_err(|e| format!("Could not copy video to output: {e}"))?;
+        return Ok(true);
     }
 
     let temp_audio = work_dir.join("temp_export_audio.m4a");
@@ -84,7 +90,15 @@ pub fn export_mux_with_audio(
         |_| {},
     )?;
 
-    crate::video_decode::remux_video_and_audio_libav(temp_video, &temp_audio, output_path)?;
+    // If remux fails, warn and fall back to video-only rather than failing the export.
+    match crate::video_decode::remux_video_and_audio_libav(temp_video, &temp_audio, output_path) {
+        Ok(()) => {}
+        Err(e) => {
+            log::warn!("export audio: remux failed ({e}) — falling back to video without audio");
+            std::fs::copy(temp_video, output_path)
+                .map_err(|ce| format!("Could not copy video to output: {ce}"))?;
+        }
+    }
     let _ = std::fs::remove_file(&temp_audio);
     Ok(true)
 }
@@ -299,11 +313,19 @@ mod export_audio_tests {
 
     #[test]
     fn mp3_mix_and_aac_roundtrip_if_ozen_present() {
-        let path = Path::new("/home/angsudo/Downloads/OZEN.mp3");
+        // Look in project root first (checked in), fall back to Downloads.
+        let path = {
+            let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("OZEN.mp3");
+            if local.exists() {
+                local
+            } else {
+                Path::new("/home/angsudo/Downloads/OZEN.mp3").to_path_buf()
+            }
+        };
         if !path.exists() {
             return;
         }
-        let (src, sr) = load_stereo_i16_layer(path).expect("load mp3");
+        let (src, sr) = load_stereo_i16_layer(&path).expect("load mp3");
         let src_peak = src.iter().map(|s| s.abs()).max().unwrap_or(0);
         assert!(src_peak > 500, "source peak {src_peak}");
         assert!(sr > 0, "sample_rate");
@@ -315,7 +337,7 @@ mod export_audio_tests {
             play_secs: 10.02,
             volume: 1.0,
         }];
-        let pcm = mix_timeline_audio_stereo_i16(&layers, 10.02, EXPORT_SAMPLE_RATE, path)
+        let pcm = mix_timeline_audio_stereo_i16(&layers, 10.02, EXPORT_SAMPLE_RATE, &path)
             .expect("mix");
         let mix_peak = pcm.iter().map(|s| s.abs()).max().unwrap_or(0);
         assert!(mix_peak > 500, "mix peak {mix_peak}");
