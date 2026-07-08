@@ -1954,12 +1954,12 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
                             }
                         }
                     });
+                }
 
-                    if let Ok(err_lock) = pass.compile_error.lock() {
-                        if let Some(ref err) = *err_lock {
-                            ui.add_space(4.0);
-                            ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
-                        }
+                if let Ok(err_lock) = pass.compile_error.lock() {
+                    if let Some(ref err) = *err_lock {
+                        ui.add_space(4.0);
+                        ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
                     }
                 }
             });
@@ -3307,12 +3307,12 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             }
                         }
                     });
+                }
 
-                    if let Ok(err_lock) = pass.compile_error.lock() {
-                        if let Some(ref err) = *err_lock {
-                            ui.add_space(4.0);
-                            ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
-                        }
+                if let Ok(err_lock) = pass.compile_error.lock() {
+                    if let Some(ref err) = *err_lock {
+                        ui.add_space(4.0);
+                        ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
                     }
                 }
             }
