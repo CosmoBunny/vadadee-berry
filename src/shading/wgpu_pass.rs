@@ -503,7 +503,7 @@ pub fn try_draw_shading_passes_gpu(
                     }
                 }
                 Err(err_msg) => {
-                    log::warn!(
+                    log::debug!(
                         "WGSL compile failed for shading pass \"{}\"; falling back to CPU",
                         pass.name
                     );
