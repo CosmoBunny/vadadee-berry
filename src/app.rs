@@ -104,6 +104,7 @@ pub struct VadadeeBerryApp {
     pub anim_keyframing_mode: bool,
     pub anim_show_timeline_window: bool,
     pub show_video_editor_window: Option<uuid::Uuid>,
+    pub show_shader_editor_window: Option<uuid::Uuid>,
     pub piano_roll_clip: Option<uuid::Uuid>,
     pub piano_roll_t: f32,
     pub piano_tool: crate::av_ui::PianoTool,
@@ -660,6 +661,7 @@ impl VadadeeBerryApp {
             anim_keyframing_mode: false,
             anim_show_timeline_window: false,
             show_video_editor_window: None,
+            show_shader_editor_window: None,
             piano_roll_clip: None,
             piano_roll_t: 0.0,
             piano_tool: crate::av_ui::PianoTool::default(),
@@ -2556,7 +2558,7 @@ impl VadadeeBerryApp {
             }
             return Some("Click to place path points".into());
         }
-        if self.on_page_text_edit.is_some() && ctx.wants_keyboard_input() {
+        if self.on_page_text_edit.is_some() && ctx.text_edit_focused() {
             return Some("Editing text".into());
         }
         if self.tools.select.node_drag_active {
@@ -3584,17 +3586,12 @@ impl VadadeeBerryApp {
     }
 
     fn object_clipboard_blocked(&self, ctx: &Context) -> bool {
-        // Block clipboard paste/copy/cut if the application window is unfocused
-        // (so global low-level listeners like device_query don't act when user
-        // is using shortcuts in other apps), or if a text widget is focused.
-        !ctx.input(|i| i.focused) || self.on_page_text_edit.is_some() || ctx.wants_keyboard_input()
+        self.on_page_text_edit.is_some() || ctx.text_edit_focused()
     }
 
     /// Called early in chrome (right after menubar) so that state changes from
     /// keyboard C/V/X are visible in the same frame's status_bar and canvas_ui,
-    /// exactly like when the user clicks the menubar items.  The blocked check
-    /// uses the focus state at the beginning of the frame (i.e. the state when
-    /// the key event actually arrived).
+    /// exactly like when the user clicks the menubar items.
     /// Returns `true` when paste was triggered from an egui input event this frame.
     pub fn handle_object_clipboard_shortcuts(&mut self, ctx: &Context) -> bool {
         if self.object_clipboard_blocked(ctx) {
@@ -3749,10 +3746,7 @@ impl VadadeeBerryApp {
     }
 
     fn keyboard_shortcuts(&mut self, ctx: &Context) {
-        if !ctx.input(|i| i.focused) {
-            return;
-        }
-        let text_focused = ctx.wants_keyboard_input();
+        let text_focused = ctx.text_edit_focused();
         let mut bubble_keys_handled = false;
         ctx.input_mut(|i| {
             let cmd = i.modifiers.command || i.modifiers.ctrl;
@@ -12066,6 +12060,7 @@ mod tests {
                 anim_keyframing_mode: false,
                 anim_show_timeline_window: false,
                 show_video_editor_window: None,
+                show_shader_editor_window: None,
                 piano_roll_clip: None,
                 piano_roll_t: 0.0,
                 piano_tool: crate::av_ui::PianoTool::default(),
@@ -12364,9 +12359,7 @@ fn spawn_video_audio_extract(
     match map.get(video_path) {
         Some(AudioExtractStatus::Ready(pb)) if pb.exists() => return,
         Some(AudioExtractStatus::Extracting { .. }) => return,
-        Some(AudioExtractStatus::Failed) => {
-            map.remove(video_path);
-        }
+        Some(AudioExtractStatus::Failed) => return,
         _ => {}
     }
 

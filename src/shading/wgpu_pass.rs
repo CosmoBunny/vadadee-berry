@@ -108,6 +108,8 @@ fn compile_pipeline(
     wgsl: &str,
     compose: bool,
 ) -> Result<CompiledShadingPipeline, String> {
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+
     let module_src = assemble_module(wgsl);
     let module = device
         .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -202,6 +204,14 @@ fn compile_pipeline(
         multiview_mask: None,
         cache: None,
     });
+
+    if let Some(err) = pollster::block_on(scope.pop()) {
+        return Err(match err {
+            wgpu::Error::Validation { description, .. } => description,
+            wgpu::Error::OutOfMemory { .. } => "Out of memory".to_string(),
+            wgpu::Error::Internal { description, .. } => description,
+        });
+    }
 
     Ok(CompiledShadingPipeline {
         compose,
@@ -449,6 +459,12 @@ impl ShadingRenderer {
     }
 }
 
+pub fn is_cpu_only_pass(pass: &ShadingPass) -> bool {
+    let name = pass.name.to_ascii_lowercase();
+    let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl);
+    name == "starfield" || wgsl.contains("// Starfield — rendered via CPU starfield path.")
+}
+
 pub fn try_draw_shading_passes_gpu(
     painter: &Painter,
     page_rect: Rect,
@@ -457,24 +473,46 @@ pub fn try_draw_shading_passes_gpu(
     render_state: &RenderState,
 ) -> bool {
     let aspect = (page_rect.width() / page_rect.height().max(1.0)).max(0.25);
-    let mut any = false;
-    for pass in passes.iter().filter(|p| p.enabled) {
-        let wgsl = pass.wgsl.trim();
-        if wgsl.is_empty() {
-            continue;
+    if let Some(pass) = passes.first().filter(|p| p.enabled) {
+        if is_cpu_only_pass(pass) {
+            return false;
         }
+        let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl).trim();
+        if wgsl.is_empty() {
+            return false;
+        }
+
+        // Check if there is a cached compile error
+        {
+            if let Ok(err_lock) = pass.compile_error.lock() {
+                if err_lock.is_some() {
+                    return false;
+                }
+            }
+        }
+
         let device = &render_state.device;
         {
             let mut renderer = render_state.renderer.write();
             let Some(gpu) = renderer.callback_resources.get_mut::<ShadingGpuResources>() else {
                 return false;
             };
-            if gpu.pipeline(device, wgsl).is_err() {
-                log::warn!(
-                    "WGSL compile failed for shading pass \"{}\"; falling back to CPU",
-                    pass.name
-                );
-                return false;
+            match gpu.pipeline(device, wgsl) {
+                Ok(_) => {
+                    if let Ok(mut err_lock) = pass.compile_error.lock() {
+                        *err_lock = None;
+                    }
+                }
+                Err(err_msg) => {
+                    log::warn!(
+                        "WGSL compile failed for shading pass \"{}\"; falling back to CPU",
+                        pass.name
+                    );
+                    if let Ok(mut err_lock) = pass.compile_error.lock() {
+                        *err_lock = Some(err_msg);
+                    }
+                    return false;
+                }
             }
         }
         let uniforms = uniform_floats(pass, time_secs, aspect);
@@ -486,14 +524,19 @@ pub fn try_draw_shading_passes_gpu(
             },
         );
         painter.add(Shape::Callback(callback));
-        any = true;
+        true
+    } else {
+        false
     }
-    any
 }
 
 pub fn shading_passes_need_input(passes: &[ShadingPass]) -> bool {
     passes
-        .iter()
+        .first()
         .filter(|p| p.enabled)
-        .any(|p| wgsl_needs_compose(&p.wgsl))
+        .map(|p| {
+            let wgsl = p.compiled_wgsl.as_ref().unwrap_or(&p.wgsl);
+            wgsl_needs_compose(wgsl)
+        })
+        .unwrap_or(false)
 }

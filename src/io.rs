@@ -1061,10 +1061,11 @@ fn apply_shading_passes_skia(
     passes: &[crate::document::ShadingPass],
     time_secs: f32,
 ) {
-    for pass in passes.iter().filter(|p| p.enabled) {
+    if let Some(pass) = passes.first().filter(|p| p.enabled) {
         let name = pass.name.to_ascii_lowercase();
-        let is_blackhole = name.contains("blackhole") || pass.wgsl.contains("blackhole");
-        let is_starfield = name.contains("star") || name.contains("space") || pass.wgsl.contains("starfield") || pass.wgsl.contains("star");
+        let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl);
+        let is_blackhole = name.contains("blackhole") || wgsl.contains("blackhole");
+        let is_starfield = name.contains("star") || name.contains("space") || wgsl.contains("starfield") || wgsl.contains("star");
         
         if is_starfield {
             let w = pixmap.width();
@@ -1138,7 +1139,7 @@ fn apply_shading_passes_skia(
                     }
                 }
             }
-        } else if name.contains("crt") || pass.wgsl.contains("scan") {
+        } else if name.contains("crt") || wgsl.contains("scan") {
             let w = pixmap.width() as usize;
             let h = pixmap.height() as usize;
             let data = pixmap.data_mut();

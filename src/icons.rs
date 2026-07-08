@@ -19,6 +19,11 @@ pub const PATH_MAGIC: &str = "󱡄";
 pub const TEXT: &str = "󱄽";
 pub const BORDER_RADIUS: &str = "󰝊";
 pub const ORIGIN: &str = "";
+pub const IMAGE: &str = "󰥶";
+pub const FLOWCHART: &str = "";
+pub const EDIT: &str = "󰏫";
+pub const ROBOT: &str = "󰚩";
+pub const FIRE: &str = "";
 
 pub const POLY_TRI: &str = "󰔷";
 pub const POLY_QUAD: &str = "";

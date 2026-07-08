@@ -28,16 +28,17 @@ fn draw_shading_passes_cpu(
     passes: &[ShadingPass],
     time_secs: f32,
 ) {
-    for pass in passes.iter().filter(|p| p.enabled) {
+    if let Some(pass) = passes.first().filter(|p| p.enabled) {
         let name = pass.name.to_ascii_lowercase();
-        let is_blackhole = name.contains("blackhole") || pass.wgsl.contains("blackhole");
-        let is_starfield = name.contains("star") || name.contains("space") || pass.wgsl.contains("starfield") || pass.wgsl.contains("star");
+        let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl);
+        let is_blackhole = name.contains("blackhole") || wgsl.contains("blackhole") || wgsl.contains("black hole");
+        let is_starfield = name == "starfield" || wgsl.contains("// Starfield — rendered via CPU starfield path.");
         
         if is_blackhole {
             draw_blackhole_shader(painter, page_rect, time_secs, pass);
         } else if is_starfield {
             draw_starfield_shader(painter, page_rect, time_secs, pass);
-        } else if name.contains("crt") || pass.wgsl.contains("scan") {
+        } else if name.contains("crt") || wgsl.contains("scan") {
             draw_crt(painter, page_rect);
         } else if name.contains("vignette") {
             draw_vignette(painter, page_rect, 0.65);

@@ -161,6 +161,7 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     app.ui_anim.advance_left_dock_slide(ui.ctx());
     app.ui_anim.tick(ui.ctx());
     video_export_progress_window(app, ui.ctx());
+    shader_editor_window(app, ui.ctx());
     status_bar_layout_reserve(ui);
 
     let canvas_alpha = app.ui_anim.canvas_alpha();
@@ -1711,7 +1712,8 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
                 ui.group(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new("🤖 System Status & Dialogue:")
+                            RichText::new(format!("{} System Status & Dialogue:", icons::ROBOT))
+                                .font(nerd_font_id(13.0))
                                 .color(colors::TEXT)
                                 .strong()
                         );
@@ -1729,7 +1731,8 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
                 ui.group(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new("🔥 System Suffering Monitor:")
+                            RichText::new(format!("{} System Suffering Monitor:", icons::FIRE))
+                                .font(nerd_font_id(13.0))
                                 .color(colors::TEXT)
                                 .strong()
                         );
@@ -1814,6 +1817,147 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
                 });
             });
         });
+}
+
+fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
+    let Some(layer_id) = app.show_shader_editor_window else {
+        return;
+    };
+    
+    // Find the layer
+    let mut open = true;
+    let mut title = "Shader Editor".to_string();
+    let mut current_pass = None;
+    
+    if let Some(l) = app.project.document.layers.iter_mut().find(|layer| layer.id == layer_id) {
+        if l.kind == crate::document::LayerKind::Shading {
+            if l.shading_passes.is_empty() {
+                l.shading_passes.push(crate::document::ShadingPass::vignette_preset());
+            }
+            title = format!("Shader Editor - {}", l.name);
+            current_pass = Some(&mut l.shading_passes[0]);
+        }
+    }
+    
+    if current_pass.is_none() {
+        app.show_shader_editor_window = None;
+        return;
+    }
+    
+    let pass = current_pass.unwrap();
+    
+    egui::Window::new(title)
+        .id(egui::Id::new("shader_editor_window_floating"))
+        .open(&mut open)
+        .default_size(egui::vec2(500.0, 400.0))
+        .show(ctx, |ui| {
+            ui.vertical(|ui| {
+                // Preset & enabled dropdown
+                let mut current_preset_name = match pass.name.as_str() {
+                    "Vignette" => "Vignette",
+                    "CRT" => "CRT",
+                    "Blackhole" => "Blackhole",
+                    "Starfield" => "Starfield",
+                    _ => "Custom",
+                };
+                
+                let preset_options = ["Vignette", "CRT", "Blackhole", "Starfield", "Custom"];
+                let mut new_preset = None;
+
+                ui.horizontal(|ui| {
+                    ui.label("Preset:");
+                    egui::ComboBox::from_id_salt("shading_preset_combo_float")
+                        .selected_text(current_preset_name)
+                        .show_ui(ui, |ui| {
+                            for opt in &preset_options {
+                                if ui.selectable_value(&mut current_preset_name, *opt, *opt).clicked() {
+                                    new_preset = Some(*opt);
+                                }
+                            }
+                        });
+                        
+                    ui.checkbox(&mut pass.enabled, "Enabled");
+                });
+
+                if let Some(opt) = new_preset {
+                    match opt {
+                        "Vignette" => {
+                            *pass = crate::document::ShadingPass::vignette_preset();
+                        }
+                        "CRT" => {
+                            *pass = crate::document::ShadingPass::crt_preset();
+                        }
+                        "Blackhole" => {
+                            *pass = crate::document::ShadingPass::blackhole_preset();
+                        }
+                        "Starfield" => {
+                            *pass = crate::document::ShadingPass::starfield_preset();
+                        }
+                        _ => {
+                            pass.name = "Custom".to_string();
+                        }
+                    }
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Reload mode:");
+                    let before_hot = pass.hot_reload;
+                    ui.radio_value(&mut pass.hot_reload, true, "Hot");
+                    ui.radio_value(&mut pass.hot_reload, false, "Press");
+                    if pass.hot_reload && !before_hot {
+                        pass.compiled_wgsl = Some(pass.wgsl.clone());
+                        if let Ok(mut err_lock) = pass.compile_error.lock() {
+                            *err_lock = None;
+                        }
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.label(RichText::new("WGSL source code:").weak());
+                
+                let text_edit_response = ui.add(
+                    egui::TextEdit::multiline(&mut pass.wgsl)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(15)
+                        .font(egui::TextStyle::Monospace),
+                );
+
+                if text_edit_response.changed() {
+                    if pass.name != "Custom" {
+                        pass.name = "Custom".to_string();
+                    }
+                    if pass.hot_reload {
+                        pass.compiled_wgsl = Some(pass.wgsl.clone());
+                        if let Ok(mut err_lock) = pass.compile_error.lock() {
+                            *err_lock = None;
+                        }
+                    }
+                }
+
+                if !pass.hot_reload {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Compile / Reload").clicked() {
+                            pass.compiled_wgsl = Some(pass.wgsl.clone());
+                            if let Ok(mut err_lock) = pass.compile_error.lock() {
+                                *err_lock = None;
+                            }
+                        }
+                    });
+
+                    if let Ok(err_lock) = pass.compile_error.lock() {
+                        if let Some(ref err) = *err_lock {
+                            ui.add_space(4.0);
+                            ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                        }
+                    }
+                }
+            });
+        });
+        
+    if !open {
+        app.show_shader_editor_window = None;
+    }
 }
 
 
@@ -2921,7 +3065,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             app.add_shading_layer(&format!("Shading {n}"));
             ui.close();
         }
-        if ui.button("⎈ Flowchart Layer").clicked() {
+        if ui.button(RichText::new(format!("{} Flowchart Layer", icons::FLOWCHART)).font(nerd_font_id(12.0))).clicked() {
             let n = app.project.document.layers.len() + 1;
             app.add_flowchart_layer(&format!("Flowchart {n}"));
             ui.close();
@@ -2966,9 +3110,9 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             let mut edit_name = name;
             let icon = match kind {
                 crate::document::LayerKind::AV => icons::VIDEO,
-                crate::document::LayerKind::Image => "🖼",
+                crate::document::LayerKind::Image => icons::IMAGE,
                 crate::document::LayerKind::Shading => icons::SHADING,
-                crate::document::LayerKind::Flowchart => "⎈",
+                crate::document::LayerKind::Flowchart => icons::FLOWCHART,
             };
             ui.label(RichText::new(icon).font(nerd_font_id(13.0)));
             let name_w = (ui.available_width() - 28.0).max(48.0);
@@ -3018,60 +3162,139 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             ui.horizontal(|ui| {
                 ui.label("Type:");
                 let current_label = match l.kind {
-                    crate::document::LayerKind::Image => "🖼 Image".to_owned(),
+                    crate::document::LayerKind::Image => format!("{} Image", icons::IMAGE),
                     crate::document::LayerKind::AV => format!("{} AV", icons::VIDEO),
                     crate::document::LayerKind::Shading => format!("{} Shading", icons::SHADING),
-                    crate::document::LayerKind::Flowchart => "⎈ Flowchart".into(),
+                    crate::document::LayerKind::Flowchart => format!("{} Flowchart", icons::FLOWCHART),
                 };
                 egui::ComboBox::from_id_salt("layer_kind_combo")
                     .selected_text(RichText::new(current_label).font(nerd_font_id(12.0)))
                     .width(100.0)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut l.kind, crate::document::LayerKind::Image, RichText::new("🖼 Image").font(nerd_font_id(12.0)));
+                        ui.selectable_value(&mut l.kind, crate::document::LayerKind::Image, RichText::new(format!("{} Image", icons::IMAGE)).font(nerd_font_id(12.0)));
                         ui.selectable_value(&mut l.kind, crate::document::LayerKind::AV, RichText::new(format!("{} AV Layer", icons::VIDEO)).font(nerd_font_id(12.0)));
                         ui.selectable_value(&mut l.kind, crate::document::LayerKind::Shading, RichText::new(format!("{} Shading", icons::SHADING)).font(nerd_font_id(12.0)));
-                        ui.selectable_value(&mut l.kind, crate::document::LayerKind::Flowchart, RichText::new("⎈ Flowchart").font(nerd_font_id(12.0)));
+                        ui.selectable_value(&mut l.kind, crate::document::LayerKind::Flowchart, RichText::new(format!("{} Flowchart", icons::FLOWCHART)).font(nerd_font_id(12.0)));
                     });
             });
 
             if l.kind == crate::document::LayerKind::Shading {
-                ui.label(RichText::new("WGSL shading passes").weak());
+                if l.shading_passes.is_empty() {
+                    l.shading_passes.push(crate::document::ShadingPass::vignette_preset());
+                }
+
+                // Clean up any extra passes so we only have one active shading pass
+                if l.shading_passes.len() > 1 {
+                    l.shading_passes.truncate(1);
+                }
+
+                let pass = &mut l.shading_passes[0];
+
+                let mut current_preset_name = match pass.name.as_str() {
+                    "Vignette" => "Vignette",
+                    "CRT" => "CRT",
+                    "Blackhole" => "Blackhole",
+                    "Starfield" => "Starfield",
+                    _ => "Custom",
+                };
+
+                let preset_options = ["Vignette", "CRT", "Blackhole", "Starfield", "Custom"];
+                let mut new_preset = None;
+
                 ui.horizontal(|ui| {
-                    if ui.button("Vignette").clicked() {
-                        l.shading_passes.push(crate::document::ShadingPass::vignette_preset());
-                    }
-                    if ui.button("CRT").clicked() {
-                        l.shading_passes.push(crate::document::ShadingPass::crt_preset());
-                    }
-                    if ui.button("Blackhole").clicked() {
-                        l.shading_passes.push(crate::document::ShadingPass::blackhole_preset());
-                    }
-                    if ui.button("Starfield").clicked() {
-                        l.shading_passes.push(crate::document::ShadingPass::starfield_preset());
-                    }
-                });
-                if !l.shading_passes.is_empty() {
-                    app.ui_shading_pass_sel = app.ui_shading_pass_sel.min(l.shading_passes.len() - 1);
-                    let names: Vec<String> = l.shading_passes.iter().map(|p| p.name.clone()).collect();
-                    egui::ComboBox::from_id_salt("shading_pass_sel")
-                        .selected_text(&names[app.ui_shading_pass_sel])
+                    ui.label("Preset:");
+                    egui::ComboBox::from_id_salt("shading_preset_combo")
+                        .selected_text(current_preset_name)
+                        .width(ui.available_width().min(200.0).max(100.0))
                         .show_ui(ui, |ui| {
-                            for (i, n) in names.iter().enumerate() {
-                                ui.selectable_value(&mut app.ui_shading_pass_sel, i, n);
+                            for opt in &preset_options {
+                                if ui.selectable_value(&mut current_preset_name, *opt, *opt).clicked() {
+                                    new_preset = Some(*opt);
+                                }
                             }
                         });
-                    if let Some(pass) = l.shading_passes.get_mut(app.ui_shading_pass_sel) {
-                        ui.checkbox(&mut pass.enabled, "Enabled");
-                        ui.label(RichText::new("WGSL source").small().weak());
-                        ui.add(
-                            egui::TextEdit::multiline(&mut pass.wgsl)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(8)
-                                .font(egui::TextStyle::Monospace),
-                        );
+                });
+
+                if let Some(opt) = new_preset {
+                    match opt {
+                        "Vignette" => {
+                            *pass = crate::document::ShadingPass::vignette_preset();
+                        }
+                        "CRT" => {
+                            *pass = crate::document::ShadingPass::crt_preset();
+                        }
+                        "Blackhole" => {
+                            *pass = crate::document::ShadingPass::blackhole_preset();
+                        }
+                        "Starfield" => {
+                            *pass = crate::document::ShadingPass::starfield_preset();
+                        }
+                        _ => {
+                            pass.name = "Custom".to_string();
+                        }
                     }
                 }
-                ui.label(format!("{} pass(es)", l.shading_passes.len()));
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut pass.enabled, "Enabled");
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Reload mode:");
+                    let before_hot = pass.hot_reload;
+                    ui.radio_value(&mut pass.hot_reload, true, "Hot");
+                    ui.radio_value(&mut pass.hot_reload, false, "Press");
+                    if pass.hot_reload && !before_hot {
+                        pass.compiled_wgsl = Some(pass.wgsl.clone());
+                        if let Ok(mut err_lock) = pass.compile_error.lock() {
+                            *err_lock = None;
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("WGSL source").small().weak());
+                    if ui.button(RichText::new(format!("{} Edit in window", icons::EDIT)).font(nerd_font_id(12.0))).clicked() {
+                        app.show_shader_editor_window = Some(l.id);
+                    }
+                });
+                let text_edit_response = ui.add(
+                    egui::TextEdit::multiline(&mut pass.wgsl)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(8)
+                        .font(egui::TextStyle::Monospace),
+                );
+
+                if text_edit_response.changed() {
+                    if pass.name != "Custom" {
+                        pass.name = "Custom".to_string();
+                    }
+                    if pass.hot_reload {
+                        pass.compiled_wgsl = Some(pass.wgsl.clone());
+                        if let Ok(mut err_lock) = pass.compile_error.lock() {
+                            *err_lock = None;
+                        }
+                    }
+                }
+
+                if !pass.hot_reload {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Compile / Reload").clicked() {
+                            pass.compiled_wgsl = Some(pass.wgsl.clone());
+                            if let Ok(mut err_lock) = pass.compile_error.lock() {
+                                *err_lock = None;
+                            }
+                        }
+                    });
+
+                    if let Ok(err_lock) = pass.compile_error.lock() {
+                        if let Some(ref err) = *err_lock {
+                            ui.add_space(4.0);
+                            ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                        }
+                    }
+                }
             }
 
             if l.kind == crate::document::LayerKind::AV {
@@ -3179,7 +3402,7 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 ui.label(RichText::new(format!("{} Shading passes (WGSL)", icons::SHADING)).font(nerd_font_id(12.0)));
             }
             crate::document::LayerKind::Flowchart => {
-                ui.label(RichText::new("⎈ Flowchart").font(nerd_font_id(12.0)));
+                ui.label(RichText::new(format!("{} Flowchart", icons::FLOWCHART)).font(nerd_font_id(12.0)));
             }
             crate::document::LayerKind::AV => {
                 ui.label(RichText::new(format!("{} {}", icons::VIDEO, truncate_name(&layer_name))).small().weak());

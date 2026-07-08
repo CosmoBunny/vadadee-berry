@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -9,7 +10,7 @@ pub enum ShadingStack {
     OnTop,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ShadingPass {
     pub id: Uuid,
     pub name: String,
@@ -21,9 +22,40 @@ pub struct ShadingPass {
     pub stack: ShadingStack,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    #[serde(skip, default = "default_compile_error")]
+    pub compile_error: Arc<Mutex<Option<String>>>,
+    #[serde(default = "default_hot_reload")]
+    pub hot_reload: bool,
+    #[serde(skip)]
+    pub compiled_wgsl: Option<String>,
+}
+
+impl Clone for ShadingPass {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            name: self.name.clone(),
+            wgsl: self.wgsl.clone(),
+            uniforms: self.uniforms.clone(),
+            stack: self.stack,
+            enabled: self.enabled,
+            compile_error: Arc::new(Mutex::new(self.compile_error.lock().unwrap().clone())),
+            hot_reload: self.hot_reload,
+            compiled_wgsl: self.compiled_wgsl.clone(),
+        }
+    }
 }
 
 fn default_enabled() -> bool {
+    true
+}
+
+fn default_compile_error() -> Arc<Mutex<Option<String>>> {
+    Arc::new(Mutex::new(None))
+}
+
+fn default_hot_reload() -> bool {
     true
 }
 
@@ -36,6 +68,9 @@ impl ShadingPass {
             uniforms: Vec::new(),
             stack: ShadingStack::OnTop,
             enabled: true,
+            compile_error: Arc::new(Mutex::new(None)),
+            hot_reload: true,
+            compiled_wgsl: None,
         }
     }
 

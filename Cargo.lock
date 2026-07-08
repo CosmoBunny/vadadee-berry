@@ -5082,6 +5082,7 @@ dependencies = [
  "libloading",
  "log",
  "lyon",
+ "pollster",
  "rand 0.8.6",
  "rayon",
  "resvg",

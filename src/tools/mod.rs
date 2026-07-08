@@ -352,10 +352,7 @@ impl SelectSession {
 
 impl ToolState {
     pub fn handle_shortcuts(&mut self, ui: &Ui) {
-        if !ui.ctx().input(|i| i.focused) {
-            return;
-        }
-        if ui.ctx().wants_keyboard_input() {
+        if ui.ctx().text_edit_focused() {
             return;
         }
         if ui.input(|i| i.modifiers.command_only()) {

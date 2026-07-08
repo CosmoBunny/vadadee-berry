@@ -32,6 +32,7 @@ desktop = []
 eframe = { version = "0.34.3", default-features = false, features = ["default_fonts", "wgpu", "persistence", "wgpu_no_default_features"] }
 egui = "0.34.3"
 egui-wgpu = "0.34.3"
+pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
 egui_extras = { version = "0.34.3", features = ["svg"] }
 wgpu = "29.0.1"
