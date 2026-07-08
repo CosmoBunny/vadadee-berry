@@ -3588,10 +3588,42 @@ impl VadadeeBerryApp {
     fn object_clipboard_blocked(&self, ctx: &Context) -> bool {
         self.on_page_text_edit.is_some()
             || ctx.text_edit_focused()
-            || ctx.memory(|mem| {
-                mem.has_focus(egui::Id::new("shader_editor_text"))
-                    || mem.has_focus(egui::Id::new("sidebar_shader_editor_text"))
-            })
+            || (self.show_shader_editor_window.is_some() && ctx.memory(|mem| mem.has_focus(egui::Id::new("shader_editor_text"))))
+            || ctx.memory(|mem| mem.has_focus(egui::Id::new("sidebar_shader_editor_text")))
+    }
+
+    fn handle_text_paste_fallback(&mut self, ctx: &Context) {
+        if !self.object_clipboard_blocked(ctx) {
+            return;
+        }
+
+        ctx.input_mut(|i| {
+            let has_cmd = i.modifiers.command || i.modifiers.ctrl;
+            let already_has_paste = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
+            if already_has_paste {
+                return;
+            }
+
+            let mut paste_pressed = false;
+            for event in &i.events {
+                if let egui::Event::Key { key: egui::Key::V, pressed: true, .. } = event {
+                    if has_cmd {
+                        paste_pressed = true;
+                        break;
+                    }
+                }
+            }
+
+            if paste_pressed {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    if let Ok(text) = cb.get_text() {
+                        i.events.push(egui::Event::Paste(text));
+                        let _ = i.consume_key(egui::Modifiers::COMMAND, egui::Key::V);
+                        let _ = i.consume_key(egui::Modifiers::CTRL, egui::Key::V);
+                    }
+                }
+            }
+        });
     }
 
     /// Called early in chrome (right after menubar) so that state changes from
@@ -11858,6 +11890,8 @@ impl eframe::App for VadadeeBerryApp {
         let paste_from_events = self.handle_object_clipboard_shortcuts(ctx);
         #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
         self.handle_paste_hotkey_fallback(ctx, paste_from_events);
+        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+        self.handle_text_paste_fallback(ctx);
         if self.ui_anim.needs_repaint() || self.paste_progress.is_some() {
             ctx.request_repaint();
         }
