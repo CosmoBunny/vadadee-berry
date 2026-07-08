@@ -361,41 +361,56 @@ mod export_audio_tests {
         }
         assert!(dec_peak > 500, "decoded aac peak {dec_peak}");
 
-        let video_only = std::env::temp_dir().join(format!("vadadee_vonly_{}.mp4", std::process::id()));
-        std::process::Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-v",
-                "error",
-                "-i",
-                "/home/angsudo/project/vadadee-berry/animation.mp4",
-                "-an",
-                "-c:v",
-                "copy",
-                video_only.to_str().unwrap(),
-            ])
-            .status()
-            .expect("video only");
-        let remuxed = std::env::temp_dir().join(format!("vadadee_remux_{}.mp4", std::process::id()));
-        crate::video_decode::remux_video_and_audio_libav(&video_only, &out, &remuxed)
-            .expect("remux");
-        let remux_wav = std::env::temp_dir().join(format!("vadadee_remux_{}.wav", std::process::id()));
-        std::process::Command::new("ffmpeg")
-            .args(["-y", "-v", "error", "-i", remuxed.to_str().unwrap(), "-map", "0:a:0", "-f", "wav", remux_wav.to_str().unwrap()])
-            .status()
-            .expect("decode remux");
-        let bytes = std::fs::read(&remux_wav).expect("remux wav");
-        let mut remux_peak = 0i16;
-        for chunk in bytes[44..].chunks_exact(2) {
-            let s = i16::from_le_bytes([chunk[0], chunk[1]]);
-            remux_peak = remux_peak.max((s as i32).abs() as i16);
+        let anim_file = Path::new("/home/angsudo/project/vadadee-berry/animation.mp4");
+        let manifest_anim = Path::new(env!("CARGO_MANIFEST_DIR")).join("animation.mp4");
+        let anim_path = if anim_file.exists() {
+            Some(anim_file)
+        } else if manifest_anim.exists() {
+            Some(manifest_anim.as_path())
+        } else {
+            None
+        };
+
+        if let Some(ap) = anim_path {
+            let video_only = std::env::temp_dir().join(format!("vadadee_vonly_{}.mp4", std::process::id()));
+            std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    ap.to_str().unwrap(),
+                    "-an",
+                    "-c:v",
+                    "copy",
+                    video_only.to_str().unwrap(),
+                ])
+                .status()
+                .expect("video only");
+            let remuxed = std::env::temp_dir().join(format!("vadadee_remux_{}.mp4", std::process::id()));
+            crate::video_decode::remux_video_and_audio_libav(&video_only, &out, &remuxed)
+                .expect("remux");
+            let remux_wav = std::env::temp_dir().join(format!("vadadee_remux_{}.wav", std::process::id()));
+            std::process::Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-i", remuxed.to_str().unwrap(), "-map", "0:a:0", "-f", "wav", remux_wav.to_str().unwrap()])
+                .status()
+                .expect("decode remux");
+            let bytes = std::fs::read(&remux_wav).expect("remux wav");
+            let mut remux_peak = 0i16;
+            for chunk in bytes[44..].chunks_exact(2) {
+                let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                remux_peak = remux_peak.max((s as i32).abs() as i16);
+            }
+            assert!(remux_peak > 500, "remuxed audio peak {remux_peak}");
+
+            let _ = std::fs::remove_file(video_only);
+            let _ = std::fs::remove_file(remuxed);
+            let _ = std::fs::remove_file(remux_wav);
+        } else {
+            println!("Skipping audio remux smoke test because animation.mp4 is not present.");
         }
-        assert!(remux_peak > 500, "remuxed audio peak {remux_peak}");
 
         let _ = std::fs::remove_file(out);
         let _ = std::fs::remove_file(wav);
-        let _ = std::fs::remove_file(video_only);
-        let _ = std::fs::remove_file(remuxed);
-        let _ = std::fs::remove_file(remux_wav);
     }
 }
