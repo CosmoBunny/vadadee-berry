@@ -1915,21 +1915,30 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
                 ui.add_space(4.0);
                 ui.label(RichText::new("WGSL source code:").weak());
                 
-                let text_edit_response = ui.add(
-                    egui::TextEdit::multiline(&mut pass.wgsl)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(15)
-                        .font(egui::TextStyle::Monospace),
-                );
+                let mut text_edit_response = None;
+                egui::ScrollArea::both()
+                    .id_salt("shader_editor_scroll")
+                    .max_height(ui.available_height() - 60.0)
+                    .show(ui, |ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(&mut pass.wgsl)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(15)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        text_edit_response = Some(resp);
+                    });
 
-                if text_edit_response.changed() {
-                    if pass.name != "Custom" {
-                        pass.name = "Custom".to_string();
-                    }
-                    if pass.hot_reload {
-                        pass.compiled_wgsl = Some(pass.wgsl.clone());
-                        if let Ok(mut err_lock) = pass.compile_error.lock() {
-                            *err_lock = None;
+                if let Some(resp) = text_edit_response {
+                    if resp.changed() {
+                        if pass.name != "Custom" {
+                            pass.name = "Custom".to_string();
+                        }
+                        if pass.hot_reload {
+                            pass.compiled_wgsl = Some(pass.wgsl.clone());
+                            if let Ok(mut err_lock) = pass.compile_error.lock() {
+                                *err_lock = None;
+                            }
                         }
                     }
                 }
