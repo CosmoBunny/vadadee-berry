@@ -1922,6 +1922,7 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
                     .show(ui, |ui| {
                         let resp = ui.add(
                             egui::TextEdit::multiline(&mut pass.wgsl)
+                                .id(egui::Id::new("shader_editor_text"))
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(15)
                                 .font(egui::TextStyle::Monospace),
@@ -3269,6 +3270,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 });
                 let text_edit_response = ui.add(
                     egui::TextEdit::multiline(&mut pass.wgsl)
+                        .id(egui::Id::new("sidebar_shader_editor_text"))
                         .desired_width(f32::INFINITY)
                         .desired_rows(8)
                         .font(egui::TextStyle::Monospace),

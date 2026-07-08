@@ -3586,7 +3586,12 @@ impl VadadeeBerryApp {
     }
 
     fn object_clipboard_blocked(&self, ctx: &Context) -> bool {
-        self.on_page_text_edit.is_some() || ctx.text_edit_focused()
+        self.on_page_text_edit.is_some()
+            || ctx.text_edit_focused()
+            || ctx.memory(|mem| {
+                mem.has_focus(egui::Id::new("shader_editor_text"))
+                    || mem.has_focus(egui::Id::new("sidebar_shader_editor_text"))
+            })
     }
 
     /// Called early in chrome (right after menubar) so that state changes from
