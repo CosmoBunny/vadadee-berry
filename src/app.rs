@@ -3591,7 +3591,7 @@ impl VadadeeBerryApp {
     /// the key event actually arrived).
     /// Returns `true` when paste was triggered from an egui input event this frame.
     pub fn handle_object_clipboard_shortcuts(&mut self, ctx: &Context) -> bool {
-        if self.object_clipboard_blocked(ctx) || !self.canvas_has_active_focus() {
+        if self.object_clipboard_blocked(ctx) {
             return false;
         }
 

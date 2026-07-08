@@ -142,7 +142,7 @@ fn pcm_has_audible_samples(pcm: &[i16]) -> bool {
 }
 
 fn pcm_peak(pcm: &[i16]) -> i16 {
-    pcm.iter().map(|s| s.abs()).max().unwrap_or(0)
+    pcm.iter().map(|&s| (s as i32).abs() as i16).max().unwrap_or(0)
 }
 
 fn layer_overlaps_export(layer: &ExportAudioLayer, export_secs: f32) -> bool {
@@ -326,7 +326,7 @@ mod export_audio_tests {
             return;
         }
         let (src, sr) = load_stereo_i16_layer(&path).expect("load mp3");
-        let src_peak = src.iter().map(|s| s.abs()).max().unwrap_or(0);
+        let src_peak = src.iter().map(|&s| (s as i32).abs() as i16).max().unwrap_or(0);
         assert!(src_peak > 500, "source peak {src_peak}");
         assert!(sr > 0, "sample_rate");
 
@@ -339,7 +339,7 @@ mod export_audio_tests {
         }];
         let pcm = mix_timeline_audio_stereo_i16(&layers, 10.02, EXPORT_SAMPLE_RATE, &path)
             .expect("mix");
-        let mix_peak = pcm.iter().map(|s| s.abs()).max().unwrap_or(0);
+        let mix_peak = pcm.iter().map(|&s| (s as i32).abs() as i16).max().unwrap_or(0);
         assert!(mix_peak > 500, "mix peak {mix_peak}");
 
         if !crate::video_decode::is_libav_available() {
@@ -357,7 +357,7 @@ mod export_audio_tests {
         let mut dec_peak = 0i16;
         for chunk in bytes[44..].chunks_exact(2) {
             let s = i16::from_le_bytes([chunk[0], chunk[1]]);
-            dec_peak = dec_peak.max(s.abs());
+            dec_peak = dec_peak.max((s as i32).abs() as i16);
         }
         assert!(dec_peak > 500, "decoded aac peak {dec_peak}");
 
@@ -388,7 +388,7 @@ mod export_audio_tests {
         let mut remux_peak = 0i16;
         for chunk in bytes[44..].chunks_exact(2) {
             let s = i16::from_le_bytes([chunk[0], chunk[1]]);
-            remux_peak = remux_peak.max(s.abs());
+            remux_peak = remux_peak.max((s as i32).abs() as i16);
         }
         assert!(remux_peak > 500, "remuxed audio peak {remux_peak}");
 
