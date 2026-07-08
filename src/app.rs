@@ -12266,6 +12266,7 @@ mod tests {
                 cached_draw_order: Vec::new(),
                 cached_draw_order_revision: u64::MAX,
                 audio_output_warned: false,
+                canvas_focused: false,
             }
         }
     }
