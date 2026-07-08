@@ -185,14 +185,20 @@ pub struct JokeRule {
 
 /// Parse a joke file.
 ///
-/// Condition header format (all case-insensitive):
-///   `[CONDITION]`           — applies on all platforms
-///   `[MOBILE CONDITION]`    — applies only on Android
-///   `[DESKTOP CONDITION]`   — applies only on desktop
+/// Condition header format (all case-insensitive, Rust-like range bounds):
+///   `[CPU 80..]`            — CPU usage >= 80
+///   `[CPU ..2]`             — CPU usage < 2
+///   `[CPU_TEMP 80..]`       — CPU temp >= 80
+///   `[SEC_PER_FRAME 0.1..=1]` — sec per frame in [0.1, 1] (roughly 1..=10 fps)
+///   `[RAM 4..16]`           — RAM in [4, 16)
+///   `[DEFAULT]`             — always matches (fallback)
+///   `[MOBILE CPU 80..]`     — only on Android
+///   `[DESKTOP CPU 80..]`    — only on desktop
 ///
 /// Each non-empty body line under a header is a **separate joke** that can be
-/// chosen independently at random — stack as many lines as you like under one
-/// condition and the engine will pick one at random each time.
+/// chosen independently. The engine cycles through matching conditions in a
+/// defined order (CPU, RAM, SEC_PER_FRAME, CPU_TEMP, DEFAULT...) then picks
+/// within the group.
 ///
 /// An empty body (no lines) means "stay silent" when the condition matches.
 /// Lines starting with `#` are treated as comments and ignored.
@@ -264,18 +270,20 @@ pub fn parse_jokes(content: &str) -> Vec<JokeRule> {
 }
 
 pub fn evaluate_condition(cond: &str, cpu_usage: f32, ram_sys_used_gb: f32, sec_per_frame: f32, cpu_temp: f32) -> bool {
-    let parts: Vec<&str> = cond.split_whitespace().collect();
-    if parts.len() == 1 && parts[0].to_ascii_uppercase() == "DEFAULT" {
+    let cond = cond.trim();
+    if cond.eq_ignore_ascii_case("DEFAULT") {
         return true;
     }
-    if parts.len() != 3 {
+    let upper = cond.to_ascii_uppercase();
+    let tokens: Vec<&str> = upper.split_whitespace().collect();
+    if tokens.len() < 2 {
         return false;
     }
-    let variable = parts[0].to_ascii_uppercase();
-    let operator = parts[1];
-    let value: f32 = parts[2].parse().unwrap_or(0.0);
+    let variable = tokens[0];
+    // Join remaining as range e.g. "80.." or "0.1..=1" or "..40"
+    let range_str: String = tokens[1..].join("");
 
-    let current_val = match variable.as_str() {
+    let current_val = match variable {
         "CPU" => cpu_usage,
         "RAM" => ram_sys_used_gb,
         "SEC_PER_FRAME" => sec_per_frame,
@@ -283,14 +291,47 @@ pub fn evaluate_condition(cond: &str, cpu_usage: f32, ram_sys_used_gb: f32, sec_
         _ => return false,
     };
 
-    match operator {
-        ">" => current_val > value,
-        "<" => current_val < value,
-        ">=" => current_val >= value,
-        "<=" => current_val <= value,
-        "==" => current_val == value,
-        _ => false,
+    evaluate_range(current_val, &range_str)
+}
+
+fn evaluate_range(val: f32, r: &str) -> bool {
+    if r.is_empty() {
+        return true;
     }
+    let has_eq = r.contains("..=");
+    let sep = if has_eq { "..=" } else { ".." };
+    let parts: Vec<&str> = r.split(sep).collect();
+    let low_str = if !parts.is_empty() { parts[0] } else { "" };
+    let high_str = if parts.len() > 1 { parts[1] } else { "" };
+
+    let low = if !low_str.is_empty() {
+        low_str.parse::<f32>().ok()
+    } else {
+        None
+    };
+    let high = if !high_str.is_empty() {
+        high_str.parse::<f32>().ok()
+    } else {
+        None
+    };
+
+    if let Some(l) = low {
+        if val < l {
+            return false;
+        }
+    }
+    if let Some(h) = high {
+        if has_eq {
+            if val > h {
+                return false;
+            }
+        } else {
+            if val >= h {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub fn choose_joke(
@@ -299,53 +340,137 @@ pub fn choose_joke(
     ram_sys_used_gb: f32,
     sec_per_frame: f32,
     cpu_temp: f32,
-    seed: u64,
     is_mobile: bool,
+    cycle_index: usize,
 ) -> String {
-    let mut matching_non_default = Vec::new();
-    let mut matching_default = Vec::new();
+    // Collect only jokes whose condition is currently true (so low-temp
+    // Antarctica jokes won't appear when CPU_TEMP==80, etc.).
+    // Then group the *matching* ones by category and cycle sequentially.
+    use std::collections::BTreeMap;
+
+    let mut matching_by_cat: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    let mut cat_order: Vec<String> = Vec::new();
 
     for rule in rules {
-        // Platform filter
         let platform_ok = match &rule.platform {
             JokePlatform::All => true,
             JokePlatform::Mobile => is_mobile,
             JokePlatform::Desktop => !is_mobile,
         };
-        if !platform_ok {
+        if !platform_ok || rule.message.is_empty() {
             continue;
         }
-
         if !evaluate_condition(&rule.condition, cpu_usage, ram_sys_used_gb, sec_per_frame, cpu_temp) {
             continue;
         }
 
-        if rule.condition.to_ascii_uppercase() == "DEFAULT" {
-            matching_default.push(rule.message.as_str());
-        } else {
-            matching_non_default.push(rule.message.as_str());
+        let cat = rule.condition.split_whitespace().next()
+            .unwrap_or("DEFAULT")
+            .to_ascii_uppercase();
+
+        if !matching_by_cat.contains_key(&cat) {
+            cat_order.push(cat.clone());
+        }
+        matching_by_cat.entry(cat).or_default().push(rule.message.as_str());
+    }
+
+    if matching_by_cat.is_empty() {
+        // Nothing specific matched — fall back to any DEFAULTs (they always match)
+        let defaults: Vec<&str> = rules.iter()
+            .filter(|r| {
+                let p_ok = match &r.platform {
+                    JokePlatform::All => true,
+                    JokePlatform::Mobile => is_mobile,
+                    JokePlatform::Desktop => !is_mobile,
+                };
+                p_ok && r.condition.eq_ignore_ascii_case("DEFAULT") && !r.message.is_empty()
+            })
+            .map(|r| r.message.as_str())
+            .collect();
+        if defaults.is_empty() {
+            return String::new();
+        }
+        let idx = cycle_index % defaults.len();
+        return defaults[idx].to_string();
+    }
+
+    // Preferred presentation order among whatever is currently relevant
+    let preferred = ["CPU", "RAM", "SEC_PER_FRAME", "CPU_TEMP", "DEFAULT"];
+    let mut ordered: Vec<String> = Vec::new();
+    for p in &preferred {
+        if matching_by_cat.contains_key(*p) && !ordered.contains(&p.to_string()) {
+            ordered.push(p.to_string());
+        }
+    }
+    for c in &cat_order {
+        if !ordered.contains(c) {
+            ordered.push(c.clone());
         }
     }
 
-    // Pick from most-specific matches first, fall back to DEFAULT.
-    // Empty message means "stay silent" — return empty string.
-    if !matching_non_default.is_empty() {
-        let idx = pseudo_random(seed, matching_non_default.len());
-        return matching_non_default[idx].to_string();
+    if ordered.is_empty() {
+        return String::new();
     }
-    if !matching_default.is_empty() {
-        let idx = pseudo_random(seed, matching_default.len());
-        return matching_default[idx].to_string();
-    }
-    String::new()
+
+    let cat_idx = cycle_index % ordered.len();
+    let cat = &ordered[cat_idx];
+    let msgs = &matching_by_cat[cat];
+
+    let j_idx = (cycle_index / ordered.len().max(1)) % msgs.len();
+    msgs[j_idx].to_string()
 }
 
-fn pseudo_random(seed: u64, max: usize) -> usize {
-    if max <= 1 {
-        return 0;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joke_cycling_sequence_demo() {
+        let content = std::fs::read_to_string("jokes_export.txt")
+            .unwrap_or_else(|_| {
+                // embedded fallback subset for CI
+                r#"[CPU 80..]
+CPU working hard.
+[CPU ..2]
+CPU sleeping.
+[CPU_TEMP 80..]
+CPU toasty.
+[RAM 16..]
+RAM full.
+[RAM ..4]
+RAM low.
+[SEC_PER_FRAME 0.1..=1]
+Mediocre fps range.
+[DEFAULT]
+Default joke here.
+"#.to_string()
+            });
+        let rules = parse_jokes(&content);
+
+        println!("\n=== Joke sequence (desktop, cycle 0..12) ===");
+        // Use values that trigger several conditions (high CPU/temp, medium RAM, ~2-5 fps)
+        for i in 0..12 {
+            let joke = choose_joke(&rules, 85.0, 12.0, 0.3, 82.0, false, i);
+            println!("  [{}] -> {}", i, joke);
+        }
+
+        println!("\n=== Joke sequence (mobile) ===");
+        for i in 0..6 {
+            let joke = choose_joke(&rules, 75.0, 4.0, 0.5, 60.0, true, i);
+            println!("  [{}] -> {}", i, joke);
+        }
     }
-    let a: u64 = 6364136223846793005;
-    let c: u64 = 1442695040888963407;
-    let next_seed = seed.wrapping_mul(a).wrapping_add(c);
-    (next_seed as usize) % max
+
+    #[test]
+    fn evaluate_range_bounds_work() {
+        // exact 80 should match high range, not low
+        assert!(evaluate_condition("CPU_TEMP 80..", 0., 0., 0., 80.));
+        assert!(!evaluate_condition("CPU_TEMP ..40", 0., 0., 0., 80.));
+        // fps 1..=10 range (sec 0.1..=1)
+        assert!(evaluate_condition("SEC_PER_FRAME 0.1..=1", 0., 0., 0.5, 0.));
+        assert!(!evaluate_condition("SEC_PER_FRAME 0.1..=1", 0., 0., 2.0, 0.));
+        assert!(evaluate_condition("CPU 80..", 85., 0., 0., 0.));
+        assert!(evaluate_condition("CPU ..2", 1., 0., 0., 0.));
+    }
 }
+

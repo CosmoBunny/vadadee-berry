@@ -1,0 +1,85 @@
+[CPU 80..]
+Your CPU became BBQ, Just cook food there and save gas bill
+CPU is busier than a bee on espresso.
+CPU is grinding like it's got a deadline tomorrow.
+CPU usage is climbing like a mountain goat.
+Your CPU is earning overtime in pure heat.
+The cores are doing the thermal tango tonight.
+Fans spinning like they owe the electric bill money.
+CPU working so hard it deserves a vacation (but can't take one).
+
+[CPU ..2]
+I think bro, you placed your laptop/desktop in Antarctica
+CPU is taking a long nap. Don't wake it.
+CPU is quieter than a library at midnight.
+CPU is slacking off like it's Monday morning.
+
+[CPU_TEMP 80..]
+CPU is hotter than a habanero.
+CPU is heating up faster than a microwave burrito.
+CPU might need a cold shower after this.
+Your heatsink is auditioning for a volcano.
+80+ and the fans are throwing a full concert.
+Thermal paste is earning its keep today.
+Your cooler is basically a tiny sauna now.
+
+[CPU_TEMP ..40]
+I think bro, you placed your laptop/desktop in Antarctica
+
+[RAM 16..]
+RAM eating competition, and your laptop/desktop is winning gold
+RAM is fuller than a clown car.
+RAM is stuffed tighter than a can of sardines.
+RAM is packed like rush-hour subway.
+RAM is holding so many tabs it's starting a support group.
+Memory is full — time for some spring cleaning (of browser tabs).
+
+[RAM ..4]
+Where is the RAM? Are you running this on a microwave?
+RAM is on vacation. System is homesick.
+RAM is missing in action. Send search party.
+RAM levels critically low. Running on fumes.
+
+[SEC_PER_FRAME 1..]
+My grandma's laptop/desktop can export video faster
+Frame every second? Flipbook in the making.
+Frames slower than molasses in winter.
+One frame per existential crisis.
+
+[SEC_PER_FRAME 0.1..=1]
+1 to 10 fps club — your PC is savoring every pixel.
+Exporting at a thoughtful pace. Cinematic, really.
+Your machine is giving each frame the attention it deserves.
+Not the fastest, but quality (and suffering) over speed.
+Your GPU is taking a well-deserved nap while CPU does all the work.
+
+[DEFAULT]
+Still exporting... Go grab a coffee, or maybe grow a tree.
+Are we there yet? My system monitor is getting bored.
+Rendering vectors... This is faster than paint drying, I promise.
+Exporting... This is your sign to stretch.
+Pixels in progress. Go blink twice.
+Still going. Your patience is being tested.
+The fans are practicing their wind-turbine impression.
+Your PC is working so hard the case is glowing with pride (and heat).
+The poor thing is exporting like it's running a marathon in flip-flops.
+
+[MOBILE CPU 75..]
+Phone CPU is in beast mode. Don't drop it.
+Phone CPU is sweating like Sahara summer.
+Phone CPU pulling overtime shifts.
+
+[MOBILE CPU_TEMP 55..]
+Phone is toasty. Great for cold hands.
+Phone is hot enough to fry an egg on.
+Phone is turning into portable heater.
+
+[DESKTOP CPU 90..]
+Desktop CPU is giving 110%. Impossible but true.
+Desktop CPU maxed out. Respect.
+Desktop CPU in beast mode.
+
+[DESKTOP RAM ..4]
+Desktop RAM is low. 2005 called, wants specs back.
+Desktop RAM low. Close those 47 tabs.
+Desktop is low on RAM. Time travel to 2010?

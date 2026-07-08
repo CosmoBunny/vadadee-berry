@@ -495,6 +495,8 @@ pub struct VideoExportState {
     pub last_joke_update: std::time::Instant,
     pub joke_rules: Vec<crate::sys_stats::JokeRule>,
     pub current_joke: String,
+    /// Cycles through jokes sequentially (CPU, RAM, DEFAULT, etc.) instead of random.
+    pub joke_cycle: usize,
     pub sec_per_frame: f32,
     pub last_frame_time: Option<std::time::Instant>,
     pub renderer_reclaim: std::sync::Arc<std::sync::Mutex<Vec<egui_wgpu::Renderer>>>,
@@ -533,33 +535,33 @@ impl Default for VideoExportState {
         if rules.is_empty() {
             rules = crate::sys_stats::parse_jokes(
                 // ── Platform-independent jokes (no prefix) ──────────────────
-                "[CPU > 85]\nYour CPU is working harder than a developer on a deadline.\n\
-                 [CPU > 85]\nThe CPU is so hot, you could fry an egg on it.\n\
-                 [CPU > 85]\nCPU became BBQ. Just cook food there and save the gas bill.\n\
-                 [CPU < 2]\nCPU usage is basically 0%... did the export even start?\n\
-                 [SEC_PER_FRAME > 2]\nThis frame took longer than a government project.\n\
-                 [SEC_PER_FRAME > 1]\nAt this speed, a flipbook would be faster.\n\
-                 [RAM > 16]\nRAM eating competition — and your device is winning gold.\n\
-                 [RAM < 2]\nWhere is the RAM? Are you exporting on a potato?\n\
-                 [CPU_TEMP > 90]\nTemperature warning: things are getting spicy in there.\n\
-                 [CPU_TEMP > 75]\nYour CPU temp is higher than my motivation on Monday.\n\
+                "[CPU 80..]\nYour CPU is working harder than a developer on a deadline.\n\
+                 [CPU 80..]\nThe CPU is so hot, you could fry an egg on it.\n\
+                 [CPU 80..]\nCPU became BBQ. Just cook food there and save the gas bill.\n\
+                 [CPU ..2]\nCPU usage is basically 0%... did the export even start?\n\
+                 [SEC_PER_FRAME 1..]\nAt this speed, a flipbook would be faster.\n\
+                 [SEC_PER_FRAME 0.1..=1]\n1-10 fps? Your PC is giving every frame a hug.\n\
+                 [RAM 16..]\nRAM eating competition — and your laptop/desktop is winning gold.\n\
+                 [RAM ..4]\nWhere is the RAM? Are you exporting on a potato?\n\
+                 [CPU_TEMP 80..]\nTemperature warning: things are getting spicy in there.\n\
+                 [CPU_TEMP 80..]\nYour CPU temp is higher than my motivation on Monday.\n\
                  \
                  # ── Desktop-only jokes ──────────────────────────────────────
-                 [DESKTOP CPU > 80]\nYour PC sounds like a jet engine. Ready for takeoff?\n\
-                 [DESKTOP CPU < 2]\nDid you accidentally place your PC in Antarctica?\n\
-                 [DESKTOP SEC_PER_FRAME > 1]\nEven my grandma\'s old PC could export this faster.\n\
-                 [DESKTOP RAM < 2]\nBro, you\'re exporting video with less RAM than a smart fridge.\n\
-                 [DESKTOP RAM > 32]\nThat\'s a lot of RAM. Your PC could run the whole country.\n\
+                 [DESKTOP CPU 80..]\nYour PC sounds like a jet engine. Ready for takeoff?\n\
+                 [DESKTOP CPU ..2]\nDid you accidentally place your laptop/desktop in Antarctica?\n\
+                 [DESKTOP SEC_PER_FRAME 1..]\nEven my grandma\'s old PC could export this faster.\n\
+                 [DESKTOP RAM ..4]\nBro, you\'re exporting video with less RAM than a smart fridge.\n\
+                 [DESKTOP RAM 32..]\nThat\'s a lot of RAM. Your PC could run the whole country.\n\
                  \
                  # ── Mobile-only jokes ───────────────────────────────────────
-                 [MOBILE CPU > 80]\nYour phone is hotter than the sun right now. Poor little guy.\n\
-                 [MOBILE CPU > 80]\nPhone CPU on max load — hope you\'re not using the camera too.\n\
-                 [MOBILE CPU < 2]\nCPU at 0% on mobile? The app might be asleep at the wheel.\n\
-                 [MOBILE SEC_PER_FRAME > 1]\nExporting video on a phone? Brave soul. Truly brave.\n\
-                 [MOBILE SEC_PER_FRAME > 2]\nMaybe send the project to a PC... just a friendly suggestion.\n\
-                 [MOBILE RAM < 2]\nYour phone is basically begging you to close some apps.\n\
-                 [MOBILE RAM > 8]\nWow, 8 GB RAM on a phone. Overkill, but we love it.\n\
-                 [MOBILE CPU_TEMP > 45]\nPhone getting warm... your pocket is a sauna now.\n\
+                 [MOBILE CPU 80..]\nYour phone is hotter than the sun right now. Poor little guy.\n\
+                 [MOBILE CPU 80..]\nPhone CPU on max load — hope you\'re not using the camera too.\n\
+                 [MOBILE CPU ..2]\nCPU at 0% on mobile? The app might be asleep at the wheel.\n\
+                 [MOBILE SEC_PER_FRAME 1..]\nExporting video on a phone? Brave soul. Truly brave.\n\
+                 [MOBILE SEC_PER_FRAME 2..]\nMaybe send the project to a PC... just a friendly suggestion.\n\
+                 [MOBILE RAM ..4]\nYour phone is basically begging you to close some apps.\n\
+                 [MOBILE RAM 8..]\nWow, 8 GB RAM on a phone. Overkill, but we love it.\n\
+                 [MOBILE CPU_TEMP 45..]\nPhone getting warm... your pocket is a sauna now.\n\
                  \
                  # ── Fallback (DEFAULT applies everywhere) ───────────────────
                  [DEFAULT]\nStill rendering... go touch some grass.\n\
@@ -595,6 +597,7 @@ impl Default for VideoExportState {
             last_joke_update: std::time::Instant::now(),
             joke_rules: rules,
             current_joke: "Still exporting... Go grab a coffee, or maybe grow a tree.".to_string(),
+            joke_cycle: 0,
             sec_per_frame: 0.0,
             last_frame_time: None,
             renderer_reclaim: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2809,16 +2812,16 @@ impl VadadeeBerryApp {
         self.video_export.last_joke_update = std::time::Instant::now();
         self.video_export.last_stats_update = std::time::Instant::now();
         self.video_export.sys_stats.update();
-        let seed = std::time::Instant::now().elapsed().as_nanos() as u64;
         let is_mobile = cfg!(target_os = "android");
+        self.video_export.joke_cycle = 0;
         self.video_export.current_joke = crate::sys_stats::choose_joke(
             &self.video_export.joke_rules,
             self.video_export.sys_stats.cpu_usage,
             self.video_export.sys_stats.ram_sys_used_gb,
             self.video_export.sec_per_frame,
             self.video_export.sys_stats.cpu_temp,
-            seed,
             is_mobile,
+            self.video_export.joke_cycle,
         );
     }
 
@@ -2908,16 +2911,16 @@ impl VadadeeBerryApp {
         }
 
         if now.duration_since(self.video_export.last_joke_update) >= std::time::Duration::from_secs(10) {
-            let seed = now.elapsed().as_nanos() as u64;
             let is_mobile = cfg!(target_os = "android");
+            self.video_export.joke_cycle = self.video_export.joke_cycle.wrapping_add(1);
             self.video_export.current_joke = crate::sys_stats::choose_joke(
                 &self.video_export.joke_rules,
                 self.video_export.sys_stats.cpu_usage,
                 self.video_export.sys_stats.ram_sys_used_gb,
                 self.video_export.sec_per_frame,
                 self.video_export.sys_stats.cpu_temp,
-                seed,
                 is_mobile,
+                self.video_export.joke_cycle,
             );
             self.video_export.last_joke_update = now;
             ctx.request_repaint();
@@ -3581,7 +3584,10 @@ impl VadadeeBerryApp {
     }
 
     fn object_clipboard_blocked(&self, ctx: &Context) -> bool {
-        self.on_page_text_edit.is_some() || ctx.wants_keyboard_input()
+        // Block clipboard paste/copy/cut if the application window is unfocused
+        // (so global low-level listeners like device_query don't act when user
+        // is using shortcuts in other apps), or if a text widget is focused.
+        !ctx.input(|i| i.focused) || self.on_page_text_edit.is_some() || ctx.wants_keyboard_input()
     }
 
     /// Called early in chrome (right after menubar) so that state changes from
@@ -3743,6 +3749,9 @@ impl VadadeeBerryApp {
     }
 
     fn keyboard_shortcuts(&mut self, ctx: &Context) {
+        if !ctx.input(|i| i.focused) {
+            return;
+        }
         let text_focused = ctx.wants_keyboard_input();
         let mut bubble_keys_handled = false;
         ctx.input_mut(|i| {
