@@ -95,6 +95,20 @@ pub struct AnimAppliedState {
     pub fill: Fill,
 }
 
+/// Graph-editor interaction for stack animation function regions.
+#[derive(Debug, Clone)]
+pub enum AnimGraphStackDrag {
+    Move {
+        id: uuid::Uuid,
+        grab_frame: f64,
+        orig_start: usize,
+    },
+    ResizeEnd {
+        id: uuid::Uuid,
+        orig_duration: usize,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct SnapGuide {
     pub start: (f64, f64),
@@ -139,10 +153,23 @@ pub struct VadadeeBerryApp {
     pub anim_graph_kf_drag_start: Option<(String, usize, egui::Pos2)>,
     /// Segment selected between two keyframe indices for bezier-add workflow: (track_lbl, left_frame, right_frame)
     pub anim_graph_selected_segment: Option<(String, usize, usize)>,
+    /// Marquee region select on graph (start_frame, end_frame) while dragging / selected.
+    pub anim_graph_region_select: Option<(usize, usize)>,
+    /// Selected stack animation function id (for header edits / move / resize).
+    pub anim_graph_selected_stack: Option<uuid::Uuid>,
+    /// Drag state for stack region: Move { id, grab_start_frame, orig_start } or ResizeEnd { id, orig_duration }.
+    pub anim_graph_stack_drag: Option<AnimGraphStackDrag>,
+    /// Double-click formula dialog: (node_id, stack_id, channel_index).
+    pub anim_stack_formula_dialog: Option<(NodeId, uuid::Uuid, usize)>,
     /// Horizontal pan for the animation graph editor (frame index at left edge).
     pub anim_graph_scroll: f32,
     /// Visible frame span in the animation graph plot.
     pub anim_graph_visible_frames: f32,
+    /// Visible frame span on the main animation / AV timelines.
+    pub anim_timeline_visible_frames: f32,
+    /// Smoothed graph Y-range (auto-fit to visible curves).
+    pub anim_graph_view_val_min: f64,
+    pub anim_graph_view_val_max: f64,
     pub anim_fps: u32,
     /// UI performance: smoothed frames per second.
     pub ui_fps: f32,
@@ -697,8 +724,15 @@ impl VadadeeBerryApp {
             anim_graph_editor_dragged_handle: None,
             anim_graph_kf_drag_start: None,
             anim_graph_selected_segment: None,
+            anim_graph_region_select: None,
+            anim_graph_selected_stack: None,
+            anim_graph_stack_drag: None,
+            anim_stack_formula_dialog: None,
             anim_graph_scroll: 0.0,
             anim_graph_visible_frames: 100.0,
+            anim_timeline_visible_frames: 100.0,
+            anim_graph_view_val_min: 0.0,
+            anim_graph_view_val_max: 1.0,
             anim_fps: 60,
             ui_fps: 60.0,
             enable_layer_raster_cache: false,
@@ -2028,6 +2062,10 @@ impl VadadeeBerryApp {
                     max_f = max_f.max(last.frame);
                 }
             }
+            // Stack animation spans must be reachable by playback.
+            for sf in &anim.stack_functions {
+                max_f = max_f.max(sf.end_frame());
+            }
         }
 
         let fps = self.anim_fps.max(1) as f32;
@@ -2067,35 +2105,53 @@ impl VadadeeBerryApp {
     }
 
     pub fn apply_animation_for_frame(&mut self, frame: usize) {
-        let updates: Vec<(NodeId, Option<f64>, Option<f64>, Option<f64>, Option<f32>, Option<[f32; 4]>, Option<Vec<f64>>)> = self.project.anim_timeline.nodes.iter()
-            .map(|(node_id, track)| {
-                let x = track.pos_x.interpolate(frame);
-                let y = track.pos_y.interpolate(frame);
-                let rot = track.rotation.interpolate(frame);
-                let opacity = track.opacity.interpolate(frame).map(|o| o as f32);
-                let r = track.color_r.interpolate(frame);
-                let g = track.color_g.interpolate(frame);
-                let b = track.color_b.interpolate(frame);
-                let a = track.color_a.interpolate(frame);
-                let color = if let (Some(r), Some(g), Some(b), Some(a)) = (r, g, b, a) {
-                    Some([r as f32, g as f32, b as f32, a as f32])
-                } else {
-                    None
-                };
-                let geom = if !track.geom_tracks.is_empty() {
-                    let mut g_vals = Vec::new();
-                    let current_geom = self.get_node_geom_floats(*node_id);
-                    for (idx, t) in track.geom_tracks.iter().enumerate() {
-                        let def_val = current_geom.get(idx).copied().unwrap_or(0.0);
-                        g_vals.push(t.interpolate(frame).unwrap_or(def_val));
-                    }
-                    Some(g_vals)
-                } else {
-                    None
-                };
-                (*node_id, x, y, rot, opacity, color, geom)
-            })
-            .collect();
+        // Collect node ids first so we can mutably sample stack functions (records formula errors).
+        let node_ids: Vec<NodeId> = self.project.anim_timeline.nodes.keys().copied().collect();
+        let mut updates: Vec<(
+            NodeId,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f32>,
+            Option<[f32; 4]>,
+            Option<Vec<f64>>,
+        )> = Vec::with_capacity(node_ids.len());
+        for node_id in node_ids {
+            let Some(track) = self.project.anim_timeline.nodes.get_mut(&node_id) else {
+                continue;
+            };
+            let x = track.sample_mut("pos_x", frame);
+            let y = track.sample_mut("pos_y", frame);
+            let rot = track.sample_mut("rotation", frame);
+            let opacity = track.sample_mut("opacity", frame).map(|o| o as f32);
+            let r = track.sample_mut("color_r", frame);
+            let g = track.sample_mut("color_g", frame);
+            let b = track.sample_mut("color_b", frame);
+            let a = track.sample_mut("color_a", frame);
+            let color = if let (Some(r), Some(g), Some(b), Some(a)) = (r, g, b, a) {
+                Some([r as f32, g as f32, b as f32, a as f32])
+            } else {
+                None
+            };
+            let geom = if !track.geom_tracks.is_empty() {
+                let current_geom = self
+                    .project
+                    .nodes
+                    .get(node_id)
+                    .map(|n| n.get_geom_floats())
+                    .unwrap_or_default();
+                let mut g_vals = Vec::new();
+                for idx in 0..track.geom_tracks.len() {
+                    let def_val = current_geom.get(idx).copied().unwrap_or(0.0);
+                    let lbl = format!("geom_{idx}");
+                    g_vals.push(track.sample_mut(&lbl, frame).unwrap_or(def_val));
+                }
+                Some(g_vals)
+            } else {
+                None
+            };
+            updates.push((node_id, x, y, rot, opacity, color, geom));
+        }
 
         for (node_id, target_x, target_y, target_rot, target_op, target_color, target_geom) in updates {
             if let Some(node) = self.project.nodes.get_mut(node_id) {
@@ -11289,6 +11345,20 @@ fn run_video_decode_thread(
                 let property = args.get("property").and_then(|v| v.as_str()).ok_or("property required")?.to_string();
                 self.mcp_clear_animation_track(id_str, &property)
             }
+            "add_stack_animation" => self.mcp_add_stack_animation(&args),
+            "edit_stack_animation" => self.mcp_edit_stack_animation(&args),
+            "remove_stack_animation" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let stack_id = args
+                    .get("stack_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("stack_id required")?;
+                self.mcp_remove_stack_animation(id_str, stack_id)
+            }
+            "list_stack_animations" => {
+                let id_filter = args.get("id").and_then(|v| v.as_str());
+                self.mcp_list_stack_animations(id_filter)
+            }
 
             "create_path" => {
                 let svg_d = args
@@ -11442,6 +11512,283 @@ fn run_video_decode_thread(
     }
 
     // === Animation / selection / layer MCP helpers ===
+    fn mcp_resolve_start_const(
+        starts: Option<&serde_json::Value>,
+        track: &str,
+        fallback: f64,
+    ) -> f64 {
+        let Some(s) = starts else {
+            return fallback;
+        };
+        if let Some(v) = s.get(track).and_then(|v| v.as_f64()) {
+            return v;
+        }
+        match track {
+            "pos_x" => s.get("x").and_then(|v| v.as_f64()).unwrap_or(fallback),
+            "pos_y" => s.get("y").and_then(|v| v.as_f64()).unwrap_or(fallback),
+            "color_r" => s.get("r").and_then(|v| v.as_f64()).unwrap_or(fallback),
+            "color_g" => s.get("g").and_then(|v| v.as_f64()).unwrap_or(fallback),
+            "color_b" => s.get("b").and_then(|v| v.as_f64()).unwrap_or(fallback),
+            "color_a" => s.get("a").and_then(|v| v.as_f64()).unwrap_or(fallback),
+            _ => s
+                .get("x")
+                .and_then(|v| v.as_f64())
+                .or_else(|| s.get("s").and_then(|v| v.as_f64()))
+                .unwrap_or(fallback),
+        }
+    }
+
+    fn mcp_add_stack_animation(&mut self, args: &serde_json::Value) -> Result<String, String> {
+        let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        if self.project.nodes.get(id).is_none() {
+            return Err(format!("Object not found: {id_str}"));
+        }
+        let start_frame = args
+            .get("start_frame")
+            .and_then(|v| v.as_u64())
+            .ok_or("start_frame required")? as usize;
+        let duration_frames = args
+            .get("duration_frames")
+            .and_then(|v| v.as_u64())
+            .ok_or("duration_frames required")? as usize;
+        let duration_frames = duration_frames.max(1);
+        let tracks: Vec<String> = args
+            .get("tracks")
+            .and_then(|v| v.as_array())
+            .ok_or("tracks array required")?
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if tracks.is_empty() {
+            return Err("tracks must be non-empty".into());
+        }
+        let exprs: Vec<String> = args
+            .get("exprs")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let starts = args.get("starts");
+        let before = self.project.anim_timeline.clone();
+        let entry = self.project.anim_timeline.nodes.entry(id).or_default();
+        // Ensure geom track slots exist if needed
+        for t in &tracks {
+            if t.starts_with("geom_") {
+                if let Ok(idx) = t["geom_".len()..].parse::<usize>() {
+                    while entry.geom_tracks.len() <= idx {
+                        entry.geom_tracks.push(crate::document::KeyframeTrack::default());
+                    }
+                }
+            }
+        }
+        let end = start_frame.saturating_add(duration_frames);
+        let mut channels = Vec::new();
+        for (i, track) in tracks.iter().enumerate() {
+            let def = entry
+                .get_track(track)
+                .and_then(|tr| tr.interpolate(start_frame))
+                .unwrap_or(0.0);
+            let start_value = Self::mcp_resolve_start_const(starts, track, def);
+            let expr = exprs.get(i).cloned().unwrap_or_default();
+            if !expr.trim().is_empty() {
+                if let Err(e) = crate::document::eval_expr(&expr, 0.5, 0.0) {
+                    return Err(format!("invalid expr for {track}: {}", e.0));
+                }
+            }
+            channels.push(crate::document::StackAnimChannel {
+                track: track.clone(),
+                expr,
+                start_value,
+                last_error: None,
+            });
+        }
+        let labels_ref: Vec<&str> = tracks.iter().map(|s| s.as_str()).collect();
+        entry.clear_keyframes_under_stack(&labels_ref, start_frame, end);
+        for ch in &channels {
+            if let Some(tr) = entry.get_track_mut(&ch.track) {
+                tr.insert(start_frame, ch.start_value);
+            }
+        }
+        let stack_id = uuid::Uuid::new_v4();
+        entry.stack_functions.push(crate::document::StackAnimationFunction {
+            id: stack_id,
+            start_frame,
+            duration_frames,
+            channels,
+        });
+        entry.ensure_stack_start_keyframes();
+        entry.ensure_stack_end_keyframes();
+        let after = self.project.anim_timeline.clone();
+        self.history.push(
+            &mut self.project,
+            crate::history::ProjectEdit::PatchTimeline { before, after },
+        );
+        self.apply_animation_for_frame(self.anim_current_frame);
+        Ok(format!(
+            "Added stack animation {stack_id} on {id_str} frames {start_frame}..{end}"
+        ))
+    }
+
+    fn mcp_edit_stack_animation(&mut self, args: &serde_json::Value) -> Result<String, String> {
+        let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        let stack_id = args
+            .get("stack_id")
+            .and_then(|v| v.as_str())
+            .ok_or("stack_id required")?;
+        let stack_id = uuid::Uuid::parse_str(stack_id).map_err(|e| e.to_string())?;
+        let before = self.project.anim_timeline.clone();
+        let entry = self
+            .project
+            .anim_timeline
+            .nodes
+            .get_mut(&id)
+            .ok_or_else(|| format!("No animation for {id_str}"))?;
+        let sf = entry
+            .stack_functions
+            .iter_mut()
+            .find(|s| s.id == stack_id)
+            .ok_or_else(|| format!("stack_id not found: {stack_id}"))?;
+        let old_start = sf.start_frame;
+        let old_end = sf.end_frame();
+        if let Some(sf_frame) = args.get("start_frame").and_then(|v| v.as_u64()) {
+            sf.start_frame = sf_frame as usize;
+        }
+        if let Some(d) = args.get("duration_frames").and_then(|v| v.as_u64()) {
+            sf.duration_frames = (d as usize).max(1);
+        }
+        if let Some(arr) = args.get("exprs").and_then(|v| v.as_array()) {
+            for (i, ch) in sf.channels.iter_mut().enumerate() {
+                if let Some(e) = arr.get(i).and_then(|v| v.as_str()) {
+                    ch.expr = e.to_string();
+                    if ch.expr.trim().is_empty() {
+                        ch.last_error = None;
+                    } else if let Err(err) = crate::document::eval_expr(&ch.expr, 0.5, 0.0) {
+                        return Err(format!("invalid expr for {}: {}", ch.track, err.0));
+                    } else {
+                        ch.last_error = None;
+                    }
+                }
+            }
+        }
+        let starts = args.get("starts");
+        if starts.is_some() {
+            for ch in sf.channels.iter_mut() {
+                ch.start_value =
+                    Self::mcp_resolve_start_const(starts, &ch.track, ch.start_value);
+            }
+        }
+        let labels: Vec<String> = sf.channels.iter().map(|c| c.track.clone()).collect();
+        let start_f = sf.start_frame;
+        let end_f = sf.end_frame();
+        let start_vals: Vec<(String, f64)> = sf
+            .channels
+            .iter()
+            .map(|c| (c.track.clone(), c.start_value))
+            .collect();
+        let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+        let lo = old_start.min(start_f);
+        let hi = old_end.max(end_f);
+        entry.clear_keyframes_under_stack(&refs, start_f, end_f);
+        for label in &labels {
+            if let Some(tr) = entry.get_track_mut(label) {
+                tr.keyframes
+                    .retain(|kf| kf.frame == start_f || kf.frame < lo || kf.frame > hi);
+            }
+        }
+        for (tr, v) in start_vals {
+            if let Some(track) = entry.get_track_mut(&tr) {
+                track.insert(start_f, v);
+            }
+        }
+        entry.ensure_stack_start_keyframes();
+        entry.ensure_stack_end_keyframes();
+        let after = self.project.anim_timeline.clone();
+        self.history.push(
+            &mut self.project,
+            crate::history::ProjectEdit::PatchTimeline { before, after },
+        );
+        self.apply_animation_for_frame(self.anim_current_frame);
+        Ok(format!("Updated stack animation {stack_id}"))
+    }
+
+    fn mcp_remove_stack_animation(
+        &mut self,
+        id_str: &str,
+        stack_id_str: &str,
+    ) -> Result<String, String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        let stack_id = uuid::Uuid::parse_str(stack_id_str).map_err(|e| e.to_string())?;
+        let before = self.project.anim_timeline.clone();
+        let entry = self
+            .project
+            .anim_timeline
+            .nodes
+            .get_mut(&id)
+            .ok_or_else(|| format!("No animation for {id_str}"))?;
+        if !entry.remove_stack_function(stack_id) {
+            return Err(format!("stack_id not found: {stack_id_str}"));
+        }
+        let after = self.project.anim_timeline.clone();
+        self.history.push(
+            &mut self.project,
+            crate::history::ProjectEdit::PatchTimeline { before, after },
+        );
+        self.apply_animation_for_frame(self.anim_current_frame);
+        Ok(format!("Removed stack animation {stack_id_str}"))
+    }
+
+    fn mcp_list_stack_animations(&self, id_filter: Option<&str>) -> Result<String, String> {
+        let filter = id_filter
+            .map(|s| uuid::Uuid::parse_str(s).map_err(|e| e.to_string()))
+            .transpose()?;
+        let mut out = Vec::new();
+        for (nid, anim) in &self.project.anim_timeline.nodes {
+            if filter.is_some_and(|f| f != *nid) {
+                continue;
+            }
+            for sf in &anim.stack_functions {
+                let channels: Vec<_> = sf
+                    .channels
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "track": c.track,
+                            "expr": c.expr,
+                            "start_value": c.start_value,
+                            "error": c.last_error,
+                        })
+                    })
+                    .collect();
+                out.push(serde_json::json!({
+                    "object_id": nid.to_string(),
+                    "stack_id": sf.id.to_string(),
+                    "start_frame": sf.start_frame,
+                    "duration_frames": sf.duration_frames,
+                    "end_frame": sf.end_frame(),
+                    "channels": channels,
+                    "f_t": format!(
+                        "f(t) = ({})",
+                        sf.channels
+                            .iter()
+                            .map(|c| if c.expr.trim().is_empty() {
+                                format!("{:.4}", c.start_value)
+                            } else {
+                                c.expr.clone()
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }));
+            }
+        }
+        Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
+    }
+
     fn mcp_list_animatable_properties(&self, id_str: &str) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         let node = self
@@ -12670,6 +13017,9 @@ impl eframe::App for VadadeeBerryApp {
                                 }
                                 entry.pos_x.insert(self.anim_current_frame, pos.0);
                                 entry.pos_y.insert(self.anim_current_frame, pos.1);
+                                entry.sync_stack_starts_from_keyframes();
+                                entry.ensure_stack_start_keyframes();
+                                entry.ensure_stack_end_keyframes();
                             }
                             if changed_rot {
                                 if entry.rotation.keyframes.is_empty() {
@@ -12746,6 +13096,9 @@ impl eframe::App for VadadeeBerryApp {
                                 }
                                 entry.pos_x.insert(self.anim_current_frame, pos.0);
                                 entry.pos_y.insert(self.anim_current_frame, pos.1);
+                                entry.sync_stack_starts_from_keyframes();
+                                entry.ensure_stack_start_keyframes();
+                                entry.ensure_stack_end_keyframes();
                             }
                             if changed_rot {
                                 if entry.rotation.keyframes.is_empty() {
@@ -13072,8 +13425,15 @@ mod tests {
                 anim_graph_editor_dragged_handle: None,
                 anim_graph_kf_drag_start: None,
                 anim_graph_selected_segment: None,
+                anim_graph_region_select: None,
+                anim_graph_selected_stack: None,
+                anim_graph_stack_drag: None,
+                anim_stack_formula_dialog: None,
                 anim_graph_scroll: 0.0,
                 anim_graph_visible_frames: 100.0,
+                anim_timeline_visible_frames: 100.0,
+                anim_graph_view_val_min: 0.0,
+                anim_graph_view_val_max: 1.0,
                 anim_fps: 60,
                 ui_fps: 60.0,
                 enable_layer_raster_cache: false,

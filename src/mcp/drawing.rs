@@ -645,6 +645,82 @@ pub fn drawing_tools() -> Vec<Value> {
     ));
 
     tools.push(tool(
+        "add_stack_animation",
+        "Add a stack animation function on an object over [start_frame, start_frame+duration]. \
+Deletes interior keyframes; keeps editable start keyframes. \
+Formulas use t (0..1), f (local frame), s (this channel start), x/y (pos starts), r/g/b/a (color starts). \
+Empty expr = constant start. Provide exprs for channels: e.g. pos_x/pos_y or color_r/g/b.",
+        json!({
+            "id": { "type": "string", "description": "Object UUID" },
+            "start_frame": { "type": "integer" },
+            "duration_frames": { "type": "integer", "description": "Span length (>=1)" },
+            "tracks": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Track labels, e.g. [\"pos_x\",\"pos_y\"] or [\"color_r\",\"color_g\",\"color_b\"]"
+            },
+            "exprs": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Parallel to tracks; empty string = constant start (x/y/r/g/b/s)"
+            },
+            "starts": {
+                "type": "object",
+                "description": "Optional start constants: x,y (pos), r,g,b,a (color), or per-track keys like pos_x",
+                "properties": {
+                    "x": { "type": "number" },
+                    "y": { "type": "number" },
+                    "r": { "type": "number" },
+                    "g": { "type": "number" },
+                    "b": { "type": "number" },
+                    "a": { "type": "number" }
+                }
+            }
+        }),
+        &["id", "start_frame", "duration_frames", "tracks"],
+    ));
+
+    tools.push(tool(
+        "edit_stack_animation",
+        "Edit an existing stack animation (start_frame, duration_frames, exprs, starts). Provide stack_id from list_stack_animations.",
+        json!({
+            "id": { "type": "string", "description": "Object UUID" },
+            "stack_id": { "type": "string" },
+            "start_frame": { "type": "integer" },
+            "duration_frames": { "type": "integer" },
+            "exprs": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Replace all channel expressions (same order as existing channels)"
+            },
+            "starts": {
+                "type": "object",
+                "description": "Update start constants: x,y,r,g,b,a or track names"
+            }
+        }),
+        &["id", "stack_id"],
+    ));
+
+    tools.push(tool(
+        "remove_stack_animation",
+        "Remove a stack animation function by stack_id.",
+        json!({
+            "id": { "type": "string", "description": "Object UUID" },
+            "stack_id": { "type": "string" }
+        }),
+        &["id", "stack_id"],
+    ));
+
+    tools.push(tool(
+        "list_stack_animations",
+        "List stack animation functions on an object (or all objects if id omitted).",
+        json!({
+            "id": { "type": "string", "description": "Optional object UUID filter" }
+        }),
+        &[],
+    ));
+
+    tools.push(tool(
         "list_animatable_properties",
         "List animatable property names for an object (pos_x, pos_y, rotation, opacity, color_*, geom_N, ...).",
         json!({

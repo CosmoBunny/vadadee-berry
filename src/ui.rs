@@ -2488,6 +2488,21 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
             ui.label(RichText::new("🎬 AV / MEDIA TIMELINE EDITOR").strong().color(colors::ACCENT));
             ui.add_space(16.0);
             ui.checkbox(&mut app.anim_timeline_follow, "Follow Playhead");
+            ui.add_space(8.0);
+            ui.label(RichText::new("Frame width").small().color(colors::TEXT_MUTED));
+            let mut vis = app.anim_timeline_visible_frames.max(10.0);
+            if ui
+                .add(
+                    egui::DragValue::new(&mut vis)
+                        .range(10.0..=5000.0)
+                        .speed(2.0)
+                        .suffix(" frames"),
+                )
+                .on_hover_text("Visible time span of the AV timeline")
+                .changed()
+            {
+                app.anim_timeline_visible_frames = vis;
+            }
             
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(RichText::new(icons::CLOSE).font(nerd_font_id(12.0))).clicked() {
@@ -2528,7 +2543,7 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
             );
 
             let start_frame = scroll;
-            let visible_frames = 100.0;
+            let visible_frames = app.anim_timeline_visible_frames.max(10.0);
             let end_frame = start_frame + visible_frames;
             let start_sec = start_frame / fps;
             let visible_sec = visible_frames / fps;
@@ -2590,7 +2605,7 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
         };
 
         let start_frame = scroll;
-        let visible_frames = 100.0;
+        let visible_frames = app.anim_timeline_visible_frames.max(10.0);
         let visible_sec = visible_frames / fps;
         let start_sec = start_frame / fps;
         let end_sec = (start_frame + visible_frames) / fps;
@@ -6147,6 +6162,7 @@ fn draw_timeline_track(
     selected_keyframe: &mut Option<(crate::document::NodeId, String, usize)>,
     graph_editor_track: &mut Option<(crate::document::NodeId, String)>,
     graph_editor_target_track: &mut Option<(crate::document::NodeId, String)>,
+    visible_frames: f32,
 ) {
     ui.horizontal(|ui| {
         ui.add_space(4.0);
@@ -6178,7 +6194,7 @@ fn draw_timeline_track(
         );
         
         let start_frame = *timeline_scroll;
-        let visible_frames = 100.0;
+        let visible_frames = visible_frames.max(10.0);
         let end_frame = start_frame + visible_frames;
         
         // Draw vertical grid lines every 10 frames in the visible range
@@ -6630,6 +6646,21 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 .small(),
             );
             ui.add_space(8.0);
+            ui.label(RichText::new("Frame width").small().color(colors::TEXT_MUTED));
+            let mut vis = app.anim_timeline_visible_frames.max(10.0);
+            if ui
+                .add(
+                    egui::DragValue::new(&mut vis)
+                        .range(10.0..=5000.0)
+                        .speed(2.0)
+                        .suffix(" frames"),
+                )
+                .on_hover_text("How many frames the animation timeline shows (time axis zoom)")
+                .changed()
+            {
+                app.anim_timeline_visible_frames = vis;
+            }
+            ui.add_space(8.0);
             ui.checkbox(&mut app.anim_timeline_follow, "Follow Playhead");
         });
         ui.add_space(4.0);
@@ -6649,7 +6680,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, colors::BORDER.gamma_multiply(0.5)), egui::StrokeKind::Inside);
             
             let start_frame = scroll;
-            let visible_frames = 100.0;
+            let visible_frames = app.anim_timeline_visible_frames.max(10.0);
             let end_frame = start_frame + visible_frames;
             
             let grid_start = ((start_frame / 10.0).floor() * 10.0) as i32;
@@ -6790,6 +6821,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut temp_selected_kf,
                                 &mut temp_graph_track,
                                 &mut temp_target_track,
+                                app.anim_timeline_visible_frames,
                             );
                         }
                         
@@ -6816,6 +6848,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut temp_selected_kf,
                                 &mut temp_graph_track,
                                 &mut temp_target_track,
+                                app.anim_timeline_visible_frames,
                             );
                         }
                         
@@ -6842,6 +6875,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut temp_selected_kf,
                                 &mut temp_graph_track,
                                 &mut temp_target_track,
+                                app.anim_timeline_visible_frames,
                             );
                         }
                         
@@ -6880,6 +6914,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 &mut temp_selected_kf,
                                 &mut temp_graph_track,
                                 &mut temp_target_track,
+                                app.anim_timeline_visible_frames,
                             );
                         }
 
@@ -6956,6 +6991,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                                         &mut temp_selected_kf,
                                                         &mut temp_graph_track,
                                                         &mut temp_target_track,
+                                                    app.anim_timeline_visible_frames,
                                                     );
                                                 }
                                             }
@@ -7006,6 +7042,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                                     &mut temp_selected_kf,
                                                     &mut temp_graph_track,
                                                     &mut temp_target_track,
+                                                app.anim_timeline_visible_frames,
                                                 );
                                             }
                                             let iw = pt_idx * 3 + 2;
@@ -7031,6 +7068,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                                     &mut temp_selected_kf,
                                                     &mut temp_graph_track,
                                                     &mut temp_target_track,
+                                                app.anim_timeline_visible_frames,
                                                 );
                                             }
                                         }
@@ -7087,6 +7125,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                                 &mut temp_selected_kf,
                                                 &mut temp_graph_track,
                                                 &mut temp_target_track,
+                                            app.anim_timeline_visible_frames,
                                             );
                                         }
                                     }
@@ -7256,6 +7295,17 @@ fn draw_dotted_line(painter: &egui::Painter, p1: egui::Pos2, p2: egui::Pos2, str
     }
 }
 
+/// Navy shade for stack-function regions (independent of track line colors).
+fn stack_region_fill() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(20, 40, 100, 72)
+}
+fn stack_region_border() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(80, 120, 200, 180)
+}
+fn stack_resize_hi() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(160, 200, 255, 220)
+}
+
 fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
     let Some((node_id, track_lbl)) = app.anim_graph_editor_track.clone() else {
         return;
@@ -7291,13 +7341,21 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
     };
     
     ui.vertical(|ui| {
-        ui.horizontal(|ui| {
+        // Title row + stack function inspector (aligned)
+        ui.horizontal_wrapped(|ui| {
             ui.add_space(4.0);
             ui.label(RichText::new(format!("GRAPH EDITOR: {}", track_name)).strong().color(colors::ACCENT));
-            
+
+            // Stack function controls (when one is selected)
+            if let Some(stack_id) = app.anim_graph_selected_stack {
+                graph_stack_header_controls(app, ui, node_id, stack_id);
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(RichText::new(icons::CLOSE).font(icons::nerd_font_id(12.0))).clicked() {
                     app.anim_graph_editor_track = None;
+                    app.anim_graph_selected_stack = None;
+                    app.anim_graph_region_select = None;
                 }
                 
                 // Show interpolation mode selector inside graph editor header
@@ -7374,126 +7432,144 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             0.0
         };
 
-        let Some(anim) = app.project.anim_timeline.nodes.get(&node_id) else {
-            return;
-        };
-        
-        // Resolve all tracks to display in this graph plot
-        let mut tracks_to_draw = Vec::new(); // Vec<(String, Color32, &KeyframeTrack, f64)>
-        
-        if track_lbl == "pos_x" || track_lbl == "pos_y" {
-            tracks_to_draw.push(("pos_x".to_string(), egui::Color32::from_rgb(0, 200, 0), &anim.pos_x, node_pos.0));
-            tracks_to_draw.push(("pos_y".to_string(), egui::Color32::from_rgb(200, 0, 0), &anim.pos_y, node_pos.1));
-        } else if track_lbl.starts_with("color_") {
-            tracks_to_draw.push(("color_r".to_string(), egui::Color32::from_rgb(255, 100, 100), &anim.color_r, node_col[0] as f64));
-            tracks_to_draw.push(("color_g".to_string(), egui::Color32::from_rgb(100, 255, 100), &anim.color_g, node_col[1] as f64));
-            tracks_to_draw.push(("color_b".to_string(), egui::Color32::from_rgb(100, 100, 255), &anim.color_b, node_col[2] as f64));
-        } else if track_lbl.starts_with("geom_") {
-            if let Ok(idx) = track_lbl["geom_".len()..].parse::<usize>() {
-                // Check if this belongs to a 2D pair (like Path X/Y, or BrushStroke X/Y)
-                let mut grouped = false;
-                if let Some(node) = app.project.nodes.get(node_id) {
-                    let base_len = node.get_geom_floats().len();
-                    if idx < base_len {
-                        match &node.kind {
-                            NodeKind::Path { .. } => {
-                                let anchor_idx = idx / 6;
-                                let sub_idx = idx % 6;
-                                if sub_idx == 0 || sub_idx == 1 {
-                                    // Pt X and Pt Y
-                                    let idx_x = anchor_idx * 6;
-                                    let idx_y = anchor_idx * 6 + 1;
-                                    let lbl_x = format!("geom_{}", idx_x);
-                                    let lbl_y = format!("geom_{}", idx_y);
-                                    let def_x = geom_floats.get(idx_x).copied().unwrap_or(0.0);
-                                    let def_y = geom_floats.get(idx_y).copied().unwrap_or(0.0);
-                                    if let Some(t_x) = anim.get_track(&lbl_x) {
-                                        tracks_to_draw.push((lbl_x, egui::Color32::from_rgb(0, 200, 0), t_x, def_x));
+        // Owned track snapshots (release timeline borrow for stack UI mutations).
+        let (tracks_to_draw, stack_fns) = {
+            let Some(anim) = app.project.anim_timeline.nodes.get(&node_id) else {
+                return;
+            };
+            let mut tracks_to_draw: Vec<(String, egui::Color32, crate::document::KeyframeTrack, f64)> =
+                Vec::new();
+            if track_lbl == "pos_x" || track_lbl == "pos_y" {
+                tracks_to_draw.push(("pos_x".to_string(), egui::Color32::from_rgb(0, 200, 0), anim.pos_x.clone(), node_pos.0));
+                tracks_to_draw.push(("pos_y".to_string(), egui::Color32::from_rgb(200, 0, 0), anim.pos_y.clone(), node_pos.1));
+            } else if track_lbl.starts_with("color_") {
+                tracks_to_draw.push(("color_r".to_string(), egui::Color32::from_rgb(255, 100, 100), anim.color_r.clone(), node_col[0] as f64));
+                tracks_to_draw.push(("color_g".to_string(), egui::Color32::from_rgb(100, 255, 100), anim.color_g.clone(), node_col[1] as f64));
+                tracks_to_draw.push(("color_b".to_string(), egui::Color32::from_rgb(100, 100, 255), anim.color_b.clone(), node_col[2] as f64));
+            } else if track_lbl.starts_with("geom_") {
+                if let Ok(idx) = track_lbl["geom_".len()..].parse::<usize>() {
+                    let mut grouped = false;
+                    if let Some(node) = app.project.nodes.get(node_id) {
+                        let base_len = node.get_geom_floats().len();
+                        if idx < base_len {
+                            match &node.kind {
+                                NodeKind::Path { .. } => {
+                                    let anchor_idx = idx / 6;
+                                    let sub_idx = idx % 6;
+                                    let pairs = match sub_idx {
+                                        0 | 1 => Some((anchor_idx * 6, anchor_idx * 6 + 1, egui::Color32::from_rgb(0, 200, 0), egui::Color32::from_rgb(200, 0, 0))),
+                                        2 | 3 => Some((anchor_idx * 6 + 2, anchor_idx * 6 + 3, egui::Color32::from_rgb(0, 200, 200), egui::Color32::from_rgb(200, 0, 200))),
+                                        4 | 5 => Some((anchor_idx * 6 + 4, anchor_idx * 6 + 5, egui::Color32::from_rgb(100, 200, 100), egui::Color32::from_rgb(200, 100, 200))),
+                                        _ => None,
+                                    };
+                                    if let Some((ix, iy, cx, cy)) = pairs {
+                                        let lbl_x = format!("geom_{ix}");
+                                        let lbl_y = format!("geom_{iy}");
+                                        let def_x = geom_floats.get(ix).copied().unwrap_or(0.0);
+                                        let def_y = geom_floats.get(iy).copied().unwrap_or(0.0);
+                                        if let Some(t_x) = anim.get_track(&lbl_x) {
+                                            tracks_to_draw.push((lbl_x, cx, t_x.clone(), def_x));
+                                        }
+                                        if let Some(t_y) = anim.get_track(&lbl_y) {
+                                            tracks_to_draw.push((lbl_y, cy, t_y.clone(), def_y));
+                                        }
+                                        grouped = true;
                                     }
-                                    if let Some(t_y) = anim.get_track(&lbl_y) {
-                                        tracks_to_draw.push((lbl_y, egui::Color32::from_rgb(200, 0, 0), t_y, def_y));
-                                    }
-                                    grouped = true;
-                                } else if sub_idx == 2 || sub_idx == 3 {
-                                    // Pt Out X and Pt Out Y
-                                    let idx_x = anchor_idx * 6 + 2;
-                                    let idx_y = anchor_idx * 6 + 3;
-                                    let lbl_x = format!("geom_{}", idx_x);
-                                    let lbl_y = format!("geom_{}", idx_y);
-                                    let def_x = geom_floats.get(idx_x).copied().unwrap_or(0.0);
-                                    let def_y = geom_floats.get(idx_y).copied().unwrap_or(0.0);
-                                    if let Some(t_x) = anim.get_track(&lbl_x) {
-                                        tracks_to_draw.push((lbl_x, egui::Color32::from_rgb(0, 200, 200), t_x, def_x));
-                                    }
-                                    if let Some(t_y) = anim.get_track(&lbl_y) {
-                                        tracks_to_draw.push((lbl_y, egui::Color32::from_rgb(200, 0, 200), t_y, def_y));
-                                    }
-                                    grouped = true;
-                                } else if sub_idx == 4 || sub_idx == 5 {
-                                    // Pt In X and Pt In Y
-                                    let idx_x = anchor_idx * 6 + 4;
-                                    let idx_y = anchor_idx * 6 + 5;
-                                    let lbl_x = format!("geom_{}", idx_x);
-                                    let lbl_y = format!("geom_{}", idx_y);
-                                    let def_x = geom_floats.get(idx_x).copied().unwrap_or(0.0);
-                                    let def_y = geom_floats.get(idx_y).copied().unwrap_or(0.0);
-                                    if let Some(t_x) = anim.get_track(&lbl_x) {
-                                        tracks_to_draw.push((lbl_x, egui::Color32::from_rgb(100, 200, 100), t_x, def_x));
-                                    }
-                                    if let Some(t_y) = anim.get_track(&lbl_y) {
-                                        tracks_to_draw.push((lbl_y, egui::Color32::from_rgb(200, 100, 200), t_y, def_y));
-                                    }
-                                    grouped = true;
                                 }
-                            }
-                            NodeKind::BrushStroke { .. } => {
-                                let pt_idx = idx / 3;
-                                let sub_idx = idx % 3;
-                                if sub_idx == 0 || sub_idx == 1 {
-                                    let idx_x = pt_idx * 3;
-                                    let idx_y = pt_idx * 3 + 1;
-                                    let lbl_x = format!("geom_{}", idx_x);
-                                    let lbl_y = format!("geom_{}", idx_y);
-                                    let def_x = geom_floats.get(idx_x).copied().unwrap_or(0.0);
-                                    let def_y = geom_floats.get(idx_y).copied().unwrap_or(0.0);
-                                    if let Some(t_x) = anim.get_track(&lbl_x) {
-                                        tracks_to_draw.push((lbl_x, egui::Color32::from_rgb(0, 200, 0), t_x, def_x));
+                                NodeKind::BrushStroke { .. } => {
+                                    let pt_idx = idx / 3;
+                                    let sub_idx = idx % 3;
+                                    if sub_idx == 0 || sub_idx == 1 {
+                                        let idx_x = pt_idx * 3;
+                                        let idx_y = pt_idx * 3 + 1;
+                                        let lbl_x = format!("geom_{idx_x}");
+                                        let lbl_y = format!("geom_{idx_y}");
+                                        let def_x = geom_floats.get(idx_x).copied().unwrap_or(0.0);
+                                        let def_y = geom_floats.get(idx_y).copied().unwrap_or(0.0);
+                                        if let Some(t_x) = anim.get_track(&lbl_x) {
+                                            tracks_to_draw.push((lbl_x, egui::Color32::from_rgb(0, 200, 0), t_x.clone(), def_x));
+                                        }
+                                        if let Some(t_y) = anim.get_track(&lbl_y) {
+                                            tracks_to_draw.push((lbl_y, egui::Color32::from_rgb(200, 0, 0), t_y.clone(), def_y));
+                                        }
+                                        grouped = true;
                                     }
-                                    if let Some(t_y) = anim.get_track(&lbl_y) {
-                                        tracks_to_draw.push((lbl_y, egui::Color32::from_rgb(200, 0, 0), t_y, def_y));
-                                    }
-                                    grouped = true;
                                 }
+                                _ => {}
                             }
-                            _ => {}
+                        }
+                    }
+                    if !grouped {
+                        if let Some(t) = anim.get_track(&track_lbl) {
+                            tracks_to_draw.push((track_lbl.clone(), colors::ACCENT, t.clone(), default_val));
                         }
                     }
                 }
-                if !grouped {
-                    if let Some(t) = anim.get_track(&track_lbl) {
-                        tracks_to_draw.push((track_lbl.clone(), colors::ACCENT, t, default_val));
-                    }
-                }
+            } else if let Some(t) = anim.get_track(&track_lbl) {
+                tracks_to_draw.push((track_lbl.clone(), colors::ACCENT, t.clone(), default_val));
             }
-        } else {
-            if let Some(t) = anim.get_track(&track_lbl) {
-                tracks_to_draw.push((track_lbl.clone(), colors::ACCENT, t, default_val));
-            }
-        }
-        
+
+            let track_labels: Vec<String> = tracks_to_draw.iter().map(|(l, _, _, _)| l.clone()).collect();
+            let stack_fns: Vec<crate::document::StackAnimationFunction> = anim
+                .stack_functions
+                .iter()
+                .filter(|sf| sf.channels.iter().any(|c| track_labels.iter().any(|l| l == &c.track)))
+                .cloned()
+                .collect();
+            (tracks_to_draw, stack_fns)
+        };
+
         if tracks_to_draw.is_empty() {
             return;
         }
+        let graph_track_labels: Vec<String> =
+            tracks_to_draw.iter().map(|(l, _, _, _)| l.clone()).collect();
+        let graph_track_defaults: Vec<f64> =
+            tracks_to_draw.iter().map(|(_, _, _, d)| *d).collect();
 
         let mut graph_scroll = app.anim_graph_scroll;
-        let graph_visible = app.anim_graph_visible_frames.max(20.0);
+        let mut graph_visible = app.anim_graph_visible_frames.max(10.0);
         let graph_frame_max = tracks_to_draw
             .iter()
             .flat_map(|(_, _, track, _)| track.keyframes.iter().map(|k| k.frame))
+            .chain(stack_fns.iter().map(|sf| sf.end_frame()))
             .max()
             .unwrap_or(0)
             .max(app.get_max_animation_frame())
             .max(100);
+
+        // Frame-width control (how many frames the graph plot shows).
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Frame width").small().color(colors::TEXT_MUTED));
+            let mut vis = graph_visible;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut vis)
+                        .range(10.0..=5000.0)
+                        .speed(2.0)
+                        .suffix(" frames"),
+                )
+                .on_hover_text("Visible span of the graph plot (time axis zoom)")
+                .changed()
+            {
+                graph_visible = vis;
+                app.anim_graph_visible_frames = vis;
+            }
+            ui.label(RichText::new("Scroll").small().color(colors::TEXT_MUTED));
+            let mut scr = graph_scroll;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut scr)
+                        .range(0.0..=(graph_frame_max as f32 + 100.0))
+                        .speed(1.0)
+                        .suffix(" start"),
+                )
+                .changed()
+            {
+                graph_scroll = scr.max(0.0);
+                app.anim_graph_scroll = graph_scroll;
+            }
+        });
 
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width() - 8.0, 136.0),
@@ -7506,44 +7582,16 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
         
         let padding = 12.0;
         
-        // Find min/max values across all resolved tracks
-        let mut val_min = f64::MAX;
-        let mut val_max = f64::MIN;
-        let mut has_keyframes = false;
-        for (_, _, track, default_val) in &tracks_to_draw {
-            for kf in &track.keyframes {
-                val_min = val_min.min(kf.value);
-                val_max = val_max.max(kf.value);
-                if kf.interpolation == crate::app::InterpolationMode::Bezier {
-                    val_min = val_min.min(kf.value + kf.handle_right.1);
-                    val_max = val_max.max(kf.value + kf.handle_right.1);
-                    val_min = val_min.min(kf.value + kf.handle_left.1);
-                    val_max = val_max.max(kf.value + kf.handle_left.1);
-                }
-                has_keyframes = true;
-            }
-            if track.keyframes.is_empty() {
-                val_min = val_min.min(*default_val);
-                val_max = val_max.max(*default_val);
-            }
-        }
-        
+        // Content exists?
+        let mut has_keyframes = tracks_to_draw.iter().any(|(_, _, t, _)| !t.keyframes.is_empty())
+            || !stack_fns.is_empty();
         if !has_keyframes {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("No keyframes on this track.").color(colors::TEXT_MUTED));
             });
             return;
         }
-        
-        if val_min >= val_max {
-            val_min -= 1.0;
-            val_max += 1.0;
-        } else {
-            let span = val_max - val_min;
-            val_min -= span * 0.25;
-            val_max += span * 0.25;
-        }
-        
+
         // Scroll / grab pan (wheel + middle/right/shift-drag), like the main timeline
         let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
         let wheel_delta = if scroll_delta.x != 0.0 {
@@ -7552,7 +7600,13 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             scroll_delta.y
         };
         if wheel_delta != 0.0 && response.hovered() {
-            graph_scroll = (graph_scroll - wheel_delta * 0.15).max(0.0);
+            // Ctrl+wheel: zoom frame width; plain wheel: pan
+            if ui.input(|i| i.modifiers.ctrl) {
+                let factor = if wheel_delta > 0.0 { 0.9 } else { 1.1 };
+                graph_visible = (graph_visible * factor).clamp(10.0, 5000.0);
+            } else {
+                graph_scroll = (graph_scroll - wheel_delta * 0.15).max(0.0);
+            }
         }
         if response.dragged_by(egui::PointerButton::Secondary)
             || response.dragged_by(egui::PointerButton::Middle)
@@ -7567,6 +7621,60 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
         }
         let scroll_max = (graph_frame_max as f32 + 20.0 - graph_visible).max(0.0);
         graph_scroll = graph_scroll.min(scroll_max);
+
+        // Auto Y-range from samples in the *visible* frame window (incl. stack exprs).
+        let vis_lo = graph_scroll.floor().max(0.0) as usize;
+        let vis_hi = (graph_scroll + graph_visible).ceil() as usize;
+        let sample_step = ((vis_hi.saturating_sub(vis_lo) / 80).max(1)) as usize;
+        let mut target_min = f64::MAX;
+        let mut target_max = f64::MIN;
+        for (lbl, _, track, default_val) in &tracks_to_draw {
+            for kf in &track.keyframes {
+                if kf.frame >= vis_lo && kf.frame <= vis_hi {
+                    target_min = target_min.min(kf.value);
+                    target_max = target_max.max(kf.value);
+                }
+            }
+            let mut f = vis_lo;
+            while f <= vis_hi {
+                let mut val = track.interpolate(f).unwrap_or(*default_val);
+                for sf in &stack_fns {
+                    if let Ok(Some(v)) = sf.sample_channel_ref(lbl, f) {
+                        val = v;
+                        break;
+                    }
+                }
+                target_min = target_min.min(val);
+                target_max = target_max.max(val);
+                f += sample_step;
+            }
+        }
+        if !target_min.is_finite() || !target_max.is_finite() || target_min > target_max {
+            target_min = 0.0;
+            target_max = 1.0;
+        }
+        if (target_max - target_min).abs() < 1e-6 {
+            target_min -= 1.0;
+            target_max += 1.0;
+        } else {
+            let pad = (target_max - target_min) * 0.18;
+            target_min -= pad;
+            target_max += pad;
+        }
+        // Smoothly approach target so range doesn't jump every frame.
+        let smooth = 0.22_f64;
+        if (app.anim_graph_view_val_max - app.anim_graph_view_val_min).abs() < 1e-9 {
+            app.anim_graph_view_val_min = target_min;
+            app.anim_graph_view_val_max = target_max;
+        } else {
+            app.anim_graph_view_val_min +=
+                (target_min - app.anim_graph_view_val_min) * smooth;
+            app.anim_graph_view_val_max +=
+                (target_max - app.anim_graph_view_val_max) * smooth;
+        }
+        let val_min = app.anim_graph_view_val_min;
+        let val_max = app.anim_graph_view_val_max;
+        ui.ctx().request_repaint(); // keep smooth Y settle
 
         // Draw grid (frame ticks in visible range)
         let grid_step = if graph_visible > 200.0 {
@@ -7640,7 +7748,118 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             (frame, value)
         };
         
-        // Draw graph curves and detect segment clicks
+        // Navy stack-function regions (under curves)
+        let mut hover_stack_resize: Option<uuid::Uuid> = None;
+        let mut hover_stack_body: Option<uuid::Uuid> = None;
+        for sf in &stack_fns {
+            let x0 = to_screen(sf.start_frame as f64, val_min).x;
+            let x1 = to_screen(sf.end_frame() as f64, val_min).x;
+            let mut region = egui::Rect::from_min_max(
+                egui::pos2(x0.min(x1), rect.top() + 2.0),
+                egui::pos2(x0.max(x1), rect.bottom() - 2.0),
+            );
+            region = region.intersect(rect);
+            if region.width() < 1.0 {
+                continue;
+            }
+            let selected = app.anim_graph_selected_stack == Some(sf.id);
+            painter.rect_filled(region, 0.0, stack_region_fill());
+            painter.rect_stroke(
+                region,
+                0.0,
+                egui::Stroke::new(if selected { 1.5 } else { 1.0 }, stack_region_border()),
+                egui::StrokeKind::Inside,
+            );
+            // Relative time endpoints: f=0 at stack start, f=duration at stack end (not global timeline).
+            let start_x = x0.min(x1);
+            let end_x = x0.max(x1);
+            let rel_end = sf.duration_frames.max(1);
+            // Start point (relative 0)
+            painter.line_segment(
+                [
+                    egui::pos2(start_x, region.top()),
+                    egui::pos2(start_x, region.bottom()),
+                ],
+                egui::Stroke::new(2.0, stack_region_border()),
+            );
+            painter.circle_filled(
+                egui::pos2(start_x, region.center().y),
+                4.0,
+                stack_region_border(),
+            );
+            painter.text(
+                egui::pos2(start_x + 3.0, region.bottom() - 2.0),
+                egui::Align2::LEFT_BOTTOM,
+                "0",
+                egui::FontId::new(9.0, egui::FontFamily::Proportional),
+                stack_region_border(),
+            );
+            // End point (relative duration)
+            painter.line_segment(
+                [
+                    egui::pos2(end_x, region.top()),
+                    egui::pos2(end_x, region.bottom()),
+                ],
+                egui::Stroke::new(2.0, stack_region_border()),
+            );
+            painter.circle_filled(
+                egui::pos2(end_x, region.center().y),
+                4.0,
+                stack_region_border(),
+            );
+            painter.text(
+                egui::pos2(end_x - 3.0, region.bottom() - 2.0),
+                egui::Align2::RIGHT_BOTTOM,
+                format!("{rel_end}"),
+                egui::FontId::new(9.0, egui::FontFamily::Proportional),
+                stack_region_border(),
+            );
+            // Formula label (relative time)
+            let parts: Vec<String> = sf
+                .channels
+                .iter()
+                .map(|c| {
+                    if c.expr.trim().is_empty() {
+                        format!("{:.3}", c.start_value)
+                    } else {
+                        c.expr.trim().to_string()
+                    }
+                })
+                .collect();
+            let label = if parts.len() == 1 {
+                format!("f(t) = {}  [t:0→1]", parts[0])
+            } else {
+                format!("f(t) = ({})  [t:0→1]", parts.join(", "))
+            };
+            painter.text(
+                egui::pos2(region.left() + 6.0, region.top() + 2.0),
+                egui::Align2::LEFT_TOP,
+                label,
+                egui::FontId::new(10.0, egui::FontFamily::Proportional),
+                colors::TEXT_MUTED.gamma_multiply(1.2),
+            );
+            // End resize hover zone
+            let end_zone = egui::Rect::from_center_size(
+                egui::pos2(end_x, region.center().y),
+                egui::vec2(10.0, region.height()),
+            );
+            if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
+                if end_zone.contains(mpos) {
+                    hover_stack_resize = Some(sf.id);
+                    painter.line_segment(
+                        [
+                            egui::pos2(end_x, region.top()),
+                            egui::pos2(end_x, region.bottom()),
+                        ],
+                        egui::Stroke::new(3.5, stack_resize_hi()),
+                    );
+                } else if region.contains(mpos) {
+                    hover_stack_body = Some(sf.id);
+                }
+            }
+        }
+
+        // Draw graph curves (stack functions override sample) and detect segment clicks
         let mut clicked_segment: Option<(String, usize, usize, egui::Pos2)> = None; // (track_lbl, left_frame, right_frame, click_pos)
         for (lbl, color, track, default_val) in &tracks_to_draw {
             let track_lbl_str = lbl.to_string();
@@ -7648,7 +7867,13 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             let sample_start = graph_scroll.floor().max(0.0) as usize;
             let sample_end = (graph_scroll + graph_visible).ceil() as usize;
             for f in sample_start..=sample_end {
-                let val = track.interpolate(f).unwrap_or(*default_val);
+                let mut val = track.interpolate(f).unwrap_or(*default_val);
+                for sf in &stack_fns {
+                    if let Ok(Some(v)) = sf.sample_channel_ref(&track_lbl_str, f) {
+                        val = v;
+                        break;
+                    }
+                }
                 curve_pts.push((f, to_screen(f as f64, val)));
             }
 
@@ -7692,8 +7917,8 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
         }
 
         // Handle segment click → select segment for bezier-add
-        if let Some((seg_lbl, lf, rf, _)) = clicked_segment {
-            app.anim_graph_selected_segment = Some((seg_lbl, lf, rf));
+        if let Some((ref seg_lbl, lf, rf, _)) = clicked_segment {
+            app.anim_graph_selected_segment = Some((seg_lbl.clone(), lf, rf));
             app.anim_selected_keyframe = None;
         }
 
@@ -7845,6 +8070,10 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                                 app.anim_selected_keyframe = Some((node_id, drag_lbl.clone(), final_frame));
                             }
                         }
+                        // Start keyframes of stacks drive start_value / x,y,r,g,b constants.
+                        anim_mut.sync_stack_starts_from_keyframes();
+                        anim_mut.ensure_stack_start_keyframes();
+                        anim_mut.ensure_stack_end_keyframes();
                     }
                     app.apply_animation_for_frame(app.anim_current_frame);
                 }
@@ -7904,71 +8133,691 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             );
         }
 
-        app.anim_graph_scroll = graph_scroll;
-        app.anim_graph_visible_frames = graph_visible;
-    });
+        // Stack region pointer: select / move / resize-end
+        if response.hovered() {
+            if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
+                if ui.input(|i| i.pointer.primary_pressed())
+                    && app.anim_graph_editor_dragged_kf.is_none()
+                    && app.anim_graph_editor_dragged_handle.is_none()
+                    && !ui.input(|i| i.modifiers.shift)
+                {
+                    if let Some(sid) = hover_stack_resize {
+                        if let Some(sf) = stack_fns.iter().find(|s| s.id == sid) {
+                            app.anim_graph_selected_stack = Some(sid);
+                            app.anim_graph_stack_drag =
+                                Some(crate::app::AnimGraphStackDrag::ResizeEnd {
+                                    id: sid,
+                                    orig_duration: sf.duration_frames,
+                                });
+                            app.anim_graph_selected_segment = None;
+                            app.anim_graph_region_select = None;
+                        }
+                    } else if let Some(sid) = hover_stack_body {
+                        if let Some(sf) = stack_fns.iter().find(|s| s.id == sid) {
+                            let (gf, _) = to_graph(mpos);
+                            app.anim_graph_selected_stack = Some(sid);
+                            app.anim_graph_stack_drag =
+                                Some(crate::app::AnimGraphStackDrag::Move {
+                                    id: sid,
+                                    grab_frame: gf,
+                                    orig_start: sf.start_frame,
+                                });
+                            app.anim_graph_selected_segment = None;
+                            app.anim_graph_region_select = None;
+                        }
+                    } else if clicked_segment.is_none()
+                        && app.anim_graph_editor_dragged_kf.is_none()
+                    {
+                        // Start marquee region select on empty graph area
+                        let (gf, _) = to_graph(mpos);
+                        let f0 = gf.round().max(0.0) as usize;
+                        app.anim_graph_region_select = Some((f0, f0));
+                        app.anim_graph_selected_stack = None;
+                    }
+                }
+            }
+        }
 
-    // Segment-selected: apply bezier on the span between two keyframes (no extra keyframe).
-    if let Some((ref seg_lbl, lf, rf)) = app.anim_graph_selected_segment.clone() {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("Segment [{} – {}] selected", lf, rf))
-                    .color(colors::TEXT_MUTED)
-                    .italics(),
-            );
-            ui.add_space(8.0);
-            let add_btn = ui.add(
-                egui::Button::new(
-                    RichText::new("+ Apply Bezier")
-                        .color(egui::Color32::from_rgb(80, 200, 120))
-                )
-                .fill(colors::BG_DEEP),
-            );
-            if add_btn.clicked() {
-                let before_timeline = app.project.anim_timeline.clone();
-                if let Some(anim_mut) = app.project.anim_timeline.nodes.get_mut(&node_id) {
-                    if let Some(track) = anim_mut.get_track_mut(&seg_lbl) {
-                        let left_val = track
-                            .keyframes
-                            .iter()
-                            .find(|k| k.frame == lf)
-                            .map(|k| k.value)
-                            .unwrap_or(0.0);
-                        let right_val = track
-                            .keyframes
-                            .iter()
-                            .find(|k| k.frame == rf)
-                            .map(|k| k.value)
-                            .unwrap_or(left_val);
-                        let range = (rf - lf) as f64;
-                        if let Some(lk) = track.keyframes.iter_mut().find(|k| k.frame == lf) {
-                            lk.interpolation = crate::app::InterpolationMode::Bezier;
-                            lk.handle_right = (
-                                (range * 0.33).clamp(1.0, range.max(1.0)),
-                                (right_val - left_val) * 0.33,
-                            );
+        // Update marquee while dragging primary
+        if response.dragged_by(egui::PointerButton::Primary)
+            && app.anim_graph_stack_drag.is_none()
+            && app.anim_graph_editor_dragged_kf.is_none()
+            && !ui.input(|i| i.modifiers.shift)
+        {
+            if let (Some(mpos), Some((a, _))) = (
+                ui.input(|i| i.pointer.hover_pos()),
+                app.anim_graph_region_select,
+            ) {
+                let (gf, _) = to_graph(mpos);
+                let f1 = gf.round().max(0.0) as usize;
+                app.anim_graph_region_select = Some((a, f1));
+            }
+        }
+
+        // Draw marquee region (navy)
+        if let Some((a, b)) = app.anim_graph_region_select {
+            let f0 = a.min(b) as f64;
+            let f1 = a.max(b) as f64;
+            let x0 = to_screen(f0, val_min).x;
+            let x1 = to_screen(f1, val_min).x;
+            let region = egui::Rect::from_min_max(
+                egui::pos2(x0.min(x1), rect.top() + 2.0),
+                egui::pos2(x0.max(x1), rect.bottom() - 2.0),
+            )
+            .intersect(rect);
+            if region.width() > 1.0 {
+                painter.rect_filled(region, 0.0, stack_region_fill());
+                painter.rect_stroke(
+                    region,
+                    0.0,
+                    egui::Stroke::new(1.0, stack_region_border()),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+
+        // Live stack move / resize
+        if let Some(drag) = app.anim_graph_stack_drag.clone() {
+            if response.dragged_by(egui::PointerButton::Primary) {
+                if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let (gf, _) = to_graph(mpos);
+                    match drag {
+                        crate::app::AnimGraphStackDrag::Move {
+                            id,
+                            grab_frame,
+                            orig_start,
+                        } => {
+                            let delta = (gf - grab_frame).round() as isize;
+                            let new_start = (orig_start as isize + delta).max(0) as usize;
+                            let mut moved = false;
+                            if let Some(anim) =
+                                app.project.anim_timeline.nodes.get_mut(&node_id)
+                            {
+                                if let Some(sf) =
+                                    anim.stack_functions.iter_mut().find(|s| s.id == id)
+                                {
+                                    if sf.start_frame != new_start {
+                                        let labels: Vec<String> = sf
+                                            .channels
+                                            .iter()
+                                            .map(|c| c.track.clone())
+                                            .collect();
+                                        let old_start = sf.start_frame;
+                                        let old_end = sf.end_frame();
+                                        let start_vals: Vec<(String, f64)> = sf
+                                            .channels
+                                            .iter()
+                                            .map(|c| (c.track.clone(), c.start_value))
+                                            .collect();
+                                        sf.start_frame = new_start;
+                                        let new_end = sf.end_frame();
+                                        let lo = old_start.min(new_start);
+                                        let hi = old_end.max(new_end);
+                                        let refs: Vec<&str> =
+                                            labels.iter().map(|s| s.as_str()).collect();
+                                        // Drop keyframes that now fall under the stack span.
+                                        anim.clear_keyframes_under_stack(
+                                            &refs, new_start, new_end,
+                                        );
+                                        // Also clear the old span interior (points left behind).
+                                        anim.clear_keyframes_under_stack(
+                                            &refs, old_start, old_end,
+                                        );
+                                        // Remove any KF still sitting in [lo, hi] except new start.
+                                        for label in &labels {
+                                            if let Some(tr) = anim.get_track_mut(label) {
+                                                tr.keyframes.retain(|kf| {
+                                                    kf.frame == new_start
+                                                        || kf.frame < lo
+                                                        || kf.frame > hi
+                                                });
+                                            }
+                                        }
+                                        for (tr, v) in &start_vals {
+                                            if let Some(track) = anim.get_track_mut(tr) {
+                                                track.insert(new_start, *v);
+                                            }
+                                        }
+                                        anim.ensure_stack_start_keyframes();
+                                        anim.ensure_stack_end_keyframes();
+                                        moved = true;
+                                    }
+                                }
+                            }
+                            if moved {
+                                app.apply_animation_for_frame(app.anim_current_frame);
+                            }
+                        }
+                        crate::app::AnimGraphStackDrag::ResizeEnd { id, orig_duration } => {
+                            let _ = orig_duration;
+                            let end = gf.round().max(0.0) as usize;
+                            let mut apply = false;
+                            let mut labels = Vec::new();
+                            let mut start = 0usize;
+                            let mut lo = 0usize;
+                            let mut hi = 0usize;
+                            let mut start_vals = Vec::new();
+                            if let Some(anim) =
+                                app.project.anim_timeline.nodes.get_mut(&node_id)
+                            {
+                                if let Some(sf) =
+                                    anim.stack_functions.iter_mut().find(|s| s.id == id)
+                                {
+                                    let new_dur =
+                                        end.saturating_sub(sf.start_frame).max(1);
+                                    if sf.duration_frames != new_dur {
+                                        labels = sf
+                                            .channels
+                                            .iter()
+                                            .map(|c| c.track.clone())
+                                            .collect();
+                                        start = sf.start_frame;
+                                        let old_end = sf.end_frame();
+                                        sf.duration_frames = new_dur;
+                                        let new_end = sf.end_frame();
+                                        lo = start;
+                                        hi = old_end.max(new_end);
+                                        start_vals = sf
+                                            .channels
+                                            .iter()
+                                            .map(|c| (c.track.clone(), c.start_value))
+                                            .collect();
+                                        apply = true;
+                                    }
+                                }
+                                if apply {
+                                    let refs: Vec<&str> =
+                                        labels.iter().map(|s| s.as_str()).collect();
+                                    anim.clear_keyframes_under_stack(&refs, start, hi.max(lo));
+                                    for (tr, v) in &start_vals {
+                                        if let Some(track) = anim.get_track_mut(tr) {
+                                            track.insert(start, *v);
+                                        }
+                                    }
+                                    anim.ensure_stack_start_keyframes();
+                                    anim.ensure_stack_end_keyframes();
+                                }
+                            }
+                            if apply {
+                                app.apply_animation_for_frame(app.anim_current_frame);
+                            }
                         }
                     }
                 }
-                let after_timeline = app.project.anim_timeline.clone();
+            } else if ui.input(|i| i.pointer.any_released()) {
+                let before = app.project.anim_timeline.clone();
                 app.history.push(
                     &mut app.project,
-                    crate::history::ProjectEdit::PatchTimeline { before: before_timeline, after: after_timeline },
+                    crate::history::ProjectEdit::PatchTimeline {
+                        before: before.clone(),
+                        after: before,
+                    },
                 );
-                app.anim_graph_selected_segment = None;
-                app.apply_animation_for_frame(app.anim_current_frame);
+                app.anim_graph_stack_drag = None;
             }
-            ui.add_space(4.0);
-            if ui
-                .button(
-                    RichText::new("x Deselect")
-                        .color(colors::TEXT_MUTED),
-                )
-                .clicked()
-            {
-                app.anim_graph_selected_segment = None;
+        }
+
+        app.anim_graph_scroll = graph_scroll;
+        app.anim_graph_visible_frames = graph_visible;
+
+        // Region or segment selected: stack function + bezier actions
+        let region_opt = app.anim_graph_region_select.map(|(a, b)| (a.min(b), a.max(b)));
+        let segment_opt = app
+            .anim_graph_selected_segment
+            .as_ref()
+            .map(|(_, lf, rf)| (*lf, *rf));
+        let apply_span = region_opt.or(segment_opt).filter(|(a, b)| b > a);
+
+        if let Some((lf, rf)) = apply_span {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("Region [{} – {}]", lf, rf))
+                        .color(colors::TEXT_MUTED)
+                        .italics(),
+                );
+                ui.add_space(6.0);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("+ Stack animation function")
+                                .color(egui::Color32::from_rgb(120, 180, 255)),
+                        )
+                        .fill(colors::BG_DEEP),
+                    )
+                    .on_hover_text(
+                        "Replace keyframes in this span with f(t) expressions (t=0..1). Deletes interior keyframes.",
+                    )
+                    .clicked()
+                {
+                    apply_stack_animation_function(
+                        app,
+                        node_id,
+                        &graph_track_labels,
+                        &graph_track_defaults,
+                        lf,
+                        rf,
+                    );
+                    app.anim_graph_selected_segment = None;
+                    app.anim_graph_region_select = None;
+                }
+                // Bezier only for pure segment selection (not after stack apply / stack selected).
+                if app.anim_graph_selected_segment.is_some()
+                    && app.anim_graph_selected_stack.is_none()
+                    && app.anim_graph_region_select.is_none()
+                {
+                    ui.add_space(4.0);
+                    if ui
+                        .button(
+                            RichText::new("+ Apply Bezier")
+                                .color(egui::Color32::from_rgb(80, 200, 120)),
+                        )
+                        .clicked()
+                    {
+                        if let Some((ref seg_lbl, lf, rf)) = app.anim_graph_selected_segment.clone()
+                        {
+                            let before_timeline = app.project.anim_timeline.clone();
+                            if let Some(anim_mut) =
+                                app.project.anim_timeline.nodes.get_mut(&node_id)
+                            {
+                                if let Some(track) = anim_mut.get_track_mut(&seg_lbl) {
+                                    let left_val = track
+                                        .keyframes
+                                        .iter()
+                                        .find(|k| k.frame == lf)
+                                        .map(|k| k.value)
+                                        .unwrap_or(0.0);
+                                    let right_val = track
+                                        .keyframes
+                                        .iter()
+                                        .find(|k| k.frame == rf)
+                                        .map(|k| k.value)
+                                        .unwrap_or(left_val);
+                                    let range = (rf - lf) as f64;
+                                    if let Some(lk) =
+                                        track.keyframes.iter_mut().find(|k| k.frame == lf)
+                                    {
+                                        lk.interpolation =
+                                            crate::app::InterpolationMode::Bezier;
+                                        lk.handle_right = (
+                                            (range * 0.33).clamp(1.0, range.max(1.0)),
+                                            (right_val - left_val) * 0.33,
+                                        );
+                                    }
+                                }
+                            }
+                            let after_timeline = app.project.anim_timeline.clone();
+                            app.history.push(
+                                &mut app.project,
+                                crate::history::ProjectEdit::PatchTimeline {
+                                    before: before_timeline,
+                                    after: after_timeline,
+                                },
+                            );
+                            app.anim_graph_selected_segment = None;
+                            app.apply_animation_for_frame(app.anim_current_frame);
+                        }
+                    }
+                }
+                ui.add_space(4.0);
+                if ui
+                    .button(RichText::new("x Deselect").color(colors::TEXT_MUTED))
+                    .clicked()
+                {
+                    app.anim_graph_selected_segment = None;
+                    app.anim_graph_region_select = None;
+                }
+            });
+        }
+    });
+
+    // Formula dialog window
+    graph_stack_formula_dialog(app, ui.ctx());
+}
+
+fn graph_stack_header_controls(
+    app: &mut VadadeeBerryApp,
+    ui: &mut egui::Ui,
+    node_id: crate::document::NodeId,
+    stack_id: uuid::Uuid,
+) {
+    // Snapshot for UI, then write back.
+    let Some(sf_snap) = app
+        .project
+        .anim_timeline
+        .nodes
+        .get(&node_id)
+        .and_then(|a| a.stack_functions.iter().find(|s| s.id == stack_id))
+        .cloned()
+    else {
+        return;
+    };
+
+    ui.separator();
+    // Placement on the global timeline (where the stack sits).
+    ui.label(
+        RichText::new("On timeline")
+            .small()
+            .color(colors::TEXT_MUTED),
+    );
+    let mut start = sf_snap.start_frame as i32;
+    let start_changed = ui
+        .add(
+            egui::DragValue::new(&mut start)
+                .range(0..=100_000)
+                .speed(1.0)
+                .prefix("frame "),
+        )
+        .on_hover_text("Global timeline frame where this stack begins (f=0 inside the formula)")
+        .changed();
+
+    ui.label(RichText::new("Length").small().color(colors::TEXT_MUTED));
+    let mut dur = sf_snap.duration_frames as i32;
+    let dur_changed = ui
+        .add(
+            egui::DragValue::new(&mut dur)
+                .range(1..=100_000)
+                .speed(1.0)
+                .suffix(" f"),
+        )
+        .on_hover_text("Relative length: formulas use t=0..1 and f=0..length (not global frame)")
+        .changed();
+    ui.label(
+        RichText::new(format!("rel 0→{}", sf_snap.duration_frames.max(1)))
+            .small()
+            .color(colors::TEXT_MUTED),
+    );
+
+    ui.label(
+        RichText::new("f(t)=")
+            .small()
+            .color(colors::TEXT_MUTED),
+    )
+    .on_hover_text(
+        "t=0 at stack start, t=1 at stack end. f=0..length (local). \
+x,y,r,g,b,a,s = start constants. Empty expr = hold start value.",
+    );
+    ui.label(RichText::new("(").color(colors::TEXT_MUTED));
+
+    let mut exprs: Vec<String> = sf_snap.channels.iter().map(|c| c.expr.clone()).collect();
+    let errs: Vec<Option<String>> = sf_snap.channels.iter().map(|c| c.last_error.clone()).collect();
+    let mut expr_changed = false;
+    let mut open_dialog: Option<usize> = None;
+
+    for ci in 0..exprs.len() {
+        if ci > 0 {
+            ui.label(RichText::new(",").color(colors::TEXT_MUTED));
+        }
+        let has_err = errs.get(ci).and_then(|e| e.as_ref()).is_some();
+        let mut te = egui::TextEdit::singleline(&mut exprs[ci])
+            .desired_width(96.0)
+            .hint_text("t,f,x,y…");
+        if has_err {
+            te = te
+                .text_color(egui::Color32::from_rgb(255, 180, 180))
+                .background_color(egui::Color32::from_rgb(60, 16, 16));
+        }
+        let r = ui.add(te);
+        if let Some(Some(e)) = errs.get(ci) {
+            r.clone().on_hover_text(e);
+            ui.painter().rect_stroke(
+                r.rect.expand(1.0),
+                2.0,
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 60, 60)),
+                egui::StrokeKind::Outside,
+            );
+        }
+        if r.changed() {
+            expr_changed = true;
+        }
+        if r.double_clicked() {
+            open_dialog = Some(ci);
+        }
+    }
+    ui.label(RichText::new(")").color(colors::TEXT_MUTED));
+
+    if ui
+        .button(RichText::new("Delete stack").color(egui::Color32::from_rgb(255, 120, 120)))
+        .on_hover_text("Remove this stack animation function")
+        .clicked()
+    {
+        delete_stack_animation_function(app, node_id, stack_id);
+        return;
+    }
+
+    if open_dialog.is_some() {
+        app.anim_stack_formula_dialog = Some((node_id, stack_id, open_dialog.unwrap()));
+    }
+
+    if start_changed || dur_changed || expr_changed {
+        let before = app.project.anim_timeline.clone();
+        if let Some(anim) = app.project.anim_timeline.nodes.get_mut(&node_id) {
+            if let Some(sf) = anim.stack_functions.iter_mut().find(|s| s.id == stack_id) {
+                let old_start = sf.start_frame;
+                let old_end = sf.end_frame();
+                if start_changed {
+                    sf.start_frame = start.max(0) as usize;
+                }
+                if dur_changed {
+                    sf.duration_frames = dur.max(1) as usize;
+                }
+                if expr_changed {
+                    for (ci, ch) in sf.channels.iter_mut().enumerate() {
+                        if let Some(e) = exprs.get(ci) {
+                            ch.expr = e.clone();
+                            if ch.expr.trim().is_empty() {
+                                ch.last_error = None;
+                            } else if let Err(err) =
+                                crate::document::eval_expr(&ch.expr, 0.5, 0.0)
+                            {
+                                // Silent UI-only error (no terminal spam while typing).
+                                ch.last_error = Some(err.0);
+                            } else {
+                                ch.last_error = None;
+                            }
+                        }
+                    }
+                }
+                let labels: Vec<String> = sf.channels.iter().map(|c| c.track.clone()).collect();
+                let start_f = sf.start_frame;
+                let end_f = sf.end_frame();
+                let start_vals: Vec<(String, f64)> = sf
+                    .channels
+                    .iter()
+                    .map(|c| (c.track.clone(), c.start_value))
+                    .collect();
+                let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+                let lo = old_start.min(start_f);
+                let hi = old_end.max(end_f);
+                anim.clear_keyframes_under_stack(&refs, start_f, end_f);
+                // Clear leftover keys from previous span when moving/resizing via UI.
+                for label in &labels {
+                    if let Some(tr) = anim.get_track_mut(label) {
+                        tr.keyframes.retain(|kf| {
+                            kf.frame == start_f || kf.frame < lo || kf.frame > hi
+                        });
+                    }
+                }
+                for (tr, v) in start_vals {
+                    if let Some(track) = anim.get_track_mut(&tr) {
+                        track.insert(start_f, v);
+                    }
+                }
+                anim.ensure_stack_start_keyframes();
+                anim.ensure_stack_end_keyframes();
             }
+        }
+        let after = app.project.anim_timeline.clone();
+        app.history.push(
+            &mut app.project,
+            crate::history::ProjectEdit::PatchTimeline { before, after },
+        );
+        app.apply_animation_for_frame(app.anim_current_frame);
+    }
+}
+
+fn apply_stack_animation_function(
+    app: &mut VadadeeBerryApp,
+    node_id: crate::document::NodeId,
+    track_labels: &[String],
+    defaults: &[f64],
+    start: usize,
+    end: usize,
+) {
+    let duration = end.saturating_sub(start).max(1);
+    let before = app.project.anim_timeline.clone();
+    let Some(anim) = app.project.anim_timeline.nodes.get_mut(&node_id) else {
+        return;
+    };
+    let mut channels = Vec::new();
+    for (i, label) in track_labels.iter().enumerate() {
+        let def = defaults.get(i).copied().unwrap_or(0.0);
+        let start_value = anim
+            .get_track(label)
+            .and_then(|t| t.interpolate(start))
+            .or_else(|| anim.sample(label, start))
+            .unwrap_or(def);
+        channels.push(crate::document::StackAnimChannel {
+            track: label.clone(),
+            expr: String::new(),
+            start_value,
+            last_error: None,
         });
+    }
+    let labels_ref: Vec<&str> = track_labels.iter().map(|s| s.as_str()).collect();
+    let end_f = start.saturating_add(duration);
+    anim.clear_keyframes_under_stack(&labels_ref, start, end_f);
+    // Editable initial keyframes at the start of the stack.
+    for ch in &channels {
+        if let Some(tr) = anim.get_track_mut(&ch.track) {
+            tr.insert(start, ch.start_value);
+        }
+    }
+    let id = uuid::Uuid::new_v4();
+    anim.stack_functions.push(crate::document::StackAnimationFunction {
+        id,
+        start_frame: start,
+        duration_frames: duration,
+        channels,
+    });
+    anim.ensure_stack_start_keyframes();
+    anim.ensure_stack_end_keyframes();
+    let after = app.project.anim_timeline.clone();
+    app.history.push(
+        &mut app.project,
+        crate::history::ProjectEdit::PatchTimeline { before, after },
+    );
+    app.anim_graph_selected_stack = Some(id);
+    app.anim_graph_selected_segment = None;
+    app.anim_graph_region_select = None;
+    app.apply_animation_for_frame(app.anim_current_frame);
+}
+
+fn delete_stack_animation_function(
+    app: &mut VadadeeBerryApp,
+    node_id: crate::document::NodeId,
+    stack_id: uuid::Uuid,
+) {
+    let before = app.project.anim_timeline.clone();
+    let Some(anim) = app.project.anim_timeline.nodes.get_mut(&node_id) else {
+        return;
+    };
+    if !anim.remove_stack_function(stack_id) {
+        return;
+    }
+    let after = app.project.anim_timeline.clone();
+    app.history.push(
+        &mut app.project,
+        crate::history::ProjectEdit::PatchTimeline { before, after },
+    );
+    if app.anim_graph_selected_stack == Some(stack_id) {
+        app.anim_graph_selected_stack = None;
+    }
+    app.apply_animation_for_frame(app.anim_current_frame);
+}
+
+fn graph_stack_formula_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
+    let Some((node_id, stack_id, ch_idx)) = app.anim_stack_formula_dialog else {
+        return;
+    };
+    let mut open = true;
+    let mut close = false;
+    let mut apply = false;
+    let mut draft = String::new();
+    let mut err: Option<String> = None;
+    let track_name = app
+        .project
+        .anim_timeline
+        .nodes
+        .get(&node_id)
+        .and_then(|a| a.stack_functions.iter().find(|s| s.id == stack_id))
+        .and_then(|s| s.channels.get(ch_idx))
+        .map(|c| c.track.clone())
+        .unwrap_or_default();
+    if let Some(anim) = app.project.anim_timeline.nodes.get(&node_id) {
+        if let Some(sf) = anim.stack_functions.iter().find(|s| s.id == stack_id) {
+            if let Some(ch) = sf.channels.get(ch_idx) {
+                draft = ch.expr.clone();
+                err = ch.last_error.clone();
+            }
+        }
+    }
+    egui::Window::new(format!("Stack formula — {track_name}"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(420.0)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(
+                    "Relative time only: t=0 at stack start → t=1 at stack end; f=0..length (not global timeline). \
+x,y / r,g,b,a / s = start constants. Empty = constant start.",
+                )
+                .small()
+                .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(4.0);
+            let mut te = egui::TextEdit::multiline(&mut draft)
+                .desired_width(f32::INFINITY)
+                .desired_rows(6);
+            if err.is_some() {
+                te = te
+                    .text_color(egui::Color32::from_rgb(255, 180, 180))
+                    .background_color(egui::Color32::from_rgb(60, 16, 16));
+            }
+            ui.add(te);
+            if let Some(ref e) = err {
+                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), e);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Apply").clicked() {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+    if apply {
+        if let Some(anim) = app.project.anim_timeline.nodes.get_mut(&node_id) {
+            if let Some(sf) = anim.stack_functions.iter_mut().find(|s| s.id == stack_id) {
+                if let Some(ch) = sf.channels.get_mut(ch_idx) {
+                    ch.expr = draft;
+                    if ch.expr.trim().is_empty() {
+                        ch.last_error = None;
+                    } else if let Err(e) = crate::document::eval_expr(&ch.expr, 0.5, 0.0) {
+                        // UI-only; no terminal log while editing.
+                        ch.last_error = Some(e.0);
+                    } else {
+                        ch.last_error = None;
+                    }
+                }
+            }
+        }
+        app.apply_animation_for_frame(app.anim_current_frame);
+        close = true;
+    }
+    if close || !open {
+        app.anim_stack_formula_dialog = None;
     }
 }
 

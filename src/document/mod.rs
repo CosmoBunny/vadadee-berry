@@ -14,6 +14,8 @@ pub use style::*;
 pub use animation::*;
 pub use music::*;
 pub use shading::*;
+pub mod expr;
+pub use expr::{eval_expr, eval_expr_vars, ExprError, ExprVars};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
