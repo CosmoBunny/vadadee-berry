@@ -280,7 +280,7 @@ pub fn mcp_tools_list_result() -> Value {
                 "properties": {
                     "wgsl": {
                         "type": "string",
-                        "description": "WGSL fragment module (@fragment fn main). Vertex shader auto-prepended if missing. Use @binding(0) uniform only for procedural; input_tex at 0 + sampler 1 + uniform 2 for compose."
+                        "description": "WGSL fragment module (@fragment fn main). Dynamic load — not a preset. Vertex auto-prepended if missing. Compose: input_tex@0, sampler@1, uniform@2. Procedural: uniform@0 only. Compute multipass (e.g. Cuneus) is not supported."
                     },
                     "name": { "type": "string", "description": "Layer name (default Shading)" },
                     "pass_name": { "type": "string", "description": "Pass label in UI (default Shader)" },

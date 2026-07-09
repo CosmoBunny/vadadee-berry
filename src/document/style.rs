@@ -400,6 +400,25 @@ pub enum LineCap {
     Square,
 }
 
+/// Whether stroke is drawn under the fill (half covered) or fully on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StrokePaintOrder {
+    /// Stroke first, then fill (inner half of stroke covered by fill). Default.
+    #[default]
+    BehindFill,
+    /// Fill first, then stroke (full stroke width visible on top).
+    AboveFill,
+}
+
+impl StrokePaintOrder {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BehindFill => "Behind",
+            Self::AboveFill => "Above",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MarkerKind {
     #[default]
@@ -466,6 +485,9 @@ pub struct Stroke {
     pub line_join: LineJoin,
     #[serde(default)]
     pub line_cap: LineCap,
+    /// Draw stroke under or over the fill.
+    #[serde(default)]
+    pub paint_order: StrokePaintOrder,
     /// Arrow / point geometry decorations on the path (start/mid/end)
     #[serde(default)]
     pub start_marker: PathMarker,
@@ -482,6 +504,7 @@ impl Default for Stroke {
             width: 2.0,
             line_join: LineJoin::Miter,
             line_cap: LineCap::Butt,
+            paint_order: StrokePaintOrder::BehindFill,
             start_marker: PathMarker::default(),
             mid_marker: PathMarker::default(),
             end_marker: PathMarker::default(),

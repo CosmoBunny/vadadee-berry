@@ -105,15 +105,14 @@ impl Default for CircularCloneEffect {
     }
 }
 
-/// A Clip Mask effect: the `source_id` object is rendered clipped to the shape of `mask_id`.
-/// The mask shape is the (approximate) axis-aligned bounding box of `mask_id` during viewport
-/// rendering, while SVG export uses a proper `<clipPath>` element.
+/// A Clip Mask effect: `source_id` (typically a raster image) is rendered clipped to the
+/// **solid face** of `mask_id` (Path/Rect/Ellipse/Arc/Polygon) — not the bounding box.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClipMaskEffect {
     pub id: Uuid,
-    /// The object being clipped / shown through the mask.
+    /// The object being clipped (usually an Image).
     pub source_id: NodeId,
-    /// The node whose geometry defines the clip region.
+    /// The node whose filled geometry defines the clip region.
     pub mask_id: NodeId,
     /// When true, the mask node itself is hidden from normal rendering.
     pub hide_mask: bool,
@@ -127,6 +126,235 @@ impl Default for ClipMaskEffect {
             mask_id: Uuid::nil(),
             hide_mask: true,
         }
+    }
+}
+
+/// Boolean op between two solid face shapes (Path / Rect / Ellipse / Arc / Polygon).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BooleanOpKind {
+    #[default]
+    Union,
+    Intersection,
+    Difference,
+}
+
+impl BooleanOpKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Union => "Union",
+            Self::Intersection => "Intersection",
+            Self::Difference => "Difference",
+        }
+    }
+}
+
+/// Live boolean path effect: result is a path node; operands can be hidden until bake.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BooleanEffect {
+    pub id: Uuid,
+    /// Operand A (left side of difference A − B).
+    pub a_id: NodeId,
+    /// Operand B.
+    pub b_id: NodeId,
+    pub op: BooleanOpKind,
+    /// Hide A and B while the effect is active (result path stays visible).
+    #[serde(default = "default_true")]
+    pub hide_operands: bool,
+    /// Generated path node showing the boolean result (updated live).
+    #[serde(default)]
+    pub result_node_id: Option<NodeId>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for BooleanEffect {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            a_id: Uuid::nil(),
+            b_id: Uuid::nil(),
+            op: BooleanOpKind::Union,
+            hide_operands: true,
+            result_node_id: None,
+        }
+    }
+}
+
+/// Shapes that support boolean solid-face ops.
+pub fn is_booleanable_shape(node: &Node) -> bool {
+    match &node.kind {
+        NodeKind::Path { path } => path.is_closed() || path.to_bez().area().abs() > 1e-3,
+        NodeKind::Rect { .. }
+        | NodeKind::Ellipse { .. }
+        | NodeKind::Polygon { .. } => true,
+        NodeKind::Arc { join, .. } => !matches!(join, super::ArcJoin::NoJoin),
+        _ => false,
+    }
+}
+
+pub fn is_raster_image(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Image { .. })
+}
+
+/// Flatten a node’s solid face to a geo MultiPolygon (doc space).
+pub fn node_to_multipolygon(node: &Node, tolerance: f64) -> Option<geo::MultiPolygon<f64>> {
+    use geo::{Coord, LineString, MultiPolygon, Polygon};
+
+    let bez = node.bez_path();
+    if bez.elements().is_empty() {
+        return None;
+    }
+    // Flatten kurbo path to polylines (closed rings).
+    let mut rings: Vec<Vec<Coord<f64>>> = Vec::new();
+    let mut cur: Vec<Coord<f64>> = Vec::new();
+    let mut start: Option<Coord<f64>> = None;
+    let mut last = Coord { x: 0.0, y: 0.0 };
+
+    let flush = |cur: &mut Vec<Coord<f64>>, rings: &mut Vec<Vec<Coord<f64>>>, start: Option<Coord<f64>>| {
+        if cur.len() < 3 {
+            cur.clear();
+            return;
+        }
+        if let Some(s) = start {
+            if cur.last().map(|c| (c.x - s.x).hypot(c.y - s.y)).unwrap_or(1.0) > 1e-6 {
+                cur.push(s);
+            }
+        }
+        if cur.len() >= 4 {
+            rings.push(std::mem::take(cur));
+        } else {
+            cur.clear();
+        }
+    };
+
+    for el in bez.elements() {
+        match el {
+            PathEl::MoveTo(p) => {
+                flush(&mut cur, &mut rings, start);
+                let c = Coord { x: p.x, y: p.y };
+                start = Some(c);
+                last = c;
+                cur.push(c);
+            }
+            PathEl::LineTo(p) => {
+                let c = Coord { x: p.x, y: p.y };
+                last = c;
+                cur.push(c);
+            }
+            PathEl::QuadTo(p1, p2) => {
+                let steps = (((last.x - p2.x).hypot(last.y - p2.y) / tolerance).ceil() as usize)
+                    .clamp(2, 24);
+                let p0 = last;
+                for s in 1..=steps {
+                    let t = s as f64 / steps as f64;
+                    let u = 1.0 - t;
+                    let x = u * u * p0.x + 2.0 * u * t * p1.x + t * t * p2.x;
+                    let y = u * u * p0.y + 2.0 * u * t * p1.y + t * t * p2.y;
+                    last = Coord { x, y };
+                    cur.push(last);
+                }
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                let steps = (((last.x - p3.x).hypot(last.y - p3.y) / tolerance).ceil() as usize)
+                    .clamp(3, 32);
+                let p0 = last;
+                for s in 1..=steps {
+                    let t = s as f64 / steps as f64;
+                    let u = 1.0 - t;
+                    let x = u * u * u * p0.x
+                        + 3.0 * u * u * t * p1.x
+                        + 3.0 * u * t * t * p2.x
+                        + t * t * t * p3.x;
+                    let y = u * u * u * p0.y
+                        + 3.0 * u * u * t * p1.y
+                        + 3.0 * u * t * t * p2.y
+                        + t * t * t * p3.y;
+                    last = Coord { x, y };
+                    cur.push(last);
+                }
+            }
+            PathEl::ClosePath => {
+                flush(&mut cur, &mut rings, start);
+                start = None;
+            }
+        }
+    }
+    flush(&mut cur, &mut rings, start);
+
+    if rings.is_empty() {
+        return None;
+    }
+    use geo::orient::{Direction, Orient};
+    let polys: Vec<Polygon<f64>> = rings
+        .into_iter()
+        .filter(|r| r.len() >= 4)
+        .map(|r| Polygon::new(LineString::new(r), vec![]).orient(Direction::Default))
+        .collect();
+    if polys.is_empty() {
+        None
+    } else {
+        Some(MultiPolygon::new(polys))
+    }
+}
+
+/// Run boolean op on two solid-face nodes → closed BezPath (possibly multi-contour).
+/// Empty intersection / difference returns `Some(empty path)` so the effect can still be
+/// created and updated when operands later overlap.
+pub fn compute_boolean_bez(
+    a: &Node,
+    b: &Node,
+    op: BooleanOpKind,
+    tolerance: f64,
+) -> Option<BezPath> {
+    use geo::BooleanOps;
+
+    let ma = node_to_multipolygon(a, tolerance)?;
+    let mb = node_to_multipolygon(b, tolerance)?;
+    let result = match op {
+        BooleanOpKind::Union => ma.union(&mb),
+        BooleanOpKind::Intersection => ma.intersection(&mb),
+        BooleanOpKind::Difference => ma.difference(&mb),
+    };
+    if result.0.is_empty() {
+        // Valid empty result (e.g. far-apart intersection) — not a conversion failure.
+        return Some(BezPath::new());
+    }
+    multipolygon_to_bez(&result)
+}
+
+fn multipolygon_to_bez(mp: &geo::MultiPolygon<f64>) -> Option<BezPath> {
+    if mp.0.is_empty() {
+        return None;
+    }
+    let mut bez = BezPath::new();
+    for poly in &mp.0 {
+        let ext: Vec<_> = poly.exterior().coords().map(|c| (c.x, c.y)).collect();
+        if ext.len() < 3 {
+            continue;
+        }
+        bez.move_to(ext[0]);
+        for &(x, y) in &ext[1..] {
+            bez.line_to((x, y));
+        }
+        bez.close_path();
+        for hole in poly.interiors() {
+            let ring: Vec<_> = hole.coords().map(|c| (c.x, c.y)).collect();
+            if ring.len() < 3 {
+                continue;
+            }
+            bez.move_to(ring[0]);
+            for &(x, y) in &ring[1..] {
+                bez.line_to((x, y));
+            }
+            bez.close_path();
+        }
+    }
+    if bez.elements().is_empty() {
+        None
+    } else {
+        Some(bez)
     }
 }
 
@@ -569,6 +797,27 @@ pub fn path_effect_move_bundle(
         v.sort_by_key(|a| a.as_u128());
         v.dedup();
         return v;
+    }
+    // Boolean: moving the *result* moves A+B+result together.
+    // Moving a ghost operand (A or B alone) must NOT drag the other operand.
+    if let Some(eff) = document.boolean_effects.values().find(|e| {
+        e.a_id == id || e.b_id == id || e.result_node_id == Some(id)
+    }) {
+        if eff.result_node_id == Some(id) {
+            let mut v = vec![eff.a_id, eff.b_id, id];
+            v.sort_by_key(|a| a.as_u128());
+            v.dedup();
+            return v;
+        }
+        return vec![id];
+    }
+    // Clip mask: image and mask move independently (re-clip is live via mesh).
+    if document
+        .clip_masks
+        .values()
+        .any(|cm| cm.source_id == id || cm.mask_id == id)
+    {
+        return vec![id];
     }
     vec![id]
 }

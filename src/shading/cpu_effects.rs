@@ -28,21 +28,33 @@ fn draw_shading_passes_cpu(
     passes: &[ShadingPass],
     time_secs: f32,
 ) {
-    if let Some(pass) = passes.first().filter(|p| p.enabled) {
-        let name = pass.name.to_ascii_lowercase();
-        let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl);
-        let is_blackhole = name.contains("blackhole") || wgsl.contains("blackhole") || wgsl.contains("black hole");
-        let is_starfield = name == "starfield" || wgsl.contains("// Starfield — rendered via CPU starfield path.");
-        
-        if is_blackhole {
-            draw_blackhole_shader(painter, page_rect, time_secs, pass);
-        } else if is_starfield {
-            draw_starfield_shader(painter, page_rect, time_secs, pass);
-        } else if name.contains("crt") || wgsl.contains("scan") {
-            draw_crt(painter, page_rect);
-        } else if name.contains("vignette") {
-            draw_vignette(painter, page_rect, 0.65);
-        }
+    // Last enabled pass (matches GPU path / MCP-after-default vignette case).
+    let Some(pass) = passes.iter().rev().find(|p| p.enabled) else {
+        return;
+    };
+    let name = pass.name.to_ascii_lowercase();
+    let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl);
+    let is_blackhole =
+        name.contains("blackhole") || wgsl.contains("blackhole") || wgsl.contains("black hole");
+    let is_starfield =
+        name == "starfield" || wgsl.contains("// Starfield — rendered via CPU starfield path.");
+    let is_water = name.contains("water") || wgsl.contains("Procedural water");
+
+    if is_blackhole {
+        draw_blackhole_shader(painter, page_rect, time_secs, pass);
+    } else if is_starfield {
+        draw_starfield_shader(painter, page_rect, time_secs, pass);
+    } else if is_water {
+        // No CPU mirror — solid tint so the layer isn't blank if GPU is off.
+        painter.rect_filled(
+            page_rect,
+            0.0,
+            Color32::from_rgb(12, 72, 110),
+        );
+    } else if name.contains("crt") || wgsl.contains("scan") {
+        draw_crt(painter, page_rect);
+    } else if name.contains("vignette") {
+        draw_vignette(painter, page_rect, 0.65);
     }
 }
 

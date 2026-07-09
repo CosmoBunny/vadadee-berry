@@ -4,7 +4,7 @@ use crate::animation::action_bar_overlay_rect;
 use crate::app::{AudioExtractStatus, KeyframeTrack, VadadeeBerryApp};
 use crate::document::{
     compute_whole_object_bounds, compute_tiling_whole_bounds, compute_circular_whole_bounds, default_loft_gap_for_node, find_effect_for_pair, ArcJoin, FillKind, GeometryProfile, LineCap,
-    LineJoin, NodeKind, OnPathMode, TextStyle,
+    LineJoin, NodeKind, OnPathMode, StrokePaintOrder, TextStyle,
 };
 use crate::gradient_ui::{
     apply_angle_to_flow_line, gradient_flow_line_editor, gradient_strip_editor,
@@ -1046,21 +1046,8 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     }
 
-    // Offer clip mask when 2+ nodes are selected and no clip mask is active yet
-    if app.selection.len() >= 2 && !app.selection_has_clip_mask() {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new("Clip Mask: ")
-                    .small()
-                    .color(colors::TEXT_MUTED),
-            );
-            if ui.button("✂ Apply Clip Mask").clicked() {
-                app.apply_clip_mask();
-                ui.ctx().request_repaint();
-            }
-        });
-        ui.add_space(4.0);
-    }
+    // Boolean ops (shape+shape) or Clip Mask (image+shape)
+    boolean_and_clip_panel(app, ui);
 
     if on_path_container {
         let expand = app.ui_anim.on_path_container_expand();
@@ -1181,35 +1168,13 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     }
 
-    // Clip Mask active panel (when selection involves a clip mask)
-    if app.selection_has_clip_mask() {
-        ui.separator();
-        ui.label(RichText::new("✂ Clip Mask").strong());
-        ui.label(
-            RichText::new("Source is rendered clipped to the mask shape.")
-                .small()
-                .color(colors::TEXT_MUTED),
-        );
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("⇄ Swap source / mask").clicked() {
-                app.swap_clip_mask_source();
-                ui.ctx().request_repaint();
-            }
-            if ui.button("✖ Remove").clicked() {
-                app.remove_clip_mask();
-                ui.ctx().request_repaint();
-            }
-        });
-        ui.add_space(4.0);
-    }
-
     if path_ids.is_empty() && app.object_on_path_panel_context().is_none() {
         // Show Tiling and CircularClone apply when only facial objects (e.g. Circle) selected, and not yet enabled
         let facial_objects: Vec<_> = app.selection.iter().filter(|&&id| {
             app.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. } | NodeKind::Group { .. }))
         }).cloned().collect();
         let has_t_or_c = app.selection_has_tiling_effect() || app.selection_has_circular_effect();
-        let has_cm = app.selection_has_clip_mask();
+        let has_bool = app.selection_has_boolean_effect() || app.selection_has_clip_mask();
         if !facial_objects.is_empty() && !has_t_or_c {
             ui.label(RichText::new("Path Magic (separate traits)").strong());
             ui.horizontal_wrapped(|ui| {
@@ -1222,9 +1187,9 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             });
             ui.add_space(8.0);
         }
-        if !has_t_or_c && !has_cm {
+        if !has_t_or_c && !has_bool && app.selection.len() < 2 {
             ui.label(
-                RichText::new("Select path(s) or one path + object(s).")
+                RichText::new("Select path(s), path + object(s), or two shapes for Boolean.")
                     .color(colors::TEXT_MUTED),
             );
         }
@@ -1302,6 +1267,272 @@ fn path_magic_card(
         ui.add_space(4.0);
         body(ui, app);
     });
+}
+
+/// Truncate for narrow Path Magic panel; full name on hover.
+fn clamp_object_label(name: &str, max_chars: usize) -> String {
+    let n = name.chars().count();
+    if n <= max_chars {
+        name.to_string()
+    } else {
+        let take = max_chars.saturating_sub(1);
+        format!("{}…", name.chars().take(take).collect::<String>())
+    }
+}
+
+fn node_display_name(app: &VadadeeBerryApp, id: crate::document::NodeId) -> String {
+    app.project
+        .nodes
+        .get(id)
+        .map(|n| {
+            if n.name.trim().is_empty() {
+                format!("{:?}", n.kind).chars().take(24).collect()
+            } else {
+                n.name.clone()
+            }
+        })
+        .unwrap_or_else(|| "Object".into())
+}
+
+/// Path Magic: Boolean (shape+shape) or Clip Mask (image+shape solid face).
+fn boolean_and_clip_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+    use crate::app::BooleanPairMode;
+    use crate::document::BooleanOpKind;
+
+    let has_bool = app.selection_has_boolean_effect();
+    let has_cm = app.selection_has_clip_mask();
+    let pair_mode = app.selection_boolean_mode();
+
+    if !has_bool && !has_cm && pair_mode.is_none() {
+        return;
+    }
+
+    ui.separator();
+
+    // Resolve A/B names (selection order, or active effect operands).
+    let (a_id, b_id, mode_kind) = if has_bool {
+        let eid = app
+            .project
+            .document
+            .boolean_effects
+            .iter()
+            .find(|(_, e)| {
+                app.selection.contains(&e.a_id)
+                    || app.selection.contains(&e.b_id)
+                    || e.result_node_id
+                        .map(|r| app.selection.contains(&r))
+                        .unwrap_or(false)
+            })
+            .map(|(k, _)| *k);
+        if let Some(eid) = eid {
+            let e = &app.project.document.boolean_effects[&eid];
+            (e.a_id, e.b_id, "boolean")
+        } else {
+            return;
+        }
+    } else if has_cm {
+        let e = app
+            .project
+            .document
+            .clip_masks
+            .values()
+            .find(|cm| {
+                app.selection.contains(&cm.source_id) || app.selection.contains(&cm.mask_id)
+            });
+        if let Some(cm) = e {
+            (cm.source_id, cm.mask_id, "clip")
+        } else {
+            return;
+        }
+    } else if let Some(mode) = pair_mode {
+        match mode {
+            BooleanPairMode::VectorBoolean { a, b } => (a, b, "boolean_offer"),
+            BooleanPairMode::ImageClip { source, mask } => (source, mask, "clip_offer"),
+        }
+    } else {
+        return;
+    };
+
+    let a_full = node_display_name(app, a_id);
+    let b_full = node_display_name(app, b_id);
+    let max_c = ((ui.available_width() / 7.5) as usize).clamp(8, 28);
+
+    let title = match mode_kind {
+        "boolean" | "boolean_offer" => "Boolean Operation",
+        _ => "Clip Mask",
+    };
+    ui.label(RichText::new(title).strong());
+
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            let a_lab = clamp_object_label(&a_full, max_c);
+            let b_lab = clamp_object_label(&b_full, max_c);
+            ui.label(RichText::new(format!("A: {a_lab}")).small())
+                .on_hover_text(&a_full);
+            ui.label(RichText::new(format!("B: {b_lab}")).small())
+                .on_hover_text(&b_full);
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let swap_label =
+                RichText::new(icons::SWAP).font(nerd_font_id(14.0));
+            if ui
+                .button(swap_label)
+                .on_hover_text("Reverse A ↔ B")
+                .clicked()
+            {
+                if mode_kind == "clip" || mode_kind == "clip_offer" {
+                    if mode_kind == "clip" {
+                        app.swap_clip_mask_source();
+                    } else {
+                        app.selection.swap(0, 1);
+                    }
+                } else {
+                    app.reverse_boolean_operands();
+                }
+                ui.ctx().request_repaint();
+            }
+        });
+    });
+
+    match mode_kind {
+        "boolean_offer" => {
+            ui.add_space(2.0);
+            ui.label(RichText::new("Op").small().color(colors::TEXT_MUTED));
+            ui.horizontal_wrapped(|ui| {
+                for op in [
+                    BooleanOpKind::Union,
+                    BooleanOpKind::Intersection,
+                    BooleanOpKind::Difference,
+                ] {
+                    let selected = app.ui_boolean_op == op;
+                    if ui.selectable_label(selected, op.label()).clicked() {
+                        app.ui_boolean_op = op;
+                    }
+                }
+            });
+            if ui.button("Apply Boolean").clicked() {
+                app.apply_boolean_effect();
+                ui.ctx().request_repaint();
+            }
+            ui.label(
+                RichText::new("Creates a result path. Use Bake to keep it without live link.")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+        }
+        "boolean" => {
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(
+                    "Ghosts (A/B): Ctrl+Shift+click or Objects tab — move independently.\n\
+                     Moving the result moves A+B together.",
+                )
+                .small()
+                .color(colors::TEXT_MUTED),
+            );
+            ui.label(RichText::new("Op").small().color(colors::TEXT_MUTED));
+            ui.horizontal_wrapped(|ui| {
+                for op in [
+                    BooleanOpKind::Union,
+                    BooleanOpKind::Intersection,
+                    BooleanOpKind::Difference,
+                ] {
+                    let selected = app.ui_boolean_op == op
+                        || app
+                            .project
+                            .document
+                            .boolean_effects
+                            .values()
+                            .any(|e| {
+                                (app.selection.contains(&e.a_id)
+                                    || app.selection.contains(&e.b_id)
+                                    || e.result_node_id
+                                        .map(|r| app.selection.contains(&r))
+                                        .unwrap_or(false))
+                                    && e.op == op
+                            });
+                    if ui.selectable_label(selected, op.label()).clicked() {
+                        app.set_boolean_op_live(op);
+                        ui.ctx().request_repaint();
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button("Bake to path")
+                    .on_hover_text("Keep result path; drop live boolean link")
+                    .clicked()
+                {
+                    app.bake_boolean_effect();
+                    ui.ctx().request_repaint();
+                }
+                if ui.button("✖ Remove").clicked() {
+                    app.remove_boolean_effect();
+                    ui.ctx().request_repaint();
+                }
+            });
+        }
+        "clip_offer" => {
+            ui.label(
+                RichText::new(
+                    "Image clipped to shape solid face (not bounding box).\n\
+                     After apply you can Rasterize the clip region only.",
+                )
+                .small()
+                .color(colors::TEXT_MUTED),
+            );
+            if ui
+                .button(
+                    RichText::new(format!("{} Apply Clip Mask", icons::IMAGE))
+                        .font(nerd_font_id(12.0)),
+                )
+                .clicked()
+            {
+                app.apply_clip_mask();
+                ui.ctx().request_repaint();
+            }
+        }
+        "clip" => {
+            ui.label(
+                RichText::new(
+                    "Image → solid-face clip. Selection box = mask bounds only.\n\
+                     Ghosts: Ctrl+Shift+click (or Objects tab) to edit image/mask alone.\n\
+                     Rasterize: bake only the clipped region to a new image.",
+                )
+                .small()
+                .color(colors::TEXT_MUTED),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button(
+                        RichText::new(format!("{} Rasterize clip", icons::RASTER))
+                            .font(nerd_font_id(12.0)),
+                    )
+                    .on_hover_text("Bake only the clip region (mask solid face) to a new raster image")
+                    .clicked()
+                {
+                    app.bake_clip_mask_to_raster();
+                    ui.ctx().request_repaint();
+                }
+                if ui
+                    .button(
+                        RichText::new(format!("{} Swap", icons::SWAP)).font(nerd_font_id(12.0)),
+                    )
+                    .on_hover_text("Swap source / mask")
+                    .clicked()
+                {
+                    app.swap_clip_mask_source();
+                    ui.ctx().request_repaint();
+                }
+                if ui.button(RichText::new(format!("{} Remove", icons::CLOSE)).font(nerd_font_id(12.0))).clicked() {
+                    app.remove_clip_mask();
+                    ui.ctx().request_repaint();
+                }
+            });
+        }
+        _ => {}
+    }
+    ui.add_space(4.0);
 }
 
 fn object_on_path_container(
@@ -1832,7 +2063,13 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
     if let Some(l) = app.project.document.layers.iter_mut().find(|layer| layer.id == layer_id) {
         if l.kind == crate::document::LayerKind::Shading {
             if l.shading_passes.is_empty() {
-                l.shading_passes.push(crate::document::ShadingPass::vignette_preset());
+                l.shading_passes
+                    .push(crate::document::ShadingPass::vignette_preset());
+            }
+            if l.shading_passes.len() > 1 {
+                let keep = l.shading_passes.pop().unwrap();
+                l.shading_passes.clear();
+                l.shading_passes.push(keep);
             }
             title = format!("Shader Editor - {}", l.name);
             current_pass = Some(&mut l.shading_passes[0]);
@@ -1894,7 +2131,7 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
                             *pass = crate::document::ShadingPass::starfield_preset();
                         }
                         _ => {
-                            pass.name = "Custom".to_string();
+                            *pass = crate::document::ShadingPass::custom_template();
                         }
                     }
                 }
@@ -1912,9 +2149,18 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
                     }
                 });
 
+                shading_wgsl_file_buttons(ui, pass);
+
                 ui.add_space(4.0);
                 ui.label(RichText::new("WGSL source code:").weak());
-                
+                ui.label(
+                    RichText::new(
+                        "Fragment only: @fragment fn main(uv) -> vec4. Load .wgsl or edit below (not multipass compute).",
+                    )
+                    .small()
+                    .weak(),
+                );
+
                 let mut text_edit_response = None;
                 egui::ScrollArea::both()
                     .id_salt("shader_editor_scroll")
@@ -1932,7 +2178,10 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
 
                 if let Some(resp) = text_edit_response {
                     if resp.changed() {
-                        if pass.name != "Custom" {
+                        if matches!(
+                            pass.name.as_str(),
+                            "Vignette" | "CRT" | "Blackhole" | "Starfield"
+                        ) {
                             pass.name = "Custom".to_string();
                         }
                         if pass.hot_reload {
@@ -1968,6 +2217,87 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
     if !open {
         app.show_shader_editor_window = None;
     }
+}
+
+/// Load / save custom WGSL for a shading pass (desktop file dialogs).
+/// Uses wrapping so narrow layer panels don't overflow on one row.
+fn shading_wgsl_file_buttons(ui: &mut egui::Ui, pass: &mut crate::document::ShadingPass) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.y = 4.0;
+
+        #[cfg(not(target_os = "android"))]
+        {
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Load").font(nerd_font_id(11.0)))
+                        .min_size(egui::vec2(0.0, 0.0)),
+                )
+                .on_hover_text("Load a fragment WGSL module from disk (dynamic, not a preset)")
+                .clicked()
+            {
+                let dlg = rfd::FileDialog::new()
+                    .add_filter("WGSL shader", &["wgsl", "txt"])
+                    .add_filter("All", &["*"]);
+                if let Some(path) = dlg.pick_file() {
+                    match crate::shading::load_wgsl_file(&path) {
+                        Ok(src) => {
+                            let stem = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("Custom");
+                            pass.load_wgsl_source(src, Some(stem));
+                            if let Err(msg) = crate::shading::validate_shading_wgsl(&pass.wgsl) {
+                                if let Ok(mut err) = pass.compile_error.lock() {
+                                    *err = Some(msg);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(mut err) = pass.compile_error.lock() {
+                                *err = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Save").font(nerd_font_id(11.0)))
+                        .min_size(egui::vec2(0.0, 0.0)),
+                )
+                .on_hover_text("Export current WGSL source as .wgsl")
+                .clicked()
+            {
+                let dlg = rfd::FileDialog::new()
+                    .add_filter("WGSL shader", &["wgsl"])
+                    .set_file_name(format!("{}.wgsl", pass.name.replace(' ', "_")));
+                if let Some(path) = dlg.save_file() {
+                    if let Err(e) = crate::shading::save_wgsl_file(&path, &pass.wgsl) {
+                        if let Ok(mut err) = pass.compile_error.lock() {
+                            *err = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+        if ui
+            .add(
+                egui::Button::new(RichText::new("Reset").font(nerd_font_id(11.0)))
+                    .min_size(egui::vec2(0.0, 0.0)),
+            )
+            .on_hover_text("Replace source with the Custom fragment starter")
+            .clicked()
+        {
+            let id = pass.id;
+            let hot = pass.hot_reload;
+            let enabled = pass.enabled;
+            *pass = crate::document::ShadingPass::custom_template();
+            pass.id = id;
+            pass.hot_reload = hot;
+            pass.enabled = enabled;
+        }
+    });
 }
 
 
@@ -3190,12 +3520,16 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
             if l.kind == crate::document::LayerKind::Shading {
                 if l.shading_passes.is_empty() {
-                    l.shading_passes.push(crate::document::ShadingPass::vignette_preset());
+                    l.shading_passes
+                        .push(crate::document::ShadingPass::vignette_preset());
                 }
 
-                // Clean up any extra passes so we only have one active shading pass
+                // One pass per layer. Prefer the last entry so MCP/custom sources
+                // that were previously appended after a default vignette survive.
                 if l.shading_passes.len() > 1 {
-                    l.shading_passes.truncate(1);
+                    let keep = l.shading_passes.pop().unwrap();
+                    l.shading_passes.clear();
+                    l.shading_passes.push(keep);
                 }
 
                 let pass = &mut l.shading_passes[0];
@@ -3240,7 +3574,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             *pass = crate::document::ShadingPass::starfield_preset();
                         }
                         _ => {
-                            pass.name = "Custom".to_string();
+                            *pass = crate::document::ShadingPass::custom_template();
                         }
                     }
                 }
@@ -3261,6 +3595,8 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         }
                     }
                 });
+
+                shading_wgsl_file_buttons(ui, pass);
 
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("WGSL source").small().weak());
@@ -3285,7 +3621,10 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
                 if let Some(resp) = text_edit_response {
                     if resp.changed() {
-                        if pass.name != "Custom" {
+                        if matches!(
+                            pass.name.as_str(),
+                            "Vignette" | "CRT" | "Blackhole" | "Starfield"
+                        ) {
                             pass.name = "Custom".to_string();
                         }
                         if pass.hot_reload {
@@ -3926,6 +4265,31 @@ fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     .clicked()
                 {
                     app.ui_stroke_line_cap = LineCap::Round;
+                    stroke_changed = true;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Order");
+                if ui
+                    .selectable_label(
+                        app.ui_stroke_paint_order == StrokePaintOrder::BehindFill,
+                        StrokePaintOrder::BehindFill.label(),
+                    )
+                    .on_hover_text("Stroke behind fill (inner half covered)")
+                    .clicked()
+                {
+                    app.ui_stroke_paint_order = StrokePaintOrder::BehindFill;
+                    stroke_changed = true;
+                }
+                if ui
+                    .selectable_label(
+                        app.ui_stroke_paint_order == StrokePaintOrder::AboveFill,
+                        StrokePaintOrder::AboveFill.label(),
+                    )
+                    .on_hover_text("Stroke above fill (full stroke on top)")
+                    .clicked()
+                {
+                    app.ui_stroke_paint_order = StrokePaintOrder::AboveFill;
                     stroke_changed = true;
                 }
             });
@@ -4618,11 +4982,18 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             ui.label(
                 RichText::new(format!("{} points selected", points_on.len())).strong(),
             );
-            ui.horizontal(|ui| {
-                if ui.button("Smooth selected points").clicked() {
+            // Wrap so long labels don't overflow the narrow Actions panel.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.y = 4.0;
+                if ui.button("Smooth").on_hover_text("Smooth selected points").clicked() {
                     app.smooth_selected_path_points();
                 }
-                if ui.button(RichText::new("Delete selected points").color(colors::ALERT)).clicked() {
+                if ui
+                    .button(RichText::new("Delete").color(colors::ALERT))
+                    .on_hover_text("Delete selected points")
+                    .clicked()
+                {
                     app.remove_selected_path_points();
                 }
             });
@@ -7621,12 +7992,18 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             .collect();
         if !multi.is_empty() {
             if multi.len() > 1 {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{} points selected", multi.len())).strong());
-                    if ui.button("Smooth selected").clicked() {
+                ui.label(RichText::new(format!("{} points selected", multi.len())).strong());
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    if ui.button("Smooth").on_hover_text("Smooth selected points").clicked() {
                         app.smooth_selected_path_points();
                     }
-                    if ui.button(RichText::new("Delete selected").color(colors::ALERT)).clicked() {
+                    if ui
+                        .button(RichText::new("Delete").color(colors::ALERT))
+                        .on_hover_text("Delete selected points")
+                        .clicked()
+                    {
                         app.remove_selected_path_points();
                     }
                 });

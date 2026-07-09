@@ -60,9 +60,12 @@ pub struct Document {
     /// CircularClone effects (separate from ObjectOnPath), keyed by effect id.
     #[serde(default)]
     pub circular_effects: IndexMap<Uuid, CircularCloneEffect>,
-    /// Clip Mask effects: source node rendered clipped to mask node's shape.
+    /// Clip Mask effects: raster (image) source clipped to solid-face mask shape.
     #[serde(default)]
     pub clip_masks: IndexMap<Uuid, ClipMaskEffect>,
+    /// Boolean ops (union / intersection / difference) between solid-face shapes.
+    #[serde(default)]
+    pub boolean_effects: IndexMap<Uuid, BooleanEffect>,
     #[serde(default = "default_page_color")]
     pub page_color: [f32; 4],
     /// Display unit for page size fields in the UI (stored width/height are always px).
@@ -281,7 +284,9 @@ impl Layer {
             media_source_duration: None,
             av_clips: Vec::new(),
             music_clips: Vec::new(),
-            shading_passes: vec![ShadingPass::vignette_preset()],
+            // Empty by default — callers attach the desired pass (preset / custom / MCP).
+            // UI fills vignette only if still empty when the layer is inspected.
+            shading_passes: Vec::new(),
         }
     }
 
@@ -423,6 +428,7 @@ impl Document {
             tiling_effects: IndexMap::new(),
             circular_effects: IndexMap::new(),
             clip_masks: IndexMap::new(),
+            boolean_effects: IndexMap::new(),
             page_color: default_page_color(),
             page_unit: PageUnit::Px,
         };

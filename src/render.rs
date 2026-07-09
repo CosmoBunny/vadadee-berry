@@ -5,14 +5,17 @@ use egui::epaint::{
 use kurbo::{BezPath, Ellipse, PathEl, Rect as KurboRect, Shape as KurboShape};
 use lyon::math::Point;
 use lyon::path::Path;
-use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers};
+use lyon::tessellation::{
+    BuffersBuilder, FillOptions, FillTessellator, FillVertex, StrokeOptions, StrokeTessellator,
+    StrokeVertex, VertexBuffers,
+};
 
 use crate::canvas::Viewport;
 use std::collections::HashSet;
 
 use crate::document::{
-    ArcJoin, FaceRenderable, Fill, LineCap, LineJoin, MarkerKind, Node, NodeId, NodeKind, NodeStore, Paint, PathMagic, PathMarker, TextStyle,
-    regular_polygon_vertices,
+    ArcJoin, FaceRenderable, Fill, LineCap, LineJoin, MarkerKind, Node, NodeId, NodeKind, NodeStore,
+    Paint, PathMagic, PathMarker, StrokePaintOrder, TextStyle, regular_polygon_vertices,
 };
 use crate::document::Stroke as DocStroke;
 use crate::theme::colors;
@@ -430,7 +433,23 @@ fn lyon_fill_options(viewport: &Viewport) -> FillOptions {
         .with_fill_rule(lyon::tessellation::FillRule::NonZero)
 }
 
-/// Stroke a kurbo path with egui feathering (anti-aliased curves and line joins).
+fn to_lyon_line_join(join: LineJoin) -> lyon::path::LineJoin {
+    match join {
+        LineJoin::Miter => lyon::path::LineJoin::Miter,
+        LineJoin::Round => lyon::path::LineJoin::Round,
+        LineJoin::Bevel => lyon::path::LineJoin::Bevel,
+    }
+}
+
+fn to_lyon_line_cap(cap: LineCap) -> lyon::path::LineCap {
+    match cap {
+        LineCap::Butt | LineCap::Square => lyon::path::LineCap::Butt,
+        LineCap::Round => lyon::path::LineCap::Round,
+    }
+}
+
+/// Continuous stroke with real miter/round/bevel joins (lyon tessellation).
+/// Segment-by-segment egui strokes used to leave double edges at sharp corners.
 fn draw_solid_bez_stroke(
     painter: &Painter,
     bez: &BezPath,
@@ -442,10 +461,18 @@ fn draw_solid_bez_stroke(
     cap: LineCap,
     closed: bool,
 ) {
-    for s in bez_to_feathered_stroke_shapes(bez, viewport, origin, width, color) {
-        painter.add(s);
+    if width <= 0.0 || color.a() == 0 {
+        return;
     }
+    if let Some(mesh) =
+        stroke_bez_lyon_mesh(bez, viewport, origin, width, color, join, cap, closed)
+    {
+        painter.add(Shape::mesh(mesh));
+        return;
+    }
+    // Fallback: continuous PathShape polyline (still better joins than per-segment strokes).
     let (screen_pts, _) = polyline_from_bez(bez, viewport, origin, closed);
+    draw_feathered_polyline_stroke(painter, &screen_pts, closed, width, color);
     if screen_pts.len() >= 2 {
         if !closed {
             stroke_cap_circles(painter, &screen_pts, width, color, cap);
@@ -454,6 +481,112 @@ fn draw_solid_bez_stroke(
             stroke_join_dots(painter, &screen_pts, width, color, join);
         }
     }
+}
+
+fn stroke_bez_lyon_mesh(
+    bez: &BezPath,
+    viewport: &Viewport,
+    origin: Pos2,
+    width: f32,
+    color: Color32,
+    join: LineJoin,
+    cap: LineCap,
+    closed: bool,
+) -> Option<Mesh> {
+    let lyon_path = bez_to_lyon_path_for_stroke(bez, viewport, origin, closed);
+    let mut tessellator = StrokeTessellator::new();
+    let mut buffers: VertexBuffers<Point, u16> = VertexBuffers::new();
+    let tolerance = (0.25 / viewport.zoom).clamp(0.04, 0.35);
+    let options = StrokeOptions::default()
+        .with_line_width(width)
+        .with_line_join(to_lyon_line_join(join))
+        .with_line_cap(to_lyon_line_cap(cap))
+        .with_miter_limit(4.0)
+        .with_tolerance(tolerance);
+    tessellator
+        .tessellate_path(
+            &lyon_path,
+            &options,
+            &mut BuffersBuilder::new(&mut buffers, |v: StrokeVertex<'_, '_>| v.position()),
+        )
+        .ok()?;
+    if buffers.indices.is_empty() || buffers.vertices.is_empty() {
+        return None;
+    }
+    let mut mesh = Mesh::default();
+    for chunk in buffers.indices.chunks_exact(3) {
+        let v0 = buffers.vertices[chunk[0] as usize];
+        let v1 = buffers.vertices[chunk[1] as usize];
+        let v2 = buffers.vertices[chunk[2] as usize];
+        let i0 = mesh.vertices.len() as u32;
+        mesh.colored_vertex(Pos2::new(v0.x, v0.y), color);
+        let i1 = mesh.vertices.len() as u32;
+        mesh.colored_vertex(Pos2::new(v1.x, v1.y), color);
+        let i2 = mesh.vertices.len() as u32;
+        mesh.colored_vertex(Pos2::new(v2.x, v2.y), color);
+        mesh.add_triangle(i0, i1, i2);
+    }
+    Some(mesh)
+}
+
+/// Like `bez_to_lyon_path`, but ensures closed subpaths call `close()` so joins form at the seam.
+fn bez_to_lyon_path_for_stroke(
+    bez: &BezPath,
+    viewport: &Viewport,
+    origin: Pos2,
+    force_closed: bool,
+) -> Path {
+    let mut builder = Path::builder();
+    let mut open = false;
+    let map = |x: f64, y: f64| {
+        let s = viewport.doc_to_screen((x, y), origin);
+        Point::new(s.x, s.y)
+    };
+    let begin_at = |builder: &mut lyon::path::Builder, open: &mut bool, x: f64, y: f64| {
+        if *open {
+            builder.end(false);
+        }
+        builder.begin(map(x, y));
+        *open = true;
+    };
+    for el in bez.elements() {
+        match el {
+            PathEl::MoveTo(p) => begin_at(&mut builder, &mut open, p.x, p.y),
+            PathEl::LineTo(p) => {
+                if !open {
+                    begin_at(&mut builder, &mut open, p.x, p.y);
+                } else {
+                    builder.line_to(map(p.x, p.y));
+                }
+            }
+            PathEl::QuadTo(p1, p2) => {
+                if !open {
+                    begin_at(&mut builder, &mut open, p1.x, p1.y);
+                }
+                builder.quadratic_bezier_to(map(p1.x, p1.y), map(p2.x, p2.y));
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                if !open {
+                    begin_at(&mut builder, &mut open, p1.x, p1.y);
+                }
+                builder.cubic_bezier_to(map(p1.x, p1.y), map(p2.x, p2.y), map(p3.x, p3.y));
+            }
+            PathEl::ClosePath => {
+                if open {
+                    builder.close();
+                    open = false;
+                }
+            }
+        }
+    }
+    if open {
+        if force_closed {
+            builder.close();
+        } else {
+            builder.end(false);
+        }
+    }
+    builder.build()
 }
 
 fn draw_feathered_polyline_stroke(
@@ -1277,7 +1410,9 @@ pub fn draw_node(
     let stroke_style = &node.style.stroke.style;
     let stroke_join = node.style.stroke.line_join;
     let stroke_cap = node.style.stroke.line_cap;
+    let stroke_order = node.style.stroke.paint_order;
     let stroke_w = stroke_width(node, viewport);
+    let stroke_behind = matches!(stroke_order, StrokePaintOrder::BehindFill);
 
     match &node.kind {
         NodeKind::Rect { x, y, w, h, rx } => {
@@ -1288,22 +1423,25 @@ pub fn draw_node(
                 .min(r.width() / 2.0)
                 .min(r.height() / 2.0);
             let has_fill = fill.is_visible();
+            let draw_r_stroke = |painter: &Painter, sw: f32| {
+                draw_rect_stroke(
+                    painter,
+                    viewport,
+                    origin,
+                    r,
+                    (*x, *y, x + w, y + h),
+                    *rx,
+                    stroke_style,
+                    opacity,
+                    sw,
+                    corner_screen,
+                    stroke_join,
+                    stroke_cap,
+                );
+            };
             if let Some(sw) = stroke_w {
-                if has_fill {
-                    draw_rect_stroke(
-                        painter,
-                        viewport,
-                        origin,
-                        r,
-                        (*x, *y, x + w, y + h),
-                        *rx,
-                        stroke_style,
-                        opacity,
-                        sw,
-                        corner_screen,
-                        stroke_join,
-                        stroke_cap,
-                    );
+                if has_fill && stroke_behind {
+                    draw_r_stroke(painter, sw);
                 }
             }
             if has_fill {
@@ -1320,21 +1458,8 @@ pub fn draw_node(
                 );
             }
             if let Some(sw) = stroke_w {
-                if !has_fill {
-                    draw_rect_stroke(
-                        painter,
-                        viewport,
-                        origin,
-                        r,
-                        (*x, *y, x + w, y + h),
-                        *rx,
-                        stroke_style,
-                        opacity,
-                        sw,
-                        corner_screen,
-                        stroke_join,
-                        stroke_cap,
-                    );
+                if !has_fill || !stroke_behind {
+                    draw_r_stroke(painter, sw);
                 }
             }
         }
@@ -1345,26 +1470,33 @@ pub fn draw_node(
             let center = r.center();
             let radius = r.size() * 0.5;
             let doc_bounds = (cx - rx, cy - ry, cx + rx, cy + ry);
-            let _bbox_screen = Rect::from_center_size(center, radius * 2.0);
-            let stroke_after_fill = stroke_w.filter(|_| {
-                !fill.is_visible() || !matches!(fill, Fill::Solid(_))
-            });
-            if fill.is_visible() {
+            let has_fill = fill.is_visible();
+            let draw_e_stroke = |painter: &Painter, sw: f32| {
+                // Always draw stroke as separate mesh so paint-order is respected
+                // (combined EllipseShape always puts stroke on top).
+                draw_ellipse_stroke(
+                    painter,
+                    viewport,
+                    origin,
+                    center,
+                    radius,
+                    doc_bounds,
+                    stroke_style,
+                    opacity,
+                    sw,
+                    stroke_join,
+                );
+            };
+            if let Some(sw) = stroke_w {
+                if has_fill && stroke_behind {
+                    draw_e_stroke(painter, sw);
+                }
+            }
+            if has_fill {
                 match fill {
                     Fill::Solid(p) => {
                         let fc = paint_to_color(*p, opacity);
-                        if let Some(sw) = stroke_w {
-                            let sc = sample_fill_at(stroke_style, opacity, 0.5, 0.5);
-                            painter.add(Shape::Ellipse(EllipseShape {
-                                center,
-                                radius,
-                                fill: fc,
-                                stroke: Stroke::new(sw, sc),
-                                angle: 0.0,
-                            }));
-                        } else {
-                            painter.add(Shape::ellipse_filled(center, radius, fc));
-                        }
+                        painter.add(Shape::ellipse_filled(center, radius, fc));
                     }
                     _ => {
                         let bez = ellipse_bez_path(*cx, *cy, *rx, *ry);
@@ -1380,19 +1512,10 @@ pub fn draw_node(
                     }
                 }
             }
-            if let Some(sw) = stroke_after_fill {
-                draw_ellipse_stroke(
-                    painter,
-                    viewport,
-                    origin,
-                    center,
-                    radius,
-                    doc_bounds,
-                    stroke_style,
-                    opacity,
-                    sw,
-                    stroke_join,
-                );
+            if let Some(sw) = stroke_w {
+                if !has_fill || !stroke_behind {
+                    draw_e_stroke(painter, sw);
+                }
             }
         }
         NodeKind::Polygon {
@@ -1410,18 +1533,21 @@ pub fn draw_node(
             let bounds = node.bounds();
             let doc_bounds = (bounds.x0, bounds.y0, bounds.x1, bounds.y1);
             let has_fill = fill.is_visible();
+            let draw_p_stroke = |painter: &Painter, sw: f32| {
+                draw_stroke_closed_ring(
+                    painter,
+                    viewport,
+                    &screen,
+                    &verts,
+                    stroke_style,
+                    opacity,
+                    sw,
+                    stroke_join,
+                );
+            };
             if let Some(sw) = stroke_w {
-                if has_fill {
-                    draw_stroke_closed_ring(
-                        painter,
-                        viewport,
-                        &screen,
-                        &verts,
-                        stroke_style,
-                        opacity,
-                        sw,
-                        stroke_join,
-                    );
+                if has_fill && stroke_behind {
+                    draw_p_stroke(painter, sw);
                 }
             }
             if has_fill {
@@ -1449,17 +1575,8 @@ pub fn draw_node(
                 }
             }
             if let Some(sw) = stroke_w {
-                if !has_fill {
-                    draw_stroke_closed_ring(
-                        painter,
-                        viewport,
-                        &screen,
-                        &verts,
-                        stroke_style,
-                        opacity,
-                        sw,
-                        stroke_join,
-                    );
+                if !has_fill || !stroke_behind {
+                    draw_p_stroke(painter, sw);
                 }
             }
             let _ = doc_bounds;
@@ -1516,8 +1633,8 @@ pub fn draw_node(
                 }
             };
 
-            // Stroke under fill on closed shapes.
-            if closed && has_fill {
+            // Stroke behind fill on closed shapes when paint_order is BehindFill.
+            if closed && has_fill && stroke_behind {
                 draw_path_stroke(painter);
             }
 
@@ -1551,7 +1668,8 @@ pub fn draw_node(
                 painter.add(s);
             }
 
-            if !has_fill || !closed {
+            // Stroke above fill, or open / unfilled paths.
+            if !closed || !has_fill || !stroke_behind {
                 draw_path_stroke(painter);
             }
 
@@ -1692,24 +1810,10 @@ pub fn draw_node(
             );
             let has_fill = fill.is_visible();
 
-            if is_closed_fill && has_fill {
-                if let Fill::Solid(p) = fill {
-                    let c = paint_to_color(*p, opacity);
-                    for s in bez_to_fill_shapes(&bez, viewport, origin, c, true) {
-                        painter.add(s);
-                    }
-                } else {
-                    let bounds = node.bounds();
-                    let docb = (bounds.x0, bounds.y0, bounds.x1, bounds.y1);
-                    let mesh = clipped_gradient_mesh_from_bez(&bez, viewport, origin, docb, fill, opacity);
-                    if !mesh.vertices.is_empty() {
-                        painter.add(Shape::mesh(mesh));
-                    }
-                }
-            }
-
-            // Stroke the (parts of) the arc
-            if let Some(sw) = stroke_w {
+            let draw_arc_stroke = |painter: &Painter| {
+                let Some(sw) = stroke_w else {
+                    return;
+                };
                 if matches!(stroke_style, Fill::Solid(_)) {
                     let c = sample_fill_at(stroke_style, opacity, 0.5, 0.5);
                     draw_solid_bez_stroke(
@@ -1740,6 +1844,30 @@ pub fn draw_node(
                         );
                     }
                 }
+            };
+
+            if is_closed_fill && has_fill && stroke_behind {
+                draw_arc_stroke(painter);
+            }
+
+            if is_closed_fill && has_fill {
+                if let Fill::Solid(p) = fill {
+                    let c = paint_to_color(*p, opacity);
+                    for s in bez_to_fill_shapes(&bez, viewport, origin, c, true) {
+                        painter.add(s);
+                    }
+                } else {
+                    let bounds = node.bounds();
+                    let docb = (bounds.x0, bounds.y0, bounds.x1, bounds.y1);
+                    let mesh = clipped_gradient_mesh_from_bez(&bez, viewport, origin, docb, fill, opacity);
+                    if !mesh.vertices.is_empty() {
+                        painter.add(Shape::mesh(mesh));
+                    }
+                }
+            }
+
+            if !is_closed_fill || !has_fill || !stroke_behind {
+                draw_arc_stroke(painter);
             }
         }
         NodeKind::Group { .. } => {}
@@ -1836,10 +1964,38 @@ pub fn selection_union_screen_rect(
     origin: Pos2,
     tiling_effects: &indexmap::IndexMap<uuid::Uuid, crate::document::TilingEffect>,
     circular_effects: &indexmap::IndexMap<uuid::Uuid, crate::document::CircularCloneEffect>,
+    clip_masks: &indexmap::IndexMap<uuid::Uuid, crate::document::ClipMaskEffect>,
 ) -> Option<Rect> {
+    // Clip unit (image + mask): selection box is the **mask solid-face bounds** only,
+    // not the full reference image.
+    if selection.len() == 2 {
+        if let Some(cm) = clip_masks.values().find(|cm| {
+            (selection[0] == cm.source_id && selection[1] == cm.mask_id)
+                || (selection[0] == cm.mask_id && selection[1] == cm.source_id)
+        }) {
+            if let Some(mask) = nodes.get(cm.mask_id) {
+                let b = mask.bounds_with_store(nodes);
+                let tl = viewport.doc_to_screen((b.x0, b.y0), origin);
+                let br = viewport.doc_to_screen((b.x1, b.y1), origin);
+                return Some(Rect::from_min_max(tl, br));
+            }
+        }
+    }
+
     let mut union: Option<kurbo::Rect> = None;
     for id in selection {
         let Some(node) = nodes.get(*id) else { continue };
+        // Single ghost image under an active clip: still show mask bounds if it's the source.
+        if selection.len() == 1 {
+            if let Some(cm) = clip_masks.values().find(|cm| cm.source_id == *id) {
+                if let Some(mask) = nodes.get(cm.mask_id) {
+                    let b = mask.bounds_with_store(nodes);
+                    let tl = viewport.doc_to_screen((b.x0, b.y0), origin);
+                    let br = viewport.doc_to_screen((b.x1, b.y1), origin);
+                    return Some(Rect::from_min_max(tl, br));
+                }
+            }
+        }
         let mut b = node.bounds_with_store(nodes);
         if let Some(e) = tiling_effects.values().find(|e| e.source_id == *id) {
             b = b.union(crate::document::compute_tiling_whole_bounds(node, e));
@@ -3612,7 +3768,7 @@ mod lyon_path_tests {
     }
 }
 
-/// Draw Clip Mask effects: render `source_id` clipped to `mask_id`'s bounding box.
+/// Draw Clip Mask: raster `source_id` clipped to the **solid face** of `mask_id`.
 pub fn draw_clip_mask_effects(
     painter: &Painter,
     nodes: &NodeStore,
@@ -3627,38 +3783,170 @@ pub fn draw_clip_mask_effects(
         let Some(mask_node) = nodes.get(cm.mask_id) else { continue };
         let Some(source_node) = nodes.get(cm.source_id) else { continue };
 
-        // Compute mask bounding box in screen coords using node's own bounding box
         let mask_bounds = mask_node.bounds();
         let tl = viewport.doc_to_screen((mask_bounds.x0, mask_bounds.y0), origin);
         let br = viewport.doc_to_screen((mask_bounds.x1, mask_bounds.y1), origin);
         let clip_rect = egui::Rect::from_min_max(tl, br);
 
-        // Draw source node clipped to mask region
-        if let Some(tex) = image_textures.get(&cm.id) {
-            painter.image(
-                tex.id(),
-                clip_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        } else {
-            let clipped_painter = painter.with_clip_rect(clip_rect);
-            draw_node(&clipped_painter, source_node, viewport, origin, false, fonts, image_textures);
+        let mut drew = false;
+
+        // 1) Preferred for images: tessellate mask solid face + UV-map the image texture
+        //    (true solid-face clip, works even when SVG bake fails).
+        if let NodeKind::Image {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } = &source_node.kind
+        {
+            if let Some(src_tex) = image_textures.get(&cm.source_id) {
+                let img_rect = kurbo::Rect::new(*x, *y, *x + *width, *y + *height);
+                if let Some(mesh) =
+                    clip_image_mesh(mask_node, img_rect, src_tex.id(), viewport, origin)
+                {
+                    painter.add(Shape::mesh(mesh));
+                    drew = true;
+                }
+            }
         }
 
-        // Draw dashed outline of the actual mask shape contour
-        let bez = mask_node.bez_path();
-        let (screen_pts, _) = polyline_from_bez(&bez, viewport, origin, true);
-        
+        // 2) Pre-baked solid-face clip texture (SVG clipPath).
+        if !drew {
+            if let Some(tex) = image_textures.get(&cm.id) {
+                painter.image(
+                    tex.id(),
+                    clip_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                drew = true;
+            }
+        }
+
+        // 3) Last resort for non-image: scissor (bbox) — better than nothing.
+        if !drew {
+            let clipped_painter = painter.with_clip_rect(clip_rect);
+            draw_node(
+                &clipped_painter,
+                source_node,
+                viewport,
+                origin,
+                false,
+                fonts,
+                image_textures,
+            );
+        }
+
+        // Subtle dashed outline only when selected (avoid soft white rim looking like a lens).
         let is_selected = selection.contains(&cm.source_id) || selection.contains(&cm.mask_id);
-        let color = if is_selected {
-            Color32::from_rgb(180, 100, 255)
-        } else {
-            Color32::from_rgba_unmultiplied(180, 100, 255, 100)
-        };
-        let width = if is_selected { 1.5 } else { 1.0 };
-        draw_dashed_polyline(painter, &screen_pts, true, 6.0, 4.0, egui::Stroke::new(width, color));
+        if is_selected {
+            let bez = mask_node.bez_path();
+            let (screen_pts, _) = polyline_from_bez(&bez, viewport, origin, true);
+            draw_dashed_polyline(
+                painter,
+                &screen_pts,
+                true,
+                5.0,
+                4.0,
+                egui::Stroke::new(1.25, Color32::from_rgb(180, 100, 255)),
+            );
+        }
     }
+}
+
+/// Tessellate **mask ∩ image-rect** solid face and UV-map the image.
+/// Intersecting first avoids transparent/white vertex blends that looked like a
+/// "lens" highlight on the top rim of circular clips.
+fn clip_image_mesh(
+    mask_node: &Node,
+    image_doc_rect: kurbo::Rect,
+    texture_id: egui::TextureId,
+    viewport: &Viewport,
+    origin: Pos2,
+) -> Option<Mesh> {
+    use crate::document::node_to_multipolygon;
+    use geo::BooleanOps;
+    use geo::{Coord, LineString, MultiPolygon, Polygon};
+
+    let mask_mp = node_to_multipolygon(mask_node, 0.5)?;
+    let r = image_doc_rect;
+    let img_ring = vec![
+        Coord { x: r.x0, y: r.y0 },
+        Coord { x: r.x1, y: r.y0 },
+        Coord { x: r.x1, y: r.y1 },
+        Coord { x: r.x0, y: r.y1 },
+        Coord { x: r.x0, y: r.y0 },
+    ];
+    let img_mp = MultiPolygon::new(vec![Polygon::new(LineString::new(img_ring), vec![])]);
+    let clipped = mask_mp.intersection(&img_mp);
+    if clipped.0.is_empty() {
+        return None;
+    }
+
+    // Build lyon path from intersection polygons (doc → screen).
+    let mut builder = Path::builder();
+    let map = |x: f64, y: f64| {
+        let s = viewport.doc_to_screen((x, y), origin);
+        Point::new(s.x, s.y)
+    };
+    for poly in &clipped.0 {
+        let coords: Vec<_> = poly.exterior().coords().collect();
+        if coords.len() < 3 {
+            continue;
+        }
+        builder.begin(map(coords[0].x, coords[0].y));
+        for c in coords.iter().skip(1) {
+            builder.line_to(map(c.x, c.y));
+        }
+        builder.close();
+        for hole in poly.interiors() {
+            let hc: Vec<_> = hole.coords().collect();
+            if hc.len() < 3 {
+                continue;
+            }
+            builder.begin(map(hc[0].x, hc[0].y));
+            for c in hc.iter().skip(1) {
+                builder.line_to(map(c.x, c.y));
+            }
+            builder.close();
+        }
+    }
+    let lyon_path = builder.build();
+
+    let mut buffers: VertexBuffers<Point, u16> = VertexBuffers::new();
+    let mut tess = FillTessellator::new();
+    if tess
+        .tessellate_path(
+            &lyon_path,
+            &lyon_fill_options(viewport),
+            &mut BuffersBuilder::new(&mut buffers, |vertex: FillVertex| vertex.position()),
+        )
+        .is_err()
+        || buffers.vertices.is_empty()
+    {
+        return None;
+    }
+
+    let iw = image_doc_rect.width().max(1e-6);
+    let ih = image_doc_rect.height().max(1e-6);
+    let mut mesh = Mesh::with_texture(texture_id);
+    for v in &buffers.vertices {
+        let doc = viewport.screen_to_doc(Pos2::new(v.x, v.y), origin);
+        let u = ((doc.0 - image_doc_rect.x0) / iw) as f32;
+        let vv = ((doc.1 - image_doc_rect.y0) / ih) as f32;
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: Pos2::new(v.x, v.y),
+            // Geometry already clipped to image rect — UV stays in [0,1].
+            uv: egui::pos2(u.clamp(0.0, 1.0), vv.clamp(0.0, 1.0)),
+            color: Color32::WHITE,
+        });
+    }
+    for tri in buffers.indices.chunks_exact(3) {
+        mesh.indices
+            .extend_from_slice(&[tri[0] as u32, tri[1] as u32, tri[2] as u32]);
+    }
+    Some(mesh)
 }
 
 /// Draw a dashed polyline.

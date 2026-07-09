@@ -79,6 +79,7 @@ pub fn import_svg(path: &Path) -> Result<ProjectFile, IoError> {
         tiling_effects: Default::default(),
         circular_effects: Default::default(),
         clip_masks: Default::default(),
+        boolean_effects: Default::default(),
         page_color: [1.0, 1.0, 1.0, 1.0],
         page_unit: PageUnit::Px,
     };

@@ -46,7 +46,10 @@ GPU-accelerated canvas.
 
 - WGSL shader passes composited over the canvas via wgpu
 - Built-in procedural shaders: blackhole (GPU and CPU), CRT, vignette
-- Custom shading layers add post-process effects on top of vector content
+- **Dynamic custom shaders**: edit WGSL in the layer panel, load/save `.wgsl` files, or pass source via MCP `add_shading_layer` — compiled at runtime (no rebuild)
+- Fragment entry required: `@fragment fn main` (or `fs_main`); multipass compute engines (e.g. Cuneus) are not drop-in compatible
+- Compose bindings: `input_tex@0`, `sampler@1`, `uniform@2` (procedural-only: uniform at `@binding(0)`)
+- Hot reload or Compile/Reload; validation errors surface in the shader editor
 - 4x MSAA rendering throughout
 
 ### Flowchart diagramming

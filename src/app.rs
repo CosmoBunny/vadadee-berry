@@ -12,6 +12,8 @@ use crate::document::{
     path_effect_move_bundle, sync_path_effect_form_geometry, BezierHandleMode, Document,
     FaceRenderable, Fill, FillKind,
     GradientStop, Node, NodeId, NodeKind, ObjectOnPathEffect, OnPathMode, Paint, PathData, PathMagic, PathPlacement, TilingEffect, CircularCloneEffect,
+    BooleanEffect, BooleanOpKind, ClipMaskEffect, is_booleanable_shape, is_raster_image,
+    compute_boolean_bez,
     PathEditTarget, ProjectFile, Stroke, TextStyle, text_display_name,
 };
 use crate::history::{snapshot_document, snapshot_project, History, ProjectEdit};
@@ -27,6 +29,14 @@ pub enum AudioExtractStatus {
     Ready(std::path::PathBuf),
     Failed,
 }
+
+/// How two selected nodes relate for Path Magic boolean / clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BooleanPairMode {
+    VectorBoolean { a: NodeId, b: NodeId },
+    ImageClip { source: NodeId, mask: NodeId },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GradientFlowTarget {
     Fill,
@@ -191,6 +201,7 @@ pub struct VadadeeBerryApp {
     pub ui_stroke_edit_gradient_line: bool,
     pub ui_stroke_line_join: crate::document::LineJoin,
     pub ui_stroke_line_cap: crate::document::LineCap,
+    pub ui_stroke_paint_order: crate::document::StrokePaintOrder,
     pub ui_stroke_kind: FillKind,
     // Path marker (arrow / point icons) UI state for start/mid/end on pen paths
     pub ui_marker_start: crate::document::PathMarker,
@@ -256,6 +267,8 @@ pub struct VadadeeBerryApp {
     pub ui_tiling_gap_y: f64,
     // CircularClone params
     pub ui_circular_copies: usize,
+    /// Preferred boolean op in Path Magic (Union / Intersection / Difference).
+    pub ui_boolean_op: BooleanOpKind,
     pub ui_circular_angle_offset: f64,
     pub ui_circular_origin_x: f64,
     pub ui_circular_origin_y: f64,
@@ -747,6 +760,7 @@ impl VadadeeBerryApp {
             ui_stroke_edit_gradient_line: false,
             ui_stroke_line_join: crate::document::LineJoin::Miter,
             ui_stroke_line_cap: crate::document::LineCap::Butt,
+            ui_stroke_paint_order: crate::document::StrokePaintOrder::BehindFill,
             ui_stroke_kind: FillKind::Solid,
             ui_stroke_angle: 0.0,
             ui_marker_start: crate::document::PathMarker::default(),
@@ -818,6 +832,7 @@ impl VadadeeBerryApp {
             ui_tiling_gap_x: 48.0,
             ui_tiling_gap_y: 48.0,
             ui_circular_copies: 6,
+            ui_boolean_op: BooleanOpKind::Union,
             ui_circular_angle_offset: 0.0,
             ui_circular_origin_x: 0.0,
             ui_circular_origin_y: 0.0,
@@ -1468,6 +1483,7 @@ impl VadadeeBerryApp {
                 }
                 self.ui_stroke_line_join = n.style.stroke.line_join;
                 self.ui_stroke_line_cap = n.style.stroke.line_cap;
+                self.ui_stroke_paint_order = n.style.stroke.paint_order;
                 self.ui_marker_start = n.style.stroke.start_marker.clone();
                 self.ui_marker_mid = n.style.stroke.mid_marker.clone();
                 self.ui_marker_end = n.style.stroke.end_marker.clone();
@@ -1668,6 +1684,7 @@ impl VadadeeBerryApp {
             },
             line_join: self.ui_stroke_line_join,
             line_cap: self.ui_stroke_line_cap,
+            paint_order: self.ui_stroke_paint_order,
             start_marker: self.ui_marker_start.clone(),
             mid_marker: self.ui_marker_mid.clone(),
             end_marker: self.ui_marker_end.clone(),
@@ -1700,6 +1717,7 @@ impl VadadeeBerryApp {
             after.style.stroke.width = ui.width;
             after.style.stroke.line_join = ui.line_join;
             after.style.stroke.line_cap = ui.line_cap;
+            after.style.stroke.paint_order = ui.paint_order;
             self.history.push(
                 &mut self.project,
                 ProjectEdit::PatchNode { id, before, after },
@@ -2431,11 +2449,50 @@ impl VadadeeBerryApp {
         if src.is_empty() {
             return Err("wgsl must not be empty".into());
         }
+        // Fail early with a clear message (e.g. compute multipass from other engines).
+        crate::shading::validate_shading_wgsl(src)?;
         let mut pass = ShadingPass::new_preset(pass_name, src);
         if let Some(u) = uniforms {
             pass.uniforms = u;
         }
         self.add_shading_layer_with_passes(layer_name, vec![pass]);
+        Ok(())
+    }
+
+    /// Replace active shading pass WGSL from a `.wgsl` file path (dynamic load, not a preset).
+    pub fn load_shading_wgsl_from_path(
+        &mut self,
+        layer_index: usize,
+        path: &std::path::Path,
+    ) -> Result<(), String> {
+        let src = crate::shading::load_wgsl_file(path)?;
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Custom")
+            .to_string();
+        let layer = self
+            .project
+            .document
+            .layers
+            .get_mut(layer_index)
+            .ok_or("Layer not found")?;
+        if layer.kind != crate::document::LayerKind::Shading {
+            return Err("Layer is not a shading layer".into());
+        }
+        if layer.shading_passes.is_empty() {
+            layer
+                .shading_passes
+                .push(crate::document::ShadingPass::custom_template());
+        }
+        let pass = &mut layer.shading_passes[0];
+        pass.load_wgsl_source(src, Some(&stem));
+        // Soft pre-validate so the UI shows a clear error immediately if needed.
+        if let Err(msg) = crate::shading::validate_shading_wgsl(&pass.wgsl) {
+            if let Ok(mut err) = pass.compile_error.lock() {
+                *err = Some(msg);
+            }
+        }
         Ok(())
     }
 
@@ -2449,7 +2506,10 @@ impl VadadeeBerryApp {
         let idx = after.add_shading_layer(name);
         after.active_layer_index = idx;
         if let Some(layer) = after.layers.get_mut(idx) {
-            layer.shading_passes.extend(passes);
+            // Replace — do not extend. Layer used to ship with a default vignette pass;
+            // extend left custom/MCP shaders as pass[1], then UI truncate kept only vignette
+            // (compose on empty input → solid black).
+            layer.shading_passes = passes;
         }
         self.history.push(
             &mut self.project,
@@ -3926,6 +3986,18 @@ impl VadadeeBerryApp {
                     let _ = i.consume_key(egui::Modifiers::COMMAND, Key::ArrowLeft);
                 }
 
+                // Ctrl+Up / Ctrl+Down: raise / lower object (or layer) z-order
+                if cmd && i.key_pressed(Key::ArrowUp) {
+                    self.nudge_z_order(1);
+                    let _ = i.consume_key(egui::Modifiers::CTRL, Key::ArrowUp);
+                    let _ = i.consume_key(egui::Modifiers::COMMAND, Key::ArrowUp);
+                }
+                if cmd && i.key_pressed(Key::ArrowDown) {
+                    self.nudge_z_order(-1);
+                    let _ = i.consume_key(egui::Modifiers::CTRL, Key::ArrowDown);
+                    let _ = i.consume_key(egui::Modifiers::COMMAND, Key::ArrowDown);
+                }
+
                 // Arrow keys nudging selected objects / points
                 let mut nudge_dx: f64 = 0.0;
                 let mut nudge_dy: f64 = 0.0;
@@ -4491,37 +4563,53 @@ impl VadadeeBerryApp {
         self.status_message = format!("Created 1s music node at {:.2}s", play_sec);
     }
 
+    /// Pick topmost node at `doc`. Ghosts (boolean/clip hidden sources) are skipped unless
+    /// `include_ghosts` (Ctrl+Shift+click or Objects tab).
     fn pick_node_at(&self, doc: (f64, f64), slop: f64) -> Option<NodeId> {
-        let hidden = self.hidden_canvas_sources();
-        if self.spatial_index.is_enabled() {
-            let (hit, _) = self.spatial_index.pick_topmost_with_document(
-                &self.project,
-                &hidden,
-                doc,
-                slop,
-                |id| self.node_uses_extended_bounds(id),
-            );
-            return hit;
+        self.pick_node_at_opts(doc, slop, false)
+    }
+
+    fn pick_node_at_opts(&self, doc: (f64, f64), slop: f64, include_ghosts: bool) -> Option<NodeId> {
+        // Normal pick: treat visible clip composites as selectable (source is hidden ghost).
+        if !include_ghosts {
+            if let Some((source, _mask)) = self.pick_clip_mask_at(doc, slop) {
+                return Some(source);
+            }
         }
-        for id in self.project.document.ordered_node_ids().into_iter().rev() {
-            if let Some(node) = self.project.nodes.get(id) {
-                let does_hit = if self.node_uses_extended_bounds(id) {
-                    let eb = crate::document::get_effective_bounds(
-                        node,
-                        &self.project.document,
-                        &self.project.nodes,
-                    );
-                    let pt = kurbo::Point::new(doc.0, doc.1);
-                    eb.inflate(slop, slop).contains(pt)
-                } else {
-                    node.hit_test_with_store(&self.project.nodes, doc.0, doc.1, slop)
-                };
-                if does_hit {
-                    return Some(id);
-                }
+        let (hit, _) = self.pick_node_at_with_bbox_fallback_opts(doc, slop, include_ghosts);
+        hit
+    }
+
+    /// Hit-test clip-mask solid faces (mask shape in doc space). Returns (source, mask).
+    fn pick_clip_mask_at(&self, doc: (f64, f64), slop: f64) -> Option<(NodeId, NodeId)> {
+        use kurbo::Shape;
+        let pt = kurbo::Point::new(doc.0, doc.1);
+        // Later effects draw on top — search in reverse insertion order.
+        for cm in self.project.document.clip_masks.values().rev() {
+            let Some(mask) = self.project.nodes.get(cm.mask_id) else {
+                continue;
+            };
+            let bez = mask.bez_path();
+            let hit = if bez.elements().is_empty() {
+                mask.bounds().inflate(slop, slop).contains(pt)
+            } else {
+                bez.contains(pt) || mask.bounds().inflate(slop, slop).contains(pt)
+            };
+            if hit {
+                return Some((cm.source_id, cm.mask_id));
             }
         }
         None
+    }
+
+    /// If `id` is part of a clip mask, return (source, mask) for unit selection.
+    fn clip_pair_for(&self, id: NodeId) -> Option<(NodeId, NodeId)> {
+        self.project
+            .document
+            .clip_masks
+            .values()
+            .find(|cm| cm.source_id == id || cm.mask_id == id)
+            .map(|cm| (cm.source_id, cm.mask_id))
     }
 
     fn pick_node_at_with_bbox_fallback(
@@ -4529,7 +4617,20 @@ impl VadadeeBerryApp {
         doc: (f64, f64),
         slop: f64,
     ) -> (Option<NodeId>, Option<NodeId>) {
-        let hidden = self.hidden_canvas_sources();
+        self.pick_node_at_with_bbox_fallback_opts(doc, slop, false)
+    }
+
+    fn pick_node_at_with_bbox_fallback_opts(
+        &self,
+        doc: (f64, f64),
+        slop: f64,
+        include_ghosts: bool,
+    ) -> (Option<NodeId>, Option<NodeId>) {
+        let hidden = if include_ghosts {
+            std::collections::HashSet::new()
+        } else {
+            self.hidden_canvas_sources()
+        };
         if self.spatial_index.is_enabled() {
             return self.spatial_index.pick_topmost_with_document(
                 &self.project,
@@ -4542,6 +4643,9 @@ impl VadadeeBerryApp {
         let mut hit: Option<NodeId> = None;
         let mut bbox_only: Option<NodeId> = None;
         for id in self.project.document.ordered_node_ids().into_iter().rev() {
+            if hidden.contains(&id) {
+                continue;
+            }
             if let Some(node) = self.project.nodes.get(id) {
                 let does_hit = if self.node_uses_extended_bounds(id) {
                     let eb = crate::document::get_effective_bounds(
@@ -5275,8 +5379,10 @@ fn run_video_decode_thread(
                             shade_time,
                             gpu,
                         );
+                        // Throttle animated shading (~30 FPS) — unbounded request_repaint
+                        // with heavy raymarch WGSL was melting the UI (~7 FPS).
                         if layer.shading_passes.iter().any(|p| p.enabled) {
-                            ctx.request_repaint();
+                            ctx.request_repaint_after(std::time::Duration::from_millis(33));
                         }
                     }
                     crate::document::LayerKind::Flowchart => {
@@ -5372,11 +5478,32 @@ fn run_video_decode_thread(
                 if self.selection.len() == 1 {
                     if let Some(id) = self.selection.first() {
                         if let Some(node) = self.project.nodes.get(*id) {
-                            let eb = crate::document::get_effective_bounds(
-                                node,
-                                &self.project.document,
-                                &self.project.nodes,
-                            );
+                            // Clip source selected alone: handles follow mask bounds (visible clip).
+                            let eb = if let Some(cm) = self
+                                .project
+                                .document
+                                .clip_masks
+                                .values()
+                                .find(|cm| cm.source_id == *id)
+                            {
+                                self.project
+                                    .nodes
+                                    .get(cm.mask_id)
+                                    .map(|m| m.bounds())
+                                    .unwrap_or_else(|| {
+                                        crate::document::get_effective_bounds(
+                                            node,
+                                            &self.project.document,
+                                            &self.project.nodes,
+                                        )
+                                    })
+                            } else {
+                                crate::document::get_effective_bounds(
+                                    node,
+                                    &self.project.document,
+                                    &self.project.nodes,
+                                )
+                            };
                             let tl = self.viewport.doc_to_screen((eb.x0, eb.y0), origin);
                             let br = self.viewport.doc_to_screen((eb.x1, eb.y1), origin);
                             let mut sr = egui::Rect::from_min_max(tl, br);
@@ -5446,6 +5573,7 @@ fn run_video_decode_thread(
                         origin,
                         &self.project.document.tiling_effects,
                         &self.project.document.circular_effects,
+                        &self.project.document.clip_masks,
                     ) {
                         render::draw_group_selection_bounds(&painter, sr);
                         if self.is_bulk_selection() {
@@ -5938,14 +6066,19 @@ fn run_video_decode_thread(
             self.sync_pen_continue_from_selection();
         }
 
-        let shift = response.ctx.input(|i| i.modifiers.shift);
-        let ctrl = response.ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        let (shift, ctrl, ghost_pick) = response.ctx.input(|i| {
+            let shift = i.modifiers.shift;
+            let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            // Ctrl+Shift+click selects ghost (hidden boolean/clip operands).
+            (shift, ctrl, shift && ctrl)
+        });
         match self.tools.active {
             ToolKind::Select => self.tool_select(
                 pos,
                 origin,
                 doc,
                 shift || ctrl,
+                ghost_pick,
                 primary_pressed,
                 primary_down,
                 primary_released,
@@ -6080,74 +6213,59 @@ fn run_video_decode_thread(
         }
     }
 
+    /// Lightweight: ensure source image textures exist. Viewport clip uses mesh UV mapping
+    /// (no per-frame SVG/base64 re-encode — that was melting FPS).
     fn update_clip_mask_textures(&mut self, ctx: &egui::Context) {
         let mut active_clip_ids = std::collections::HashSet::new();
-        
-        // Temporarily clone clip masks to avoid borrow checker issues with self
-        let clip_masks: Vec<crate::document::ClipMaskEffect> = self.project.document.clip_masks.values().cloned().collect();
-        
+        let clip_masks: Vec<crate::document::ClipMaskEffect> =
+            self.project.document.clip_masks.values().cloned().collect();
+
         for cm in &clip_masks {
             active_clip_ids.insert(cm.id);
-            let Some(mask_node) = self.project.nodes.get(cm.mask_id) else { continue };
-            let Some(source_node) = self.project.nodes.get(cm.source_id) else { continue };
-            
-            let sig = format!("{:?}_{:?}", mask_node, source_node);
-            let needs_update = self.clip_mask_signatures.get(&cm.id) != Some(&sig);
-            
-            if needs_update {
-                // Generate SVG fragment for mask and source
-                let mask_svg = io::node_to_svg_fragment(mask_node, &self.project.nodes);
-                let source_svg = io::node_to_svg_fragment(source_node, &self.project.nodes);
-                
-                let mask_bounds = mask_node.bounds();
-                let w = mask_bounds.width().max(1.0);
-                let h = mask_bounds.height().max(1.0);
-                
-                // Let's use a scale of 2.0 to keep it sharp
-                let scale = 2.0f32;
-                let pixel_w = (w * scale as f64).round().max(1.0) as u32;
-                let pixel_h = (h * scale as f64).round().max(1.0) as u32;
-                
-                let svg_data = format!(
-                    r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{} {} {} {}" width="{}" height="{}">
-                      <defs>
-                        <clipPath id="clip">
-                          {}
-                        </clipPath>
-                      </defs>
-                      <g clip-path="url(#clip)">
-                        {}
-                      </g>
-                    </svg>"#,
-                    mask_bounds.x0, mask_bounds.y0, w, h,
-                    w, h,
-                    mask_svg,
-                    source_svg
-                );
-                
-                let opt = crate::fonts::usvg_options();
-                if let Ok(tree) = usvg::Tree::from_str(&svg_data, &opt) {
-                    if let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(pixel_w, pixel_h) {
-                        resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
-                        let rgba = pixmap.take();
-                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                            [pixel_w as usize, pixel_h as usize],
-                            &rgba,
-                        );
-                        let handle = ctx.load_texture(
-                            format!("clip-mask-{}", cm.id.as_simple()),
-                            color_image,
-                            egui::TextureOptions::default(),
-                        );
-                        self.image_textures.insert(cm.id, handle);
-                        self.clip_mask_signatures.insert(cm.id, sig);
-                    }
+            // Cheap signature — never Debug whole Node (Image bytes kill the frame).
+            let sig = {
+                let mask_b = self
+                    .project
+                    .nodes
+                    .get(cm.mask_id)
+                    .map(|n| n.bounds())
+                    .unwrap_or_default();
+                let src_b = self
+                    .project
+                    .nodes
+                    .get(cm.source_id)
+                    .map(|n| n.bounds())
+                    .unwrap_or_default();
+                format!(
+                    "{}:{}:{:.1},{:.1},{:.1},{:.1}:{:.1},{:.1},{:.1},{:.1}",
+                    cm.source_id.as_simple(),
+                    cm.mask_id.as_simple(),
+                    mask_b.x0,
+                    mask_b.y0,
+                    mask_b.x1,
+                    mask_b.y1,
+                    src_b.x0,
+                    src_b.y0,
+                    src_b.x1,
+                    src_b.y1
+                )
+            };
+            if self.clip_mask_signatures.get(&cm.id) == Some(&sig) {
+                continue;
+            }
+            if let Some(source_node) = self.project.nodes.get(cm.source_id) {
+                if let NodeKind::Image { bytes, .. } = &source_node.kind {
+                    let bytes = bytes.clone();
+                    self.ensure_image_texture(cm.source_id, &bytes, ctx);
                 }
             }
+            // Drop any stale baked clip texture; mesh path is authoritative for images.
+            self.image_textures.remove(&cm.id);
+            self.clip_mask_signatures.insert(cm.id, sig);
         }
-        
-        // Retain only active clip masks
-        self.clip_mask_signatures.retain(|id, _| active_clip_ids.contains(id));
+
+        self.clip_mask_signatures
+            .retain(|id, _| active_clip_ids.contains(id));
     }
 
     fn hidden_canvas_sources(&self) -> std::collections::HashSet<NodeId> {
@@ -6167,6 +6285,12 @@ fn run_video_decode_thread(
             hidden.insert(cm.source_id);
             if cm.hide_mask {
                 hidden.insert(cm.mask_id);
+            }
+        }
+        for e in self.project.document.boolean_effects.values() {
+            if e.hide_operands {
+                hidden.insert(e.a_id);
+                hidden.insert(e.b_id);
             }
         }
         hidden
@@ -7308,77 +7432,533 @@ fn run_video_decode_thread(
         self.status_message = "Removed CircularClone effect(s)".into();
     }
 
-    /// Returns true if any selected node is the source_id or mask_id of a clip mask effect.
-    pub fn selection_has_clip_mask(&self) -> bool {
+    /// First two selected nodes as (A, B) if both present.
+    pub fn selection_boolean_pair(&self) -> Option<(NodeId, NodeId)> {
+        if self.selection.len() < 2 {
+            return None;
+        }
+        Some((self.selection[0], self.selection[1]))
+    }
+
+    /// Classify pair for Path Magic: vector boolean vs image clip.
+    pub fn selection_boolean_mode(
+        &self,
+    ) -> Option<BooleanPairMode> {
+        let (a, b) = self.selection_boolean_pair()?;
+        let na = self.project.nodes.get(a)?;
+        let nb = self.project.nodes.get(b)?;
+        let a_shape = is_booleanable_shape(na);
+        let b_shape = is_booleanable_shape(nb);
+        let a_img = is_raster_image(na);
+        let b_img = is_raster_image(nb);
+        if a_shape && b_shape {
+            return Some(BooleanPairMode::VectorBoolean { a, b });
+        }
+        if a_img && b_shape {
+            return Some(BooleanPairMode::ImageClip {
+                source: a,
+                mask: b,
+            });
+        }
+        if b_img && a_shape {
+            return Some(BooleanPairMode::ImageClip {
+                source: b,
+                mask: a,
+            });
+        }
+        None
+    }
+
+    pub fn selection_has_boolean_effect(&self) -> bool {
         self.selection.iter().any(|&id| {
-            self.project.document.clip_masks.values().any(|cm| cm.source_id == id || cm.mask_id == id)
+            self.project.document.boolean_effects.values().any(|e| {
+                e.a_id == id
+                    || e.b_id == id
+                    || e.result_node_id == Some(id)
+            })
         })
     }
 
-    /// Apply a clip mask: first selected non-path object becomes source_id, first path becomes mask_id.
-    pub fn apply_clip_mask(&mut self) {
-        let paths: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| matches!(&n.kind, NodeKind::Path { .. }))
-        }).copied().collect();
-        let objects: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).copied().collect();
-        let (source_id, mask_id) = match (objects.first(), paths.first()) {
-            (Some(&s), Some(&m)) => (s, m),
-            // If both are paths, use first as source and second as mask
-            _ => {
-                let sel = &self.selection;
-                if sel.len() >= 2 { (sel[0], sel[1]) } else { return; }
-            }
+    pub fn selection_has_clip_mask(&self) -> bool {
+        self.selection.iter().any(|&id| {
+            self.project
+                .document
+                .clip_masks
+                .values()
+                .any(|cm| cm.source_id == id || cm.mask_id == id)
+        })
+    }
+
+    fn find_boolean_effect_for_selection(&self) -> Option<uuid::Uuid> {
+        let sel = &self.selection;
+        self.project
+            .document
+            .boolean_effects
+            .iter()
+            .find(|(_, e)| {
+                sel.contains(&e.a_id)
+                    || sel.contains(&e.b_id)
+                    || e.result_node_id.map(|r| sel.contains(&r)).unwrap_or(false)
+            })
+            .map(|(k, _)| *k)
+    }
+
+    /// Apply live boolean effect for two solid-face shapes (creates result path).
+    pub fn apply_boolean_effect(&mut self) {
+        let Some(BooleanPairMode::VectorBoolean { a, b }) = self.selection_boolean_mode() else {
+            self.status_message = "Boolean needs two solid shapes (path/rect/circle/arc/polygon)".into();
+            return;
         };
-        // Avoid duplicates
-        if self.project.document.clip_masks.values().any(|cm| cm.source_id == source_id && cm.mask_id == mask_id) {
+        if self.project.document.boolean_effects.values().any(|e| {
+            (e.a_id == a && e.b_id == b) || (e.a_id == b && e.b_id == a)
+        }) {
+            return;
+        }
+        let Some(na) = self.project.nodes.get(a).cloned() else { return };
+        let Some(nb) = self.project.nodes.get(b).cloned() else { return };
+        let Some(bez) = compute_boolean_bez(&na, &nb, self.ui_boolean_op, 0.75) else {
+            self.status_message =
+                "Boolean failed (could not convert shapes to polygons)".into();
+            return;
+        };
+        let empty = bez.elements().is_empty();
+        let mut result = if empty {
+            // Placeholder so the effect exists; moves of A/B recompute when they overlap.
+            Node::path_from_bez(
+                {
+                    let mut p = kurbo::BezPath::new();
+                    let c = na.bounds().center();
+                    p.move_to((c.x, c.y));
+                    p.line_to((c.x + 1.0, c.y));
+                    p.line_to((c.x + 1.0, c.y + 1.0));
+                    p.close_path();
+                    p
+                },
+                format!("{} {} {} (empty)", na.name, self.ui_boolean_op.label(), nb.name),
+            )
+        } else {
+            Node::path_from_bez(
+                bez,
+                format!("{} {} {}", na.name, self.ui_boolean_op.label(), nb.name),
+            )
+        };
+        result.style = na.style.clone();
+        if empty {
+            result.style.opacity = 0.0; // invisible until shapes overlap
+        }
+
+        let before = snapshot_project(&self.project);
+        let mut after = before.clone();
+        let result_id = after.nodes.insert(result);
+        // Put result on active layer
+        if let Some(layer) = after.document.layers.get_mut(after.document.active_layer_index) {
+            if !layer.nodes.contains(&result_id) {
+                layer.nodes.push(result_id);
+            }
+        }
+        let effect = BooleanEffect {
+            id: uuid::Uuid::new_v4(),
+            a_id: a,
+            b_id: b,
+            op: self.ui_boolean_op,
+            // Keep operands visible when result is empty so they can be moved into overlap.
+            hide_operands: !empty,
+            result_node_id: Some(result_id),
+        };
+        after.document.boolean_effects.insert(effect.id, effect);
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::SetDocument { before, after },
+        );
+        // Select operands when empty (result is invisible); else select result.
+        self.selection = if empty {
+            vec![a, b]
+        } else {
+            vec![result_id]
+        };
+        self.status_message = if empty {
+            format!(
+                "Boolean {} applied (empty — move A/B so they overlap)",
+                self.ui_boolean_op.label()
+            )
+        } else {
+            format!("Boolean {} applied", self.ui_boolean_op.label())
+        };
+    }
+
+    pub fn reverse_boolean_operands(&mut self) {
+        // Live effect reverse
+        if let Some(eid) = self.find_boolean_effect_for_selection() {
+            let before_doc = snapshot_document(&self.project.document);
+            let mut after_doc = before_doc.clone();
+            if let Some(e) = after_doc.boolean_effects.get_mut(&eid) {
+                std::mem::swap(&mut e.a_id, &mut e.b_id);
+            }
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchDocument {
+                    before: before_doc,
+                    after: after_doc,
+                },
+            );
+            self.refresh_boolean_effects_live();
+            self.status_message = "Boolean A ↔ B reversed".into();
+            return;
+        }
+        // Pre-apply: reverse selection order
+        if self.selection.len() >= 2 {
+            self.selection.swap(0, 1);
+            self.status_message = "Operands A ↔ B reversed".into();
+        }
+    }
+
+    pub fn set_boolean_op_live(&mut self, op: BooleanOpKind) {
+        self.ui_boolean_op = op;
+        if let Some(eid) = self.find_boolean_effect_for_selection() {
+            let before_doc = snapshot_document(&self.project.document);
+            let mut after_doc = before_doc.clone();
+            if let Some(e) = after_doc.boolean_effects.get_mut(&eid) {
+                e.op = op;
+            }
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchDocument {
+                    before: before_doc,
+                    after: after_doc,
+                },
+            );
+            self.refresh_boolean_effects_live();
+        }
+    }
+
+    /// Recompute result path geometry from current operands + op.
+    /// Call after A/B move or op change — not needed mid-drag if A+B+result move together.
+    pub fn refresh_boolean_effects_live(&mut self) {
+        // Skip while dragging so we don't fight the drag snapshot / wipe the move.
+        if !self.tools.select.drag_snapshot.is_empty() {
+            return;
+        }
+        let effects: Vec<_> = self.project.document.boolean_effects.values().cloned().collect();
+        for e in effects {
+            let Some(na) = self.project.nodes.get(e.a_id).cloned() else { continue };
+            let Some(nb) = self.project.nodes.get(e.b_id).cloned() else { continue };
+            let Some(bez) = compute_boolean_bez(&na, &nb, e.op, 0.75) else { continue };
+            let Some(rid) = e.result_node_id else { continue };
+            if let Some(node) = self.project.nodes.get_mut(rid) {
+                if let NodeKind::Path { path } = &mut node.kind {
+                    if bez.elements().is_empty() {
+                        // Keep a tiny handle so the result stays pickable/movable.
+                        let c = na.bounds().center();
+                        let mut p = kurbo::BezPath::new();
+                        p.move_to((c.x, c.y));
+                        p.line_to((c.x + 1.0, c.y));
+                        p.line_to((c.x + 1.0, c.y + 1.0));
+                        p.close_path();
+                        *path = PathData::from_bez(&p);
+                        node.style.opacity = 0.0;
+                    } else {
+                        *path = PathData::from_bez(&bez);
+                        if node.style.opacity < 0.05 {
+                            node.style.opacity = na.style.opacity.max(0.05);
+                        }
+                        // Once we have a real result, hide operands if that was intended.
+                        if let Some(eff) = self
+                            .project
+                            .document
+                            .boolean_effects
+                            .values_mut()
+                            .find(|eff| eff.result_node_id == Some(rid))
+                        {
+                            if !eff.hide_operands {
+                                eff.hide_operands = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bake: drop live effect, keep result path as normal object; unhide operands.
+    pub fn bake_boolean_effect(&mut self) {
+        let Some(eid) = self.find_boolean_effect_for_selection() else { return };
+        let before = snapshot_project(&self.project);
+        let mut after = before.clone();
+        let Some(effect) = after.document.boolean_effects.swap_remove(&eid) else { return };
+        // Result stays in nodes/layers; operands remain (visible again).
+        let _ = effect;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::SetDocument { before, after },
+        );
+        self.status_message = "Boolean baked to path".into();
+    }
+
+    pub fn remove_boolean_effect(&mut self) {
+        let Some(eid) = self.find_boolean_effect_for_selection() else { return };
+        let before = snapshot_project(&self.project);
+        let mut after = before.clone();
+        let Some(effect) = after.document.boolean_effects.swap_remove(&eid) else { return };
+        if let Some(rid) = effect.result_node_id {
+            after.nodes.remove(rid);
+            for layer in &mut after.document.layers {
+                layer.nodes.retain(|id| *id != rid);
+            }
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::SetDocument { before, after },
+        );
+        self.status_message = "Boolean effect removed".into();
+    }
+
+    /// Apply clip mask only for raster image + solid-face shape.
+    pub fn apply_clip_mask(&mut self) {
+        let Some(BooleanPairMode::ImageClip { source, mask }) = self.selection_boolean_mode() else {
+            self.status_message =
+                "Clip Mask needs a raster image + a solid shape (path/rect/circle/arc/polygon)"
+                    .into();
+            return;
+        };
+        if self
+            .project
+            .document
+            .clip_masks
+            .values()
+            .any(|cm| cm.source_id == source && cm.mask_id == mask)
+        {
             return;
         }
         let before_doc = snapshot_document(&self.project.document);
         let mut after_doc = before_doc.clone();
-        let effect = crate::document::ClipMaskEffect {
+        let effect = ClipMaskEffect {
             id: uuid::Uuid::new_v4(),
-            source_id,
-            mask_id,
+            source_id: source,
+            mask_id: mask,
             hide_mask: true,
         };
         after_doc.clip_masks.insert(effect.id, effect);
-        self.history.push(&mut self.project, ProjectEdit::PatchDocument { before: before_doc, after: after_doc });
-        self.status_message = "Clip Mask applied".into();
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument {
+                before: before_doc,
+                after: after_doc,
+            },
+        );
+        self.status_message = "Clip Mask applied (image → solid face)".into();
     }
 
-    /// Remove all clip mask effects that involve any selected node.
     pub fn remove_clip_mask(&mut self) {
         let sel = self.selection.clone();
         let before_doc = snapshot_document(&self.project.document);
         let mut after_doc = before_doc.clone();
-        let mut removed = false;
-        let keys: Vec<uuid::Uuid> = after_doc.clip_masks.iter().filter(|(_, cm)| {
-            sel.contains(&cm.source_id) || sel.contains(&cm.mask_id)
-        }).map(|(k, _)| *k).collect();
+        let keys: Vec<uuid::Uuid> = after_doc
+            .clip_masks
+            .iter()
+            .filter(|(_, cm)| sel.contains(&cm.source_id) || sel.contains(&cm.mask_id))
+            .map(|(k, _)| *k)
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
         for k in keys {
             after_doc.clip_masks.swap_remove(&k);
-            removed = true;
+            self.image_textures.remove(&k);
+            self.clip_mask_signatures.remove(&k);
         }
-        if !removed { return; }
-        self.history.push(&mut self.project, ProjectEdit::PatchDocument { before: before_doc, after: after_doc });
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument {
+                before: before_doc,
+                after: after_doc,
+            },
+        );
         self.status_message = "Clip Mask removed".into();
     }
 
-    /// Swap source_id and mask_id in the clip mask that involves the current selection.
+    /// Bake active clip mask to a raster image of **only the clip region** (mask solid face).
+    /// Removes the live clip effect afterward; leaves source + mask nodes in place.
+    pub fn bake_clip_mask_to_raster(&mut self) {
+        let sel = self.selection.clone();
+        let Some(cm) = self
+            .project
+            .document
+            .clip_masks
+            .values()
+            .find(|cm| sel.contains(&cm.source_id) || sel.contains(&cm.mask_id))
+            .cloned()
+        else {
+            self.status_message = "No clip mask on selection".into();
+            return;
+        };
+        let Some(mask_node) = self.project.nodes.get(cm.mask_id).cloned() else {
+            return;
+        };
+        let Some(source_node) = self.project.nodes.get(cm.source_id).cloned() else {
+            return;
+        };
+        let NodeKind::Image {
+            x: img_x,
+            y: img_y,
+            width: img_w,
+            height: img_h,
+            bytes,
+            ..
+        } = &source_node.kind
+        else {
+            self.status_message = "Clip bake needs a raster image source".into();
+            return;
+        };
+
+        let mask_bounds = mask_node.bounds();
+        let w = mask_bounds.width().max(1.0);
+        let h = mask_bounds.height().max(1.0);
+        let scale = 2.0f64;
+        let pixel_w = (w * scale).round().max(1.0) as u32;
+        let pixel_h = (h * scale).round().max(1.0) as u32;
+
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let mime = if bytes.starts_with(b"\x89PNG") {
+            "image/png"
+        } else if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+            "image/jpeg"
+        } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" {
+            "image/webp"
+        } else {
+            "image/png"
+        };
+        let mask_d = mask_node.bez_path().to_svg();
+        let svg_data = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="{} {} {} {}" width="{}" height="{}">
+              <defs>
+                <clipPath id="clip" clipPathUnits="userSpaceOnUse">
+                  <path d="{}" fill="black" stroke="none"/>
+                </clipPath>
+              </defs>
+              <g clip-path="url(#clip)">
+                <image x="{}" y="{}" width="{}" height="{}" preserveAspectRatio="none"
+                  href="data:{mime};base64,{b64}" xlink:href="data:{mime};base64,{b64}"/>
+              </g>
+            </svg>"#,
+            mask_bounds.x0,
+            mask_bounds.y0,
+            w,
+            h,
+            pixel_w,
+            pixel_h,
+            mask_d,
+            img_x,
+            img_y,
+            img_w,
+            img_h,
+        );
+
+        let opt = crate::fonts::usvg_options();
+        let Ok(tree) = usvg::Tree::from_str(&svg_data, &opt) else {
+            self.status_message = "Clip bake failed (SVG parse)".into();
+            return;
+        };
+        let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(pixel_w, pixel_h) else {
+            self.status_message = "Clip bake failed (pixmap)".into();
+            return;
+        };
+        let sx = pixel_w as f32 / w as f32;
+        let sy = pixel_h as f32 / h as f32;
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            &mut pixmap.as_mut(),
+        );
+        let rgba = pixmap.take();
+        if !rgba.chunks(4).any(|px| px[3] > 8) {
+            self.status_message =
+                "Clip bake empty — image and mask may not overlap".into();
+            return;
+        }
+        // Encode PNG
+        let mut png_bytes = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut png_bytes);
+            let enc = image::codecs::png::PngEncoder::new(&mut cursor);
+            use image::ImageEncoder;
+            if enc
+                .write_image(
+                    &rgba,
+                    pixel_w,
+                    pixel_h,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .is_err()
+            {
+                self.status_message = "Clip bake PNG encode failed".into();
+                return;
+            }
+        }
+
+        let before = snapshot_project(&self.project);
+        let mut after = before.clone();
+        let name = if source_node.name.trim().is_empty() {
+            "Clipped raster".into()
+        } else {
+            format!("{} clipped", source_node.name)
+        };
+        let mut node = Node::image(mask_bounds.x0, mask_bounds.y0, w, h, png_bytes);
+        node.name = name;
+        let new_id = after.nodes.insert(node);
+        if let Some(layer) = after.document.layers.get_mut(after.document.active_layer_index) {
+            layer.nodes.push(new_id);
+        }
+        after.document.clip_masks.swap_remove(&cm.id);
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::SetDocument { before, after },
+        );
+        self.image_textures.remove(&cm.id);
+        self.clip_mask_signatures.remove(&cm.id);
+        self.selection = vec![new_id];
+        self.status_message = "Baked clip region to raster image".into();
+    }
+
     pub fn swap_clip_mask_source(&mut self) {
         let sel = &self.selection;
-        let effect_id = self.project.document.clip_masks.iter().find(|(_, cm)| {
-            sel.contains(&cm.source_id) || sel.contains(&cm.mask_id)
-        }).map(|(k, _)| *k);
+        let effect_id = self
+            .project
+            .document
+            .clip_masks
+            .iter()
+            .find(|(_, cm)| sel.contains(&cm.source_id) || sel.contains(&cm.mask_id))
+            .map(|(k, _)| *k);
         let Some(eid) = effect_id else { return };
         let before_doc = snapshot_document(&self.project.document);
         let mut after_doc = before_doc.clone();
         if let Some(cm) = after_doc.clip_masks.get_mut(&eid) {
-            std::mem::swap(&mut cm.source_id, &mut cm.mask_id);
+            // Only swap if both remain valid roles after swap (image as source, shape as mask).
+            let s = cm.source_id;
+            let m = cm.mask_id;
+            let ok = self.project.nodes.get(m).map(is_raster_image).unwrap_or(false)
+                && self
+                    .project
+                    .nodes
+                    .get(s)
+                    .map(is_booleanable_shape)
+                    .unwrap_or(false);
+            if ok {
+                std::mem::swap(&mut cm.source_id, &mut cm.mask_id);
+            } else {
+                self.status_message =
+                    "Clip Mask swap requires image as source and shape as mask".into();
+                return;
+            }
         }
-        self.history.push(&mut self.project, ProjectEdit::PatchDocument { before: before_doc, after: after_doc });
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument {
+                before: before_doc,
+                after: after_doc,
+            },
+        );
+        self.clip_mask_signatures.clear(); // force rebuild
         self.status_message = "Clip Mask swapped".into();
     }
 
@@ -8048,13 +8628,14 @@ fn run_video_decode_thread(
         origin: Pos2,
         doc: (f64, f64),
         shift: bool,
+        ghost_pick: bool,
         pressed: bool,
         down: bool,
         released: bool,
         double_clicked: bool,
     ) {
         if double_clicked {
-            let hit = self.pick_node_at(doc, 4.0 / self.viewport.zoom as f64);
+            let hit = self.pick_node_at_opts(doc, 4.0 / self.viewport.zoom as f64, ghost_pick);
             if let Some(id) = hit {
                 self.tools.select.drag_mode = None;
                 self.tools.select.marquee = None;
@@ -8327,7 +8908,8 @@ fn run_video_decode_thread(
                 return;
             }
 
-            let hit = self.pick_node_at(doc, 4.0 / self.viewport.zoom as f64);
+            let hit =
+                self.pick_node_at_opts(doc, 4.0 / self.viewport.zoom as f64, ghost_pick);
             if let Some(edit_id) = self.on_page_text_edit {
                 let keep_editing = hit == Some(edit_id);
                 if !keep_editing {
@@ -8339,7 +8921,15 @@ fn run_video_decode_thread(
                 self.tools.select.clear_path_point_selection();
                 let already_selected = self.selection.contains(&id);
                 self.tools.select.clicked_already_selected = already_selected;
-                if shift {
+                // Ghost pick (Ctrl+Shift): always select only that ghost for independent edit.
+                if ghost_pick {
+                    self.selection = vec![id];
+                    self.tools.select.select_rotation_mode = false;
+                } else if let Some((source, mask)) = self.clip_pair_for(id) {
+                    // Clicking the visible clipped composite selects image + mask as a unit.
+                    self.selection = vec![source, mask];
+                    self.tools.select.select_rotation_mode = false;
+                } else if shift {
                     if self.selection.contains(&id) {
                         self.selection.retain(|s| *s != id);
                     } else {
@@ -8356,7 +8946,23 @@ fn run_video_decode_thread(
                     self.setup_bulk_drag_if_needed(&selection);
                     if self.tools.select.bulk_drag.is_none() {
                         let mut nodes_to_snapshot = Vec::new();
-                        let drag_ids = self.expand_drag_ids_for_path_effects(&selection);
+                        // Ghost edit: do not expand to sibling operands.
+                        // Clip unit (source+mask both selected): snapshot both without re-expanding.
+                        let drag_ids = if ghost_pick {
+                            selection.clone()
+                        } else if selection.len() == 2
+                            && self
+                                .clip_pair_for(selection[0])
+                                .map(|(s, m)| {
+                                    (selection[0] == s && selection[1] == m)
+                                        || (selection[0] == m && selection[1] == s)
+                                })
+                                .unwrap_or(false)
+                        {
+                            selection.clone()
+                        } else {
+                            self.expand_drag_ids_for_path_effects(&selection)
+                        };
                         for &sid in &drag_ids {
                             if let Some(node) = self.project.nodes.get(sid) {
                                 if let NodeKind::Group { children } = &node.kind {
@@ -8497,6 +9103,7 @@ fn run_video_decode_thread(
             if let Some(m) = self.tools.select.marquee.take() {
                 if tools::marquee_is_drag(m.origin_doc, m.current_doc) {
                     let rect = tools::marquee_rect(m.origin_doc, m.current_doc);
+                    // Marquee never picks ghosts (boolean/clip hidden sources).
                     let hidden = self.hidden_canvas_sources();
                     let picked: Vec<NodeId> = if self.spatial_index.is_enabled() {
                         self.spatial_index.nodes_in_marquee(&self.project, &hidden, rect)
@@ -8506,6 +9113,9 @@ fn run_video_decode_thread(
                             .ordered_node_ids()
                             .into_iter()
                             .filter(|id| {
+                                if hidden.contains(id) {
+                                    return false;
+                                }
                                 self.project.nodes.get(*id).is_some_and(|n| {
                                     if self.node_uses_extended_bounds(*id) {
                                         let eb = crate::document::get_effective_bounds(
@@ -9779,6 +10389,7 @@ fn run_video_decode_thread(
                     width: 0.0,
                     line_join: crate::document::LineJoin::Miter,
                     line_cap: crate::document::LineCap::Butt,
+                    paint_order: crate::document::StrokePaintOrder::BehindFill,
                     start_marker: crate::document::PathMarker::default(),
                     mid_marker: crate::document::PathMarker::default(),
                     end_marker: crate::document::PathMarker::default(),
@@ -11513,6 +12124,10 @@ fn run_video_decode_thread(
 impl eframe::App for VadadeeBerryApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.update_clip_mask_textures(ctx);
+        // Keep boolean result paths in sync when operands move (cheap if no effects).
+        if !self.project.document.boolean_effects.is_empty() {
+            self.refresh_boolean_effects_live();
+        }
         self.update_layer_raster_cache(ctx);
         if self.cached_draw_order_revision != self.history.revision() {
             self.rebuild_spatial_index();
@@ -12179,6 +12794,7 @@ mod tests {
                 ui_stroke_edit_gradient_line: false,
                 ui_stroke_line_join: crate::document::LineJoin::Miter,
                 ui_stroke_line_cap: crate::document::LineCap::Butt,
+                ui_stroke_paint_order: crate::document::StrokePaintOrder::BehindFill,
                 ui_stroke_kind: FillKind::Solid,
                 ui_stroke_angle: 0.0,
                 ui_marker_start: crate::document::PathMarker::default(),
@@ -12238,6 +12854,7 @@ mod tests {
                 ui_tiling_gap_x: 48.0,
                 ui_tiling_gap_y: 48.0,
                 ui_circular_copies: 6,
+                ui_boolean_op: BooleanOpKind::Union,
                 ui_circular_angle_offset: 0.0,
                 ui_circular_origin_x: 0.0,
                 ui_circular_origin_y: 0.0,

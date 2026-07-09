@@ -101,6 +101,62 @@ fn fragment_entry(wgsl: &str) -> &'static str {
     }
 }
 
+/// Static checks before wgpu so users get actionable errors (compute multipass, missing entry, …).
+pub fn validate_shading_wgsl(wgsl: &str) -> Result<(), String> {
+    let src = wgsl.trim();
+    if src.is_empty() {
+        return Err("WGSL source is empty.".into());
+    }
+    // CPU-only stub passes are allowed through; they never reach GPU compile.
+    if src.contains("// Starfield — rendered via CPU starfield path.") {
+        return Ok(());
+    }
+
+    let has_fragment = src.contains("@fragment");
+    let has_compute = src.contains("@compute");
+    if has_compute && !has_fragment {
+        return Err(
+            "This looks like a compute multipass shader (@compute only).\n\
+             Vadadee shading layers need a single fragment entry:\n\
+               @fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32>\n\
+             Engines like Cuneus use storage textures + several compute kernels; \
+             those cannot be pasted here. Use Custom template or a fragment port."
+                .into(),
+        );
+    }
+    if !has_fragment && !src.contains("@vertex") {
+        // Vertex may be auto-prepended; still require a fragment entry named main/fs_main.
+        let entry = fragment_entry(src);
+        if !src.contains(&format!("fn {entry}")) {
+            return Err(format!(
+                "Missing fragment entry point `{entry}`.\n\
+                 Add:\n  @fragment\n  fn {entry}(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {{ ... }}"
+            ));
+        }
+        return Err(
+            "Missing `@fragment` on the entry function.\n\
+             Shading layers use a render pipeline (vertex + fragment), not compute."
+                .into(),
+        );
+    }
+    let entry = fragment_entry(src);
+    // Require the chosen entry to appear near @fragment (best-effort).
+    if has_fragment {
+        let needle_main = "fn main";
+        let needle_fs = "fn fs_main";
+        let has_named = match entry {
+            "fs_main" => src.contains(needle_fs),
+            _ => src.contains(needle_main) || src.contains(needle_fs),
+        };
+        if !has_named {
+            return Err(format!(
+                "Unable to find fragment entry `{entry}`. Name it `main` or `fs_main` with @fragment."
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn compile_pipeline(
     device: &wgpu::Device,
     target_format: wgpu::TextureFormat,
@@ -108,6 +164,8 @@ fn compile_pipeline(
     wgsl: &str,
     compose: bool,
 ) -> Result<CompiledShadingPipeline, String> {
+    validate_shading_wgsl(wgsl)?;
+
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
     let module_src = assemble_module(wgsl);
@@ -416,25 +474,44 @@ impl CallbackTrait for ShadingPaintCallback {
             return;
         };
         let bind_group = gpu.bind_group(&pipeline.bind_group_layout, pipeline.compose);
-        let vp = info.viewport_in_pixels();
-        if vp.width_px == 0 || vp.height_px == 0 {
+
+        // IMPORTANT: do NOT use viewport_in_pixels() for set_viewport.
+        // That helper clamps the rect to the screen. When the page is partially
+        // panned off-screen, the clamped viewport is only the *visible slice*,
+        // but the fullscreen triangle still maps UV 0..1 across it — so the
+        // shader appears "squeezed". Keep the full page as the NDC viewport
+        // (allowing coords outside the framebuffer) and scissor to the visible area.
+        let ppp = info.pixels_per_point;
+        let page = info.viewport; // full PaintCallback::rect (page), unclamped
+        let left = ppp * page.min.x;
+        let top = ppp * page.min.y;
+        let width = (ppp * page.width()).max(1.0);
+        let height = (ppp * page.height()).max(1.0);
+        if width < 1.0 || height < 1.0 {
             return;
         }
-        render_pass.set_viewport(
-            vp.left_px as f32,
-            vp.top_px as f32,
-            vp.width_px as f32,
-            vp.height_px as f32,
-            0.0,
-            1.0,
-        );
+        render_pass.set_viewport(left, top, width, height, 0.0, 1.0);
+
         let clip = info.clip_rect_in_pixels();
-        render_pass.set_scissor_rect(
-            clip.left_px.max(0) as u32,
-            clip.top_px.max(0) as u32,
-            clip.width_px.max(0) as u32,
-            clip.height_px.max(0) as u32,
-        );
+        let sx = clip.left_px.max(0) as u32;
+        let sy = clip.top_px.max(0) as u32;
+        let sw = clip.width_px.max(0) as u32;
+        let sh = clip.height_px.max(0) as u32;
+        if sw == 0 || sh == 0 {
+            return;
+        }
+        // Intersect scissor with framebuffer just in case.
+        let fb_w = info.screen_size_px[0];
+        let fb_h = info.screen_size_px[1];
+        let sx2 = sx.min(fb_w);
+        let sy2 = sy.min(fb_h);
+        let sw2 = sw.min(fb_w.saturating_sub(sx2));
+        let sh2 = sh.min(fb_h.saturating_sub(sy2));
+        if sw2 == 0 || sh2 == 0 {
+            return;
+        }
+        render_pass.set_scissor_rect(sx2, sy2, sw2, sh2);
+
         render_pass.set_pipeline(&pipeline.pipeline);
         render_pass.set_bind_group(0, &bind_group, &[]);
         render_pass.draw(0..3, 0..1);
@@ -464,6 +541,11 @@ pub fn is_cpu_only_pass(pass: &ShadingPass) -> bool {
     name == "starfield" || wgsl.contains("// Starfield — rendered via CPU starfield path.")
 }
 
+/// Active pass for a layer: last enabled (so MCP/custom appended after a default survives).
+fn active_shading_pass(passes: &[ShadingPass]) -> Option<&ShadingPass> {
+    passes.iter().rev().find(|p| p.enabled)
+}
+
 pub fn try_draw_shading_passes_gpu(
     painter: &Painter,
     page_rect: Rect,
@@ -472,67 +554,64 @@ pub fn try_draw_shading_passes_gpu(
     render_state: &RenderState,
 ) -> bool {
     let aspect = (page_rect.width() / page_rect.height().max(1.0)).max(0.25);
-    if let Some(pass) = passes.first().filter(|p| p.enabled) {
-        if is_cpu_only_pass(pass) {
-            return false;
-        }
-        let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl).trim();
-        if wgsl.is_empty() {
-            return false;
-        }
-
-        // Check if there is a cached compile error
-        {
-            if let Ok(err_lock) = pass.compile_error.lock() {
-                if err_lock.is_some() {
-                    return false;
-                }
-            }
-        }
-
-        let device = &render_state.device;
-        {
-            let mut renderer = render_state.renderer.write();
-            let Some(gpu) = renderer.callback_resources.get_mut::<ShadingGpuResources>() else {
-                return false;
-            };
-            match gpu.pipeline(device, wgsl) {
-                Ok(_) => {
-                    if let Ok(mut err_lock) = pass.compile_error.lock() {
-                        *err_lock = None;
-                    }
-                }
-                Err(err_msg) => {
-                    log::debug!(
-                        "WGSL compile failed for shading pass \"{}\"; falling back to CPU",
-                        pass.name
-                    );
-                    if let Ok(mut err_lock) = pass.compile_error.lock() {
-                        *err_lock = Some(err_msg);
-                    }
-                    return false;
-                }
-            }
-        }
-        let uniforms = uniform_floats(pass, time_secs, aspect);
-        let callback = Callback::new_paint_callback(
-            page_rect,
-            ShadingPaintCallback {
-                wgsl: Arc::from(wgsl),
-                uniforms,
-            },
-        );
-        painter.add(Shape::Callback(callback));
-        true
-    } else {
-        false
+    let Some(pass) = active_shading_pass(passes) else {
+        return false;
+    };
+    if is_cpu_only_pass(pass) {
+        return false;
     }
+    let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl).trim();
+    if wgsl.is_empty() {
+        return false;
+    }
+
+    // Check if there is a cached compile error
+    {
+        if let Ok(err_lock) = pass.compile_error.lock() {
+            if err_lock.is_some() {
+                return false;
+            }
+        }
+    }
+
+    let device = &render_state.device;
+    {
+        let mut renderer = render_state.renderer.write();
+        let Some(gpu) = renderer.callback_resources.get_mut::<ShadingGpuResources>() else {
+            return false;
+        };
+        match gpu.pipeline(device, wgsl) {
+            Ok(_) => {
+                if let Ok(mut err_lock) = pass.compile_error.lock() {
+                    *err_lock = None;
+                }
+            }
+            Err(err_msg) => {
+                log::debug!(
+                    "WGSL compile failed for shading pass \"{}\"; falling back to CPU",
+                    pass.name
+                );
+                if let Ok(mut err_lock) = pass.compile_error.lock() {
+                    *err_lock = Some(err_msg);
+                }
+                return false;
+            }
+        }
+    }
+    let uniforms = uniform_floats(pass, time_secs, aspect);
+    let callback = Callback::new_paint_callback(
+        page_rect,
+        ShadingPaintCallback {
+            wgsl: Arc::from(wgsl),
+            uniforms,
+        },
+    );
+    painter.add(Shape::Callback(callback));
+    true
 }
 
 pub fn shading_passes_need_input(passes: &[ShadingPass]) -> bool {
-    passes
-        .first()
-        .filter(|p| p.enabled)
+    active_shading_pass(passes)
         .map(|p| {
             let wgsl = p.compiled_wgsl.as_ref().unwrap_or(&p.wgsl);
             wgsl_needs_compose(wgsl)

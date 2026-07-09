@@ -59,18 +59,72 @@ fn default_hot_reload() -> bool {
     true
 }
 
+/// Starter fragment module for Custom / file-loaded shaders.
+/// Bindings: compose = input_tex@0, sampler@1, uniform@2.
+/// Runtime fills uniforms[0] += time, uniforms[3] = page aspect.
+pub const CUSTOM_WGSL_TEMPLATE: &str = r#"// Custom shading pass (fragment, not compute).
+// Required entry: @fragment fn main(...) -> @location(0) vec4<f32>
+// Compose bindings (when using input_tex):
+//   @group(0) @binding(0) texture_2d  input_tex
+//   @group(0) @binding(1) sampler     input_sampler
+//   @group(0) @binding(2) uniform     u
+// Procedural only (no input_tex): put uniform at @binding(0).
+// Runtime: u[0] gets +time, u[3] is page aspect (ensure at least 4 floats).
+
+@group(0) @binding(0) var input_tex: texture_2d<f32>;
+@group(0) @binding(1) var input_sampler: sampler;
+
+struct Uniforms {
+    time: f32,
+    strength: f32,
+    _pad2: f32,
+    aspect: f32,
+}
+@group(0) @binding(2) var<uniform> u: Uniforms;
+
+@fragment
+fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let c = textureSample(input_tex, input_sampler, uv);
+    let d = distance(uv, vec2(0.5));
+    let vig = smoothstep(0.9, 0.35 * (1.0 - u.strength), d);
+    return vec4(c.rgb * vig, c.a);
+}
+"#;
+
 impl ShadingPass {
     pub fn new_preset(name: impl Into<String>, wgsl: impl Into<String>) -> Self {
+        let wgsl = wgsl.into();
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
-            wgsl: wgsl.into(),
+            wgsl: wgsl.clone(),
             uniforms: Vec::new(),
             stack: ShadingStack::OnTop,
             enabled: true,
             compile_error: Arc::new(Mutex::new(None)),
             hot_reload: true,
-            compiled_wgsl: None,
+            // Compile immediately so GPU path sees the source without waiting for Hot toggle.
+            compiled_wgsl: Some(wgsl),
+        }
+    }
+
+    /// Editable starter for user shaders (not a fixed visual preset).
+    pub fn custom_template() -> Self {
+        let mut p = Self::new_preset("Custom", CUSTOM_WGSL_TEMPLATE);
+        p.uniforms = vec![0.0, 0.5, 0.0];
+        p
+    }
+
+    /// Replace source with arbitrary WGSL (file load / paste / MCP). Marks as Custom and arms compile.
+    pub fn load_wgsl_source(&mut self, source: impl Into<String>, display_name: Option<&str>) {
+        let src = source.into();
+        self.name = display_name
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "Custom".to_string());
+        self.wgsl = src.clone();
+        self.compiled_wgsl = Some(src);
+        if let Ok(mut err) = self.compile_error.lock() {
+            *err = None;
         }
     }
 

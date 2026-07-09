@@ -48,6 +48,9 @@ pub const MUSIC: &str = "󰽰";
 pub const ADD: &str = "󰷫";
 pub const REMOVE: &str = "󰇾";
 pub const GRAB: &str = "";
+/// Swap / reverse operands (nf-fa-exchange / ).
+pub const SWAP: &str = "";
+pub const RASTER: &str = "󰹑";
 pub const SHADING: &str = "󰌾";
 /// Live collaboration chat (Nerd Font).
 pub const CHAT: &str = "󰭹";
