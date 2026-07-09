@@ -365,6 +365,7 @@ impl Layer {
         .is_audio_only()
     }
 
+    /// Copy primary clip timing into legacy layer fields (UI / preview).
     pub fn sync_legacy_from_primary_clip(&mut self) {
         if let Some(clip) = self.av_clips.first() {
             self.video_path = clip.media_path.clone();
@@ -372,6 +373,39 @@ impl Layer {
             self.video_play_length = clip.video_play_length;
             self.video_timeline_start = clip.video_timeline_start;
             self.media_source_duration = clip.media_source_duration;
+        }
+    }
+
+    /// Push Active Track Details trim/duration onto the primary clip.
+    /// Timeline placement stays clip-authoritative (strip drag); only in-point and
+    /// play length are written from the layer fields used by the details bar.
+    pub fn sync_primary_clip_from_legacy(&mut self) {
+        if self.kind != LayerKind::AV {
+            return;
+        }
+        self.ensure_av_clips();
+        if let Some(clip) = self.av_clips.first_mut() {
+            if clip.media_path.is_empty() && !self.video_path.is_empty() {
+                clip.media_path = self.video_path.clone();
+            }
+            clip.video_start_offset = self.video_start_offset.max(0.0);
+            clip.video_play_length = self.video_play_length.max(0.1);
+            if self.media_source_duration.is_some() {
+                clip.media_source_duration = self.media_source_duration;
+            } else if clip.media_source_duration.is_none() {
+                clip.media_source_duration = self.media_source_duration;
+            }
+        }
+    }
+
+    /// Ensure clips exist and primary clip carries layer Trim Start / Play Duration.
+    pub fn prepare_av_for_export(&mut self) {
+        if self.kind != LayerKind::AV {
+            return;
+        }
+        self.ensure_av_clips();
+        if !self.av_clips.is_empty() {
+            self.sync_primary_clip_from_legacy();
         }
     }
 
@@ -383,16 +417,17 @@ impl Layer {
         Self::new_av_layer(id, name, audio_path)
     }
 
-    /// Seconds of source media used on the timeline (play length capped by probe).
+    /// Seconds of source media used on the timeline (play length capped by probe + trim).
     pub fn timeline_play_secs(&self) -> f32 {
-        let cap = self
+        let source_cap = self
             .media_source_duration
             .unwrap_or(self.video_play_length)
             .max(0.0);
+        let remaining = (source_cap - self.video_start_offset.max(0.0)).max(0.0);
         if self.video_play_length >= 3599.0 {
-            return cap;
+            return remaining;
         }
-        self.video_play_length.min(cap)
+        self.video_play_length.min(remaining).max(0.0)
     }
 
     /// End time of this clip on the project timeline (seconds).

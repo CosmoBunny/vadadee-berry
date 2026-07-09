@@ -110,30 +110,58 @@ fn collect_export_audio_layers(project: &ProjectFile) -> Vec<ExportAudioLayer> {
             continue;
         }
         let mut layer_clone = layer.clone();
-        layer_clone.ensure_av_clips();
+        // Push Active Track Trim Start / Play Duration onto primary clip before mix.
+        layer_clone.prepare_av_for_export();
+
         if !layer_clone.av_clips.is_empty() {
-            for clip in &layer_clone.av_clips {
+            // Stable track order: sub-row then timeline position.
+            let mut clips: Vec<_> = layer_clone.av_clips.iter().collect();
+            clips.sort_by(|a, b| {
+                a.track_row
+                    .cmp(&b.track_row)
+                    .then(
+                        a.video_timeline_start
+                            .partial_cmp(&b.video_timeline_start)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+            });
+            for clip in clips {
                 if clip.media_path.is_empty() {
+                    continue;
+                }
+                let start_offset = clip.video_start_offset.max(0.0);
+                let play_secs = clip.timeline_play_secs();
+                if play_secs <= 0.0 {
                     continue;
                 }
                 out.push(ExportAudioLayer {
                     path: clip.media_path.clone(),
-                    timeline_start: clip.video_timeline_start,
-                    start_offset: clip.video_start_offset,
-                    play_secs: clip.timeline_play_secs(),
+                    timeline_start: clip.video_timeline_start.max(0.0),
+                    start_offset,
+                    play_secs,
                     volume: layer_clone.volume.max(0.0),
                 });
             }
         } else if !layer_clone.video_path.is_empty() {
-            out.push(ExportAudioLayer {
-                path: layer_clone.video_path.clone(),
-                timeline_start: layer_clone.video_timeline_start,
-                start_offset: layer_clone.video_start_offset,
-                play_secs: layer_clone.timeline_play_secs(),
-                volume: layer_clone.volume.max(0.0),
-            });
+            let play_secs = layer_clone.timeline_play_secs();
+            if play_secs > 0.0 {
+                out.push(ExportAudioLayer {
+                    path: layer_clone.video_path.clone(),
+                    timeline_start: layer_clone.video_timeline_start.max(0.0),
+                    start_offset: layer_clone.video_start_offset.max(0.0),
+                    play_secs,
+                    volume: layer_clone.volume.max(0.0),
+                });
+            }
         }
     }
+    // Global order: timeline start then path (deterministic mix).
+    out.sort_by(|a, b| {
+        a.timeline_start
+            .partial_cmp(&b.timeline_start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     out
 }
 
@@ -309,7 +337,141 @@ fn is_video_container_ext(path: &str) -> bool {
 #[cfg(test)]
 mod export_audio_tests {
     use super::*;
+    use crate::document::{AvClip, Layer, LayerKind, ProjectFile};
     use std::path::Path;
+    use uuid::Uuid;
+
+    #[test]
+    fn prepare_pushes_layer_trim_start_onto_primary_clip() {
+        let mut layer = Layer::new_av_layer(Uuid::new_v4(), "Audio".into(), "track.mp3".into());
+        layer.av_clips.clear();
+        layer.av_clips.push(AvClip {
+            id: Uuid::new_v4(),
+            name: "clip".into(),
+            media_path: "track.mp3".into(),
+            video_start_offset: 0.0,
+            video_play_length: 120.0,
+            video_timeline_start: 0.0,
+            media_source_duration: Some(180.0),
+            track_row: 0,
+        });
+        layer.video_start_offset = 40.0;
+        layer.video_play_length = 60.0;
+        layer.media_source_duration = Some(180.0);
+        layer.prepare_av_for_export();
+        let clip = layer.av_clips.first().expect("primary");
+        assert!(
+            (clip.video_start_offset - 40.0).abs() < 1e-4,
+            "expected trim start 40s on clip, got {}",
+            clip.video_start_offset
+        );
+        assert!((clip.video_play_length - 60.0).abs() < 1e-4);
+        assert!((clip.timeline_play_secs() - 60.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn collect_export_audio_respects_trim_start_and_sorts() {
+        let mut layer = Layer::new_av_layer(Uuid::new_v4(), "A".into(), "a.mp3".into());
+        layer.kind = LayerKind::AV;
+        layer.visible = true;
+        layer.is_renderer = true;
+        layer.volume = 1.0;
+        layer.video_start_offset = 40.0;
+        layer.video_play_length = 10.0;
+        layer.media_source_duration = Some(200.0);
+        layer.av_clips = vec![
+            // Primary clip (index 0) receives Active Track Trim Start via prepare.
+            AvClip {
+                id: Uuid::new_v4(),
+                name: "early".into(),
+                media_path: "a.mp3".into(),
+                video_start_offset: 0.0, // stale — prepare should push 40 from layer
+                video_play_length: 10.0,
+                video_timeline_start: 0.0,
+                media_source_duration: Some(200.0),
+                track_row: 0,
+            },
+            AvClip {
+                id: Uuid::new_v4(),
+                name: "late".into(),
+                media_path: "b.mp3".into(),
+                video_start_offset: 0.0,
+                video_play_length: 5.0,
+                video_timeline_start: 20.0,
+                media_source_duration: Some(50.0),
+                track_row: 1,
+            },
+        ];
+        let mut doc = crate::document::Document::new_empty_project().document;
+        doc.layers.clear();
+        doc.layers.push(layer);
+        let project = ProjectFile::new(doc, crate::document::NodeStore::default());
+
+        let layers = collect_export_audio_layers(&project);
+        assert_eq!(layers.len(), 2, "expected both clips");
+        // Sorted by timeline start: early (0) then late (20)
+        assert_eq!(layers[0].path, "a.mp3");
+        assert!(
+            (layers[0].start_offset - 40.0).abs() < 1e-4,
+            "primary trim start should be 40s, got {}",
+            layers[0].start_offset
+        );
+        assert_eq!(layers[1].path, "b.mp3");
+        assert!((layers[1].timeline_start - 20.0).abs() < 1e-4);
+        assert!((layers[1].start_offset - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn mix_applies_start_offset_if_ozen_present() {
+        let path = {
+            let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("OZEN.mp3");
+            if local.exists() {
+                local
+            } else {
+                return;
+            }
+        };
+        let (src, sr) = load_stereo_i16_layer(&path).expect("load");
+        if sr == 0 || src.len() < sr as usize * 2 * 50 {
+            return; // need ~50s of audio
+        }
+        // Sample at t=0 vs t=40s should differ if track is not silence/constant.
+        let at0 = src[0].abs().max(src[1].abs());
+        let idx40 = (40.0 * sr as f32) as usize * 2;
+        if idx40 + 1 >= src.len() {
+            return;
+        }
+        let at40 = src[idx40].abs().max(src[idx40 + 1].abs());
+
+        let layers_trim = vec![ExportAudioLayer {
+            path: path.to_string_lossy().into_owned(),
+            timeline_start: 0.0,
+            start_offset: 40.0,
+            play_secs: 1.0,
+            volume: 1.0,
+        }];
+        let layers_head = vec![ExportAudioLayer {
+            path: path.to_string_lossy().into_owned(),
+            timeline_start: 0.0,
+            start_offset: 0.0,
+            play_secs: 1.0,
+            volume: 1.0,
+        }];
+        let pcm_trim =
+            mix_timeline_audio_stereo_i16(&layers_trim, 1.0, EXPORT_SAMPLE_RATE, &path).unwrap();
+        let pcm_head =
+            mix_timeline_audio_stereo_i16(&layers_head, 1.0, EXPORT_SAMPLE_RATE, &path).unwrap();
+        // First frame of each mix should track different source positions.
+        let d0 = (pcm_trim[0] as i32 - pcm_head[0] as i32).abs()
+            + (pcm_trim[1] as i32 - pcm_head[1] as i32).abs();
+        // Only assert when source content at 0 vs 40 differs.
+        if (at0 as i32 - at40 as i32).abs() > 200 {
+            assert!(
+                d0 > 50,
+                "trim mix should not match untrimmed head (diff {d0})"
+            );
+        }
+    }
 
     #[test]
     fn mp3_mix_and_aac_roundtrip_if_ozen_present() {

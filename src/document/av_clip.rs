@@ -79,14 +79,16 @@ impl AvClip {
     }
 
     pub fn timeline_play_secs(&self) -> f32 {
-        let cap = self
+        let source_cap = self
             .media_source_duration
             .unwrap_or(self.video_play_length)
             .max(0.0);
+        // Media available after in-point (trim start).
+        let remaining = (source_cap - self.video_start_offset.max(0.0)).max(0.0);
         if self.video_play_length >= 3599.0 {
-            return cap;
+            return remaining;
         }
-        self.video_play_length.min(cap)
+        self.video_play_length.min(remaining).max(0.0)
     }
 
     pub fn timeline_end_secs(&self) -> f32 {

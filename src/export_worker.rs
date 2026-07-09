@@ -489,7 +489,8 @@ fn collect_export_video_layers(project: &ProjectFile) -> Vec<ExportVideoLayer> {
             continue;
         }
         let mut layer_clone = layer.clone();
-        layer_clone.ensure_av_clips();
+        // Keep primary clip in-point / play length aligned with Active Track Details.
+        layer_clone.prepare_av_for_export();
         let color = ColorAdjust {
             hue: layer_clone.hue,
             saturation: layer_clone.saturation,
@@ -497,30 +498,45 @@ fn collect_export_video_layers(project: &ProjectFile) -> Vec<ExportVideoLayer> {
             contrast: layer_clone.contrast,
         };
         if !layer_clone.av_clips.is_empty() {
-            for clip in &layer_clone.av_clips {
+            let mut clips: Vec<_> = layer_clone.av_clips.iter().collect();
+            clips.sort_by(|a, b| {
+                a.track_row.cmp(&b.track_row).then(
+                    a.video_timeline_start
+                        .partial_cmp(&b.video_timeline_start)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+            });
+            for clip in clips {
                 if clip.media_path.is_empty() || clip.is_audio_only() {
+                    continue;
+                }
+                let play_secs = clip.timeline_play_secs();
+                if play_secs <= 0.0 {
                     continue;
                 }
                 out.push(ExportVideoLayer {
                     id: clip.id,
                     layer_id: layer_clone.id,
                     path: clip.media_path.clone(),
-                    timeline_start: clip.video_timeline_start,
-                    start_offset: clip.video_start_offset,
-                    play_secs: clip.timeline_play_secs(),
+                    timeline_start: clip.video_timeline_start.max(0.0),
+                    start_offset: clip.video_start_offset.max(0.0),
+                    play_secs,
                     color: color.clone(),
                 });
             }
         } else if !layer_clone.video_path.is_empty() {
-            out.push(ExportVideoLayer {
-                id: layer_clone.id,
-                layer_id: layer_clone.id,
-                path: layer_clone.video_path.clone(),
-                timeline_start: layer_clone.video_timeline_start,
-                start_offset: layer_clone.video_start_offset,
-                play_secs: layer_clone.timeline_play_secs(),
-                color,
-            });
+            let play_secs = layer_clone.timeline_play_secs();
+            if play_secs > 0.0 {
+                out.push(ExportVideoLayer {
+                    id: layer_clone.id,
+                    layer_id: layer_clone.id,
+                    path: layer_clone.video_path.clone(),
+                    timeline_start: layer_clone.video_timeline_start.max(0.0),
+                    start_offset: layer_clone.video_start_offset.max(0.0),
+                    play_secs,
+                    color,
+                });
+            }
         }
     }
     out

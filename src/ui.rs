@@ -2942,6 +2942,9 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                     ui.separator();
                     ui.add_space(8.0);
 
+                    // Ensure a primary clip exists so Trim Start / Play Duration mux correctly.
+                    layer.ensure_av_clips();
+
                     let source_cap = layer
                         .media_source_duration
                         .filter(|d| *d > 0.05)
@@ -2951,25 +2954,49 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                     ui.label("Trim Start:");
                     if layer.video_start_offset > trim_max {
                         layer.video_start_offset = 0.0;
+                        layer.sync_primary_clip_from_legacy();
                     }
-                    ui.add(egui::DragValue::new(&mut layer.video_start_offset)
-                        .speed(0.1)
-                        .range(0.0..=trim_max)
-                        .suffix("s"));
+                    let mut trim_start = layer.video_start_offset.clamp(0.0, trim_max);
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut trim_start)
+                                .speed(0.1)
+                                .range(0.0..=trim_max)
+                                .suffix("s"),
+                        )
+                        .changed()
+                    {
+                        layer.video_start_offset = trim_start;
+                        // Remaining media after new in-point.
+                        let remaining = (source_cap - trim_start).max(0.1);
+                        if layer.video_play_length > remaining {
+                            layer.video_play_length = remaining;
+                        }
+                        // Push into primary clip — export/mux reads clips, not layer alone.
+                        layer.sync_primary_clip_from_legacy();
+                    }
 
                     ui.add_space(8.0);
 
                     ui.label("Play Duration:");
+                    let remaining_after_trim =
+                        (source_cap - layer.video_start_offset.max(0.0)).max(0.1);
                     let mut play_len = layer.video_play_length;
-                    if play_len >= 3599.0 && layer.media_source_duration.is_some() {
-                        play_len = layer.media_source_duration.unwrap();
+                    if play_len >= 3599.0 {
+                        play_len = remaining_after_trim;
                     }
-                    let play_max = trim_max.max(0.1);
-                    if ui.add(egui::DragValue::new(&mut play_len)
-                        .speed(0.1)
-                        .range(0.1..=play_max)
-                        .suffix("s")).changed() {
+                    let play_max = remaining_after_trim;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut play_len)
+                                .speed(0.1)
+                                .range(0.1..=play_max)
+                                .suffix("s"),
+                        )
+                        .changed()
+                    {
                         layer.video_play_length = play_len.min(play_max);
+                        layer.sync_primary_clip_from_legacy();
                     }
 
                     ui.add_space(8.0);
