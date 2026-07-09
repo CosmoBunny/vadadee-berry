@@ -161,6 +161,8 @@ pub struct VadadeeBerryApp {
     pub anim_graph_stack_drag: Option<AnimGraphStackDrag>,
     /// Double-click formula dialog: (node_id, stack_id, channel_index).
     pub anim_stack_formula_dialog: Option<(NodeId, uuid::Uuid, usize)>,
+    /// In-progress formula text for [`Self::anim_stack_formula_dialog`] (not written until Apply).
+    pub anim_stack_formula_draft: String,
     /// Horizontal pan for the animation graph editor (frame index at left edge).
     pub anim_graph_scroll: f32,
     /// Visible frame span in the animation graph plot.
@@ -728,6 +730,7 @@ impl VadadeeBerryApp {
             anim_graph_selected_stack: None,
             anim_graph_stack_drag: None,
             anim_stack_formula_dialog: None,
+            anim_stack_formula_draft: String::new(),
             anim_graph_scroll: 0.0,
             anim_graph_visible_frames: 100.0,
             anim_timeline_visible_frames: 100.0,
@@ -13429,6 +13432,7 @@ mod tests {
                 anim_graph_selected_stack: None,
                 anim_graph_stack_drag: None,
                 anim_stack_formula_dialog: None,
+                anim_stack_formula_draft: String::new(),
                 anim_graph_scroll: 0.0,
                 anim_graph_visible_frames: 100.0,
                 anim_timeline_visible_frames: 100.0,

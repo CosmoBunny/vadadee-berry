@@ -8534,7 +8534,7 @@ fn graph_stack_header_controls(
     )
     .on_hover_text(
         "t=0 at stack start, t=1 at stack end. f=0..length (local). \
-x,y,r,g,b,a,s = start constants. Empty expr = hold start value.",
+x,y,r,g,b,a,s = start constants. abs(x) for positive; mod(a,m) or a%m (0..|m|). Empty = hold start.",
     );
     ui.label(RichText::new("(").color(colors::TEXT_MUTED));
 
@@ -8584,8 +8584,10 @@ x,y,r,g,b,a,s = start constants. Empty expr = hold start value.",
         return;
     }
 
-    if open_dialog.is_some() {
-        app.anim_stack_formula_dialog = Some((node_id, stack_id, open_dialog.unwrap()));
+    if let Some(ci) = open_dialog {
+        // Seed draft once on open; dialog edits this buffer until Apply/Cancel.
+        app.anim_stack_formula_draft = exprs.get(ci).cloned().unwrap_or_default();
+        app.anim_stack_formula_dialog = Some((node_id, stack_id, ci));
     }
 
     if start_changed || dur_changed || expr_changed {
@@ -8742,8 +8744,6 @@ fn graph_stack_formula_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
     let mut open = true;
     let mut close = false;
     let mut apply = false;
-    let mut draft = String::new();
-    let mut err: Option<String> = None;
     let track_name = app
         .project
         .anim_timeline
@@ -8753,15 +8753,19 @@ fn graph_stack_formula_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
         .and_then(|s| s.channels.get(ch_idx))
         .map(|c| c.track.clone())
         .unwrap_or_default();
-    if let Some(anim) = app.project.anim_timeline.nodes.get(&node_id) {
-        if let Some(sf) = anim.stack_functions.iter().find(|s| s.id == stack_id) {
-            if let Some(ch) = sf.channels.get(ch_idx) {
-                draft = ch.expr.clone();
-                err = ch.last_error.clone();
-            }
+    // Live-validate the draft buffer (do not overwrite document until Apply).
+    let draft_err = {
+        let d = app.anim_stack_formula_draft.trim();
+        if d.is_empty() {
+            None
+        } else {
+            crate::document::eval_expr(d, 0.5, 0.0)
+                .err()
+                .map(|e| e.0)
         }
-    }
+    };
     egui::Window::new(format!("Stack formula — {track_name}"))
+        .id(egui::Id::new(("stack_formula_dialog", stack_id, ch_idx)))
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -8770,22 +8774,23 @@ fn graph_stack_formula_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
             ui.label(
                 RichText::new(
                     "Relative time only: t=0 at stack start → t=1 at stack end; f=0..length (not global timeline). \
-x,y / r,g,b,a / s = start constants. Empty = constant start.",
+x,y / r,g,b,a / s = start constants. abs(x); mod(a,m) or a%m (always ≥0). Empty = constant start.",
                 )
                 .small()
                 .color(colors::TEXT_MUTED),
             );
             ui.add_space(4.0);
-            let mut te = egui::TextEdit::multiline(&mut draft)
+            let mut te = egui::TextEdit::multiline(&mut app.anim_stack_formula_draft)
+                .id_source(("stack_formula_edit", stack_id, ch_idx))
                 .desired_width(f32::INFINITY)
                 .desired_rows(6);
-            if err.is_some() {
+            if draft_err.is_some() {
                 te = te
                     .text_color(egui::Color32::from_rgb(255, 180, 180))
                     .background_color(egui::Color32::from_rgb(60, 16, 16));
             }
             ui.add(te);
-            if let Some(ref e) = err {
+            if let Some(ref e) = draft_err {
                 ui.colored_label(egui::Color32::from_rgb(255, 120, 120), e);
             }
             ui.horizontal(|ui| {
@@ -8798,6 +8803,8 @@ x,y / r,g,b,a / s = start constants. Empty = constant start.",
             });
         });
     if apply {
+        let draft = app.anim_stack_formula_draft.clone();
+        let before = app.project.anim_timeline.clone();
         if let Some(anim) = app.project.anim_timeline.nodes.get_mut(&node_id) {
             if let Some(sf) = anim.stack_functions.iter_mut().find(|s| s.id == stack_id) {
                 if let Some(ch) = sf.channels.get_mut(ch_idx) {
@@ -8812,12 +8819,19 @@ x,y / r,g,b,a / s = start constants. Empty = constant start.",
                     }
                 }
             }
+            anim.ensure_stack_end_keyframes();
         }
+        let after = app.project.anim_timeline.clone();
+        app.history.push(
+            &mut app.project,
+            crate::history::ProjectEdit::PatchTimeline { before, after },
+        );
         app.apply_animation_for_frame(app.anim_current_frame);
         close = true;
     }
     if close || !open {
         app.anim_stack_formula_dialog = None;
+        app.anim_stack_formula_draft.clear();
     }
 }
 

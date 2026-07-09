@@ -2,7 +2,7 @@
 //! Time is **relative to the stack span** (not the global timeline):
 //! - `t` = 0 at stack start → 1 at stack end
 //! - `f` = 0 at stack start → duration at stack end
-//! Also: `s`/`x`/`y`/`r`/`g`/`b`/`a` start constants; + - * / ^; sin cos tan abs sqrt floor ceil min max pow.
+//! Also: `s`/`x`/`y`/`r`/`g`/`b`/`a` start constants; + - * / % ^; sin cos tan abs sqrt floor ceil min max pow mod.
 
 #[derive(Debug, Clone)]
 pub struct ExprError(pub String);
@@ -115,6 +115,15 @@ fn parse_mul(b: &[u8], i: &mut usize, vars: ExprVars) -> Result<f64, ExprError> 
                     return Err(ExprError("division by zero".into()));
                 }
                 v /= d;
+            }
+            Some(b'%') => {
+                *i += 1;
+                let d = parse_pow(b, i, vars)?;
+                if d.abs() < 1e-15 {
+                    return Err(ExprError("modulo by zero".into()));
+                }
+                // Euclidean remainder: result in [0, |d|) so negatives stay non-negative.
+                v = v.rem_euclid(d);
             }
             _ => break,
         }
@@ -299,6 +308,14 @@ fn call_fn(name: &str, args: &[f64]) -> Result<f64, ExprError> {
             need(2)?;
             Ok(args[0].max(args[1]))
         }
+        // Positive (Euclidean) modulus: mod(a, m) ∈ [0, |m|).
+        "mod" | "modulus" => {
+            need(2)?;
+            if args[1].abs() < 1e-15 {
+                return Err(ExprError("modulo by zero".into()));
+            }
+            Ok(args[0].rem_euclid(args[1]))
+        }
         _ => Err(ExprError(format!("unknown function '{name}'"))),
     }
 }
@@ -313,5 +330,9 @@ mod tests {
         assert!((eval_expr("t*100", 0.5, 0.0).unwrap() - 50.0).abs() < 1e-9);
         assert!((eval_expr("sin(0)", 0.0, 0.0).unwrap()).abs() < 1e-9);
         assert!((eval_expr("100+20*t", 1.0, 0.0).unwrap() - 120.0).abs() < 1e-9);
+        assert!((eval_expr("abs(-3)", 0.0, 0.0).unwrap() - 3.0).abs() < 1e-9);
+        assert!((eval_expr("mod(7, 5)", 0.0, 0.0).unwrap() - 2.0).abs() < 1e-9);
+        assert!((eval_expr("(-1) % 5", 0.0, 0.0).unwrap() - 4.0).abs() < 1e-9);
+        assert!((eval_expr("mod(-1, 5)", 0.0, 0.0).unwrap() - 4.0).abs() < 1e-9);
     }
 }
