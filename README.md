@@ -50,6 +50,7 @@ GPU-accelerated canvas.
 - Fragment entry required: `@fragment fn main` (or `fs_main`); multipass compute engines (e.g. Cuneus) are not drop-in compatible
 - Compose bindings: `input_tex@0`, `sampler@1`, `uniform@2` (procedural-only: uniform at `@binding(0)`)
 - Hot reload or Compile/Reload; validation errors surface in the shader editor
+- **MCP control**: geometry create/edit, style (incl. blend_mode / paint_order), animation keyframes (`set_keyframe` / `remove_keyframe` / tracks), layers, selection, image create + canvas capture (async, up to 60s)
 - 4x MSAA rendering throughout
 
 ### Flowchart diagramming

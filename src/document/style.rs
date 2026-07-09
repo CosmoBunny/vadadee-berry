@@ -590,6 +590,31 @@ impl BlendMode {
             Self::Subtract    => "plus-darker",
         }
     }
+
+    pub fn from_label(s: &str) -> Option<Self> {
+        let k = s.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+        Some(match k.as_str() {
+            "normal" => Self::Normal,
+            "multiply" => Self::Multiply,
+            "screen" => Self::Screen,
+            "overlay" => Self::Overlay,
+            "darken" => Self::Darken,
+            "lighten" => Self::Lighten,
+            "color-dodge" | "colordodge" => Self::ColorDodge,
+            "color-burn" | "colorburn" => Self::ColorBurn,
+            "hard-light" | "hardlight" => Self::HardLight,
+            "soft-light" | "softlight" => Self::SoftLight,
+            "difference" => Self::Difference,
+            "exclusion" => Self::Exclusion,
+            "hue" => Self::Hue,
+            "saturation" => Self::Saturation,
+            "color" => Self::Color,
+            "luminosity" => Self::Luminosity,
+            "addition" | "add" | "plus-lighter" => Self::Addition,
+            "subtract" | "plus-darker" => Self::Subtract,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

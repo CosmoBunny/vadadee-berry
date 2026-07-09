@@ -96,6 +96,7 @@ fn composite_pixel(dst: [f32; 4], src: [f32; 4], mode: BlendMode) -> [f32; 4] {
 }
 
 /// Stamp `src` RGBA (straight alpha in bytes) onto `dst` at pixel offset `(ox, oy)`.
+/// Hot path: clip to dst bounds, skip fully-transparent rows/pixels, use integer math for Normal.
 pub fn composite_stamp(
     dst: &mut [u8],
     dst_w: u32,
@@ -108,25 +109,62 @@ pub fn composite_stamp(
     mode: BlendMode,
     opacity: f32,
 ) {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return;
+    }
     let op = opacity.clamp(0.0, 1.0);
-    for sy in 0..src_h as i32 {
+    if op <= 1e-6 {
+        return;
+    }
+
+    // Clip source rect to destination.
+    let src_x0 = (-ox).max(0);
+    let src_y0 = (-oy).max(0);
+    let src_x1 = ((dst_w as i32 - ox).min(src_w as i32)).max(src_x0);
+    let src_y1 = ((dst_h as i32 - oy).min(src_h as i32)).max(src_y0);
+    if src_x0 >= src_x1 || src_y0 >= src_y1 {
+        return;
+    }
+
+    let op_u = (op * 255.0).round() as u32;
+
+    for sy in src_y0..src_y1 {
         let dy = oy + sy;
-        if dy < 0 || dy >= dst_h as i32 {
-            continue;
-        }
-        for sx in 0..src_w as i32 {
+        let srow = (sy as u32 * src_w) as usize * 4;
+        let drow = (dy as u32 * dst_w) as usize * 4;
+        for sx in src_x0..src_x1 {
             let dx = ox + sx;
-            if dx < 0 || dx >= dst_w as i32 {
-                continue;
-            }
-            let si = ((sy as u32 * src_w + sx as u32) * 4) as usize;
+            let si = srow + (sx as usize) * 4;
             if si + 3 >= src.len() {
                 continue;
             }
-            let a = (src[si + 3] as f32 / 255.0) * op;
-            if a <= 1e-6 {
+            let sa = src[si + 3] as u32;
+            if sa == 0 {
                 continue;
             }
+            let a_u = (sa * op_u) / 255;
+            if a_u == 0 {
+                continue;
+            }
+            let di = drow + (dx as usize) * 4;
+            if di + 3 >= dst.len() {
+                continue;
+            }
+
+            if mode == BlendMode::Normal {
+                // Premultiplied over with 8-bit integer blend.
+                let inv = 255 - a_u;
+                let sr = (src[si] as u32 * a_u) / 255;
+                let sg = (src[si + 1] as u32 * a_u) / 255;
+                let sb = (src[si + 2] as u32 * a_u) / 255;
+                dst[di] = ((sr + (dst[di] as u32 * inv) / 255).min(255)) as u8;
+                dst[di + 1] = ((sg + (dst[di + 1] as u32 * inv) / 255).min(255)) as u8;
+                dst[di + 2] = ((sb + (dst[di + 2] as u32 * inv) / 255).min(255)) as u8;
+                dst[di + 3] = ((a_u + (dst[di + 3] as u32 * inv) / 255).min(255)) as u8;
+                continue;
+            }
+
+            let a = a_u as f32 / 255.0;
             let src_px = premultiply(
                 [
                     src[si] as f32 / 255.0,
@@ -135,27 +173,13 @@ pub fn composite_stamp(
                 ],
                 a,
             );
-            let di = ((dy as u32 * dst_w + dx as u32) * 4) as usize;
-            if di + 3 >= dst.len() {
-                continue;
-            }
             let dst_px = [
                 dst[di] as f32 / 255.0,
                 dst[di + 1] as f32 / 255.0,
                 dst[di + 2] as f32 / 255.0,
                 dst[di + 3] as f32 / 255.0,
             ];
-            let out = if mode == BlendMode::Normal {
-                let inv = 1.0 - src_px[3];
-                [
-                    src_px[0] + dst_px[0] * inv,
-                    src_px[1] + dst_px[1] * inv,
-                    src_px[2] + dst_px[2] * inv,
-                    (src_px[3] + dst_px[3] * inv).min(1.0),
-                ]
-            } else {
-                composite_pixel(dst_px, src_px, mode)
-            };
+            let out = composite_pixel(dst_px, src_px, mode);
             dst[di] = (out[0].clamp(0.0, 1.0) * 255.0).round() as u8;
             dst[di + 1] = (out[1].clamp(0.0, 1.0) * 255.0).round() as u8;
             dst[di + 2] = (out[2].clamp(0.0, 1.0) * 255.0).round() as u8;

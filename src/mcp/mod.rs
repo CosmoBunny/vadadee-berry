@@ -250,13 +250,13 @@ pub fn mcp_tools_list_result() -> Value {
         })),
         mcp_tool(
             "capture_canvas_raster",
-            "Raster preview of canvas region for AI vision (PNG base64). Does not flatten or lock objects.",
+            "Raster preview of canvas region for AI vision (PNG base64 + optional save_path). Runs async up to 60s. Prefer resolution_percent 15-40 for large pages. Does not flatten or lock objects.",
             json!({
                 "type": "object",
                 "properties": {
                     "resolution_percent": {
                         "type": "number",
-                        "description": "Output scale 1-100 (100 = full doc px density in crop)"
+                        "description": "Output scale 1-100 (default 25; 100 = full doc px density in crop)"
                     },
                     "x": { "type": "number", "description": "Crop origin X (default 0)" },
                     "y": { "type": "number", "description": "Crop origin Y (default 0)" },
@@ -449,6 +449,8 @@ fn is_drawing_tool(name: &str) -> bool {
             | "set_object_transform"
             | "set_object_geometry"
             | "add_layer"
+            | "list_layers"
+            | "set_active_layer"
             | "add_shading_layer"
             | "create_path"
             | "set_keyframe"
@@ -459,6 +461,13 @@ fn is_drawing_tool(name: &str) -> bool {
             | "get_current_anim_frame"
             | "set_keyframes"
             | "clear_animation_track"
+            | "list_animatable_properties"
+            | "list_animation_tracks"
+            | "play_animation"
+            | "get_object_properties"
+            | "set_selection"
+            | "duplicate_object"
+            | "reorder_object"
     )
 }
 
@@ -467,6 +476,12 @@ fn is_mcp_notification(method: &str) -> bool {
 }
 
 fn host_call(shared: &McpShared, req: McpHostRequest) -> Value {
+    // Capture / heavy tools need a longer wait (raster runs off the UI thread).
+    let timeout = match &req {
+        McpHostRequest::CaptureCanvasRaster { .. } => std::time::Duration::from_secs(60),
+        McpHostRequest::ProjectJson => std::time::Duration::from_secs(15),
+        _ => std::time::Duration::from_secs(8),
+    };
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if shared.request_tx.send((req, reply_tx)).is_err() {
         return json!({
@@ -474,7 +489,7 @@ fn host_call(shared: &McpShared, req: McpHostRequest) -> Value {
             "content": [{ "type": "text", "text": "editor not running" }]
         });
     }
-    match reply_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+    match reply_rx.recv_timeout(timeout) {
         Ok(McpHostResponse::Snapshot(s)) => json!({
             "content": [{ "type": "text", "text": serde_json::to_string_pretty(&json!({
                 "title": s.title,

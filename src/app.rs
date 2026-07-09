@@ -11336,6 +11336,72 @@ fn run_video_decode_thread(
                     "Added shading layer \"{name}\" with runtime WGSL pass \"{pass_name}\""
                 ))
             }
+            "list_animatable_properties" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                self.mcp_list_animatable_properties(id_str)
+            }
+            "list_animation_tracks" => {
+                let id_filter = args.get("id").and_then(|v| v.as_str());
+                self.mcp_list_animation_tracks(id_filter)
+            }
+            "play_animation" => {
+                let playing = args
+                    .get("playing")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                self.anim_is_playing = playing;
+                if playing {
+                    self.apply_animation_for_frame(self.anim_current_frame);
+                }
+                Ok(if playing {
+                    format!("Playing from frame {}", self.anim_current_frame)
+                } else {
+                    format!("Paused at frame {}", self.anim_current_frame)
+                })
+            }
+            "get_object_properties" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                self.mcp_get_object_properties(id_str)
+            }
+            "set_selection" => {
+                self.mcp_set_selection(&args)
+            }
+            "duplicate_object" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let ox = args.get("offset_x").and_then(|v| v.as_f64()).unwrap_or(20.0);
+                let oy = args.get("offset_y").and_then(|v| v.as_f64()).unwrap_or(20.0);
+                self.mcp_duplicate_object(id_str, ox, oy)
+            }
+            "reorder_object" => {
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let action = args
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .ok_or("action required")?;
+                self.mcp_reorder_object(id_str, action)
+            }
+            "list_layers" => self.mcp_list_layers(),
+            "set_active_layer" => {
+                if let Some(idx) = args.get("index").and_then(|v| v.as_u64()) {
+                    let i = idx as usize;
+                    if i >= self.project.document.layers.len() {
+                        return Err(format!("layer index {i} out of range"));
+                    }
+                    self.project.document.active_layer_index = i;
+                    return Ok(format!("Active layer index {i}"));
+                }
+                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("index or id required")?;
+                let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+                let pos = self
+                    .project
+                    .document
+                    .layers
+                    .iter()
+                    .position(|l| l.id == id)
+                    .ok_or_else(|| format!("layer not found: {id_str}"))?;
+                self.project.document.active_layer_index = pos;
+                Ok(format!("Active layer {id_str} (index {pos})"))
+            }
             _ => Err(format!("Unknown drawing tool: {name}")),
         }
     }
@@ -11375,7 +11441,276 @@ fn run_video_decode_thread(
         self.mcp_patch_nodes(patches)
     }
 
-    // === Animation MCP helpers ===
+    // === Animation / selection / layer MCP helpers ===
+    fn mcp_list_animatable_properties(&self, id_str: &str) -> Result<String, String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        let node = self
+            .project
+            .nodes
+            .get(id)
+            .ok_or_else(|| format!("Object not found: {id_str}"))?;
+        let mut props = vec![
+            "pos_x".into(),
+            "pos_y".into(),
+            "rotation".into(),
+            "opacity".into(),
+            "color_r".into(),
+            "color_g".into(),
+            "color_b".into(),
+            "color_a".into(),
+        ];
+        let n_geom = node.get_geom_floats().len();
+        for i in 0..n_geom {
+            props.push(format!("geom_{i}"));
+        }
+        let labels: Vec<_> = (0..n_geom)
+            .map(|i| {
+                serde_json::json!({
+                    "property": format!("geom_{i}"),
+                    "label": self.get_node_geom_track_name(id, i),
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "id": id_str,
+            "kind": self.mcp_node_kind_name(node),
+            "properties": props,
+            "geom_labels": labels,
+            "workflow": "set_keyframe(id, property, frame, value, interpolation?) → scrub with set_current_anim_frame / play_animation → remove_keyframe / clear_animation_track",
+        }))
+        .unwrap_or_default())
+    }
+
+    fn mcp_list_animation_tracks(&self, id_filter: Option<&str>) -> Result<String, String> {
+        let filter = id_filter
+            .map(|s| uuid::Uuid::parse_str(s).map_err(|e| e.to_string()))
+            .transpose()?;
+        let mut tracks = Vec::new();
+        for (nid, anim) in &self.project.anim_timeline.nodes {
+            if filter.is_some_and(|f| f != *nid) {
+                continue;
+            }
+            let name = self
+                .project
+                .nodes
+                .get(*nid)
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| nid.to_string());
+            let push_track = |prop: &str, track: &crate::document::KeyframeTrack, tracks: &mut Vec<serde_json::Value>| {
+                if track.keyframes.is_empty() {
+                    return;
+                }
+                let frames: Vec<usize> = track.keyframes.iter().map(|k| k.frame).collect();
+                tracks.push(serde_json::json!({
+                    "id": nid.to_string(),
+                    "name": name,
+                    "property": prop,
+                    "keyframe_count": track.keyframes.len(),
+                    "frame_min": frames.iter().copied().min(),
+                    "frame_max": frames.iter().copied().max(),
+                    "frames": frames,
+                }));
+            };
+            for prop in [
+                "pos_x", "pos_y", "rotation", "opacity", "color_r", "color_g", "color_b", "color_a",
+            ] {
+                if let Some(t) = anim.get_track(prop) {
+                    push_track(prop, t, &mut tracks);
+                }
+            }
+            for (i, t) in anim.geom_tracks.iter().enumerate() {
+                push_track(&format!("geom_{i}"), t, &mut tracks);
+            }
+        }
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "current_frame": self.anim_current_frame,
+            "playing": self.anim_is_playing,
+            "tracks": tracks,
+        }))
+        .unwrap_or_default())
+    }
+
+    fn mcp_get_object_properties(&self, id_str: &str) -> Result<String, String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        let node = self
+            .project
+            .nodes
+            .get(id)
+            .ok_or_else(|| format!("Object not found: {id_str}"))?;
+        let b = node.bounds();
+        let fill = match &node.style.fill {
+            crate::document::Fill::Solid(p) => serde_json::json!({
+                "kind": "solid",
+                "rgba": p.rgba,
+                "hex": format!("#{:02X}{:02X}{:02X}",
+                    (p.rgba[0]*255.0) as u8, (p.rgba[1]*255.0) as u8, (p.rgba[2]*255.0) as u8),
+            }),
+            crate::document::Fill::None => serde_json::json!({ "kind": "none" }),
+            other => serde_json::json!({ "kind": format!("{:?}", other).split_whitespace().next().unwrap_or("other") }),
+        };
+        let stroke = serde_json::json!({
+            "width": node.style.stroke.width,
+            "paint_order": node.style.stroke.paint_order.label(),
+            "line_join": format!("{:?}", node.style.stroke.line_join),
+            "line_cap": format!("{:?}", node.style.stroke.line_cap),
+        });
+        let geom: Vec<serde_json::Value> = node
+            .get_geom_floats()
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                serde_json::json!({
+                    "index": i,
+                    "property": format!("geom_{i}"),
+                    "label": self.get_node_geom_track_name(id, i),
+                    "value": v,
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "id": id_str,
+            "name": node.name,
+            "kind": self.mcp_node_kind_name(node),
+            "bounds": { "x0": b.x0, "y0": b.y0, "x1": b.x1, "y1": b.y1, "w": b.width(), "h": b.height() },
+            "transform": {
+                "translate": node.transform.translation,
+                "scale": node.transform.scale,
+                "rotation_deg": node.transform.rotation_rad.to_degrees(),
+            },
+            "style": {
+                "opacity": node.style.opacity,
+                "blend_mode": node.style.blend_mode.label(),
+                "fill": fill,
+                "stroke": stroke,
+            },
+            "geometry": geom,
+            "animatable": [
+                "pos_x","pos_y","rotation","opacity","color_r","color_g","color_b","color_a"
+            ],
+        }))
+        .unwrap_or_default())
+    }
+
+    fn mcp_node_kind_name(&self, node: &crate::document::Node) -> &'static str {
+        match &node.kind {
+            NodeKind::Rect { .. } => "rect",
+            NodeKind::Ellipse { .. } => "ellipse",
+            NodeKind::Polygon { .. } => "polygon",
+            NodeKind::Path { .. } => "path",
+            NodeKind::Text { .. } => "text",
+            NodeKind::Image { .. } => "image",
+            NodeKind::Arc { .. } => "arc",
+            NodeKind::Group { .. } => "group",
+            NodeKind::BrushStroke { .. } => "brush",
+            NodeKind::FlowchartNode { .. } => "flowchart_node",
+            NodeKind::FlowchartPath { .. } => "flowchart_path",
+        }
+    }
+
+    fn mcp_set_selection(&mut self, args: &serde_json::Value) -> Result<String, String> {
+        let mut ids = Vec::new();
+        if let Some(arr) = args.get("ids").and_then(|v| v.as_array()) {
+            for v in arr {
+                let s = v.as_str().ok_or("ids must be strings")?;
+                ids.push(uuid::Uuid::parse_str(s).map_err(|e| e.to_string())?);
+            }
+        } else if let Some(s) = args.get("id").and_then(|v| v.as_str()) {
+            ids.push(uuid::Uuid::parse_str(s).map_err(|e| e.to_string())?);
+        }
+        for id in &ids {
+            if self.project.nodes.get(*id).is_none() {
+                return Err(format!("Object not found: {id}"));
+            }
+        }
+        self.selection = ids.clone();
+        Ok(format!("Selection set to {} object(s)", ids.len()))
+    }
+
+    fn mcp_duplicate_object(&mut self, id_str: &str, ox: f64, oy: f64) -> Result<String, String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        let src = self
+            .project
+            .nodes
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Object not found: {id_str}"))?;
+        // Prefer source layer so duplicate lands with siblings.
+        if let Some(layer_idx) = self
+            .project
+            .document
+            .layers
+            .iter()
+            .position(|l| l.nodes.contains(&id))
+        {
+            self.project.document.active_layer_index = layer_idx;
+        }
+        let mut dup = src.duplicate();
+        dup.translate(ox, oy);
+        let new_id = dup.id;
+        self.history
+            .push(&mut self.project, crate::history::ProjectEdit::InsertNode { node: dup });
+        self.selection = vec![new_id];
+        Ok(format!("Duplicated {id_str} → {new_id}"))
+    }
+
+    fn mcp_reorder_object(&mut self, id_str: &str, action: &str) -> Result<String, String> {
+        let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+        if self.project.nodes.get(id).is_none() {
+            return Err(format!("Object not found: {id_str}"));
+        }
+        self.selection = vec![id];
+        let delta = match action.to_ascii_lowercase().as_str() {
+            "raise" | "up" | "forward" => 1,
+            "lower" | "down" | "backward" => -1,
+            "bring_to_front" | "front" | "to_front" => {
+                // Raise many times within layer.
+                for _ in 0..64 {
+                    self.nudge_z_order(1);
+                }
+                return Ok(format!("Brought {id_str} toward front"));
+            }
+            "send_to_back" | "back" | "to_back" => {
+                for _ in 0..64 {
+                    self.nudge_z_order(-1);
+                }
+                return Ok(format!("Sent {id_str} toward back"));
+            }
+            _ => {
+                return Err(
+                    "action must be raise|lower|bring_to_front|send_to_back".into(),
+                )
+            }
+        };
+        self.nudge_z_order(delta);
+        Ok(format!("Reordered {id_str} ({action})"))
+    }
+
+    fn mcp_list_layers(&self) -> Result<String, String> {
+        let layers: Vec<_> = self
+            .project
+            .document
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                serde_json::json!({
+                    "index": i,
+                    "id": l.id.to_string(),
+                    "name": l.name,
+                    "kind": format!("{:?}", l.kind),
+                    "visible": l.visible,
+                    "locked": l.locked,
+                    "active": i == self.project.document.active_layer_index,
+                    "node_count": l.nodes.len(),
+                    "av_clips": l.av_clips.len(),
+                    "shading_passes": l.shading_passes.len(),
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string_pretty(&serde_json::json!({ "layers": layers }))
+            .unwrap_or_default())
+    }
+
     fn mcp_set_keyframe(&mut self, id_str: &str, property: &str, frame: usize, value: f64, mode: crate::document::InterpolationMode) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         let before = self.project.anim_timeline.clone();

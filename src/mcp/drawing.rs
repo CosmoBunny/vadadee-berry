@@ -124,6 +124,49 @@ pub fn apply_style_patch(style: &mut crate::document::NodeStyle, patch: &Value) 
     if let Some(o) = patch.get("opacity").and_then(|v| v.as_f64()) {
         style.opacity = o.clamp(0.0, 1.0) as f32;
     }
+    if let Some(bm) = patch
+        .get("blend_mode")
+        .or_else(|| patch.get("blend"))
+        .and_then(|v| v.as_str())
+    {
+        style.blend_mode = crate::document::BlendMode::from_label(bm)
+            .ok_or_else(|| format!("unknown blend_mode: {bm}"))?;
+    }
+    if let Some(po) = patch
+        .get("paint_order")
+        .or_else(|| patch.get("stroke_paint_order"))
+        .and_then(|v| v.as_str())
+    {
+        style.stroke.paint_order = match po.to_ascii_lowercase().as_str() {
+            "behind" | "behind_fill" | "under" => crate::document::StrokePaintOrder::BehindFill,
+            "above" | "above_fill" | "over" => crate::document::StrokePaintOrder::AboveFill,
+            _ => return Err(format!("unknown paint_order: {po} (behind|above)")),
+        };
+    }
+    if let Some(j) = patch
+        .get("line_join")
+        .or_else(|| patch.get("stroke_join"))
+        .and_then(|v| v.as_str())
+    {
+        style.stroke.line_join = match j.to_ascii_lowercase().as_str() {
+            "miter" | "sharp" => crate::document::LineJoin::Miter,
+            "round" | "smooth" => crate::document::LineJoin::Round,
+            "bevel" => crate::document::LineJoin::Bevel,
+            _ => return Err(format!("unknown line_join: {j}")),
+        };
+    }
+    if let Some(c) = patch
+        .get("line_cap")
+        .or_else(|| patch.get("stroke_cap"))
+        .and_then(|v| v.as_str())
+    {
+        style.stroke.line_cap = match c.to_ascii_lowercase().as_str() {
+            "butt" | "flat" => crate::document::LineCap::Butt,
+            "round" => crate::document::LineCap::Round,
+            "square" => crate::document::LineCap::Square,
+            _ => return Err(format!("unknown line_cap: {c}")),
+        };
+    }
 
     // Support for path markers (geometry on path arrows)
     apply_marker_patch(&mut style.stroke.start_marker, patch.get("start_marker"));
@@ -429,7 +472,7 @@ pub fn drawing_tools() -> Vec<Value> {
 
     tools.push(tool(
         "set_object_style",
-        "Set fill, stroke, and opacity on any object (also accepts \"ids\": string[] for bulk)",
+        "Set fill, stroke, opacity, blend_mode, paint_order, line_join/cap on any object (also accepts \"ids\": string[] for bulk)",
         json!({
             "id": { "type": "string" },
             "ids": { "type": "array", "items": { "type": "string" } },
@@ -438,14 +481,18 @@ pub fn drawing_tools() -> Vec<Value> {
             "stroke_color": style["stroke_color"].clone(),
             "stroke_alpha": style["stroke_alpha"].clone(),
             "stroke_width": style["stroke_width"].clone(),
-            "opacity": { "type": "number" }
+            "opacity": { "type": "number" },
+            "blend_mode": { "type": "string", "description": "normal|multiply|screen|overlay|darken|lighten|..." },
+            "paint_order": { "type": "string", "description": "behind|above — stroke under/over fill" },
+            "line_join": { "type": "string", "description": "miter|round|bevel" },
+            "line_cap": { "type": "string", "description": "butt|round|square" }
         }),
         &[],  // id or ids
     ));
 
     tools.push(tool(
         "set_objects_style",
-        "Set fill, stroke, and opacity on many objects at once (ids array). Recommended for recoloring large numbers of pixel rects.",
+        "Set fill, stroke, opacity, blend_mode on many objects at once (ids array).",
         json!({
             "ids": { "type": "array", "items": { "type": "string" } },
             "fill_color": style["fill_color"].clone(),
@@ -453,7 +500,9 @@ pub fn drawing_tools() -> Vec<Value> {
             "stroke_color": style["stroke_color"].clone(),
             "stroke_alpha": style["stroke_alpha"].clone(),
             "stroke_width": style["stroke_width"].clone(),
-            "opacity": { "type": "number" }
+            "opacity": { "type": "number" },
+            "blend_mode": { "type": "string" },
+            "paint_order": { "type": "string" }
         }),
         &["ids"],
     ));
@@ -596,10 +645,94 @@ pub fn drawing_tools() -> Vec<Value> {
     ));
 
     tools.push(tool(
+        "list_animatable_properties",
+        "List animatable property names for an object (pos_x, pos_y, rotation, opacity, color_*, geom_N, ...).",
+        json!({
+            "id": { "type": "string", "description": "Object UUID" }
+        }),
+        &["id"],
+    ));
+
+    tools.push(tool(
+        "list_animation_tracks",
+        "List all animation tracks in the project (object id, property, keyframe count, frame range). Optional filter by object id.",
+        json!({
+            "id": { "type": "string", "description": "Optional object UUID filter" }
+        }),
+        &[],
+    ));
+
+    tools.push(tool(
+        "play_animation",
+        "Start or stop animation playback.",
+        json!({
+            "playing": { "type": "boolean", "description": "true = play, false = pause (default true)" }
+        }),
+        &[],
+    ));
+
+    tools.push(tool(
+        "get_object_properties",
+        "Full property dump for an object: kind, name, bounds, transform, style (fill/stroke/blend/paint_order), geometry summary, animatable props.",
+        json!({
+            "id": { "type": "string" }
+        }),
+        &["id"],
+    ));
+
+    tools.push(tool(
+        "set_selection",
+        "Set editor selection to the given object UUID(s). Empty ids clears selection.",
+        json!({
+            "ids": { "type": "array", "items": { "type": "string" }, "description": "Object UUIDs" },
+            "id": { "type": "string", "description": "Single object UUID (alternative to ids)" }
+        }),
+        &[],
+    ));
+
+    tools.push(tool(
+        "duplicate_object",
+        "Duplicate an object (offset slightly) and select the copy.",
+        json!({
+            "id": { "type": "string" },
+            "offset_x": { "type": "number", "description": "default 20" },
+            "offset_y": { "type": "number", "description": "default 20" }
+        }),
+        &["id"],
+    ));
+
+    tools.push(tool(
+        "reorder_object",
+        "Change z-order of an object: bring_to_front | send_to_back | raise | lower",
+        json!({
+            "id": { "type": "string" },
+            "action": { "type": "string", "description": "bring_to_front|send_to_back|raise|lower" }
+        }),
+        &["id", "action"],
+    ));
+
+    tools.push(tool(
         "add_layer",
         "Add a new image layer and make it active",
         json!({
             "name": { "type": "string" }
+        }),
+        &[],
+    ));
+
+    tools.push(tool(
+        "list_layers",
+        "List document layers (id, name, kind, visible, clip/shading counts).",
+        json!({}),
+        &[],
+    ));
+
+    tools.push(tool(
+        "set_active_layer",
+        "Set the active layer by index or id.",
+        json!({
+            "index": { "type": "integer" },
+            "id": { "type": "string", "description": "Layer UUID" }
         }),
         &[],
     ));

@@ -2165,6 +2165,50 @@ pub fn draw_nodes(
     }
 }
 
+/// Fixed pixel budget for blend ROIs — independent of zoom (high zoom just upscales).
+const BLEND_ROI_MAX_EDGE: u32 = 192;
+
+/// Cached CPU blend ROI texture (rebuild when content/zoom changes, not every pan).
+#[derive(Clone)]
+struct BlendRoiCache {
+    key: u64,
+    tex: egui::TextureHandle,
+}
+
+fn blend_content_key(zoom: f32, blend_id: NodeId, under: &[(NodeId, &Node)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Coarse zoom buckets: small zoom tweaks don't thrash the cache.
+    ((zoom * 8.0).round() as i32).hash(&mut h);
+    blend_id.hash(&mut h);
+    for (id, n) in under {
+        id.hash(&mut h);
+        let b = n.bounds();
+        ((b.x0 * 50.0).round() as i64).hash(&mut h);
+        ((b.y0 * 50.0).round() as i64).hash(&mut h);
+        ((b.x1 * 50.0).round() as i64).hash(&mut h);
+        ((b.y1 * 50.0).round() as i64).hash(&mut h);
+        n.style.blend_mode.label().hash(&mut h);
+        ((n.style.opacity * 255.0) as u8).hash(&mut h);
+        match &n.style.fill {
+            Fill::Solid(p) => {
+                for c in p.rgba {
+                    ((c * 255.0) as u8).hash(&mut h);
+                }
+            }
+            Fill::None => 0u8.hash(&mut h),
+            _ => 1u8.hash(&mut h),
+        }
+        ((n.style.stroke.width * 10.0) as i32).hash(&mut h);
+        if let NodeKind::Image { bytes, width, height, .. } = &n.kind {
+            bytes.len().hash(&mut h);
+            ((*width * 10.0) as i64).hash(&mut h);
+            ((*height * 10.0) as i64).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 fn draw_nodes_with_blend(
     painter: &Painter,
     nodes: &NodeStore,
@@ -2179,46 +2223,14 @@ fn draw_nodes_with_blend(
     fonts: &crate::fonts::FontRegistry,
     image_textures: &std::collections::HashMap<NodeId, egui::TextureHandle>,
 ) {
-    let doc_w = page_w as f64;
-    let doc_h = page_h as f64;
-    let tl = viewport.doc_to_screen((0.0, 0.0), origin);
-    let br = viewport.doc_to_screen((doc_w, doc_h), origin);
-    let page_rect = Rect::from_min_max(tl, br);
-    let pw = page_rect.width().ceil().max(1.0) as u32;
-    let ph = page_rect.height().ceil().max(1.0) as u32;
-    let mut layer = vec![255u8; (pw * ph * 4) as usize];
-    let scale = viewport.zoom;
+    let _ = (page_w, page_h);
+    let vis = painter.clip_rect();
+    if vis.width() < 1.0 || vis.height() < 1.0 {
+        return;
+    }
 
-    let mut draw_one = |node: &Node, sel: bool| {
-        if matches!(node.kind, NodeKind::Group { .. }) {
-            return;
-        }
-        let b = node.bounds();
-        if b.width() < 0.5 || b.height() < 0.5 {
-            return;
-        }
-        let svg = crate::io::node_svg_for_bounds(node, b, nodes);
-        let Some((nw, nh, rgba)) = crate::io::render_svg_to_rgba(&svg, scale) else {
-            draw_node(painter, node, viewport, origin, sel, fonts, image_textures);
-            return;
-        };
-        let node_tl = viewport.doc_to_screen((b.x0, b.y0), origin);
-        let ox = (node_tl.x - page_rect.left()).round() as i32;
-        let oy = (node_tl.y - page_rect.top()).round() as i32;
-        crate::blend::composite_stamp(
-            &mut layer,
-            pw,
-            ph,
-            &rgba,
-            nw,
-            nh,
-            ox,
-            oy,
-            node.style.blend_mode,
-            node.style.opacity,
-        );
-    };
-
+    // Paint list of ids only (avoid cloning image bytes every frame).
+    let mut paint_ids: Vec<(NodeId, bool)> = Vec::with_capacity(order.len());
     for id in order {
         if hidden.contains(id) {
             continue;
@@ -2226,43 +2238,397 @@ fn draw_nodes_with_blend(
         let Some(raw_node) = nodes.get(*id) else {
             continue;
         };
-        let node = if loft_paths.contains(id) {
-            let mut n = raw_node.clone();
-            if matches!(n.kind, NodeKind::Path { .. }) {
-                if !selection.contains(id) {
-                    n.style.stroke.width = 0.0;
-                }
-                n.style.fill = Fill::None;
-            }
-            n
-        } else {
-            raw_node.clone()
-        };
-        if let NodeKind::Group { children } = &node.kind {
-            let sel = selection.contains(id);
+        let sel = selection.contains(id);
+        if let NodeKind::Group { children } = &raw_node.kind {
             for cid in children {
-                if let Some(child) = nodes.get(*cid) {
-                    draw_one(child, sel);
+                if nodes.get(*cid).is_some() {
+                    paint_ids.push((*cid, sel));
                 }
             }
             continue;
         }
-        let sel = selection.contains(id);
-        draw_one(&node, sel);
+        paint_ids.push((*id, sel));
     }
 
-    let image = egui::ColorImage::from_rgba_premultiplied([pw as usize, ph as usize], &layer);
-    let tex = painter.ctx().load_texture(
-        "blend_page_composite",
-        image,
-        egui::TextureOptions::LINEAR,
+    // Loft style override (rare) — only clone those paths.
+    let loft_override = |id: NodeId, n: &Node| -> Option<Node> {
+        if !loft_paths.contains(&id) {
+            return None;
+        }
+        if !matches!(n.kind, NodeKind::Path { .. }) {
+            return None;
+        }
+        let mut c = n.clone();
+        if !selection.contains(&id) {
+            c.style.stroke.width = 0.0;
+        }
+        c.style.fill = Fill::None;
+        Some(c)
+    };
+
+    for i in 0..paint_ids.len() {
+        let (id, sel) = paint_ids[i];
+        let Some(raw) = nodes.get(id) else {
+            continue;
+        };
+        let lofted = loft_override(id, raw);
+        let node = lofted.as_ref().unwrap_or(raw);
+
+        if node.style.blend_mode == crate::document::BlendMode::Normal {
+            draw_node(painter, node, viewport, origin, sel, fonts, image_textures);
+            continue;
+        }
+
+        let b = node.bounds();
+        if b.width() < 0.5 || b.height() < 0.5 {
+            continue;
+        }
+        let stroke_pad = (node.style.stroke.width.max(0.0) * 0.5) as f64;
+        let ntl = viewport.doc_to_screen((b.x0 - stroke_pad, b.y0 - stroke_pad), origin);
+        let nbr = viewport.doc_to_screen((b.x1 + stroke_pad, b.y1 + stroke_pad), origin);
+        let node_screen = Rect::from_min_max(ntl, nbr).expand(1.0);
+        let roi = node_screen.intersect(vis);
+        if roi.width() < 1.0 || roi.height() < 1.0 {
+            continue;
+        }
+
+        // Cache key from store refs (pan-independent doc bounds + coarse zoom).
+        let mut under_refs: Vec<(NodeId, &Node)> = Vec::with_capacity(i + 1);
+        for j in 0..=i {
+            let (uid, _) = paint_ids[j];
+            if let Some(un) = nodes.get(uid) {
+                under_refs.push((uid, un));
+            }
+        }
+        let key = blend_content_key(viewport.zoom, id, &under_refs);
+
+        let cache_id = egui::Id::new("blend_roi_v3").with(id);
+        let cached_tex = painter.ctx().data(|d| {
+            d.get_temp::<BlendRoiCache>(cache_id)
+                .filter(|e| e.key == key)
+                .map(|e| e.tex.clone())
+        });
+
+        let tex = if let Some(t) = cached_tex {
+            t
+        } else {
+            // Always build a tiny buffer (≤192px edge) — zoom only changes display scale.
+            let full_w = roi.width().max(1.0);
+            let full_h = roi.height().max(1.0);
+            let down = (BLEND_ROI_MAX_EDGE as f32 / full_w.max(full_h)).min(1.0);
+            let rw = (full_w * down).round().max(1.0) as u32;
+            let rh = (full_h * down).round().max(1.0) as u32;
+            let sx = rw as f32 / full_w;
+            let sy = rh as f32 / full_h;
+
+            let mut layer = vec![255u8; (rw * rh * 4) as usize];
+            for j in 0..=i {
+                let (uid, _) = paint_ids[j];
+                let Some(un) = nodes.get(uid) else {
+                    continue;
+                };
+                let lofted_u = loft_override(uid, un);
+                let under_n = lofted_u.as_ref().unwrap_or(un);
+                if matches!(under_n.kind, NodeKind::Group { .. }) {
+                    continue;
+                }
+                stamp_node_into_blend_roi(
+                    &mut layer,
+                    rw,
+                    rh,
+                    roi,
+                    sx,
+                    sy,
+                    under_n,
+                    nodes,
+                    viewport,
+                    origin,
+                );
+            }
+
+            let image =
+                egui::ColorImage::from_rgba_premultiplied([rw as usize, rh as usize], &layer);
+            let tex = painter.ctx().load_texture(
+                format!("blend_roi_{id}"),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            painter.ctx().data_mut(|d| {
+                d.insert_temp(
+                    cache_id,
+                    BlendRoiCache {
+                        key,
+                        tex: tex.clone(),
+                    },
+                );
+            });
+            tex
+        };
+
+        painter.image(
+            tex.id(),
+            roi,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    }
+}
+
+/// Stamp a node into an ROI buffer at exact pixel size of the ROI∩node intersection
+/// (prevents white cuts / vertical squeeze from max-edge caps).
+fn stamp_node_into_blend_roi(
+    layer: &mut [u8],
+    rw: u32,
+    rh: u32,
+    roi: Rect,
+    sx: f32,
+    sy: f32,
+    node: &Node,
+    nodes: &NodeStore,
+    viewport: &Viewport,
+    origin: Pos2,
+) {
+    let b = node.bounds();
+    if b.width() < 0.5 || b.height() < 0.5 {
+        return;
+    }
+    let utl = viewport.doc_to_screen((b.x0, b.y0), origin);
+    let ubr = viewport.doc_to_screen((b.x1, b.y1), origin);
+    let under_screen = Rect::from_min_max(utl, ubr);
+    let hit = under_screen.intersect(roi);
+    if hit.width() < 0.5 || hit.height() < 0.5 {
+        return;
+    }
+
+    // Destination pixel rect inside ROI buffer (uniform mapping).
+    let ox = ((hit.left() - roi.left()) * sx).floor() as i32;
+    let oy = ((hit.top() - roi.top()) * sy).floor() as i32;
+    let nw = ((hit.width() * sx).ceil() as u32).max(1).min(rw);
+    let nh = ((hit.height() * sy).ceil() as u32).max(1).min(rh);
+
+    // UV of hit within the node's full screen rect (for cropping images / SVG).
+    let u0 = ((hit.left() - under_screen.left()) / under_screen.width()).clamp(0.0, 1.0);
+    let v0 = ((hit.top() - under_screen.top()) / under_screen.height()).clamp(0.0, 1.0);
+    let u1 = ((hit.right() - under_screen.left()) / under_screen.width()).clamp(0.0, 1.0);
+    let v1 = ((hit.bottom() - under_screen.top()) / under_screen.height()).clamp(0.0, 1.0);
+
+    let Some(rgba) = rasterize_node_region(node, nodes, u0, v0, u1, v1, nw, nh) else {
+        return;
+    };
+    crate::blend::composite_stamp(
+        layer,
+        rw,
+        rh,
+        &rgba,
+        nw,
+        nh,
+        ox,
+        oy,
+        node.style.blend_mode,
+        node.style.opacity,
     );
-    painter.image(
-        tex.id(),
-        page_rect,
-        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-        Color32::WHITE,
-    );
+}
+
+/// Rasterize a sub-rectangle of a node to exactly `out_w`×`out_h` (no aspect distortion).
+fn rasterize_node_region(
+    node: &Node,
+    nodes: &NodeStore,
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+    out_w: u32,
+    out_h: u32,
+) -> Option<Vec<u8>> {
+    if out_w == 0 || out_h == 0 {
+        return None;
+    }
+    let u0 = u0.clamp(0.0, 1.0);
+    let v0 = v0.clamp(0.0, 1.0);
+    let u1 = u1.clamp(u0 + 1e-5, 1.0);
+    let v1 = v1.clamp(v0 + 1e-5, 1.0);
+
+    match &node.kind {
+        NodeKind::Image { bytes, .. } if !bytes.is_empty() => {
+            let img = decode_image_cached(bytes)?;
+            let iw = img.width() as f32;
+            let ih = img.height() as f32;
+            let x0 = (u0 * iw).floor().max(0.0) as u32;
+            let y0 = (v0 * ih).floor().max(0.0) as u32;
+            let x1 = (u1 * iw).ceil().min(iw) as u32;
+            let y1 = (v1 * ih).ceil().min(ih) as u32;
+            if x1 <= x0 || y1 <= y0 {
+                return None;
+            }
+            let crop = image::imageops::crop_imm(&img, x0, y0, x1 - x0, y1 - y0).to_image();
+            let resized = if crop.width() == out_w && crop.height() == out_h {
+                crop
+            } else {
+                image::imageops::resize(
+                    &crop,
+                    out_w,
+                    out_h,
+                    image::imageops::FilterType::Triangle,
+                )
+            };
+            Some(resized.into_raw())
+        }
+        NodeKind::Rect { rx, .. }
+            if *rx <= 0.5 && matches!(node.style.fill, Fill::Solid(_) | Fill::None) =>
+        {
+            // Solid fill for the hit region (stroke approximated when full node is covered).
+            let mut rgba = vec![0u8; (out_w * out_h * 4) as usize];
+            if let Fill::Solid(p) = &node.style.fill {
+                let a = (p.rgba[3].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let r = (p.rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let g = (p.rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let bch = (p.rgba[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                for px in rgba.chunks_exact_mut(4) {
+                    px[0] = r;
+                    px[1] = g;
+                    px[2] = bch;
+                    px[3] = a;
+                }
+            }
+            // Stroke only when the region includes the shape edge (near u/v border).
+            let near_edge = u0 < 0.02 || v0 < 0.02 || u1 > 0.98 || v1 > 0.98;
+            if near_edge
+                && node.style.stroke.width > 0.01
+                && node.style.stroke.style.is_visible()
+            {
+                if let Fill::Solid(sp) = &node.style.stroke.style {
+                    let sa = (sp.rgba[3].clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let sr = (sp.rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let sg = (sp.rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let sb = (sp.rgba[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                    let t = ((out_w.min(out_h) as f32) * 0.04).ceil().max(1.0) as u32;
+                    let t = t.min(out_w / 2).min(out_h / 2).max(1);
+                    for y in 0..out_h {
+                        for x in 0..out_w {
+                            // Map pixel back to node UV; paint stroke if near geometric edge.
+                            let pu = u0 + (u1 - u0) * (x as f32 + 0.5) / out_w as f32;
+                            let pv = v0 + (v1 - v0) * (y as f32 + 0.5) / out_h as f32;
+                            let edge = pu < 0.02
+                                || pv < 0.02
+                                || pu > 0.98
+                                || pv > 0.98
+                                || x < t
+                                || y < t
+                                || x >= out_w - t
+                                || y >= out_h - t;
+                            if edge && (pu < 0.04 || pv < 0.04 || pu > 0.96 || pv > 0.96) {
+                                let i = ((y * out_w + x) * 4) as usize;
+                                rgba[i] = sr;
+                                rgba[i + 1] = sg;
+                                rgba[i + 2] = sb;
+                                rgba[i + 3] = sa;
+                            }
+                        }
+                    }
+                }
+            }
+            Some(rgba)
+        }
+        _ => {
+            // SVG fallback: rasterize full node then crop+resize to exact out size.
+            let b = node.bounds();
+            let svg = crate::io::node_svg_for_bounds(node, b, nodes);
+            // Aim for a source large enough for the crop.
+            let src_w = ((out_w as f32) / (u1 - u0).max(0.05)).ceil().min(1024.0) as u32;
+            let src_h = ((out_h as f32) / (v1 - v0).max(0.05)).ceil().min(1024.0) as u32;
+            let scale = (src_w as f32 / b.width().max(1.0) as f32)
+                .min(src_h as f32 / b.height().max(1.0) as f32)
+                .max(0.01);
+            let (fw, fh, full) = crate::io::render_svg_to_rgba(&svg, scale)?;
+            let x0 = (u0 * fw as f32).floor().max(0.0) as u32;
+            let y0 = (v0 * fh as f32).floor().max(0.0) as u32;
+            let x1 = (u1 * fw as f32).ceil().min(fw as f32) as u32;
+            let y1 = (v1 * fh as f32).ceil().min(fh as f32) as u32;
+            if x1 <= x0 || y1 <= y0 {
+                return None;
+            }
+            let cropped = crop_rgba(&full, fw, fh, x0, y0, x1, y1);
+            Some(resize_rgba(&cropped, x1 - x0, y1 - y0, out_w, out_h))
+        }
+    }
+}
+
+fn decode_image_cached(bytes: &[u8]) -> Option<image::RgbaImage> {
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<u64, image::RgbaImage>>> = Mutex::new(None);
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.len().hash(&mut hasher);
+    // Sample ends to reduce collision risk without hashing whole buffer every time.
+    if bytes.len() > 64 {
+        bytes[..32].hash(&mut hasher);
+        bytes[bytes.len() - 32..].hash(&mut hasher);
+    } else {
+        bytes.hash(&mut hasher);
+    }
+    let key = hasher.finish();
+
+    let mut guard = CACHE.lock().ok()?;
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(img) = map.get(&key) {
+        return Some(img.clone());
+    }
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    // Bound cache size.
+    if map.len() > 8 {
+        map.clear();
+    }
+    map.insert(key, img.clone());
+    Some(img)
+}
+
+fn crop_rgba(src: &[u8], sw: u32, sh: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> Vec<u8> {
+    let cw = x1 - x0;
+    let ch = y1 - y0;
+    let mut out = vec![0u8; (cw * ch * 4) as usize];
+    for y in 0..ch {
+        let sy = y0 + y;
+        if sy >= sh {
+            break;
+        }
+        for x in 0..cw {
+            let sx = x0 + x;
+            if sx >= sw {
+                break;
+            }
+            let si = ((sy * sw + sx) * 4) as usize;
+            let di = ((y * cw + x) * 4) as usize;
+            out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+    out
+}
+
+fn resize_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    if sw == dw && sh == dh {
+        return src.to_vec();
+    }
+    if let Some(img) = image::RgbaImage::from_raw(sw, sh, src.to_vec()) {
+        let resized =
+            image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Triangle);
+        return resized.into_raw();
+    }
+    // Nearest-neighbor fallback.
+    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    for y in 0..dh {
+        let sy = (y as u64 * sh as u64 / dh as u64) as u32;
+        for x in 0..dw {
+            let sx = (x as u64 * sw as u64 / dw as u64) as u32;
+            let si = ((sy * sw + sx) * 4) as usize;
+            let di = ((y * dw + x) * 4) as usize;
+            if si + 3 < src.len() {
+                out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+    }
+    out
 }
 
 pub fn draw_tiling_effects(
