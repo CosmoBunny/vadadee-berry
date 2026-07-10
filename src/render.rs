@@ -1097,6 +1097,187 @@ fn linear_gradient_rect_bands(
 // The gradient is defined over the object's bounding box (normalized 0..1 in x/y).
 // Lyon tessellates the closed path outline as a clip mask; each interior vertex samples
 // the bbox gradient field at its position. Works for concave paths and arbitrary winding.
+//
+// Multi-stop linear/radial gradients cannot rely on plain vertex-color interpolation: a
+// triangle spanning t=0..1 would lerp first→last and skip intermediate stop colors. We
+// therefore split triangles along iso-parameter lines at each stop position so every
+// band only interpolates between two consecutive stops.
+
+#[derive(Clone, Copy)]
+struct GradVert {
+    p: Pos2,
+    /// Gradient parameter (linear projection t, or radial distance parameter).
+    t: f32,
+}
+
+fn fill_param_at(fill: &Fill, nx: f32, ny: f32) -> f32 {
+    match fill {
+        Fill::LinearGradient {
+            line_x0,
+            line_y0,
+            line_x1,
+            line_y1,
+            ..
+        } => crate::document::project_onto_linear_line(nx, ny, *line_x0, *line_y0, *line_x1, *line_y1),
+        Fill::RadialGradient {
+            center_x,
+            center_y,
+            ..
+        } => {
+            let dx = nx - center_x;
+            let dy = ny - center_y;
+            ((dx * dx + dy * dy).sqrt() * 1.25).clamp(0.0, 1.0)
+        }
+        _ => 0.0,
+    }
+}
+
+fn gradient_cut_levels(fill: &Fill) -> Vec<f32> {
+    let stops = match fill {
+        Fill::LinearGradient { stops, .. } | Fill::RadialGradient { stops, .. } => stops.as_slice(),
+        _ => return Vec::new(),
+    };
+    if stops.len() <= 2 {
+        return Vec::new();
+    }
+    let mut levels: Vec<f32> = stops
+        .iter()
+        .map(|s| s.pos.clamp(0.0, 1.0))
+        .filter(|p| *p > 1e-4 && *p < 1.0 - 1e-4)
+        .collect();
+    levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    levels.dedup_by(|a, b| (*a - *b).abs() < 1e-5);
+    levels
+}
+
+fn lerp_grad_vert(a: GradVert, b: GradVert, t_cut: f32) -> GradVert {
+    let denom = b.t - a.t;
+    let u = if denom.abs() < 1e-12 {
+        0.5
+    } else {
+        ((t_cut - a.t) / denom).clamp(0.0, 1.0)
+    };
+    GradVert {
+        p: a.p + (b.p - a.p) * u,
+        t: t_cut,
+    }
+}
+
+/// Split one triangle by the iso-line `t = cut`. Returns 1–3 triangles covering the same area.
+fn split_triangle_at_t(v: [GradVert; 3], cut: f32) -> Vec<[GradVert; 3]> {
+    let eps = 1e-5;
+    let side = |t: f32| -> i8 {
+        if t < cut - eps {
+            -1
+        } else if t > cut + eps {
+            1
+        } else {
+            0
+        }
+    };
+    let s = [side(v[0].t), side(v[1].t), side(v[2].t)];
+    // No strict crossing → leave as-is.
+    if !((s[0] < 0 || s[1] < 0 || s[2] < 0) && (s[0] > 0 || s[1] > 0 || s[2] > 0)) {
+        return vec![v];
+    }
+
+    // Count strictly below / above; treat on-plane as neither for isolation pick.
+    let mut below: Vec<usize> = Vec::new();
+    let mut above: Vec<usize> = Vec::new();
+    let mut on: Vec<usize> = Vec::new();
+    for i in 0..3 {
+        match s[i] {
+            -1 => below.push(i),
+            1 => above.push(i),
+            _ => on.push(i),
+        }
+    }
+
+    // One vertex alone on one side of the cut; the other two on the opposite side (or on-plane).
+    let (alone_idx, alone_side, others) = if below.len() == 1 && above.len() + on.len() == 2 {
+        (below[0], -1i8, {
+            let mut o = above.clone();
+            o.extend(on.iter().copied());
+            o
+        })
+    } else if above.len() == 1 && below.len() + on.len() == 2 {
+        (above[0], 1i8, {
+            let mut o = below.clone();
+            o.extend(on.iter().copied());
+            o
+        })
+    } else if below.len() == 2 && above.len() == 1 {
+        (above[0], 1i8, below.clone())
+    } else if above.len() == 2 && below.len() == 1 {
+        (below[0], -1i8, above.clone())
+    } else {
+        // Degenerate classification (e.g. two on plane) — skip split.
+        return vec![v];
+    };
+    let _ = alone_side;
+    if others.len() != 2 {
+        return vec![v];
+    }
+    let a = v[alone_idx];
+    let b = v[others[0]];
+    let c = v[others[1]];
+    let i_ab = if (a.t - cut).abs() < eps {
+        a
+    } else if (b.t - cut).abs() < eps {
+        b
+    } else {
+        lerp_grad_vert(a, b, cut)
+    };
+    let i_ac = if (a.t - cut).abs() < eps {
+        a
+    } else if (c.t - cut).abs() < eps {
+        c
+    } else {
+        lerp_grad_vert(a, c, cut)
+    };
+    // Alone side triangle + quad on the other side (two tris).
+    vec![[a, i_ab, i_ac], [i_ab, b, c], [i_ab, c, i_ac]]
+}
+
+fn subdivide_triangle_for_stops(v: [GradVert; 3], cuts: &[f32]) -> Vec<[GradVert; 3]> {
+    let mut tris = vec![v];
+    for &cut in cuts {
+        let mut next = Vec::with_capacity(tris.len() * 2);
+        for tri in tris {
+            let tmin = tri[0].t.min(tri[1].t).min(tri[2].t);
+            let tmax = tri[0].t.max(tri[1].t).max(tri[2].t);
+            if cut > tmin + 1e-5 && cut < tmax - 1e-5 {
+                next.extend(split_triangle_at_t(tri, cut));
+            } else {
+                next.push(tri);
+            }
+        }
+        tris = next;
+    }
+    tris
+}
+
+fn emit_grad_triangle(
+    mesh: &mut Mesh,
+    fill: &Fill,
+    opacity: f32,
+    bbox_screen: Rect,
+    tri: [GradVert; 3],
+) {
+    let sample = |gv: GradVert| -> Color32 {
+        let (nx, ny) = screen_norm(gv.p, bbox_screen);
+        // Prefer exact sample at the gradient parameter when this vertex was placed on a cut.
+        // Using geometric (nx,ny) keeps radial/linear consistent with the true field.
+        sample_fill_at(fill, opacity, nx, ny)
+    };
+    let i0 = mesh.vertices.len() as u32;
+    mesh.colored_vertex(tri[0].p, sample(tri[0]));
+    let i1 = mesh.vertices.len() as u32;
+    mesh.colored_vertex(tri[1].p, sample(tri[1]));
+    let i2 = mesh.vertices.len() as u32;
+    mesh.colored_vertex(tri[2].p, sample(tri[2]));
+    mesh.add_triangle(i0, i1, i2);
+}
 
 fn tessellate_clipped_gradient(
     mesh: &mut Mesh,
@@ -1124,6 +1305,13 @@ fn tessellate_clipped_gradient(
         return;
     }
 
+    let cuts = gradient_cut_levels(fill);
+    let need_subdiv = !cuts.is_empty()
+        && matches!(
+            fill,
+            Fill::LinearGradient { .. } | Fill::RadialGradient { .. }
+        );
+
     for chunk in buffers.indices.chunks_exact(3) {
         let v0 = buffers.vertices[chunk[0] as usize];
         let v1 = buffers.vertices[chunk[1] as usize];
@@ -1132,17 +1320,40 @@ fn tessellate_clipped_gradient(
         let p1 = Pos2::new(v1.x, v1.y);
         let p2 = Pos2::new(v2.x, v2.y);
 
+        if !need_subdiv {
+            let (nx0, ny0) = screen_norm(p0, bbox_screen);
+            let (nx1, ny1) = screen_norm(p1, bbox_screen);
+            let (nx2, ny2) = screen_norm(p2, bbox_screen);
+            let i0 = mesh.vertices.len() as u32;
+            mesh.colored_vertex(p0, sample_fill_at(fill, opacity, nx0, ny0));
+            let i1 = mesh.vertices.len() as u32;
+            mesh.colored_vertex(p1, sample_fill_at(fill, opacity, nx1, ny1));
+            let i2 = mesh.vertices.len() as u32;
+            mesh.colored_vertex(p2, sample_fill_at(fill, opacity, nx2, ny2));
+            mesh.add_triangle(i0, i1, i2);
+            continue;
+        }
+
         let (nx0, ny0) = screen_norm(p0, bbox_screen);
         let (nx1, ny1) = screen_norm(p1, bbox_screen);
         let (nx2, ny2) = screen_norm(p2, bbox_screen);
-
-        let i0 = mesh.vertices.len() as u32;
-        mesh.colored_vertex(p0, sample_fill_at(fill, opacity, nx0, ny0));
-        let i1 = mesh.vertices.len() as u32;
-        mesh.colored_vertex(p1, sample_fill_at(fill, opacity, nx1, ny1));
-        let i2 = mesh.vertices.len() as u32;
-        mesh.colored_vertex(p2, sample_fill_at(fill, opacity, nx2, ny2));
-        mesh.add_triangle(i0, i1, i2);
+        let tri = [
+            GradVert {
+                p: p0,
+                t: fill_param_at(fill, nx0, ny0),
+            },
+            GradVert {
+                p: p1,
+                t: fill_param_at(fill, nx1, ny1),
+            },
+            GradVert {
+                p: p2,
+                t: fill_param_at(fill, nx2, ny2),
+            },
+        ];
+        for sub in subdivide_triangle_for_stops(tri, &cuts) {
+            emit_grad_triangle(mesh, fill, opacity, bbox_screen, sub);
+        }
     }
 }
 
@@ -1216,6 +1427,14 @@ fn draw_shape_fill(
             }
         }
         _ => {
+            // Sharp axis-aligned rect + linear multi-stop: explicit iso-t bands (accurate stops).
+            if rx_doc <= 0.0 {
+                if matches!(fill, Fill::LinearGradient { .. }) {
+                    let mesh = rect_gradient_mesh(screen_rect, doc_bounds, fill, opacity);
+                    painter.add(Shape::mesh(mesh));
+                    return;
+                }
+            }
             let (x0, y0, x1, y1) = doc_bounds;
             let r = KurboRect::new(x0, y0, x1, y1);
             let path = if rx_doc > 0.0 {
@@ -3788,6 +4007,35 @@ fn gradient_line_screen(
     (a, b, mid)
 }
 
+fn paint_to_overlay_color(p: crate::document::Paint) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        (p.rgba[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (p.rgba[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (p.rgba[2].clamp(0.0, 1.0) * 255.0) as u8,
+        255,
+    )
+}
+
+/// Draw every gradient stop as a colored disc along the linear flow line (or radial rings).
+fn draw_stop_markers_on_line(
+    painter: &Painter,
+    a: Pos2,
+    b: Pos2,
+    stops: &[crate::document::GradientStop],
+) {
+    if stops.is_empty() {
+        return;
+    }
+    for stop in stops {
+        let t = stop.pos.clamp(0.0, 1.0);
+        let p = a + (b - a) * t;
+        let fill = paint_to_overlay_color(stop.color);
+        painter.circle_filled(p, 5.5, fill);
+        painter.circle_stroke(p, 5.5, Stroke::new(1.5, Color32::WHITE));
+        painter.circle_stroke(p, 5.5, Stroke::new(1.0, colors::ACCENT));
+    }
+}
+
 pub fn draw_gradient_flow_overlay(
     painter: &Painter,
     viewport: &Viewport,
@@ -3797,6 +4045,7 @@ pub fn draw_gradient_flow_overlay(
     line: (f32, f32, f32, f32),
     radial_cx: f32,
     radial_cy: f32,
+    stops: &[crate::document::GradientStop],
 ) {
     let tl = viewport.doc_to_screen((bounds.x0, bounds.y0), origin);
     let br = viewport.doc_to_screen((bounds.x1, bounds.y1), origin);
@@ -3810,19 +4059,43 @@ pub fn draw_gradient_flow_overlay(
     match kind {
         crate::document::FillKind::LinearGradient => {
             let (a, b, mid) = gradient_line_screen(r, line);
-            painter.line_segment([a, b], Stroke::new(3.0, colors::ACCENT));
+            // Multi-stop preview stroke along the flow line.
+            if stops.len() >= 2 {
+                const SEGS: usize = 32;
+                for i in 0..SEGS {
+                    let t0 = i as f32 / SEGS as f32;
+                    let t1 = (i + 1) as f32 / SEGS as f32;
+                    let p0 = a + (b - a) * t0;
+                    let p1 = a + (b - a) * t1;
+                    let c = paint_to_overlay_color(crate::document::sample_stops(stops, t0));
+                    painter.line_segment([p0, p1], Stroke::new(4.0, c));
+                }
+            } else {
+                painter.line_segment([a, b], Stroke::new(3.0, colors::ACCENT));
+            }
+            // Endpoint / mid handles (flow geometry), then all stop markers on top.
             painter.circle_filled(a, 6.0, Color32::WHITE);
             painter.circle_filled(b, 6.0, Color32::WHITE);
             painter.circle_stroke(a, 6.0, Stroke::new(1.5, colors::ACCENT));
             painter.circle_stroke(b, 6.0, Stroke::new(1.5, colors::ACCENT));
-            painter.circle_filled(mid, 6.0, colors::ACCENT);
-            painter.circle_stroke(mid, 6.0, Stroke::new(1.5, Color32::WHITE));
+            painter.circle_filled(mid, 5.0, colors::ACCENT);
+            painter.circle_stroke(mid, 5.0, Stroke::new(1.5, Color32::WHITE));
+            draw_stop_markers_on_line(painter, a, b, stops);
         }
         crate::document::FillKind::RadialGradient => {
             let focal = Pos2::new(
                 r.left() + r.width() * radial_cx,
                 r.top() + r.height() * radial_cy,
             );
+            // Approximate stop rings: t maps to radius via same scale as sample_at (dist * 1.25).
+            let max_r = (r.width().hypot(r.height()) * 0.5).max(8.0);
+            for stop in stops {
+                let rad = (stop.pos / 1.25).clamp(0.0, 1.0) * max_r;
+                if rad > 2.0 {
+                    let c = paint_to_overlay_color(stop.color);
+                    painter.circle_stroke(focal, rad, Stroke::new(2.0, c));
+                }
+            }
             painter.circle_filled(focal, 7.0, colors::ACCENT);
             painter.circle_stroke(focal, 7.0, Stroke::new(2.0, Color32::WHITE));
         }

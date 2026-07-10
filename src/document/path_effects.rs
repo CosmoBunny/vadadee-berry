@@ -136,6 +136,9 @@ pub enum BooleanOpKind {
     Union,
     Intersection,
     Difference,
+    /// Symmetric difference (A △ B). Only valid for exactly two operands.
+    #[serde(alias = "Xor", alias = "Exclude")]
+    Exclude,
 }
 
 impl BooleanOpKind {
@@ -144,7 +147,13 @@ impl BooleanOpKind {
             Self::Union => "Union",
             Self::Intersection => "Intersection",
             Self::Difference => "Difference",
+            Self::Exclude => "Exclude",
         }
+    }
+
+    /// Ops that fold cleanly over N≥2 operands.
+    pub fn supports_multi(self) -> bool {
+        matches!(self, Self::Union | Self::Intersection)
     }
 }
 
@@ -316,6 +325,7 @@ pub fn compute_boolean_bez(
         BooleanOpKind::Union => ma.union(&mb),
         BooleanOpKind::Intersection => ma.intersection(&mb),
         BooleanOpKind::Difference => ma.difference(&mb),
+        BooleanOpKind::Exclude => ma.xor(&mb),
     };
     if result.0.is_empty() {
         // Valid empty result (e.g. far-apart intersection) — not a conversion failure.

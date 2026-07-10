@@ -162,6 +162,7 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     app.ui_anim.tick(ui.ctx());
     video_export_progress_window(app, ui.ctx());
     shader_editor_window(app, ui.ctx());
+    object_rename_dialog(app, ui.ctx());
     status_bar_layout_reserve(ui);
 
     let canvas_alpha = app.ui_anim.canvas_alpha();
@@ -1294,7 +1295,7 @@ fn node_display_name(app: &VadadeeBerryApp, id: crate::document::NodeId) -> Stri
         .unwrap_or_else(|| "Object".into())
 }
 
-/// Path Magic: Boolean (shape+shape) or Clip Mask (image+shape solid face).
+/// Path Magic: Boolean (shape+shape or N-way) or Clip Mask (image+shape solid face).
 fn boolean_and_clip_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     use crate::app::BooleanPairMode;
     use crate::document::BooleanOpKind;
@@ -1302,6 +1303,8 @@ fn boolean_and_clip_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     let has_bool = app.selection_has_boolean_effect();
     let has_cm = app.selection_has_clip_mask();
     let pair_mode = app.selection_boolean_mode();
+    let multi_shapes = app.selection_booleanable_shapes();
+    let multi_count = multi_shapes.len();
 
     if !has_bool && !has_cm && pair_mode.is_none() {
         return;
@@ -1344,6 +1347,8 @@ fn boolean_and_clip_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         } else {
             return;
         }
+    } else if multi_count >= 3 {
+        (multi_shapes[0], multi_shapes[1], "boolean_multi")
     } else if let Some(mode) = pair_mode {
         match mode {
             BooleanPairMode::VectorBoolean { a, b } => (a, b, "boolean_offer"),
@@ -1358,43 +1363,93 @@ fn boolean_and_clip_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     let max_c = ((ui.available_width() / 7.5) as usize).clamp(8, 28);
 
     let title = match mode_kind {
-        "boolean" | "boolean_offer" => "Boolean Operation",
+        "boolean" | "boolean_offer" | "boolean_multi" => "Boolean Operation",
         _ => "Clip Mask",
     };
     ui.label(RichText::new(title).strong());
 
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            let a_lab = clamp_object_label(&a_full, max_c);
-            let b_lab = clamp_object_label(&b_full, max_c);
-            ui.label(RichText::new(format!("A: {a_lab}")).small())
-                .on_hover_text(&a_full);
-            ui.label(RichText::new(format!("B: {b_lab}")).small())
-                .on_hover_text(&b_full);
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let swap_label =
-                RichText::new(icons::SWAP).font(nerd_font_id(14.0));
-            if ui
-                .button(swap_label)
-                .on_hover_text("Reverse A ↔ B")
-                .clicked()
-            {
-                if mode_kind == "clip" || mode_kind == "clip_offer" {
-                    if mode_kind == "clip" {
-                        app.swap_clip_mask_source();
-                    } else {
-                        app.selection.swap(0, 1);
-                    }
-                } else {
-                    app.reverse_boolean_operands();
-                }
-                ui.ctx().request_repaint();
+            if mode_kind == "boolean_multi" {
+                ui.label(
+                    RichText::new(format!("{multi_count} shapes selected"))
+                        .small()
+                        .color(colors::ACCENT),
+                )
+                .on_hover_text(
+                    multi_shapes
+                        .iter()
+                        .map(|id| node_display_name(app, *id))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            } else {
+                let a_lab = clamp_object_label(&a_full, max_c);
+                let b_lab = clamp_object_label(&b_full, max_c);
+                ui.label(RichText::new(format!("A: {a_lab}")).small())
+                    .on_hover_text(&a_full);
+                ui.label(RichText::new(format!("B: {b_lab}")).small())
+                    .on_hover_text(&b_full);
             }
         });
+        if mode_kind != "boolean_multi" {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let swap_label =
+                    RichText::new(icons::SWAP).font(nerd_font_id(14.0));
+                if ui
+                    .button(swap_label)
+                    .on_hover_text("Reverse A ↔ B")
+                    .clicked()
+                {
+                    if mode_kind == "clip" || mode_kind == "clip_offer" {
+                        if mode_kind == "clip" {
+                            app.swap_clip_mask_source();
+                        } else {
+                            app.selection.swap(0, 1);
+                        }
+                    } else {
+                        app.reverse_boolean_operands();
+                    }
+                    ui.ctx().request_repaint();
+                }
+            });
+        }
     });
 
     match mode_kind {
+        "boolean_multi" => {
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(
+                    "3+ shapes: Union and Intersection fold all operands.\n\
+                     Difference / Exclude need exactly 2 shapes.",
+                )
+                .small()
+                .color(colors::TEXT_MUTED),
+            );
+            ui.label(RichText::new("Op").small().color(colors::TEXT_MUTED));
+            ui.horizontal_wrapped(|ui| {
+                for op in [BooleanOpKind::Union, BooleanOpKind::Intersection] {
+                    let selected = app.ui_boolean_op == op;
+                    if ui.selectable_label(selected, op.label()).clicked() {
+                        app.ui_boolean_op = op;
+                    }
+                }
+            });
+            // If user had Difference/Exclude selected, snap to Union for multi.
+            if !app.ui_boolean_op.supports_multi() {
+                app.ui_boolean_op = BooleanOpKind::Union;
+            }
+            if ui.button("Apply Boolean").clicked() {
+                app.apply_boolean_effect();
+                ui.ctx().request_repaint();
+            }
+            ui.label(
+                RichText::new("Baked result path (operands hidden). Not a live multi-link.")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+        }
         "boolean_offer" => {
             ui.add_space(2.0);
             ui.label(RichText::new("Op").small().color(colors::TEXT_MUTED));
@@ -1403,6 +1458,7 @@ fn boolean_and_clip_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     BooleanOpKind::Union,
                     BooleanOpKind::Intersection,
                     BooleanOpKind::Difference,
+                    BooleanOpKind::Exclude,
                 ] {
                     let selected = app.ui_boolean_op == op;
                     if ui.selectable_label(selected, op.label()).clicked() {
@@ -1436,6 +1492,7 @@ fn boolean_and_clip_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     BooleanOpKind::Union,
                     BooleanOpKind::Intersection,
                     BooleanOpKind::Difference,
+                    BooleanOpKind::Exclude,
                 ] {
                     let selected = app.ui_boolean_op == op
                         || app
@@ -1911,6 +1968,110 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     });
 }
 
+/// Close any dialog when Escape is pressed (shared helper).
+fn dialog_escape_close(ctx: &egui::Context, open: &mut bool) {
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        *open = false;
+    }
+}
+
+fn object_rename_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
+    let Some((id_copy, is_layer_copy)) = app
+        .object_rename_dialog
+        .as_ref()
+        .map(|(id, _, layer)| (*id, *layer))
+    else {
+        return;
+    };
+    let mut open = true;
+    let mut apply = false;
+    let mut close = false;
+    let title = if is_layer_copy {
+        "Rename layer"
+    } else {
+        "Rename object"
+    };
+    dialog_escape_close(ctx, &mut open);
+    egui::Window::new(title)
+        .id(egui::Id::new(("object_rename_dlg", id_copy)))
+        .collapsible(false)
+        .resizable(false)
+        .default_width(320.0)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new("Enter a new name. Esc or Cancel closes without saving.")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(4.0);
+            if let Some((_, draft, _)) = app.object_rename_dialog.as_mut() {
+                let te = ui.add(
+                    egui::TextEdit::singleline(draft)
+                        .id(egui::Id::new(("object_rename_edit", id_copy)))
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Name"),
+                );
+                // Focus once when the dialog opens.
+                if ctx.data(|d| d.get_temp::<bool>(egui::Id::new(("rename_focus", id_copy))).is_none()) {
+                    te.request_focus();
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("rename_focus", id_copy)), true));
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Rename").clicked() {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+    if apply {
+        let name = app
+            .object_rename_dialog
+            .as_ref()
+            .map(|(_, d, _)| d.trim().to_string())
+            .unwrap_or_default();
+        if !name.is_empty() {
+            if is_layer_copy {
+                if let Some(layer) = app
+                    .project
+                    .document
+                    .layers
+                    .iter_mut()
+                    .find(|l| l.id == id_copy)
+                {
+                    layer.name = name;
+                }
+            } else if let Some(node) = app.project.nodes.get(id_copy) {
+                let before = node.clone();
+                let mut after = before.clone();
+                after.name = name;
+                if before != after {
+                    app.history.push(
+                        &mut app.project,
+                        crate::history::ProjectEdit::PatchNode {
+                            id: id_copy,
+                            before,
+                            after,
+                        },
+                    );
+                }
+            }
+        }
+        ctx.data_mut(|d| d.remove::<bool>(egui::Id::new(("rename_focus", id_copy))));
+        app.object_rename_dialog = None;
+    } else if close || !open {
+        ctx.data_mut(|d| d.remove::<bool>(egui::Id::new(("rename_focus", id_copy))));
+        app.object_rename_dialog = None;
+    }
+}
+
 fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
     if !app.video_export.progress_visible {
         return;
@@ -1918,6 +2079,12 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
     let Some(prog) = app.video_export.progress else {
         return;
     };
+    let mut open = true;
+    dialog_escape_close(ctx, &mut open);
+    if !open && !app.video_export.rendering {
+        app.video_export.progress_visible = false;
+        return;
+    }
     egui::Window::new("Render to Video")
         .id(egui::Id::new("video_progress_dlg"))
         .collapsible(false)
@@ -2082,6 +2249,7 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
     }
     
     let pass = current_pass.unwrap();
+    dialog_escape_close(ctx, &mut open);
     
     egui::Window::new(title)
         .id(egui::Id::new("shader_editor_window_floating"))
@@ -3849,7 +4017,12 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             if resp.clicked() {
                                 app.set_selection(vec![*id]);
                             }
-                            resp.on_hover_text(&node_name);
+                            if resp.double_clicked() {
+                                app.set_selection(vec![*id]);
+                                app.object_rename_dialog =
+                                    Some((*id, node_name.clone(), false));
+                            }
+                            resp.on_hover_text(format!("{node_name}\nDouble-click to rename"));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let delete_btn = ui.add(
                                     egui::Button::new(
@@ -3974,6 +4147,7 @@ fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             &mut app.tools.brush.radial_cx,
                             &mut app.tools.brush.radial_cy,
                             1.0,
+                            &app.tools.brush.fill_stops,
                         ) {
                             if app.tools.brush.fill_kind == FillKind::LinearGradient {
                                 app.tools.brush.gradient_angle = sync_angle_from_flow_line((
@@ -4146,6 +4320,7 @@ fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             &mut app.ui_radial_cx,
                             &mut app.ui_radial_cy,
                             aspect,
+                            &app.ui_fill_stops,
                         ) {
                             if app.ui_fill_kind == FillKind::LinearGradient {
                                 app.ui_gradient_angle = sync_angle_from_flow_line((
@@ -4244,6 +4419,7 @@ fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             &mut app.ui_stroke_radial_cx,
                             &mut app.ui_stroke_radial_cy,
                             aspect,
+                            &app.ui_stroke_stops,
                         ) {
                             if app.ui_stroke_kind == FillKind::LinearGradient {
                                 app.ui_stroke_angle = sync_angle_from_flow_line((
@@ -8764,6 +8940,7 @@ fn graph_stack_formula_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
                 .map(|e| e.0)
         }
     };
+    dialog_escape_close(ctx, &mut open);
     egui::Window::new(format!("Stack formula — {track_name}"))
         .id(egui::Id::new(("stack_formula_dialog", stack_id, ch_idx)))
         .open(&mut open)
@@ -9079,6 +9256,24 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         };
         app.get_node_geom_floats(id)
     };
+
+    // Paths with many anchors (e.g. boolean results) must not expand thousands of
+    // geom track rows / empty KeyframeTrack slots — that freezes the Animation tab.
+    let is_path = app
+        .project
+        .nodes
+        .get(id)
+        .is_some_and(|n| matches!(n.kind, NodeKind::Path { .. }));
+    let path_anchor_count = app
+        .project
+        .nodes
+        .get(id)
+        .and_then(|n| match &n.kind {
+            NodeKind::Path { path } => Some(path.anchor_positions().len()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let path_geom_lazy = is_path && selected_point_indices.is_empty() && path_anchor_count > 8;
     
     if !geom_floats.is_empty() {
         ui.add_space(4.0);
@@ -9086,8 +9281,57 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         ui.separator();
         ui.add_space(4.0);
 
-        // Ensure we have enough keyframe tracks for each geometry float
-        while entry.geom_tracks.len() < geom_floats.len() {
+        if path_geom_lazy {
+            ui.label(
+                RichText::new(format!(
+                    "Path has {path_anchor_count} points — per-point keyframes are hidden for performance."
+                ))
+                .small()
+                .color(colors::TEXT_MUTED),
+            );
+            ui.label(
+                RichText::new("Select points with the Node tool to keyframe only those points.")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            // Still show existing keyframed geom tracks (if any) without allocating all slots.
+            let existing: Vec<usize> = entry
+                .geom_tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| !t.keyframes.is_empty())
+                .map(|(i, _)| i)
+                .collect();
+            if !existing.is_empty() {
+                ui.label(
+                    RichText::new(format!(
+                        "{} geom track(s) already have keyframes",
+                        existing.len()
+                    ))
+                    .small()
+                    .color(colors::ACCENT),
+                );
+            }
+        }
+
+        // Ensure we have enough keyframe tracks only for indices we will edit this frame.
+        let need_tracks_upto = if path_geom_lazy {
+            entry.geom_tracks.len()
+        } else if is_path && !selected_point_indices.is_empty() {
+            selected_point_indices
+                .iter()
+                .map(|p| p * 6 + 5)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0)
+                .min(geom_floats.len())
+        } else if is_path {
+            // Small paths: full geom is fine.
+            geom_floats.len()
+        } else {
+            geom_floats.len()
+        };
+        while entry.geom_tracks.len() < need_tracks_upto {
             entry.geom_tracks.push(crate::app::KeyframeTrack::default());
         }
 
@@ -9116,7 +9360,19 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 NodeKind::Path { path } => {
                     let mut v = Vec::new();
                     let num_anchors = path.anchor_positions().len();
+                    // Only build labels for selected points (or all if few anchors).
+                    let show_all = selected_point_indices.is_empty() && num_anchors <= 8;
                     for i in 0..num_anchors {
+                        if !show_all && !selected_point_indices.contains(&i) {
+                            // Placeholder so indices stay aligned; rows are skipped below.
+                            v.push((format!("Pt {} X", i), -10000.0, 10000.0, 1.0));
+                            v.push((format!("Pt {} Y", i), -10000.0, 10000.0, 1.0));
+                            v.push((format!("Pt {} Out X", i), -10000.0, 10000.0, 1.0));
+                            v.push((format!("Pt {} Out Y", i), -10000.0, 10000.0, 1.0));
+                            v.push((format!("Pt {} In X", i), -10000.0, 10000.0, 1.0));
+                            v.push((format!("Pt {} In Y", i), -10000.0, 10000.0, 1.0));
+                            continue;
+                        }
                         v.push((format!("Pt {} X", i), -10000.0, 10000.0, 1.0));
                         v.push((format!("Pt {} Y", i), -10000.0, 10000.0, 1.0));
                         v.push((format!("Pt {} Out X", i), -10000.0, 10000.0, 1.0));
@@ -9175,10 +9431,14 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         };
 
                 for i in 0..geom_floats.len() {
+                    if path_geom_lazy {
+                        break; // message already shown; do not paint thousands of rows
+                    }
                     if let Some(node) = app.project.nodes.get(id) {
-                        if matches!(&node.kind, NodeKind::Path { .. }) && !selected_point_indices.is_empty() {
+                        if matches!(&node.kind, NodeKind::Path { .. }) {
                             let pt_idx = i / 6;
-                            if !selected_point_indices.contains(&pt_idx) {
+                            let few = path_anchor_count <= 8 && selected_point_indices.is_empty();
+                            if !few && !selected_point_indices.contains(&pt_idx) {
                                 continue;
                             }
                         }
@@ -9401,7 +9661,11 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     }
 
-    app.project.anim_timeline.nodes.insert(id, entry);
+    // Only write the cloned entry back when the user edited something. Always inserting
+    // would stomp concurrent timeline/keyframe updates with a stale clone.
+    if entry_changed {
+        app.project.anim_timeline.nodes.insert(id, entry);
+    }
     
     if let Some((track, frame)) = delete_kf_target {
         app.delete_keyframe(id, &track, frame);

@@ -89,8 +89,13 @@ pub fn gradient_strip_editor(
         }
 
         if let Some(i) = drag_i {
-            *selected = i;
+            // Re-select by position after sort so the handle index matches the stop.
+            let pos = stops.get(i).map(|s| s.pos).unwrap_or(0.0);
             stops.sort_by(|a, b| a.pos.partial_cmp(&b.pos).unwrap());
+            *selected = stops
+                .iter()
+                .position(|s| (s.pos - pos).abs() < 1e-6)
+                .unwrap_or(i.min(stops.len().saturating_sub(1)));
             focus = which;
         }
     });
@@ -102,10 +107,25 @@ pub fn gradient_strip_editor(
     ui.push_id(strip_id.with("toolbar"), |ui| {
         ui.horizontal(|ui| {
             if ui.small_button("+ stop").clicked() {
-                let t = 0.5;
+                // Prefer midpoint of largest gap so new stops don't stack on existing ones.
+                let mut ordered = stops.clone();
+                ordered.sort_by(|a, b| a.pos.partial_cmp(&b.pos).unwrap());
+                let mut t = 0.5;
+                let mut best_gap = 0.0f32;
+                for w in ordered.windows(2) {
+                    let gap = w[1].pos - w[0].pos;
+                    if gap > best_gap {
+                        best_gap = gap;
+                        t = (w[0].pos + w[1].pos) * 0.5;
+                    }
+                }
                 let color = sample_stops(stops, t);
                 stops.push(GradientStop::new(t, color));
                 crate::document::normalize_stops(stops);
+                *selected = stops
+                    .iter()
+                    .position(|s| (s.pos - t).abs() < 1e-4)
+                    .unwrap_or(stops.len().saturating_sub(1));
                 changed = true;
                 focus = which;
             }
@@ -194,6 +214,7 @@ fn line_to_screen(rect: Rect, x0: f32, y0: f32, x1: f32, y1: f32) -> (Pos2, Pos2
 }
 
 /// Edit the virtual line the gradient flows along (endpoints + draggable midpoint).
+/// `stops` are drawn as colored markers along the line (positions must match strip % offsets).
 pub fn gradient_flow_line_editor(
     ui: &mut Ui,
     editor_id: Id,
@@ -205,6 +226,7 @@ pub fn gradient_flow_line_editor(
     radial_cx: &mut f32,
     radial_cy: &mut f32,
     aspect: f32,
+    stops: &[GradientStop],
 ) -> bool {
     if !matches!(kind, FillKind::LinearGradient | FillKind::RadialGradient) {
         return false;
@@ -221,13 +243,35 @@ pub fn gradient_flow_line_editor(
         match kind {
             FillKind::LinearGradient => {
                 let (a, b, mid) = line_to_screen(rect, *line_x0, *line_y0, *line_x1, *line_y1);
-                painter.line_segment([a, b], Stroke::new(2.5, colors::ACCENT));
+                // Multi-stop color stroke so the preview matches the strip / fill.
+                if stops.len() >= 2 {
+                    const SEGS: usize = 24;
+                    for i in 0..SEGS {
+                        let t0 = i as f32 / SEGS as f32;
+                        let t1 = (i + 1) as f32 / SEGS as f32;
+                        let p0 = a + (b - a) * t0;
+                        let p1 = a + (b - a) * t1;
+                        let c = sample_stops(stops, t0).to_egui();
+                        painter.line_segment([p0, p1], Stroke::new(3.0, c));
+                    }
+                } else {
+                    painter.line_segment([a, b], Stroke::new(2.5, colors::ACCENT));
+                }
                 painter.circle_filled(a, 5.0, Color32::WHITE);
                 painter.circle_filled(b, 5.0, Color32::WHITE);
                 painter.circle_stroke(a, 5.0, Stroke::new(1.5, colors::ACCENT));
                 painter.circle_stroke(b, 5.0, Stroke::new(1.5, colors::ACCENT));
                 painter.circle_filled(mid, 5.0, colors::ACCENT);
                 painter.circle_stroke(mid, 5.0, Stroke::new(1.5, Color32::WHITE));
+                // All stop markers at their true pos along the flow line.
+                for (i, stop) in stops.iter().enumerate() {
+                    let t = stop.pos.clamp(0.0, 1.0);
+                    let p = a + (b - a) * t;
+                    let fill_c = stop.color.to_egui();
+                    painter.circle_filled(p, 4.5, fill_c);
+                    painter.circle_stroke(p, 4.5, Stroke::new(1.2, Color32::WHITE));
+                    let _ = i;
+                }
 
                 let drag_end0 = ui.interact(
                     Rect::from_center_size(a, Vec2::splat(14.0)),
@@ -297,6 +341,17 @@ pub fn gradient_flow_line_editor(
                 let px = rect.left() + rect.width() * *radial_cx;
                 let py = rect.top() + rect.height() * *radial_cy;
                 let focal = Pos2::new(px, py);
+                let max_r = (rect.width().hypot(rect.height()) * 0.5).max(8.0);
+                for stop in stops {
+                    let rad = (stop.pos / 1.25).clamp(0.0, 1.0) * max_r;
+                    if rad > 2.0 {
+                        painter.circle_stroke(
+                            focal,
+                            rad,
+                            Stroke::new(1.5, stop.color.to_egui()),
+                        );
+                    }
+                }
                 painter.circle_filled(focal, 7.0, colors::ACCENT);
                 painter.circle_stroke(focal, 7.0, Stroke::new(1.5, Color32::WHITE));
                 let drag = ui.interact(

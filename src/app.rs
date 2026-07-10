@@ -163,6 +163,8 @@ pub struct VadadeeBerryApp {
     pub anim_stack_formula_dialog: Option<(NodeId, uuid::Uuid, usize)>,
     /// In-progress formula text for [`Self::anim_stack_formula_dialog`] (not written until Apply).
     pub anim_stack_formula_draft: String,
+    /// Objects tab rename dialog: (node_or_layer id, draft name, is_layer).
+    pub object_rename_dialog: Option<(uuid::Uuid, String, bool)>,
     /// Horizontal pan for the animation graph editor (frame index at left edge).
     pub anim_graph_scroll: f32,
     /// Visible frame span in the animation graph plot.
@@ -731,6 +733,7 @@ impl VadadeeBerryApp {
             anim_graph_stack_drag: None,
             anim_stack_formula_dialog: None,
             anim_stack_formula_draft: String::new(),
+            object_rename_dialog: None,
             anim_graph_scroll: 0.0,
             anim_graph_visible_frames: 100.0,
             anim_timeline_visible_frames: 100.0,
@@ -1863,6 +1866,7 @@ impl VadadeeBerryApp {
             &mut self.project,
             ProjectEdit::PatchNode { id, before, after },
         );
+        self.sync_anim_transform_from_node(id);
     }
 
     pub fn set_ellipse_geometry(
@@ -1893,6 +1897,7 @@ impl VadadeeBerryApp {
             &mut self.project,
             ProjectEdit::PatchNode { id, before, after },
         );
+        self.sync_anim_transform_from_node(id);
     }
 
     pub fn set_line_geometry(
@@ -2107,6 +2112,54 @@ impl VadadeeBerryApp {
         }
     }
 
+    /// When the user moves/edits an object that already has position (or rotation) keyframes,
+    /// keep those keyframes in sync so the next `apply_animation_for_frame` does not snap back.
+    /// At the start of the timeline (frame ≤ first keyframe), the first keyframe is updated.
+    pub fn sync_anim_transform_from_node(&mut self, id: NodeId) {
+        let Some(node) = self.project.nodes.get(id) else {
+            return;
+        };
+        let (x, y) = node.get_pos();
+        let rot = node.get_rotation();
+        let frame = self.anim_current_frame;
+        let Some(entry) = self.project.anim_timeline.nodes.get_mut(&id) else {
+            return;
+        };
+        if !entry.pos_x.keyframes.is_empty() {
+            Self::write_anim_keyframe_at_edit(&mut entry.pos_x, frame, x);
+        }
+        if !entry.pos_y.keyframes.is_empty() {
+            Self::write_anim_keyframe_at_edit(&mut entry.pos_y, frame, y);
+        }
+        if !entry.rotation.keyframes.is_empty() {
+            Self::write_anim_keyframe_at_edit(&mut entry.rotation, frame, rot);
+        }
+    }
+
+    fn write_anim_keyframe_at_edit(track: &mut KeyframeTrack, frame: usize, value: f64) {
+        if track.keyframes.is_empty() {
+            return;
+        }
+        if track.keyframes.iter().any(|k| k.frame == frame) {
+            track.insert(frame, value);
+            return;
+        }
+        // Hold-before-first: editing at the beginning updates the first keyframe
+        // (otherwise interpolate(frame) keeps returning the old first value forever).
+        let first = track.keyframes[0].frame;
+        if frame <= first {
+            track.insert(first, value);
+            return;
+        }
+        let last = track.keyframes[track.keyframes.len() - 1].frame;
+        if frame >= last {
+            track.insert(last, value);
+            return;
+        }
+        // Between keys: insert a new key at the scrubbed frame.
+        track.insert(frame, value);
+    }
+
     pub fn apply_animation_for_frame(&mut self, frame: usize) {
         // Collect node ids first so we can mutably sample stack functions (records formula errors).
         let node_ids: Vec<NodeId> = self.project.anim_timeline.nodes.keys().copied().collect();
@@ -2136,18 +2189,24 @@ impl VadadeeBerryApp {
             } else {
                 None
             };
-            let geom = if !track.geom_tracks.is_empty() {
+            // Skip geom apply when no geom keyframes exist (avoids rewriting heavy paths every frame).
+            let geom = if track.geom_tracks.iter().any(|t| !t.keyframes.is_empty()) {
                 let current_geom = self
                     .project
                     .nodes
                     .get(node_id)
                     .map(|n| n.get_geom_floats())
                     .unwrap_or_default();
-                let mut g_vals = Vec::new();
-                for idx in 0..track.geom_tracks.len() {
+                let mut g_vals = Vec::with_capacity(track.geom_tracks.len().max(current_geom.len()));
+                let n = track.geom_tracks.len().max(current_geom.len());
+                for idx in 0..n {
                     let def_val = current_geom.get(idx).copied().unwrap_or(0.0);
-                    let lbl = format!("geom_{idx}");
-                    g_vals.push(track.sample_mut(&lbl, frame).unwrap_or(def_val));
+                    if idx < track.geom_tracks.len() {
+                        let lbl = format!("geom_{idx}");
+                        g_vals.push(track.sample_mut(&lbl, frame).unwrap_or(def_val));
+                    } else {
+                        g_vals.push(def_val);
+                    }
                 }
                 Some(g_vals)
             } else {
@@ -3993,7 +4052,20 @@ impl VadadeeBerryApp {
             if i.key_pressed(Key::Enter) && self.tools.active == ToolKind::Pen {
                 self.finish_pen_path(self.tools.pen.was_closed);
             } else if i.key_pressed(Key::Escape) {
-                if self.on_page_text_edit.is_some() {
+                // Prefer closing modal dialogs over tool cancel / deselect.
+                if self.object_rename_dialog.is_some() {
+                    self.object_rename_dialog = None;
+                } else if self.anim_stack_formula_dialog.is_some() {
+                    self.anim_stack_formula_dialog = None;
+                    self.anim_stack_formula_draft.clear();
+                } else if self.show_shader_editor_window.is_some() {
+                    self.show_shader_editor_window = None;
+                } else if self.video_export.progress_visible {
+                    // Don't abort render mid-export; only hide the dialog if idle.
+                    if !self.video_export.rendering {
+                        self.video_export.progress_visible = false;
+                    }
+                } else if self.on_page_text_edit.is_some() {
                     self.finish_on_page_text_edit();
                 } else {
                     self.cancel_tool_to_select();
@@ -4546,10 +4618,14 @@ impl VadadeeBerryApp {
             }
         }
         if !patches.is_empty() {
+            let ids: Vec<NodeId> = patches.iter().map(|(id, _, _)| *id).collect();
             self.history.push(
                 &mut self.project,
                 ProjectEdit::PatchNodes { patches },
             );
+            for id in ids {
+                self.sync_anim_transform_from_node(id);
+            }
         }
         self.sync_flowchart_paths_if_active_layer();
     }
@@ -5736,6 +5812,7 @@ fn run_video_decode_thread(
                                 ),
                                 self.ui_radial_cx,
                                 self.ui_radial_cy,
+                                &self.ui_fill_stops,
                             );
                         }
                         if self.ui_stroke_edit_gradient_line
@@ -5759,6 +5836,7 @@ fn run_video_decode_thread(
                                 ),
                                 self.ui_stroke_radial_cx,
                                 self.ui_stroke_radial_cy,
+                                &self.ui_stroke_stops,
                             );
                         }
                     }
@@ -6217,6 +6295,7 @@ fn run_video_decode_thread(
                 }
             }
         }
+        let mut moved_ids = Vec::new();
         for (id, before) in self.tools.select.drag_snapshot.drain(..) {
             let Some(after) = self.project.nodes.get(id).cloned() else {
                 continue;
@@ -6226,7 +6305,12 @@ fn run_video_decode_thread(
                     &mut self.project,
                     ProjectEdit::PatchNode { id, before, after },
                 );
+                moved_ids.push(id);
             }
+        }
+        // Keep animation keyframes in sync so position does not snap back on apply.
+        for id in moved_ids {
+            self.sync_anim_transform_from_node(id);
         }
         self.tools.select.drag_mode = None;
         self.tools.select.node_edit_target = None;
@@ -7499,10 +7583,33 @@ fn run_video_decode_thread(
         Some((self.selection[0], self.selection[1]))
     }
 
+    /// All selected solid-face shapes eligible for boolean (order = selection order).
+    pub fn selection_booleanable_shapes(&self) -> Vec<NodeId> {
+        self.selection
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.project
+                    .nodes
+                    .get(*id)
+                    .is_some_and(is_booleanable_shape)
+            })
+            .collect()
+    }
+
     /// Classify pair for Path Magic: vector boolean vs image clip.
+    /// When 3+ vector shapes are selected, still returns VectorBoolean for the first pair
+    /// so the panel opens; multi-ops use [`Self::selection_booleanable_shapes`].
     pub fn selection_boolean_mode(
         &self,
     ) -> Option<BooleanPairMode> {
+        let shapes = self.selection_booleanable_shapes();
+        if shapes.len() >= 2 {
+            return Some(BooleanPairMode::VectorBoolean {
+                a: shapes[0],
+                b: shapes[1],
+            });
+        }
         let (a, b) = self.selection_boolean_pair()?;
         let na = self.project.nodes.get(a)?;
         let nb = self.project.nodes.get(b)?;
@@ -7562,12 +7669,28 @@ fn run_video_decode_thread(
             .map(|(k, _)| *k)
     }
 
-    /// Apply live boolean effect for two solid-face shapes (creates result path).
+    /// Apply boolean: 2 shapes → live effect; 3+ shapes → one-shot fold (Union/Intersection only).
     pub fn apply_boolean_effect(&mut self) {
-        let Some(BooleanPairMode::VectorBoolean { a, b }) = self.selection_boolean_mode() else {
-            self.status_message = "Boolean needs two solid shapes (path/rect/circle/arc/polygon)".into();
+        let shapes = self.selection_booleanable_shapes();
+        if shapes.len() < 2 {
+            self.status_message =
+                "Boolean needs two or more solid shapes (path/rect/circle/arc/polygon)".into();
             return;
-        };
+        }
+        if shapes.len() > 2 {
+            if !self.ui_boolean_op.supports_multi() {
+                self.status_message = format!(
+                    "{} needs exactly 2 shapes; use Union or Intersection for {} shapes",
+                    self.ui_boolean_op.label(),
+                    shapes.len()
+                );
+                return;
+            }
+            self.apply_multi_boolean_fold(&shapes);
+            return;
+        }
+        let a = shapes[0];
+        let b = shapes[1];
         if self.project.document.boolean_effects.values().any(|e| {
             (e.a_id == a && e.b_id == b) || (e.a_id == b && e.b_id == a)
         }) {
@@ -7643,6 +7766,69 @@ fn run_video_decode_thread(
         } else {
             format!("Boolean {} applied", self.ui_boolean_op.label())
         };
+    }
+
+    /// Fold Union/Intersection over N≥3 shapes into one baked result path (no live multi-link).
+    fn apply_multi_boolean_fold(&mut self, shapes: &[NodeId]) {
+        let op = self.ui_boolean_op;
+        if shapes.len() < 3 || !op.supports_multi() {
+            return;
+        }
+        let nodes: Vec<Node> = shapes
+            .iter()
+            .filter_map(|id| self.project.nodes.get(*id).cloned())
+            .collect();
+        if nodes.len() < 3 {
+            return;
+        }
+        let mut acc = nodes[0].clone();
+        // Work on a temporary path node carrying the accumulated bez.
+        for other in nodes.iter().skip(1) {
+            let Some(bez) = compute_boolean_bez(&acc, other, op, 0.75) else {
+                self.status_message = format!(
+                    "Boolean {} failed while combining {}",
+                    op.label(),
+                    other.name
+                );
+                return;
+            };
+            if bez.elements().is_empty() {
+                self.status_message = format!(
+                    "Boolean {} produced empty result (shapes may not overlap)",
+                    op.label()
+                );
+                return;
+            }
+            let mut next = Node::path_from_bez(bez, acc.name.clone());
+            next.style = acc.style.clone();
+            acc = next;
+        }
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        acc.name = format!("{} ({})", op.label(), names.join(" + "));
+        let before = snapshot_project(&self.project);
+        let mut after = before.clone();
+        let result_id = after.nodes.insert(acc);
+        if let Some(layer) = after.document.layers.get_mut(after.document.active_layer_index) {
+            if !layer.nodes.contains(&result_id) {
+                layer.nodes.push(result_id);
+            }
+        }
+        // Hide original operands (same UX as pair live boolean with hide_operands).
+        for id in shapes {
+            if let Some(n) = after.nodes.get_mut(*id) {
+                n.style.opacity = 0.0;
+            }
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::SetDocument { before, after },
+        );
+        self.selection = vec![result_id];
+        self.status_message = format!(
+            "Boolean {} applied to {} shapes (baked result)",
+            op.label(),
+            shapes.len()
+        );
     }
 
     pub fn reverse_boolean_operands(&mut self) {
@@ -12281,7 +12467,8 @@ fn run_video_decode_thread(
             after.transform.scale[1] = sy;
         }
         if let Some(deg) = patch.get("rotation_deg").and_then(|v| v.as_f64()) {
-            after.transform.rotation_rad = deg.to_radians();
+            // Must bake geometry (set_rotation), not only store transform metadata.
+            after.set_rotation(deg.to_radians());
         }
         Self::mcp_apply_geometry_patch(&mut after, patch)?;
         if before != after {
@@ -12878,7 +13065,9 @@ impl eframe::App for VadadeeBerryApp {
         }
 
         let frame_scrubbed = self.anim_current_frame != self.anim_last_seen_frame;
-        if frame_scrubbed || frame_changed {
+        // Never re-apply animation mid-drag — it would fight live position edits.
+        let dragging = self.tools.select.drag_mode.is_some();
+        if (frame_scrubbed || frame_changed) && !dragging {
             self.apply_animation_for_frame(self.anim_current_frame);
             self.anim_last_seen_frame = self.anim_current_frame;
             self.anim_last_applied_states.clear();
@@ -13012,10 +13201,12 @@ impl eframe::App for VadadeeBerryApp {
                             let entry = self.project.anim_timeline.nodes.entry(*id).or_default();
                             
                             if changed_pos {
-                                if entry.pos_x.keyframes.is_empty() {
+                                // Seed a baseline only when recording a later frame (not frame 0),
+                                // so the first edit at the beginning is the single keyframe.
+                                if entry.pos_x.keyframes.is_empty() && self.anim_current_frame > 0 {
                                     entry.pos_x.insert(0, last.pos.0);
                                 }
-                                if entry.pos_y.keyframes.is_empty() {
+                                if entry.pos_y.keyframes.is_empty() && self.anim_current_frame > 0 {
                                     entry.pos_y.insert(0, last.pos.1);
                                 }
                                 entry.pos_x.insert(self.anim_current_frame, pos.0);
@@ -13025,19 +13216,19 @@ impl eframe::App for VadadeeBerryApp {
                                 entry.ensure_stack_end_keyframes();
                             }
                             if changed_rot {
-                                if entry.rotation.keyframes.is_empty() {
+                                if entry.rotation.keyframes.is_empty() && self.anim_current_frame > 0 {
                                     entry.rotation.insert(0, last.rotation);
                                 }
                                 entry.rotation.insert(self.anim_current_frame, rot);
                             }
                             if changed_op {
-                                if entry.opacity.keyframes.is_empty() {
+                                if entry.opacity.keyframes.is_empty() && self.anim_current_frame > 0 {
                                     entry.opacity.insert(0, last.opacity as f64);
                                 }
                                 entry.opacity.insert(self.anim_current_frame, op as f64);
                             }
                             if changed_col {
-                                if entry.color_r.keyframes.is_empty() {
+                                if entry.color_r.keyframes.is_empty() && self.anim_current_frame > 0 {
                                     entry.color_r.insert(0, last.color[0] as f64);
                                     entry.color_g.insert(0, last.color[1] as f64);
                                     entry.color_b.insert(0, last.color[2] as f64);
@@ -13054,7 +13245,7 @@ impl eframe::App for VadadeeBerryApp {
                                 }
                                 for i in 0..geom.len() {
                                     let baseline = if i < last.geom_floats.len() { last.geom_floats[i] } else { geom[i] };
-                                    if entry.geom_tracks[i].keyframes.is_empty() {
+                                    if entry.geom_tracks[i].keyframes.is_empty() && self.anim_current_frame > 0 {
                                         entry.geom_tracks[i].insert(0, baseline);
                                     }
                                     entry.geom_tracks[i].insert(self.anim_current_frame, geom[i]);
@@ -13433,6 +13624,7 @@ mod tests {
                 anim_graph_stack_drag: None,
                 anim_stack_formula_dialog: None,
                 anim_stack_formula_draft: String::new(),
+                object_rename_dialog: None,
                 anim_graph_scroll: 0.0,
                 anim_graph_visible_frames: 100.0,
                 anim_timeline_visible_frames: 100.0,

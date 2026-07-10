@@ -2188,6 +2188,19 @@ impl Node {
             NodeKind::Path { path } => {
                 let anchors = path.anchor_positions();
                 let new_anchors: Vec<_> = anchors.iter().map(|&(px, py)| map(px, py)).collect();
+                // Handle offsets are document-space vectors — rotate them with the path.
+                let rot_off = |off: &mut [f64; 2]| {
+                    let dx = off[0];
+                    let dy = off[1];
+                    off[0] = dx * c - dy * s;
+                    off[1] = dx * s + dy * c;
+                };
+                for off in path.handle_out_offset.values_mut() {
+                    rot_off(off);
+                }
+                for off in path.handle_in_offset.values_mut() {
+                    rot_off(off);
+                }
                 path.replace_anchors(&new_anchors);
             }
             NodeKind::Text { x, y, .. } => {

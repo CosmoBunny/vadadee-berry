@@ -192,16 +192,28 @@ pub fn sample_stops(stops: &[GradientStop], t: f32) -> Paint {
         return stops[0].color;
     }
     let t = t.clamp(0.0, 1.0);
-    for w in stops.windows(2) {
-        let a = &w[0];
-        let b = &w[1];
+    // Ensure ascending pos so multi-stop windows cover the full range even if UI
+    // drag reordering lagged a frame.
+    let mut ordered: Vec<&GradientStop> = stops.iter().collect();
+    ordered.sort_by(|a, b| a.pos.partial_cmp(&b.pos).unwrap_or(std::cmp::Ordering::Equal));
+    if t <= ordered[0].pos {
+        return ordered[0].color;
+    }
+    if let Some(last) = ordered.last() {
+        if t >= last.pos {
+            return last.color;
+        }
+    }
+    for w in ordered.windows(2) {
+        let a = w[0];
+        let b = w[1];
         if t >= a.pos && t <= b.pos {
             let span = (b.pos - a.pos).max(1e-6);
             let local = (t - a.pos) / span;
             return Paint::lerp(a.color, b.color, local);
         }
     }
-    stops.last().map(|s| s.color).unwrap_or(Paint::none())
+    ordered.last().map(|s| s.color).unwrap_or(Paint::none())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
