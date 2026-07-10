@@ -37,6 +37,10 @@ pub const CAP_ROUND: &str = "";
 pub const CAP_BUTT: &str = "󰹞";
 pub const CENTER: &str = "󰌘";
 pub const ARC: &str = "";
+/// Graph / function plotter (nf-md-chart-bell-curve-cumulative).
+pub const PLOTTER: &str = "󰺒";
+/// Right arrow (nf-fa-long-arrow-right) — use instead of Unicode → (missing in UI fonts → box).
+pub const ARROW_RIGHT: &str = "";
 pub const ACTION_HIDE: &str = "";
 pub const ACTION_SHOW: &str = "󰞓";
 pub const CLOSE: &str = "";

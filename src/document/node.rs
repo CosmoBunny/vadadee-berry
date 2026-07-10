@@ -95,12 +95,33 @@ pub enum GeometryProfile {
         angle_deg: f64,
     },
     ClosedPath {
+        origin_x: f64,
+        origin_y: f64,
         vertices: usize,
         cyclic: bool,
     },
     OpenPath {
+        origin_x: f64,
+        origin_y: f64,
         vertices: usize,
         cyclic: bool,
+    },
+    /// Function plotter region + curve.
+    Plotter {
+        origin_x: f64,
+        origin_y: f64,
+        width: f64,
+        height: f64,
+        expr: String,
+        ref_axis: PlotterRef,
+        domain_min: f64,
+        domain_max: f64,
+        range_min: f64,
+        range_max: f64,
+        auto_range: bool,
+        margin_pct: f64,
+        plot_stroke_width: f32,
+        plot_stroke_rgba: [f32; 4],
     },
     /// Arc / chord / pie slice.
     Arc {
@@ -134,6 +155,65 @@ pub enum GeometryProfile {
 
 fn default_font_family() -> String {
     "Noto Sans".to_string()
+}
+
+/// Independent axis for [`NodeKind::Plotter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PlotterRef {
+    /// f(x) → y (curve along X).
+    #[default]
+    Fx,
+    /// f(y) → x (curve along Y).
+    Fy,
+}
+
+impl PlotterRef {
+    /// Label using ASCII only (safe in any font). Prefer [`Self::label_ui`] in egui.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fx => "f(x) -> y",
+            Self::Fy => "f(y) -> x",
+        }
+    }
+
+    /// Parts for UI: prefix, nerd arrow, suffix — render arrow with nerd font.
+    pub fn label_parts(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Fx => ("f(x) ", " y"),
+            Self::Fy => ("f(y) ", " x"),
+        }
+    }
+}
+
+fn default_plot_expr() -> String {
+    "sin(x)".into()
+}
+fn default_plot_domain_min() -> f64 {
+    0.0
+}
+fn default_plot_domain_max() -> f64 {
+    std::f64::consts::TAU
+}
+fn default_plot_range_min() -> f64 {
+    -1.0
+}
+fn default_plot_range_max() -> f64 {
+    1.0
+}
+fn default_true() -> bool {
+    true
+}
+fn default_margin_pct() -> f64 {
+    10.0
+}
+fn default_plot_stroke_width() -> f32 {
+    2.0
+}
+fn default_plot_stroke_rgba() -> [f32; 4] {
+    [0.15, 0.45, 0.95, 1.0]
+}
+fn default_plot_samples() -> u32 {
+    256
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,6 +262,36 @@ pub enum NodeKind {
         /// SHA256 hex for collab wire sync (bytes stripped on send).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         collab_asset_sha256: Option<String>,
+    },
+    /// Graph plotter: filled region (like rect) + plotted f(x) or f(y) curve.
+    Plotter {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        #[serde(default = "default_plot_expr")]
+        expr: String,
+        #[serde(default)]
+        ref_axis: PlotterRef,
+        #[serde(default = "default_plot_domain_min")]
+        domain_min: f64,
+        #[serde(default = "default_plot_domain_max")]
+        domain_max: f64,
+        #[serde(default = "default_plot_range_min")]
+        range_min: f64,
+        #[serde(default = "default_plot_range_max")]
+        range_max: f64,
+        #[serde(default = "default_true")]
+        auto_range: bool,
+        /// Padding on dependent axis as % of data span (top & bottom / both sides).
+        #[serde(default = "default_margin_pct")]
+        margin_pct: f64,
+        #[serde(default = "default_plot_stroke_width")]
+        plot_stroke_width: f32,
+        #[serde(default = "default_plot_stroke_rgba")]
+        plot_stroke_rgba: [f32; 4],
+        #[serde(default = "default_plot_samples")]
+        samples: u32,
     },
     Arc {
         cx: f64,
@@ -1048,10 +1158,68 @@ impl PathData {
         self.points = points;
     }
 
+    /// Faithful verb/point playback (preserves multi-subpath boolean results + holes).
+    pub fn to_bez_from_verbs(&self) -> BezPath {
+        let mut bez = BezPath::new();
+        let mut pi = 0usize;
+        for &v in &self.verbs {
+            match v {
+                0 => {
+                    if let Some(p) = self.points.get(pi) {
+                        bez.move_to((p[0], p[1]));
+                        pi += 1;
+                    }
+                }
+                1 => {
+                    if let Some(p) = self.points.get(pi) {
+                        bez.line_to((p[0], p[1]));
+                        pi += 1;
+                    }
+                }
+                2 => {
+                    if pi + 1 < self.points.len() {
+                        let p1 = self.points[pi];
+                        let p2 = self.points[pi + 1];
+                        bez.quad_to((p1[0], p1[1]), (p2[0], p2[1]));
+                        pi += 2;
+                    }
+                }
+                3 => {
+                    if pi + 2 < self.points.len() {
+                        let p1 = self.points[pi];
+                        let p2 = self.points[pi + 1];
+                        let p3 = self.points[pi + 2];
+                        bez.curve_to((p1[0], p1[1]), (p2[0], p2[1]), (p3[0], p3[1]));
+                        pi += 3;
+                    }
+                }
+                4 => {
+                    bez.close_path();
+                }
+                _ => {}
+            }
+        }
+        bez
+    }
+
     pub fn to_bez(&self) -> BezPath {
+        // Boolean unions / multi-contour paths must not go through the single-contour
+        // smooth-anchor rebuild (that warps shutter-style geometry into triangles).
+        let multi_subpath = self.verbs.iter().filter(|&&v| v == 0).count() > 1;
+        if multi_subpath
+            || (self.smooth_anchors.is_empty()
+                && self.corner_fillets.is_empty()
+                && !self.verbs.is_empty())
+        {
+            let raw = self.to_bez_from_verbs();
+            if !raw.elements().is_empty() {
+                return raw;
+            }
+        }
+
         let anchors = self.anchor_positions();
         if anchors.is_empty() {
-            return BezPath::new();
+            return self.to_bez_from_verbs();
         }
         let n = anchors.len();
         let closed = self.is_closed();
@@ -1621,6 +1789,29 @@ impl Node {
         self.style.fill = Fill::Solid(Paint { rgba });
     }
 
+    pub fn get_stroke_width(&self) -> f32 {
+        self.style.stroke.width
+    }
+
+    pub fn set_stroke_width(&mut self, width: f32) {
+        self.style.stroke.width = width.max(0.0);
+    }
+
+    pub fn get_stroke_color(&self) -> [f32; 4] {
+        match &self.style.stroke.style {
+            Fill::Solid(paint) => paint.rgba,
+            Fill::LinearGradient { stops, .. } | Fill::RadialGradient { stops, .. } => stops
+                .first()
+                .map(|s| s.color.rgba)
+                .unwrap_or([0.1, 0.1, 0.18, 1.0]),
+            Fill::None => [0.0, 0.0, 0.0, 0.0],
+        }
+    }
+
+    pub fn set_stroke_color(&mut self, rgba: [f32; 4]) {
+        self.style.stroke.style = Fill::Solid(Paint { rgba });
+    }
+
     pub fn get_pos(&self) -> (f64, f64) {
         match &self.kind {
             NodeKind::Rect { x, y, .. } => (*x, *y),
@@ -1636,6 +1827,7 @@ impl Node {
             NodeKind::Text { x, y, .. } => (*x, *y),
             NodeKind::Group { .. } => (0.0, 0.0),
             NodeKind::Image { x, y, .. } => (*x, *y),
+            NodeKind::Plotter { x, y, .. } => (*x, *y),
             NodeKind::Arc { cx, cy, .. } => (*cx, *cy),
             NodeKind::BrushStroke { points } => {
                 if points.is_empty() {
@@ -1664,6 +1856,31 @@ impl Node {
             transform: Transform2D::default(),
             path_effect_links: Vec::new(),
         }
+    }
+
+    pub fn plotter(x: f64, y: f64, w: f64, h: f64, fill: Fill) -> Self {
+        let mut n = Self::new(
+            NodeKind::Plotter {
+                x,
+                y,
+                w,
+                h,
+                expr: default_plot_expr(),
+                ref_axis: PlotterRef::Fx,
+                domain_min: default_plot_domain_min(),
+                domain_max: default_plot_domain_max(),
+                range_min: default_plot_range_min(),
+                range_max: default_plot_range_max(),
+                auto_range: true,
+                margin_pct: default_margin_pct(),
+                plot_stroke_width: default_plot_stroke_width(),
+                plot_stroke_rgba: default_plot_stroke_rgba(),
+                samples: default_plot_samples(),
+            },
+            "Plotter",
+        );
+        n.style.fill = fill;
+        n
     }
 
     pub fn rect(x: f64, y: f64, w: f64, h: f64, fill: Fill) -> Self {
@@ -1762,6 +1979,11 @@ impl Node {
                 }
             }
             NodeKind::Path { path } => {
+                let (ox, oy) = if path.points.is_empty() {
+                    (0.0, 0.0)
+                } else {
+                    (path.points[0][0], path.points[0][1])
+                };
                 if path.points.len() == 2 && path.verbs == [0, 1] && !path.is_closed() {
                     let (x0, y0) = (path.points[0][0], path.points[0][1]);
                     let (x1, y1) = (path.points[1][0], path.points[1][1]);
@@ -1777,16 +1999,52 @@ impl Node {
                     }
                 } else if path.is_closed() {
                     GeometryProfile::ClosedPath {
+                        origin_x: ox,
+                        origin_y: oy,
                         vertices: path_anchor_point_indices(path).len(),
                         cyclic: true,
                     }
                 } else {
                     GeometryProfile::OpenPath {
+                        origin_x: ox,
+                        origin_y: oy,
                         vertices: path_anchor_point_indices(path).len(),
                         cyclic: false,
                     }
                 }
             }
+            NodeKind::Plotter {
+                x,
+                y,
+                w,
+                h,
+                expr,
+                ref_axis,
+                domain_min,
+                domain_max,
+                range_min,
+                range_max,
+                auto_range,
+                margin_pct,
+                plot_stroke_width,
+                plot_stroke_rgba,
+                ..
+            } => GeometryProfile::Plotter {
+                origin_x: *x,
+                origin_y: *y,
+                width: *w,
+                height: *h,
+                expr: expr.clone(),
+                ref_axis: *ref_axis,
+                domain_min: *domain_min,
+                domain_max: *domain_max,
+                range_min: *range_min,
+                range_max: *range_max,
+                auto_range: *auto_range,
+                margin_pct: *margin_pct,
+                plot_stroke_width: *plot_stroke_width,
+                plot_stroke_rgba: *plot_stroke_rgba,
+            },
             NodeKind::Polygon {
                 cx,
                 cy,
@@ -1849,13 +2107,108 @@ impl Node {
                         angle_deg: dy.atan2(dx).to_degrees(),
                     }
                 } else {
+                    let (ox, oy) = path.points.first().copied().unwrap_or((0.0, 0.0));
                     GeometryProfile::OpenPath {
+                        origin_x: ox,
+                        origin_y: oy,
                         vertices: path.points.len(),
                         cyclic: false,
                     }
                 }
             },
         }
+    }
+
+    /// Sample plotter curve as document-space polyline points.
+    /// Also returns effective (range_min, range_max) after auto-range + margin.
+    pub fn plotter_polyline(&self) -> Option<(Vec<(f64, f64)>, f64, f64)> {
+        let NodeKind::Plotter {
+            x,
+            y,
+            w,
+            h,
+            expr,
+            ref_axis,
+            domain_min,
+            domain_max,
+            range_min,
+            range_max,
+            auto_range,
+            margin_pct,
+            samples,
+            ..
+        } = &self.kind
+        else {
+            return None;
+        };
+        let n = (*samples).max(2) as usize;
+        let d0 = *domain_min;
+        let d1 = if (domain_max - domain_min).abs() < 1e-12 {
+            domain_min + 1.0
+        } else {
+            *domain_max
+        };
+        let is_fx = matches!(ref_axis, PlotterRef::Fx);
+        let mut samples_out: Vec<(f64, f64)> = Vec::with_capacity(n); // (independent, dependent)
+        for i in 0..n {
+            let t = i as f64 / (n - 1) as f64;
+            let u = d0 + t * (d1 - d0);
+            let mut vars = crate::document::ExprVars::simple(t, u, 0.0);
+            if is_fx {
+                vars.x = u;
+                vars.y = 0.0;
+            } else {
+                vars.y = u;
+                vars.x = 0.0;
+            }
+            // Also expose independent as `s` for convenience.
+            vars.s = u;
+            match crate::document::eval_expr_vars(expr, vars) {
+                Ok(v) if v.is_finite() => samples_out.push((u, v)),
+                _ => {}
+            }
+        }
+        if samples_out.is_empty() {
+            return Some((Vec::new(), *range_min, *range_max));
+        }
+        let (mut r0, mut r1) = if *auto_range {
+            let mut mn = f64::INFINITY;
+            let mut mx = f64::NEG_INFINITY;
+            for &(_, v) in &samples_out {
+                mn = mn.min(v);
+                mx = mx.max(v);
+            }
+            if !mn.is_finite() || !mx.is_finite() {
+                (*range_min, *range_max)
+            } else {
+                if (mx - mn).abs() < 1e-12 {
+                    mn -= 1.0;
+                    mx += 1.0;
+                }
+                let pad = (mx - mn) * (*margin_pct / 100.0).max(0.0);
+                (mn - pad, mx + pad)
+            }
+        } else {
+            (*range_min, *range_max)
+        };
+        if (r1 - r0).abs() < 1e-12 {
+            r0 -= 1.0;
+            r1 += 1.0;
+        }
+        let mut pts = Vec::with_capacity(samples_out.len());
+        for &(u, v) in &samples_out {
+            let tn = (u - d0) / (d1 - d0);
+            let rn = ((v - r0) / (r1 - r0)).clamp(-10.0, 10.0);
+            let (px, py) = if is_fx {
+                // domain → X, dependent → Y (Y grows upward in data, down on canvas)
+                (*x + tn * *w, *y + *h - rn * *h)
+            } else {
+                // domain → Y, dependent → X
+                (*x + rn * *w, *y + tn * *h)
+            };
+            pts.push((px, py));
+        }
+        Some((pts, r0, r1))
     }
 
     pub fn text(x: f64, y: f64, style: TextStyle) -> Self {
@@ -1945,6 +2298,7 @@ impl Node {
             NodeKind::Text { x, y, style } => text_bounds(*x, *y, style),
             NodeKind::Group { .. } => Rect::ZERO,
             NodeKind::Image { x, y, width, height, .. } => Rect::new(*x, *y, *x + *width, *y + *height),
+            NodeKind::Plotter { x, y, w, h, .. } => Rect::new(*x, *y, *x + *w, *y + *h),
             NodeKind::Arc { cx, cy, radius, .. } => Rect::new(cx - radius, cy - radius, cx + radius, cy + radius),
             NodeKind::BrushStroke { points } => {
                 let mut min_x = f64::MAX;
@@ -2020,6 +2374,9 @@ impl Node {
             NodeKind::Text { .. } => BezPath::new(),
             NodeKind::Group { .. } => BezPath::new(),
             NodeKind::Image { .. } => BezPath::new(),
+            NodeKind::Plotter { x, y, w, h, .. } => {
+                Rect::new(*x, *y, *x + *w, *y + *h).to_path(0.1)
+            }
             NodeKind::Arc { cx, cy, radius, start_angle_rad, sweep_angle_rad, join } => {
                 build_arc_bez(*cx, *cy, *radius, *start_angle_rad, *sweep_angle_rad, *join)
             }
@@ -2152,7 +2509,7 @@ impl Node {
             (cx + dx * c - dy * s, cy + dx * s + dy * c)
         };
         match &mut self.kind {
-            NodeKind::Rect { x, y, w, h, .. } => {
+            NodeKind::Rect { x, y, w, h, .. } | NodeKind::Plotter { x, y, w, h, .. } => {
                 let corners = [
                     (*x, *y),
                     (*x + *w, *y),
@@ -2167,6 +2524,7 @@ impl Node {
                     std::collections::HashMap::new(),
                     true,
                 );
+                // Rotating a plotter bakes it to a path (region only).
                 self.kind = NodeKind::Path { path };
             }
             NodeKind::Ellipse { cx: ecx, cy: ecy, rx, ry } => {
@@ -2273,7 +2631,7 @@ impl Node {
         let cy = (b.y0 + b.y1) * 0.5;
         let map = |x: f64, y: f64| (cx + (x - cx) * scale, cy + (y - cy) * scale);
         match &mut self.kind {
-            NodeKind::Rect { x, y, w, h, .. } => {
+            NodeKind::Rect { x, y, w, h, .. } | NodeKind::Plotter { x, y, w, h, .. } => {
                 *w *= scale;
                 *h *= scale;
                 *x = cx - *w * 0.5;
@@ -2324,7 +2682,7 @@ impl Node {
 
     pub fn translate(&mut self, dx: f64, dy: f64) {
         match &mut self.kind {
-            NodeKind::Rect { x, y, .. } => {
+            NodeKind::Rect { x, y, .. } | NodeKind::Plotter { x, y, .. } => {
                 *x += dx;
                 *y += dy;
             }
@@ -2389,7 +2747,8 @@ impl Node {
         let w = (bounds.x1 - bounds.x0).max(1.0);
         let h = (bounds.y1 - bounds.y0).max(1.0);
         match &mut self.kind {
-            NodeKind::Rect { x, y, w: rw, h: rh, .. } => {
+            NodeKind::Rect { x, y, w: rw, h: rh, .. }
+            | NodeKind::Plotter { x, y, w: rw, h: rh, .. } => {
                 *x = bounds.x0;
                 *y = bounds.y0;
                 *rw = w;
@@ -2447,54 +2806,133 @@ impl Node {
         n
     }
 
-    /// Flip the node horizontally (mirror across vertical centre axis).
+    /// Flip the node horizontally (mirror across vertical centre of its bounds).
     pub fn flip_h(&mut self) {
         let b = self.bounds();
         let cx = (b.x0 + b.x1) * 0.5;
+        self.flip_h_about(cx);
+    }
+
+    /// Flip the node vertically (mirror across horizontal centre of its bounds).
+    pub fn flip_v(&mut self) {
+        let b = self.bounds();
+        let cy = (b.y0 + b.y1) * 0.5;
+        self.flip_v_about(cy);
+    }
+
+    /// Mirror across the vertical line `x = axis_x` (left ↔ right).
+    pub fn flip_h_about(&mut self, axis_x: f64) {
         match &mut self.kind {
             NodeKind::Path { path } => {
-                path.mirror_horizontal(cx);
+                path.mirror_horizontal(axis_x);
             }
             NodeKind::BrushStroke { points } => {
                 for pt in points.iter_mut() {
-                    pt.0[0] = 2.0 * cx - pt.0[0];
+                    pt.0[0] = 2.0 * axis_x - pt.0[0];
                 }
                 points.reverse();
             }
             NodeKind::Image { x, width, .. } => {
-                *x = 2.0 * cx - *x - *width;
+                *x = 2.0 * axis_x - *x - *width;
             }
-            // Ellipse/Polygon/Rect/Arc are symmetric — flip is a no-op for shape
-            // but we still need to adjust position for Rect
-            NodeKind::Rect { x, w, .. } => {
-                *x = 2.0 * cx - *x - *w;
+            NodeKind::Rect { x, w, .. } | NodeKind::Plotter { x, w, .. } => {
+                *x = 2.0 * axis_x - *x - *w;
             }
-            _ => {}
+            NodeKind::Ellipse { cx, .. } => {
+                *cx = 2.0 * axis_x - *cx;
+            }
+            NodeKind::Polygon {
+                cx, rotation_rad, ..
+            } => {
+                *cx = 2.0 * axis_x - *cx;
+                // Reflect orientation: θ → π − θ
+                *rotation_rad = std::f64::consts::PI - *rotation_rad;
+            }
+            NodeKind::Arc {
+                cx,
+                start_angle_rad,
+                sweep_angle_rad,
+                ..
+            } => {
+                *cx = 2.0 * axis_x - *cx;
+                // Mirror polar angles: θ → π − θ; preserve sweep magnitude.
+                let end = *start_angle_rad + *sweep_angle_rad;
+                *start_angle_rad = std::f64::consts::PI - end;
+                // sweep stays the same: end'−start' = (π−start)−(π−end) = end−start
+            }
+            NodeKind::Text { x, .. } => {
+                *x = 2.0 * axis_x - *x;
+            }
+            NodeKind::FlowchartNode { cx, .. } => {
+                *cx = 2.0 * axis_x - *cx;
+            }
+            NodeKind::FlowchartPath { path } => {
+                for p in &mut path.points {
+                    p.0 = 2.0 * axis_x - p.0;
+                }
+                path.points.reverse();
+            }
+            NodeKind::Group { .. } => {}
         }
+        // Keep rotation metadata consistent with mirrored geometry.
+        self.transform.rotation_rad = std::f64::consts::PI - self.transform.rotation_rad;
     }
 
-    /// Flip the node vertically (mirror across horizontal centre axis).
-    pub fn flip_v(&mut self) {
-        let b = self.bounds();
-        let cy = (b.y0 + b.y1) * 0.5;
+    /// Mirror across the horizontal line `y = axis_y` (top ↔ bottom).
+    pub fn flip_v_about(&mut self, axis_y: f64) {
         match &mut self.kind {
             NodeKind::Path { path } => {
-                path.mirror_vertical(cy);
+                path.mirror_vertical(axis_y);
             }
             NodeKind::BrushStroke { points } => {
                 for pt in points.iter_mut() {
-                    pt.0[1] = 2.0 * cy - pt.0[1];
+                    pt.0[1] = 2.0 * axis_y - pt.0[1];
                 }
                 points.reverse();
             }
             NodeKind::Image { y, height, .. } => {
-                *y = 2.0 * cy - *y - *height;
+                *y = 2.0 * axis_y - *y - *height;
             }
-            NodeKind::Rect { y, h, .. } => {
-                *y = 2.0 * cy - *y - *h;
+            NodeKind::Rect { y, h, .. } | NodeKind::Plotter { y, h, .. } => {
+                *y = 2.0 * axis_y - *y - *h;
             }
-            _ => {}
+            NodeKind::Ellipse { cy, .. } => {
+                *cy = 2.0 * axis_y - *cy;
+            }
+            NodeKind::Polygon {
+                cy, rotation_rad, ..
+            } => {
+                *cy = 2.0 * axis_y - *cy;
+                // Reflect orientation: θ → −θ
+                *rotation_rad = -*rotation_rad;
+            }
+            NodeKind::Arc {
+                cy,
+                start_angle_rad,
+                sweep_angle_rad,
+                ..
+            } => {
+                *cy = 2.0 * axis_y - *cy;
+                // Mirror polar angles: θ → −θ
+                let end = *start_angle_rad + *sweep_angle_rad;
+                *start_angle_rad = -end;
+                // sweep' = (−start) − (−end) = end − start = sweep
+            }
+            NodeKind::Text { y, .. } => {
+                *y = 2.0 * axis_y - *y;
+            }
+            NodeKind::FlowchartNode { cy, .. } => {
+                *cy = 2.0 * axis_y - *cy;
+            }
+            NodeKind::FlowchartPath { path } => {
+                for p in &mut path.points {
+                    p.1 = 2.0 * axis_y - p.1;
+                }
+                path.points.reverse();
+            }
+            NodeKind::Group { .. } => {}
         }
+        self.transform.rotation_rad = -self.transform.rotation_rad;
     }
 
     pub fn node_points(&self) -> Vec<(f64, f64)> {
@@ -2510,6 +2948,7 @@ impl Node {
                 | (NodeKind::Polygon { .. }, 0)
                 | (NodeKind::Image { .. }, 0)
                 | (NodeKind::Arc { .. }, 0)
+                | (NodeKind::Plotter { .. }, 0)
         )
     }
 
@@ -2634,7 +3073,7 @@ impl Node {
 
     pub fn edit_handles(&self) -> Vec<(f64, f64)> {
         match &self.kind {
-            NodeKind::Rect { x, y, w, h, .. } => vec![
+            NodeKind::Rect { x, y, w, h, .. } | NodeKind::Plotter { x, y, w, h, .. } => vec![
                 (*x + *w * 0.5, *y + *h * 0.5),
                 (*x, *y),
                 (*x + *w, *y),
@@ -2691,7 +3130,8 @@ impl Node {
     pub fn set_edit_handle(&mut self, index: usize, x: f64, y: f64) {
         let circle = self.is_circle();
         match &mut self.kind {
-            NodeKind::Rect { x: rx, y: ry, w, h, .. } => match index {
+            NodeKind::Rect { x: rx, y: ry, w, h, .. }
+            | NodeKind::Plotter { x: rx, y: ry, w, h, .. } => match index {
                 0 => {
                     *rx = x - *w * 0.5;
                     *ry = y - *h * 0.5;
@@ -2822,6 +3262,26 @@ impl Node {
     pub fn get_geom_floats(&self) -> Vec<f64> {
         let mut v = match &self.kind {
             NodeKind::Rect { w, h, rx, .. } => vec![*w, *h, *rx],
+            NodeKind::Plotter {
+                w,
+                h,
+                domain_min,
+                domain_max,
+                range_min,
+                range_max,
+                margin_pct,
+                plot_stroke_width,
+                ..
+            } => vec![
+                *w,
+                *h,
+                *domain_min,
+                *domain_max,
+                *range_min,
+                *range_max,
+                *margin_pct,
+                *plot_stroke_width as f64,
+            ],
             NodeKind::Ellipse { rx, ry, .. } => vec![*rx, *ry],
             NodeKind::Polygon { r, sides, rotation_rad, .. } => vec![*r, *sides as f64, *rotation_rad],
             NodeKind::Arc { radius, start_angle_rad, sweep_angle_rad, .. } => vec![*radius, *start_angle_rad, *sweep_angle_rad],
@@ -2897,6 +3357,7 @@ impl Node {
         }
         let base_len = match &self.kind {
             NodeKind::Rect { .. } => 3,
+            NodeKind::Plotter { .. } => 8,
             NodeKind::Ellipse { .. } => 2,
             NodeKind::Polygon { .. } => 3,
             NodeKind::Arc { .. } => 3,
@@ -2910,6 +3371,28 @@ impl Node {
                     *w = floats[0];
                     *h = floats[1];
                     *rx = floats[2];
+                }
+            }
+            NodeKind::Plotter {
+                w,
+                h,
+                domain_min,
+                domain_max,
+                range_min,
+                range_max,
+                margin_pct,
+                plot_stroke_width,
+                ..
+            } => {
+                if floats.len() >= 8 {
+                    *w = floats[0].max(1.0);
+                    *h = floats[1].max(1.0);
+                    *domain_min = floats[2];
+                    *domain_max = floats[3];
+                    *range_min = floats[4];
+                    *range_max = floats[5];
+                    *margin_pct = floats[6].clamp(0.0, 200.0);
+                    *plot_stroke_width = floats[7].max(0.0) as f32;
                 }
             }
             NodeKind::Ellipse { rx, ry, .. } => {

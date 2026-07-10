@@ -1,6 +1,8 @@
 use undo::{Edit, Record};
 
-use crate::document::{Document, Node, NodeId, ProjectFile, AnimationTimeline};
+use crate::document::{
+    AnimationTimeline, Document, Node, NodeAnimation, NodeId, ProjectFile,
+};
 
 pub const DEFAULT_UNDO_LIMIT: usize = 30;
 
@@ -13,6 +15,8 @@ pub enum ProjectEdit {
     PatchNodes { patches: Vec<(NodeId, Node, Node)> },
     RemoveNodes {
         removed: Vec<(NodeId, Node)>,
+        /// Animation tracks removed with the nodes (restored on undo).
+        removed_anims: Vec<(NodeId, NodeAnimation)>,
         layer_index: usize,
         layer_nodes_before: Vec<NodeId>,
     },
@@ -147,12 +151,20 @@ fn apply_forward(cmd: &ProjectEdit, project: &mut ProjectFile) {
         ProjectEdit::InsertNodesApplied { .. } => {}
         ProjectEdit::RemoveNodes {
             removed,
+            removed_anims,
             layer_index,
             layer_nodes_before,
         } => {
             let gone: std::collections::HashSet<_> = removed.iter().map(|(id, _)| *id).collect();
             for (id, _) in removed {
                 project.nodes.remove(*id);
+            }
+            for (id, _) in removed_anims {
+                project.anim_timeline.nodes.remove(id);
+            }
+            // Belt-and-suspenders: any leftover tracks for deleted ids.
+            for id in &gone {
+                project.anim_timeline.nodes.remove(id);
             }
             if let Some(layer) = project.document.layers.get_mut(*layer_index) {
                 layer.nodes = layer_nodes_before
@@ -216,6 +228,7 @@ fn apply_inverse(cmd: &ProjectEdit, project: &mut ProjectFile) {
         }
         ProjectEdit::RemoveNodes {
             removed,
+            removed_anims,
             layer_index,
             layer_nodes_before,
         } => {
@@ -224,6 +237,9 @@ fn apply_inverse(cmd: &ProjectEdit, project: &mut ProjectFile) {
             }
             for (id, node) in removed {
                 project.nodes.map.insert(*id, node.clone());
+            }
+            for (id, anim) in removed_anims {
+                project.anim_timeline.nodes.insert(*id, anim.clone());
             }
         }
         ProjectEdit::PatchNode { id, before, .. } => {

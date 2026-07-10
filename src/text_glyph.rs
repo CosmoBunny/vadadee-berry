@@ -334,5 +334,50 @@ pub fn draw_text_glyphs(
         painter.add(Shape::mesh(mesh));
     }
 
+    // Soft anti-aliased edge: thin feathered outline of the glyph path (lyon meshes are hard-edged).
+    // Slightly expands the silhouette so text/line edges are not staircased.
+    let edge_w = 0.9_f32;
+    let edge_color = if fill.is_visible() {
+        let c = sample_paint_fill(fill, opacity * 0.55, 0.5, 0.5);
+        c
+    } else if stroke_style.is_visible() {
+        sample_paint_fill(stroke_style, opacity * 0.55, 0.5, 0.5)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    if edge_color.a() > 0 {
+        if let Some(edge) = tessellate_stroke_mesh(
+            &path,
+            &Fill::Solid(crate::document::Paint {
+                rgba: [
+                    edge_color.r() as f32 / 255.0,
+                    edge_color.g() as f32 / 255.0,
+                    edge_color.b() as f32 / 255.0,
+                    edge_color.a() as f32 / 255.0,
+                ],
+            }),
+            1.0,
+            edge_w,
+            LineJoin::Round,
+            LineCap::Round,
+            tolerance * 0.6,
+        ) {
+            let mut edge = edge;
+            if rotation_rad.abs() > 1e-9 {
+                let center = bbox.center();
+                let c = rotation_rad.cos() as f32;
+                let s = rotation_rad.sin() as f32;
+                for v in &mut edge.vertices {
+                    let dx = v.pos.x - center.x;
+                    let dy = v.pos.y - center.y;
+                    v.pos.x = center.x + dx * c - dy * s;
+                    v.pos.y = center.y + dx * s + dy * c;
+                }
+            }
+            // Draw edge under fill for AA halo, after stroke so it softens both.
+            painter.add(Shape::mesh(edge));
+        }
+    }
+
     true
 }

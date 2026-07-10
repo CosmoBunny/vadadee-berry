@@ -51,7 +51,10 @@ impl SpatialIndex {
         let pairs: Vec<((i32, i32), NodeId)> = flat_order
             .par_iter()
             .flat_map(|id| {
-                if hidden.contains(id) {
+                // Keep circular/tiling/on-path sources indexable even when hide_source.
+                if hidden.contains(id)
+                    && !crate::document::is_pickable_effect_source(&project.document, *id)
+                {
                     return vec![];
                 }
                 let Some(node) = project.nodes.get(*id) else {
@@ -96,13 +99,23 @@ impl SpatialIndex {
         let mut bbox_only: Option<NodeId> = None;
         let candidates = self.candidates_near(doc, slop);
         for id in candidates.into_iter().rev() {
-            if hidden.contains(&id) {
+            if hidden.contains(&id)
+                && !crate::document::is_pickable_effect_source(&project.document, id)
+            {
                 continue;
             }
             let Some(node) = project.nodes.get(id) else {
                 continue;
             };
-            let does_hit = if node_uses_extended_bounds(id) {
+            // Prefer precise circular-instance hit when applicable.
+            let does_hit = if let Some(e) = project
+                .document
+                .circular_effects
+                .values()
+                .find(|e| e.source_id == id)
+            {
+                crate::document::hit_test_circular_clone(node, e, doc.0, doc.1, slop)
+            } else if node_uses_extended_bounds(id) {
                 let eb =
                     crate::document::get_effective_bounds(node, &project.document, &project.nodes);
                 let pt = kurbo::Point::new(doc.0, doc.1);
@@ -114,7 +127,13 @@ impl SpatialIndex {
                 continue;
             }
             let pt = kurbo::Point::new(doc.0, doc.1);
-            let precise = if node_uses_extended_bounds(id) {
+            let precise = if node_uses_extended_bounds(id)
+                || project
+                    .document
+                    .circular_effects
+                    .values()
+                    .any(|e| e.source_id == id)
+            {
                 true
             } else {
                 node.bez_path().contains(pt)
@@ -179,7 +198,13 @@ impl SpatialIndex {
             for cx in x0..=x1 {
                 if let Some(ids) = self.cells.get(&(cx, cy)) {
                     for id in ids {
-                        if seen.insert(*id) && !hidden.contains(id) {
+                        if seen.insert(*id)
+                            && (!hidden.contains(id)
+                                || crate::document::is_pickable_effect_source(
+                                    &project.document,
+                                    *id,
+                                ))
+                        {
                             if let Some(node) = project.nodes.get(*id) {
                                 let b = crate::document::spatial_index_bounds(
                                     node,

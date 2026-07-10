@@ -177,20 +177,59 @@ impl StackAnimationFunction {
         let mut g = 0.0;
         let mut b = 0.0;
         let mut a = 1.0;
+        let mut have_x = false;
+        let mut have_y = false;
         for ch in &self.channels {
             match ch.track.as_str() {
-                "pos_x" => x = ch.start_value,
-                "pos_y" => y = ch.start_value,
+                "pos_x" => {
+                    x = ch.start_value;
+                    have_x = true;
+                }
+                "pos_y" => {
+                    y = ch.start_value;
+                    have_y = true;
+                }
                 "color_r" => r = ch.start_value,
                 "color_g" => g = ch.start_value,
                 "color_b" => b = ch.start_value,
                 "color_a" => a = ch.start_value,
+                // Path geom: 6 floats/pt (X,Y,OutX,OutY,InX,InY). Brush: 3 (X,Y,W).
+                // Expose first X-like / Y-like channel as formula vars x / y (for Pt stacks).
+                t if t.starts_with("geom_") => {
+                    if let Ok(idx) = t["geom_".len()..].parse::<usize>() {
+                        // Path mod-6: 0/2/4 = X components, 1/3/5 = Y.
+                        // Brush mod-3: 0=X, 1=Y (2=W ignored for x/y).
+                        let (is_x, is_y) = match idx % 6 {
+                            0 | 2 | 4 => (true, false),
+                            1 | 3 | 5 => (false, true),
+                            _ => (false, false),
+                        };
+                        if is_x && !have_x {
+                            x = ch.start_value;
+                            have_x = true;
+                        } else if is_y && !have_y {
+                            y = ch.start_value;
+                            have_y = true;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
-        // Single-channel stacks: expose start as x as well.
-        if self.channels.len() == 1 {
-            x = self.channels[0].start_value;
+        // Channel-order fallback: 1st → x, 2nd → y (common for Pt X / Pt Y pairs).
+        if !have_x {
+            if let Some(ch) = self.channels.first() {
+                x = ch.start_value;
+                have_x = true;
+            }
+        }
+        if !have_y {
+            if let Some(ch) = self.channels.get(1) {
+                y = ch.start_value;
+            } else if have_x && self.channels.len() == 1 {
+                // Single channel: also expose as y so y matches s/x when useful.
+                y = x;
+            }
         }
         (x, y, r, g, b, a)
     }
@@ -266,10 +305,24 @@ pub struct NodeAnimation {
     pub color_g: KeyframeTrack,
     pub color_b: KeyframeTrack,
     pub color_a: KeyframeTrack,
+    /// Stroke width (document units / px).
+    #[serde(default)]
+    pub stroke_width: KeyframeTrack,
+    #[serde(default)]
+    pub stroke_r: KeyframeTrack,
+    #[serde(default)]
+    pub stroke_g: KeyframeTrack,
+    #[serde(default)]
+    pub stroke_b: KeyframeTrack,
+    #[serde(default)]
+    pub stroke_a: KeyframeTrack,
     #[serde(default)]
     pub geom_tracks: Vec<KeyframeTrack>,
     #[serde(default)]
     pub base_fill: Option<Fill>,
+    /// Base stroke paint (for solid / gradient tint while color tracks play).
+    #[serde(default)]
+    pub base_stroke: Option<Fill>,
     /// Formula-driven spans from the Graph Editor (override keyframes while active).
     #[serde(default)]
     pub stack_functions: Vec<StackAnimationFunction>,
@@ -286,12 +339,27 @@ impl NodeAnimation {
             "color_g" => Some(&mut self.color_g),
             "color_b" => Some(&mut self.color_b),
             "color_a" => Some(&mut self.color_a),
+            "stroke_width" => Some(&mut self.stroke_width),
+            "stroke_r" => Some(&mut self.stroke_r),
+            "stroke_g" => Some(&mut self.stroke_g),
+            "stroke_b" => Some(&mut self.stroke_b),
+            "stroke_a" => Some(&mut self.stroke_a),
             _ if label.starts_with("geom_") => {
                 let idx: usize = label["geom_".len()..].parse().ok()?;
+                // Grow geom tracks so stack/keyframe insert always works for Pt N.
+                if self.geom_tracks.len() <= idx {
+                    self.geom_tracks
+                        .resize_with(idx + 1, KeyframeTrack::default);
+                }
                 self.geom_tracks.get_mut(idx)
             }
             _ => None,
         }
+    }
+
+    /// Ensure a track slot exists (esp. geom_N for path points).
+    pub fn ensure_track(&mut self, label: &str) {
+        let _ = self.get_track_mut(label);
     }
 
     pub fn get_track(&self, label: &str) -> Option<&KeyframeTrack> {
@@ -304,6 +372,11 @@ impl NodeAnimation {
             "color_g" => Some(&self.color_g),
             "color_b" => Some(&self.color_b),
             "color_a" => Some(&self.color_a),
+            "stroke_width" => Some(&self.stroke_width),
+            "stroke_r" => Some(&self.stroke_r),
+            "stroke_g" => Some(&self.stroke_g),
+            "stroke_b" => Some(&self.stroke_b),
+            "stroke_a" => Some(&self.stroke_a),
             _ if label.starts_with("geom_") => {
                 let idx: usize = label["geom_".len()..].parse().ok()?;
                 self.geom_tracks.get(idx)
@@ -436,6 +509,44 @@ impl NodeAnimation {
         let before = self.stack_functions.len();
         self.stack_functions.retain(|s| s.id != id);
         self.stack_functions.len() != before
+    }
+
+    /// Remove a stack and the start/end keyframes it generated on its channels.
+    /// Remaining stacks re-get their endpoint anchors afterward.
+    pub fn remove_stack_function_with_keyframes(&mut self, id: Uuid) -> bool {
+        let Some(sf) = self.stack_functions.iter().find(|s| s.id == id).cloned() else {
+            return false;
+        };
+        let start = sf.start_frame;
+        let end = sf.end_frame();
+        let tracks: Vec<String> = sf.channels.iter().map(|c| c.track.clone()).collect();
+        self.stack_functions.retain(|s| s.id != id);
+
+        // Frames that remaining stacks still need as anchors (keep those).
+        let mut keep: std::collections::HashSet<(String, usize)> =
+            std::collections::HashSet::new();
+        for other in &self.stack_functions {
+            let oe = other.end_frame();
+            for ch in &other.channels {
+                keep.insert((ch.track.clone(), other.start_frame));
+                keep.insert((ch.track.clone(), oe));
+            }
+        }
+
+        for track in &tracks {
+            if let Some(tr) = self.get_track_mut(track) {
+                tr.keyframes.retain(|kf| {
+                    let is_stack_end = kf.frame == start || kf.frame == end;
+                    if !is_stack_end {
+                        return true;
+                    }
+                    keep.contains(&(track.clone(), kf.frame))
+                });
+            }
+        }
+        self.ensure_stack_start_keyframes();
+        self.ensure_stack_end_keyframes();
+        true
     }
 }
 

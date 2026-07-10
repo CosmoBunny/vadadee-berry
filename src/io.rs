@@ -347,6 +347,31 @@ pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> 
         NodeKind::Rect { x, y, w, h, rx } => format!(
             r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" {fill} {stroke} opacity="{op}"/>"#,
         ),
+        NodeKind::Plotter { x, y, w, h, plot_stroke_rgba, plot_stroke_width, .. } => {
+            let mut s = format!(
+                r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" {fill} {stroke} opacity="{op}"/>"#
+            );
+            if let Some((pts, _, _)) = node.plotter_polyline() {
+                if pts.len() >= 2 {
+                    let mut d = String::new();
+                    for (i, (px, py)) in pts.iter().enumerate() {
+                        if i == 0 {
+                            d.push_str(&format!("M{px} {py}"));
+                        } else {
+                            d.push_str(&format!(" L{px} {py}"));
+                        }
+                    }
+                    let pr = (plot_stroke_rgba[0] * 255.0) as u8;
+                    let pg = (plot_stroke_rgba[1] * 255.0) as u8;
+                    let pb = (plot_stroke_rgba[2] * 255.0) as u8;
+                    let pa = plot_stroke_rgba[3];
+                    s.push_str(&format!(
+                        r#"<path d="{d}" fill="none" stroke="rgba({pr},{pg},{pb},{pa})" stroke-width="{plot_stroke_width}" opacity="{op}"/>"#
+                    ));
+                }
+            }
+            s
+        }
         NodeKind::Ellipse { cx, cy, rx, ry } => format!(
             r#"<ellipse cx="{cx}" cy="{cy}" rx="{rx}" ry="{ry}" {fill} {stroke} opacity="{op}"/>"#,
         ),

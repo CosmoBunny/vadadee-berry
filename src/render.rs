@@ -529,6 +529,20 @@ fn stroke_bez_lyon_mesh(
     Some(mesh)
 }
 
+/// Paint a lyon stroke mesh plus a soft AA fringe via a wider, translucent second pass.
+pub fn paint_stroke_mesh_with_aa(painter: &Painter, mesh: Mesh, fringe_color: Color32, fringe_width_boost: f32) {
+    // Soft underlay first (slightly expanded visually via thicker alternative path is not available
+    // on mesh; approximate with a second mesh draw at reduced alpha when caller passes fringe).
+    if fringe_color.a() > 0 && fringe_width_boost > 0.0 {
+        let mut soft = mesh.clone();
+        for v in &mut soft.vertices {
+            v.color = fringe_color;
+        }
+        painter.add(Shape::mesh(soft));
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
 /// Like `bez_to_lyon_path`, but ensures closed subpaths call `close()` so joins form at the seam.
 fn bez_to_lyon_path_for_stroke(
     bez: &BezPath,
@@ -599,12 +613,29 @@ fn draw_feathered_polyline_stroke(
     if screen_pts.len() < 2 || (closed && screen_pts.len() < 3) {
         return;
     }
+    // Core stroke (egui PathShape applies edge feathering / AA).
     painter.add(Shape::Path(PathShape {
         points: screen_pts.to_vec(),
         closed,
         fill: Color32::TRANSPARENT,
         stroke: PathStroke::new(width, color),
     }));
+    // Extra soft halo (~1px) reduces stairstepping on thin or diagonal lines.
+    if width < 8.0 {
+        let a = color.a() as f32 / 255.0;
+        let soft = Color32::from_rgba_unmultiplied(
+            color.r(),
+            color.g(),
+            color.b(),
+            ((a * 0.35) * 255.0) as u8,
+        );
+        painter.add(Shape::Path(PathShape {
+            points: screen_pts.to_vec(),
+            closed,
+            fill: Color32::TRANSPARENT,
+            stroke: PathStroke::new((width + 1.25).max(1.5), soft),
+        }));
+    }
 }
 
 fn bez_to_lyon_path(bez: &BezPath, viewport: &Viewport, origin: Pos2) -> Path {
@@ -1461,6 +1492,12 @@ fn bez_to_feathered_stroke_shapes(
     width: f32,
     color: Color32,
 ) -> Vec<Shape> {
+    // Soft outer stroke first (underlay) for extra AA on diagonals.
+    let soft_a = (color.a() as f32 / 255.0 * 0.32 * 255.0) as u8;
+    let soft = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), soft_a);
+    let soft_w = (width + 1.15).max(width * 1.15);
+    let path_stroke_soft = PathStroke::new(soft_w, soft);
+    let line_stroke_soft = Stroke::new(soft_w, soft);
     let path_stroke = PathStroke::new(width, color);
     let line_stroke = Stroke::new(width, color);
     let map = |x: f64, y: f64| doc_to_screen_pos(viewport, origin, x, y);
@@ -1479,6 +1516,7 @@ fn bez_to_feathered_stroke_shapes(
                 let to = map(p.x, p.y);
                 if let Some(from) = pen {
                     if from.distance(to) > 1e-4 {
+                        shapes.push(Shape::line_segment([from, to], line_stroke_soft));
                         shapes.push(Shape::line_segment([from, to], line_stroke));
                     }
                 }
@@ -1486,9 +1524,18 @@ fn bez_to_feathered_stroke_shapes(
             }
             PathEl::QuadTo(p1, p2) => {
                 let from = pen.unwrap_or_else(|| map(p1.x, p1.y));
+                let pts = [from, map(p1.x, p1.y), map(p2.x, p2.y)];
                 shapes.push(Shape::QuadraticBezier(
                     QuadraticBezierShape::from_points_stroke(
-                        [from, map(p1.x, p1.y), map(p2.x, p2.y)],
+                        pts,
+                        false,
+                        Color32::TRANSPARENT,
+                        path_stroke_soft.clone(),
+                    ),
+                ));
+                shapes.push(Shape::QuadraticBezier(
+                    QuadraticBezierShape::from_points_stroke(
+                        pts,
                         false,
                         Color32::TRANSPARENT,
                         path_stroke.clone(),
@@ -1498,8 +1545,15 @@ fn bez_to_feathered_stroke_shapes(
             }
             PathEl::CurveTo(p1, p2, p3) => {
                 let from = pen.unwrap_or_else(|| map(p1.x, p1.y));
+                let pts = [from, map(p1.x, p1.y), map(p2.x, p2.y), map(p3.x, p3.y)];
                 shapes.push(Shape::CubicBezier(CubicBezierShape::from_points_stroke(
-                    [from, map(p1.x, p1.y), map(p2.x, p2.y), map(p3.x, p3.y)],
+                    pts,
+                    false,
+                    Color32::TRANSPARENT,
+                    path_stroke_soft.clone(),
+                )));
+                shapes.push(Shape::CubicBezier(CubicBezierShape::from_points_stroke(
+                    pts,
                     false,
                     Color32::TRANSPARENT,
                     path_stroke.clone(),
@@ -1509,6 +1563,7 @@ fn bez_to_feathered_stroke_shapes(
             PathEl::ClosePath => {
                 if let Some(from) = pen {
                     if from.distance(subpath_start) > 1e-4 {
+                        shapes.push(Shape::line_segment([from, subpath_start], line_stroke_soft));
                         shapes.push(Shape::line_segment([from, subpath_start], line_stroke));
                     }
                 }
@@ -1679,6 +1734,99 @@ pub fn draw_node(
             if let Some(sw) = stroke_w {
                 if !has_fill || !stroke_behind {
                     draw_r_stroke(painter, sw);
+                }
+            }
+        }
+        NodeKind::Plotter {
+            x,
+            y,
+            w,
+            h,
+            plot_stroke_width,
+            plot_stroke_rgba,
+            ..
+        } => {
+            let tl = viewport.doc_to_screen((*x, *y), origin);
+            let br = viewport.doc_to_screen((x + w, y + h), origin);
+            let r = Rect::from_min_max(tl, br);
+            let has_fill = fill.is_visible();
+            let draw_r_stroke = |painter: &Painter, sw: f32| {
+                draw_rect_stroke(
+                    painter,
+                    viewport,
+                    origin,
+                    r,
+                    (*x, *y, x + w, y + h),
+                    0.0,
+                    stroke_style,
+                    opacity,
+                    sw,
+                    0.0,
+                    stroke_join,
+                    stroke_cap,
+                );
+            };
+            if let Some(sw) = stroke_w {
+                if has_fill && stroke_behind {
+                    draw_r_stroke(painter, sw);
+                }
+            }
+            if has_fill {
+                draw_shape_fill(
+                    painter,
+                    viewport,
+                    origin,
+                    fill,
+                    opacity,
+                    r,
+                    (*x, *y, x + w, y + h),
+                    0.0,
+                    0.0,
+                );
+            }
+            if let Some(sw) = stroke_w {
+                if !has_fill || !stroke_behind {
+                    draw_r_stroke(painter, sw);
+                }
+            }
+            // Plot curve clipped to region
+            if let Some((pts, _, _)) = node.plotter_polyline() {
+                if pts.len() >= 2 && *plot_stroke_width > 0.05 {
+                    let mut screen_pts: Vec<Pos2> = pts
+                        .iter()
+                        .map(|&(px, py)| viewport.doc_to_screen((px, py), origin))
+                        .collect();
+                    // Clip soft: only draw segments that overlap the rect expanded a bit
+                    let clip = r.expand(2.0);
+                    let col = Color32::from_rgba_unmultiplied(
+                        (plot_stroke_rgba[0] * 255.0).clamp(0.0, 255.0) as u8,
+                        (plot_stroke_rgba[1] * 255.0).clamp(0.0, 255.0) as u8,
+                        (plot_stroke_rgba[2] * 255.0).clamp(0.0, 255.0) as u8,
+                        ((plot_stroke_rgba[3] * opacity).clamp(0.0, 1.0) * 255.0) as u8,
+                    );
+                    let sw = (*plot_stroke_width * viewport.zoom).max(0.5);
+                    // Drop points far outside (keeps auto-range overflow from painting whole canvas)
+                    screen_pts.retain(|p| {
+                        p.x >= clip.left() - r.width()
+                            && p.x <= clip.right() + r.width()
+                            && p.y >= clip.top() - r.height()
+                            && p.y <= clip.bottom() + r.height()
+                    });
+                    if screen_pts.len() >= 2 {
+                        painter.add(egui::Shape::line(
+                            screen_pts,
+                            egui::Stroke::new(sw, col),
+                        ));
+                    }
+                    // Region outline when no object stroke (subtle)
+                    if stroke_w.is_none() {
+                        painter.rect_stroke(
+                            r,
+                            0.0,
+                            egui::Stroke::new(1.0, Color32::from_white_alpha(40)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
                 }
             }
         }
@@ -2217,10 +2365,21 @@ pub fn selection_union_screen_rect(
         }
         let mut b = node.bounds_with_store(nodes);
         if let Some(e) = tiling_effects.values().find(|e| e.source_id == *id) {
-            b = b.union(crate::document::compute_tiling_whole_bounds(node, e));
+            let whole = crate::document::compute_tiling_whole_bounds(node, e);
+            b = if e.hide_source {
+                whole
+            } else {
+                b.union(whole)
+            };
         }
         if let Some(e) = circular_effects.values().find(|e| e.source_id == *id) {
-            b = b.union(crate::document::compute_circular_whole_bounds(node, e));
+            let whole = crate::document::compute_circular_whole_bounds(node, e);
+            // Don't keep the hidden source's old bbox edge glued to the selection box.
+            b = if e.hide_source {
+                whole
+            } else {
+                b.union(whole)
+            };
         }
         union = Some(match union {
             None => b,
@@ -2354,13 +2513,18 @@ pub fn draw_nodes(
             raw_node.clone()
         };
 
-        // Simple screen-space culling to reduce work for off-viewport nodes (helps with large diagrams / many small objects).
-        let b = node.bounds();
-        let tl = viewport.doc_to_screen((b.x0, b.y0), origin);
-        let br = viewport.doc_to_screen((b.x1, b.y1), origin);
-        let nr = egui::Rect::from_min_max(egui::pos2(tl.x as f32, tl.y as f32), egui::pos2(br.x as f32, br.y as f32));
-        if !painter.clip_rect().intersects(nr) {
-            continue;
+        // Groups use child union bounds (plain bounds() is ZERO → false top-left handle).
+        let b = node.bounds_with_store(nodes);
+        if b.width() > 1e-9 || b.height() > 1e-9 {
+            let tl = viewport.doc_to_screen((b.x0, b.y0), origin);
+            let br = viewport.doc_to_screen((b.x1, b.y1), origin);
+            let nr = egui::Rect::from_min_max(
+                egui::pos2(tl.x as f32, tl.y as f32),
+                egui::pos2(br.x as f32, br.y as f32),
+            );
+            if !painter.clip_rect().intersects(nr) {
+                continue;
+            }
         }
 
         if let NodeKind::Group { children } = &node.kind {
@@ -2922,44 +3086,30 @@ pub fn draw_circular_effects(
     for effect in effects.values() {
         let Some(source) = nodes.get(effect.source_id) else { continue; };
         let src_face: &dyn FaceRenderable = source;
-        let dx = effect.base_x - effect.origin_x;
-        let dy = effect.base_y - effect.origin_y;
-        let r = dx.hypot(dy).max(1.0);
-        let base_ang = dy.atan2(dx);
         let n = effect.copies.max(3);
         for i in 0..n {
-            let ang = base_ang + (i as f64 / n as f64) * std::f64::consts::TAU + effect.angle_offset.to_radians();
-            let x = effect.origin_x + r * ang.cos();
-            let y = effect.origin_y + r * ang.sin();
-            let pl = crate::document::PathPlacement {
-                x,
-                y,
-                angle_rad: ang,
-                scale: 1.0,
-                opacity_mul: 1.0,
-            };
+            let pl = effect.path_placement(i);
             let inst = node_at_placement(src_face, &pl);
             draw_node(painter, &inst, viewport, origin, false, fonts, image_textures);
         }
         if selection.contains(&effect.source_id) {
             let p0 = viewport.doc_to_screen((effect.base_x, effect.base_y), origin);
             let p1 = viewport.doc_to_screen((effect.origin_x, effect.origin_y), origin);
-            // compute p2 as one step
-            let dx = effect.base_x - effect.origin_x;
-            let dy = effect.base_y - effect.origin_y;
-            let r = dx.hypot(dy).max(1.0);
-            let base_ang = dy.atan2(dx);
-            let ang1 = base_ang + (std::f64::consts::TAU / effect.copies.max(3) as f64) + effect.angle_offset.to_radians();
-            let p2x = effect.origin_x + r * ang1.cos();
-            let p2y = effect.origin_y + r * ang1.sin();
+            let (p2x, p2y) = effect.placement_xy(1.min(n.saturating_sub(1)));
             let p2 = viewport.doc_to_screen((p2x, p2y), origin);
             let col = Color32::from_rgb(255, 165, 0);
-            painter.line_segment([p0, p1], Stroke::new(2.0, col));
+            // Radius line (base ↔ origin) + angle sector (origin ↔ next copy).
+            painter.line_segment([p0, p1], Stroke::new(2.5, col));
             painter.line_segment([p1, p2], Stroke::new(2.0, col));
-            painter.circle_filled(p0, 5.0, Color32::WHITE);
-            painter.circle_stroke(p0, 5.0, Stroke::new(1.5, col));
-            painter.circle_filled(p1, 5.0, Color32::WHITE);
-            painter.circle_stroke(p1, 5.0, Stroke::new(1.5, col));
+            // Base (object on ring) — larger white handle
+            painter.circle_filled(p0, 7.0, Color32::WHITE);
+            painter.circle_stroke(p0, 7.0, Stroke::new(2.0, col));
+            // Origin (center) — filled orange
+            painter.circle_filled(p1, 7.0, col);
+            painter.circle_stroke(p1, 7.0, Stroke::new(1.5, Color32::WHITE));
+            // Angle tip (next copy) — small white
+            painter.circle_filled(p2, 5.5, Color32::WHITE);
+            painter.circle_stroke(p2, 5.5, Stroke::new(1.5, col));
         }
     }
 }

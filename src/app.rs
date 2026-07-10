@@ -11,7 +11,7 @@ use crate::document::{
     node_uses_extended_pick_bounds, path_effect_by_form_node, path_effect_form_node_ids,
     path_effect_move_bundle, sync_path_effect_form_geometry, BezierHandleMode, Document,
     FaceRenderable, Fill, FillKind,
-    GradientStop, Node, NodeId, NodeKind, ObjectOnPathEffect, OnPathMode, Paint, PathData, PathMagic, PathPlacement, TilingEffect, CircularCloneEffect,
+    GradientStop, Node, NodeId, NodeKind, ObjectOnPathEffect, OnPathMode, Paint, PathData, PathMagic, PathPlacement, TilingEffect, CircularCloneEffect, CircularRotateMode,
     BooleanEffect, BooleanOpKind, ClipMaskEffect, is_booleanable_shape, is_raster_image,
     compute_boolean_bez,
     PathEditTarget, ProjectFile, Stroke, TextStyle, text_display_name,
@@ -91,6 +91,8 @@ pub struct AnimAppliedState {
     pub rotation: f64,
     pub opacity: f32,
     pub color: [f32; 4],
+    pub stroke_width: f32,
+    pub stroke_color: [f32; 4],
     pub geom_floats: Vec<f64>,
     pub fill: Fill,
 }
@@ -163,6 +165,14 @@ pub struct VadadeeBerryApp {
     pub anim_stack_formula_dialog: Option<(NodeId, uuid::Uuid, usize)>,
     /// In-progress formula text for [`Self::anim_stack_formula_dialog`] (not written until Apply).
     pub anim_stack_formula_draft: String,
+    /// Plotter formula dialog: node id (double-click expression in Geometry).
+    pub plotter_formula_dialog: Option<NodeId>,
+    /// Draft expression for [`Self::plotter_formula_dialog`].
+    pub plotter_formula_draft: String,
+    /// Inline Geometry-tab expression draft: (node_id, text). Avoids snap-back while typing.
+    pub plotter_inline_expr: Option<(NodeId, String)>,
+    /// Node snapshot when expression edit began (history committed on focus-lost / dialog Apply).
+    pub plotter_expr_edit_before: Option<(NodeId, Node)>,
     /// Objects tab rename dialog: (node_or_layer id, draft name, is_layer).
     pub object_rename_dialog: Option<(uuid::Uuid, String, bool)>,
     /// Horizontal pan for the animation graph editor (frame index at left edge).
@@ -214,6 +224,11 @@ pub struct VadadeeBerryApp {
     pub viewport: Viewport,
     pub tools: ToolState,
     pub selection: Vec<NodeId>,
+    /// Multi-hit picker: when several objects share the same click, show an overlay list.
+    /// `(screen_pos, candidate_ids)`.
+    pub hit_pick_menu: Option<(Pos2, Vec<NodeId>)>,
+    /// After choosing an object, ignore clicks on others until Esc / empty-space deselect.
+    pub selection_sticky: bool,
     pub history: History,
     pub ui_fill_stops: Vec<GradientStop>,
     pub ui_fill_stop_sel: usize,
@@ -303,6 +318,8 @@ pub struct VadadeeBerryApp {
     pub ui_circular_angle_offset: f64,
     pub ui_circular_origin_x: f64,
     pub ui_circular_origin_y: f64,
+    /// CircularClone instance orientation mode (static | rotate about origin).
+    pub ui_circular_rotate_mode: CircularRotateMode,
     pub ui_anim: UiAnimation,
     pub gradient_editor_focus: crate::gradient_ui::GradientEditorFocus,
     /// Cached textures for Image nodes (keyed by NodeId). Reloaded from .bytes on demand.
@@ -526,6 +543,8 @@ pub struct VideoExportState {
     pub total_frames: usize,
     /// 0 = auto from timeline/content; otherwise fixed export length in seconds.
     pub export_duration_secs: f32,
+    /// How many times to repeat the animation loop in the export (1 = once).
+    pub export_cycles: u32,
     pub restore_anim_frame: usize,
     pub frames_dir: Option<std::path::PathBuf>,
     pub output_path: Option<std::path::PathBuf>,
@@ -629,6 +648,7 @@ impl Default for VideoExportState {
             frame_done: 0,
             total_frames: 0,
             export_duration_secs: 0.0,
+            export_cycles: 1,
             restore_anim_frame: 0,
             frames_dir: None,
             output_path: None,
@@ -733,6 +753,10 @@ impl VadadeeBerryApp {
             anim_graph_stack_drag: None,
             anim_stack_formula_dialog: None,
             anim_stack_formula_draft: String::new(),
+            plotter_formula_dialog: None,
+            plotter_formula_draft: String::new(),
+            plotter_inline_expr: None,
+            plotter_expr_edit_before: None,
             object_rename_dialog: None,
             anim_graph_scroll: 0.0,
             anim_graph_visible_frames: 100.0,
@@ -767,6 +791,8 @@ impl VadadeeBerryApp {
                 ..Default::default()
             },
             selection: vec![],
+            hit_pick_menu: None,
+            selection_sticky: false,
             history: History::default(),
             ui_fill_stops: default_gradient_stops(),
             ui_fill_stop_sel: 0,
@@ -876,6 +902,7 @@ impl VadadeeBerryApp {
             ui_circular_angle_offset: 0.0,
             ui_circular_origin_x: 0.0,
             ui_circular_origin_y: 0.0,
+            ui_circular_rotate_mode: CircularRotateMode::ReferenceOrigin,
             ui_anim: {
                 let mut anim = UiAnimation::new();
                 anim.seed_status_board("Idle", 80.0, 56.0);
@@ -1926,6 +1953,157 @@ impl VadadeeBerryApp {
         );
     }
 
+    /// Move a path so its first anchor sits at `(ox, oy)` (Geometry origin for open/closed paths).
+    pub fn set_path_origin(&mut self, id: NodeId, ox: f64, oy: f64) {
+        let Some(before) = self.project.nodes.get(id).cloned() else {
+            return;
+        };
+        let mut after = before.clone();
+        let (cx, cy) = match &after.kind {
+            NodeKind::Path { path } if !path.points.is_empty() => {
+                (path.points[0][0], path.points[0][1])
+            }
+            NodeKind::FlowchartPath { path } if !path.points.is_empty() => {
+                (path.points[0].0, path.points[0].1)
+            }
+            _ => return,
+        };
+        let dx = ox - cx;
+        let dy = oy - cy;
+        if dx.abs() < 1e-12 && dy.abs() < 1e-12 {
+            return;
+        }
+        after.translate(dx, dy);
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchNode { id, before, after },
+        );
+        self.sync_anim_transform_from_node(id);
+    }
+
+    pub fn set_plotter_geometry(
+        &mut self,
+        id: NodeId,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        expr: String,
+        ref_axis: crate::document::PlotterRef,
+        domain_min: f64,
+        domain_max: f64,
+        range_min: f64,
+        range_max: f64,
+        auto_range: bool,
+        margin_pct: f64,
+        plot_stroke_width: f32,
+        plot_stroke_rgba: [f32; 4],
+    ) {
+        let Some(before) = self.project.nodes.get(id).cloned() else {
+            return;
+        };
+        let mut after = before.clone();
+        if let NodeKind::Plotter {
+            x: px,
+            y: py,
+            w: pw,
+            h: ph,
+            expr: pexpr,
+            ref_axis: pra,
+            domain_min: pd0,
+            domain_max: pd1,
+            range_min: pr0,
+            range_max: pr1,
+            auto_range: pauto,
+            margin_pct: pm,
+            plot_stroke_width: psw,
+            plot_stroke_rgba: pcol,
+            ..
+        } = &mut after.kind
+        {
+            *px = x;
+            *py = y;
+            *pw = w.max(1.0);
+            *ph = h.max(1.0);
+            *pexpr = expr;
+            *pra = ref_axis;
+            *pd0 = domain_min;
+            *pd1 = domain_max;
+            *pr0 = range_min;
+            *pr1 = range_max;
+            *pauto = auto_range;
+            *pm = margin_pct.clamp(0.0, 200.0);
+            *psw = plot_stroke_width.max(0.0);
+            *pcol = plot_stroke_rgba;
+        } else {
+            return;
+        }
+        if before == after {
+            return;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchNode { id, before, after },
+        );
+        self.sync_anim_transform_from_node(id);
+    }
+
+    /// Live-update plotter expression (no history) so the curve redraws while typing.
+    pub fn set_plotter_expr_live(&mut self, id: NodeId, expr: String) {
+        let Some(node) = self.project.nodes.get_mut(id) else {
+            return;
+        };
+        if let NodeKind::Plotter { expr: pe, .. } = &mut node.kind {
+            if *pe != expr {
+                *pe = expr;
+            }
+        }
+    }
+
+    /// Begin expression edit undo snapshot if not already open for this node.
+    pub fn begin_plotter_expr_edit(&mut self, id: NodeId) {
+        if matches!(self.plotter_expr_edit_before.as_ref(), Some((nid, _)) if *nid == id) {
+            return;
+        }
+        if let Some(node) = self.project.nodes.get(id).cloned() {
+            self.plotter_expr_edit_before = Some((id, node));
+        }
+    }
+
+    /// Commit one undo step for expression edits since [`begin_plotter_expr_edit`].
+    pub fn commit_plotter_expr_edit(&mut self, id: NodeId) {
+        let Some((bid, before)) = self.plotter_expr_edit_before.take() else {
+            return;
+        };
+        if bid != id {
+            self.plotter_expr_edit_before = Some((bid, before));
+            return;
+        }
+        let Some(after) = self.project.nodes.get(id).cloned() else {
+            return;
+        };
+        if before == after {
+            return;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchNode { id, before, after },
+        );
+    }
+
+    /// Cancel live expression edit and restore pre-edit node (e.g. dialog Cancel).
+    pub fn cancel_plotter_expr_edit(&mut self, id: NodeId) {
+        if let Some((bid, before)) = self.plotter_expr_edit_before.take() {
+            if bid == id {
+                if let Some(n) = self.project.nodes.get_mut(id) {
+                    *n = before;
+                }
+                return;
+            }
+            self.plotter_expr_edit_before = Some((bid, before));
+        }
+    }
+
     pub fn set_arc_geometry(
         &mut self,
         id: NodeId,
@@ -2055,10 +2233,15 @@ impl VadadeeBerryApp {
 
     pub fn get_max_animation_frame(&self) -> usize {
         let mut max_f = 0usize;
-        for anim in self.project.anim_timeline.nodes.values() {
+        // Only living nodes/layers — deleted objects leave orphan tracks otherwise.
+        for (id, anim) in &self.project.anim_timeline.nodes {
+            if !self.project.owns_animation_id(*id) {
+                continue;
+            }
             let tracks = [
                 &anim.pos_x, &anim.pos_y, &anim.rotation, &anim.opacity,
-                &anim.color_r, &anim.color_g, &anim.color_b, &anim.color_a
+                &anim.color_r, &anim.color_g, &anim.color_b, &anim.color_a,
+                &anim.stroke_width, &anim.stroke_r, &anim.stroke_g, &anim.stroke_b, &anim.stroke_a,
             ];
             for t in tracks {
                 if let Some(last) = t.keyframes.last() {
@@ -2095,6 +2278,11 @@ impl VadadeeBerryApp {
             max_f = 300; // default room (~5s @60fps) when project is empty
         }
         max_f
+    }
+
+    /// Drop animation tracks for nodes/layers that no longer exist.
+    pub fn prune_orphan_animation_tracks(&mut self) -> usize {
+        self.project.prune_orphan_animation_tracks()
     }
 
     pub fn animation_content_duration_secs(&self) -> f32 {
@@ -2161,6 +2349,8 @@ impl VadadeeBerryApp {
     }
 
     pub fn apply_animation_for_frame(&mut self, frame: usize) {
+        // Ignore (and drop) tracks whose object no longer exists.
+        let _ = self.project.prune_orphan_animation_tracks();
         // Collect node ids first so we can mutably sample stack functions (records formula errors).
         let node_ids: Vec<NodeId> = self.project.anim_timeline.nodes.keys().copied().collect();
         let mut updates: Vec<(
@@ -2168,6 +2358,8 @@ impl VadadeeBerryApp {
             Option<f64>,
             Option<f64>,
             Option<f64>,
+            Option<f32>,
+            Option<[f32; 4]>,
             Option<f32>,
             Option<[f32; 4]>,
             Option<Vec<f64>>,
@@ -2185,6 +2377,16 @@ impl VadadeeBerryApp {
             let b = track.sample_mut("color_b", frame);
             let a = track.sample_mut("color_a", frame);
             let color = if let (Some(r), Some(g), Some(b), Some(a)) = (r, g, b, a) {
+                Some([r as f32, g as f32, b as f32, a as f32])
+            } else {
+                None
+            };
+            let stroke_w = track.sample_mut("stroke_width", frame).map(|w| w as f32);
+            let sr = track.sample_mut("stroke_r", frame);
+            let sg = track.sample_mut("stroke_g", frame);
+            let sb = track.sample_mut("stroke_b", frame);
+            let sa = track.sample_mut("stroke_a", frame);
+            let stroke_color = if let (Some(r), Some(g), Some(b), Some(a)) = (sr, sg, sb, sa) {
                 Some([r as f32, g as f32, b as f32, a as f32])
             } else {
                 None
@@ -2212,10 +2414,21 @@ impl VadadeeBerryApp {
             } else {
                 None
             };
-            updates.push((node_id, x, y, rot, opacity, color, geom));
+            updates.push((node_id, x, y, rot, opacity, color, stroke_w, stroke_color, geom));
         }
 
-        for (node_id, target_x, target_y, target_rot, target_op, target_color, target_geom) in updates {
+        for (
+            node_id,
+            target_x,
+            target_y,
+            target_rot,
+            target_op,
+            target_color,
+            target_stroke_w,
+            target_stroke_col,
+            target_geom,
+        ) in updates
+        {
             if let Some(node) = self.project.nodes.get_mut(node_id) {
                 // Apply position
                 let (curr_x, curr_y) = node.get_pos();
@@ -2235,7 +2448,7 @@ impl VadadeeBerryApp {
                     node.set_opacity(op);
                 }
                 
-                // Apply color
+                // Apply fill color
                 if let Some(color) = target_color {
                     let mut base_fill = self.project.anim_timeline.nodes.get(&node_id)
                         .and_then(|track| track.base_fill.clone());
@@ -2269,6 +2482,52 @@ impl VadadeeBerryApp {
                         }
                     } else {
                         node.set_color(color);
+                    }
+                }
+
+                // Apply stroke width
+                if let Some(sw) = target_stroke_w {
+                    node.set_stroke_width(sw);
+                }
+
+                // Apply stroke color
+                if let Some(color) = target_stroke_col {
+                    let mut base_stroke = self
+                        .project
+                        .anim_timeline
+                        .nodes
+                        .get(&node_id)
+                        .and_then(|track| track.base_stroke.clone());
+                    if base_stroke.is_none() {
+                        base_stroke = Some(node.style.stroke.style.clone());
+                        if let Some(track) = self.project.anim_timeline.nodes.get_mut(&node_id) {
+                            track.base_stroke = base_stroke.clone();
+                        }
+                    }
+                    if let Some(mut bs) = base_stroke {
+                        match &mut bs {
+                            Fill::Solid(paint) => {
+                                paint.rgba = color;
+                                node.style.stroke.style = Fill::Solid(*paint);
+                            }
+                            Fill::LinearGradient { stops, .. }
+                            | Fill::RadialGradient { stops, .. } => {
+                                for stop in stops {
+                                    stop.color.rgba = [
+                                        stop.color.rgba[0] * color[0],
+                                        stop.color.rgba[1] * color[1],
+                                        stop.color.rgba[2] * color[2],
+                                        stop.color.rgba[3] * color[3],
+                                    ];
+                                }
+                                node.style.stroke.style = bs;
+                            }
+                            Fill::None => {
+                                node.set_stroke_color(color);
+                            }
+                        }
+                    } else {
+                        node.set_stroke_color(color);
                     }
                 }
 
@@ -2930,20 +3189,24 @@ impl VadadeeBerryApp {
         let anim_fps = self.anim_fps.max(1);
         let export_fps = self.video_export.fps.max(1);
         let content_secs = self.animation_content_duration_secs();
-        let export_secs = if self.video_export.export_duration_secs > 0.05 {
+        let cycle_secs = if self.video_export.export_duration_secs > 0.05 {
             self.video_export.export_duration_secs.max(content_secs)
         } else {
             content_secs
         }
         .max(1.0 / anim_fps as f32);
-        let max_frame = ((export_secs * anim_fps as f32).ceil() as usize)
+        let cycles = self.video_export.export_cycles.max(1);
+        let export_secs = cycle_secs * cycles as f32;
+        // Animation loops within one cycle; frames beyond wrap via modulo in the worker.
+        let max_frame = ((cycle_secs * anim_fps as f32).ceil() as usize)
             .saturating_sub(1)
             .max(content_max_frame);
+        let cycle_frame_count = ((cycle_secs * export_fps as f32).ceil().max(1.0) as usize).max(1);
         let temp =
             std::env::temp_dir().join(format!("vadadee_video_{}", uuid::Uuid::new_v4().as_simple()));
         let _ = std::fs::create_dir_all(&temp);
         let restore = self.anim_current_frame;
-        let total_frames = (export_secs * export_fps as f32).ceil().max(1.0) as usize;
+        let total_frames = cycle_frame_count.saturating_mul(cycles as usize).max(1);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2959,6 +3222,8 @@ impl VadadeeBerryApp {
             total_frames,
             anim_fps,
             max_anim_frame: max_frame,
+            cycle_frame_count,
+            export_cycles: cycles,
         };
 
         crate::export_worker::spawn_export_worker(
@@ -2981,8 +3246,11 @@ impl VadadeeBerryApp {
         self.video_export.export_rx = Some(rx);
         self.video_export.export_cancel = Some(cancel);
         self.video_export.status_msg = format!(
-            "Rendering {} frames @ {} fps, {}% resolution…",
-            total_frames, self.video_export.fps, self.video_export.resolution_pct
+            "Rendering {} frames @ {} fps, {}% · {} cycle(s)…",
+            total_frames,
+            self.video_export.fps,
+            self.video_export.resolution_pct,
+            cycles
         );
         self.status_message = "Video export started (background)".into();
 
@@ -3582,16 +3850,73 @@ impl VadadeeBerryApp {
     }
 
     /// Flip all selected nodes horizontally (if `horizontal`) or vertically.
+    /// Multi-selection flips about the **shared** selection centre so relative layout mirrors.
     pub fn flip_selection(&mut self, horizontal: bool) {
-        for &id in &self.selection.clone() {
+        if self.selection.is_empty() || !self.layer_editable() {
+            return;
+        }
+        // Shared flip axis from union of selected bounds (incl. group children).
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for &id in &self.selection {
+            let Some(node) = self.project.nodes.get(id) else {
+                continue;
+            };
+            let b = node.bounds_with_store(&self.project.nodes);
+            if b.width() <= 0.0 && b.height() <= 0.0 {
+                continue;
+            }
+            min_x = min_x.min(b.x0);
+            min_y = min_y.min(b.y0);
+            max_x = max_x.max(b.x1);
+            max_y = max_y.max(b.y1);
+        }
+        if !min_x.is_finite() {
+            return;
+        }
+        let axis_x = (min_x + max_x) * 0.5;
+        let axis_y = (min_y + max_y) * 0.5;
+
+        let ids = self.selection.clone();
+        for &id in &ids {
             let Some(before) = self.project.nodes.get(id).cloned() else {
                 continue;
             };
+            // Expand groups: flip each child about the shared axis.
+            if let NodeKind::Group { children } = &before.kind {
+                for &cid in children {
+                    let Some(cb) = self.project.nodes.get(cid).cloned() else {
+                        continue;
+                    };
+                    let mut ca = cb.clone();
+                    if horizontal {
+                        ca.flip_h_about(axis_x);
+                    } else {
+                        ca.flip_v_about(axis_y);
+                    }
+                    if cb != ca {
+                        self.history.push(
+                            &mut self.project,
+                            ProjectEdit::PatchNode {
+                                id: cid,
+                                before: cb,
+                                after: ca,
+                            },
+                        );
+                    }
+                }
+                continue;
+            }
             let mut after = before.clone();
             if horizontal {
-                after.flip_h();
+                after.flip_h_about(axis_x);
             } else {
-                after.flip_v();
+                after.flip_v_about(axis_y);
+            }
+            if before == after {
+                continue;
             }
             self.history.push(
                 &mut self.project,
@@ -3602,6 +3927,11 @@ impl VadadeeBerryApp {
                 },
             );
         }
+        self.status_message = if horizontal {
+            "Flipped horizontal".into()
+        } else {
+            "Flipped vertical".into()
+        };
     }
 
     fn layer_editable(&self) -> bool {
@@ -3792,7 +4122,8 @@ impl VadadeeBerryApp {
                 }
             }
 
-            if paste_pressed {
+            // Never inject paste for Ctrl+Shift+V (reserved for flip when selection exists).
+            if paste_pressed && !i.modifiers.shift {
                 if let Ok(mut cb) = arboard::Clipboard::new() {
                     if let Ok(text) = cb.get_text() {
                         i.events.push(egui::Event::Paste(text));
@@ -3813,56 +4144,103 @@ impl VadadeeBerryApp {
             return false;
         }
 
+        let has_selection = !self.selection.is_empty();
+
         // egui-winit turns Ctrl+C/V/X into Event::Copy/Cut/Paste (not Event::Key), so we must
         // listen for both. Ctrl+D/Z still arrive as Key events, which is why those worked.
-        let (want_copy, want_copy_png, want_cut, want_paste) = ctx.input(|i| {
-            let has_cmd = i.modifiers.command || i.modifiers.ctrl;
-            let has_shift = i.modifiers.shift;
-            let mut copy = false;
-            let mut copy_png = false;
-            let mut copy_png_from_key = false;
-            let mut cut = false;
-            let mut paste = false;
-            for event in &i.events {
-                match event {
-                    Event::Copy => {
-                        if has_shift || copy_png_from_key {
-                            copy_png = true;
-                        } else {
-                            copy = true;
+        //
+        // Ctrl+Shift+V with a selection is **flip vertical**, never paste.
+        // Ctrl+Shift+H with a selection is **flip horizontal**.
+        let (want_copy, want_copy_png, want_cut, want_paste, want_flip_h, want_flip_v) =
+            ctx.input(|i| {
+                let has_cmd = i.modifiers.command || i.modifiers.ctrl;
+                let has_shift = i.modifiers.shift;
+                let mut copy = false;
+                let mut copy_png = false;
+                let mut copy_png_from_key = false;
+                let mut cut = false;
+                let mut paste = false;
+                let mut flip_h = false;
+                let mut flip_v = false;
+                for event in &i.events {
+                    match event {
+                        Event::Copy => {
+                            if has_shift || copy_png_from_key {
+                                copy_png = true;
+                            } else {
+                                copy = true;
+                            }
                         }
-                    }
-                    Event::Cut => cut = true,
-                    Event::Paste(_) => paste = true,
-                    Event::Key {
-                        key: Key::C,
-                        pressed: true,
-                        ..
-                    } if has_cmd => {
-                        if has_shift {
-                            copy_png = true;
-                            copy_png_from_key = true;
-                        } else {
-                            copy = true;
+                        Event::Cut => cut = true,
+                        Event::Paste(_) => {
+                            // OS may emit Paste for Ctrl+Shift+V — never paste when
+                            // selection is non-empty and Shift is held (flip instead).
+                            if has_shift && has_selection {
+                                flip_v = true;
+                            } else if !has_shift {
+                                paste = true;
+                            }
+                            // Shift + no selection: ignore (do not paste)
                         }
+                        Event::Key {
+                            key: Key::C,
+                            pressed: true,
+                            ..
+                        } if has_cmd => {
+                            if has_shift {
+                                copy_png = true;
+                                copy_png_from_key = true;
+                            } else {
+                                copy = true;
+                            }
+                        }
+                        Event::Key {
+                            key: Key::X,
+                            pressed: true,
+                            ..
+                        } if has_cmd => cut = true,
+                        Event::Key {
+                            key: Key::V,
+                            pressed: true,
+                            ..
+                        } if has_cmd => {
+                            if has_shift && has_selection {
+                                flip_v = true;
+                            } else if !has_shift {
+                                paste = true;
+                            }
+                            // Ctrl+Shift+V, no selection → neither paste nor flip
+                        }
+                        Event::Key {
+                            key: Key::H,
+                            pressed: true,
+                            ..
+                        } if has_cmd && has_shift && has_selection => {
+                            flip_h = true;
+                        }
+                        _ => {}
                     }
-                    Event::Key {
-                        key: Key::X,
-                        pressed: true,
-                        ..
-                    } if has_cmd => cut = true,
-                    Event::Key {
-                        key: Key::V,
-                        pressed: true,
-                        ..
-                    } if has_cmd => paste = true,
-                    _ => {}
                 }
-            }
-            (copy, copy_png, cut, paste)
-        });
+                // Also catch held modifiers + key_pressed when events were already filtered.
+                if has_cmd && has_shift && has_selection {
+                    if i.key_pressed(Key::V) {
+                        flip_v = true;
+                        paste = false;
+                    }
+                    if i.key_pressed(Key::H) {
+                        flip_h = true;
+                    }
+                }
+                (copy, copy_png, cut, paste, flip_h, flip_v)
+            });
 
-        if !(want_copy || want_copy_png || want_cut || want_paste) {
+        if !(want_copy
+            || want_copy_png
+            || want_cut
+            || want_paste
+            || want_flip_h
+            || want_flip_v)
+        {
             return false;
         }
 
@@ -3889,7 +4267,27 @@ impl VadadeeBerryApp {
                 let _ = i.consume_key(egui::Modifiers::COMMAND, Key::V);
                 let _ = i.consume_key(egui::Modifiers::CTRL, Key::V);
             }
+            if want_flip_v {
+                let _ = i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::V);
+                let _ = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::V);
+            }
+            if want_flip_h {
+                let _ = i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::H);
+                let _ = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::H);
+            }
         });
+
+        // Flip takes priority over paste when selection is non-empty.
+        if want_flip_h {
+            self.flip_selection(true);
+            ctx.request_repaint();
+            return false;
+        }
+        if want_flip_v {
+            self.flip_selection(false);
+            ctx.request_repaint();
+            return false;
+        }
 
         if want_copy_png && !self.selection.is_empty() {
             log::info!("CLIPBOARD: detected copy PNG shortcut");
@@ -3945,8 +4343,11 @@ impl VadadeeBerryApp {
         use device_query::{DeviceQuery, DeviceState, Keycode};
 
         let keys = DeviceState::new().get_keys();
-        let down = keys.contains(&Keycode::V)
-            && (keys.contains(&Keycode::LControl) || keys.contains(&Keycode::RControl));
+        let ctrl = keys.contains(&Keycode::LControl) || keys.contains(&Keycode::RControl);
+        let shift = keys.contains(&Keycode::LShift) || keys.contains(&Keycode::RShift);
+        let v = keys.contains(&Keycode::V);
+        // Only plain Ctrl+V is paste. Ctrl+Shift+V is flip when objects are selected.
+        let down = v && ctrl && !shift;
         let edge = down && !self.paste_hotkey_was_down;
         self.paste_hotkey_was_down = down;
 
@@ -4048,16 +4449,38 @@ impl VadadeeBerryApp {
                     let _ = i.consume_key(egui::Modifiers::CTRL, Key::D);
                     self.duplicate_selection();
                 }
+                // Flip: Ctrl+Shift+H / Ctrl+Shift+V (not Ctrl+V paste — requires Shift).
+                if i.modifiers.shift && i.key_pressed(Key::H) && !text_focused {
+                    let _ = i.consume_key(
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                        Key::H,
+                    );
+                    let _ = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::H);
+                    self.flip_selection(true);
+                }
+                if i.modifiers.shift && i.key_pressed(Key::V) && !text_focused {
+                    let _ = i.consume_key(
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                        Key::V,
+                    );
+                    let _ = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::V);
+                    self.flip_selection(false);
+                }
             }
             if i.key_pressed(Key::Enter) && self.tools.active == ToolKind::Pen {
                 self.finish_pen_path(self.tools.pen.was_closed);
             } else if i.key_pressed(Key::Escape) {
                 // Prefer closing modal dialogs over tool cancel / deselect.
-                if self.object_rename_dialog.is_some() {
+                if self.hit_pick_menu.is_some() {
+                    self.hit_pick_menu = None;
+                } else if self.object_rename_dialog.is_some() {
                     self.object_rename_dialog = None;
                 } else if self.anim_stack_formula_dialog.is_some() {
                     self.anim_stack_formula_dialog = None;
                     self.anim_stack_formula_draft.clear();
+                } else if self.plotter_formula_dialog.is_some() {
+                    self.plotter_formula_dialog = None;
+                    self.plotter_formula_draft.clear();
                 } else if self.show_shader_editor_window.is_some() {
                     self.show_shader_editor_window = None;
                 } else if self.video_export.progress_visible {
@@ -4250,6 +4673,13 @@ impl VadadeeBerryApp {
             } else {
                 "Select".into()
             };
+        } else {
+            // Select tool + Esc: clear sticky selection so another object can be picked.
+            self.selection.clear();
+            self.selection_sticky = false;
+            self.hit_pick_menu = None;
+            self.tools.select.select_rotation_mode = false;
+            self.status_message = "Deselected".into();
         }
     }
 
@@ -4433,15 +4863,20 @@ impl VadadeeBerryApp {
             .map(|l| l.nodes.clone())
             .unwrap_or_default();
         let mut removed = Vec::new();
+        let mut removed_anims = Vec::new();
         for id in &self.selection {
             if let Some(node) = self.project.nodes.get(*id).cloned() {
                 removed.push((*id, node));
+            }
+            if let Some(anim) = self.project.anim_timeline.nodes.get(id).cloned() {
+                removed_anims.push((*id, anim));
             }
         }
         self.history.push(
             &mut self.project,
             ProjectEdit::RemoveNodes {
                 removed,
+                removed_anims,
                 layer_index,
                 layer_nodes_before,
             },
@@ -4700,6 +5135,17 @@ impl VadadeeBerryApp {
 
     /// Pick topmost node at `doc`. Ghosts (boolean/clip hidden sources) are skipped unless
     /// `include_ghosts` (Ctrl+Shift+click or Objects tab).
+    /// Apply a choice from the multi-hit object picker overlay.
+    pub fn select_from_hit_picker(&mut self, id: NodeId) {
+        self.selection = vec![id];
+        self.selection_sticky = true;
+        self.tools.select.select_rotation_mode = false;
+        self.hit_pick_menu = None;
+        self.sync_inspector_from_selection();
+        self.status_message =
+            "Object selected (sticky — Esc or empty click to deselect)".into();
+    }
+
     fn pick_node_at(&self, doc: (f64, f64), slop: f64) -> Option<NodeId> {
         self.pick_node_at_opts(doc, slop, false)
     }
@@ -4761,60 +5207,48 @@ impl VadadeeBerryApp {
         slop: f64,
         include_ghosts: bool,
     ) -> (Option<NodeId>, Option<NodeId>) {
+        let all = self.pick_all_nodes_at(doc, slop, include_ghosts);
+        let hit = all.first().copied();
+        (hit, None)
+    }
+
+    /// All nodes under the pointer (topmost first). Used for multi-object hit picker.
+    fn pick_all_nodes_at(
+        &self,
+        doc: (f64, f64),
+        slop: f64,
+        include_ghosts: bool,
+    ) -> Vec<NodeId> {
         let hidden = if include_ghosts {
             std::collections::HashSet::new()
         } else {
             self.hidden_canvas_sources()
         };
-        if self.spatial_index.is_enabled() {
-            return self.spatial_index.pick_topmost_with_document(
-                &self.project,
-                &hidden,
-                doc,
-                slop,
-                |id| self.node_uses_extended_bounds(id),
-            );
-        }
-        let mut hit: Option<NodeId> = None;
-        let mut bbox_only: Option<NodeId> = None;
+        let mut precise: Vec<NodeId> = Vec::new();
+        let mut bbox_only: Vec<NodeId> = Vec::new();
+        // Topmost first (paint order reversed).
         for id in self.project.document.ordered_node_ids().into_iter().rev() {
-            if hidden.contains(&id) {
+            if hidden.contains(&id)
+                && !crate::document::is_pickable_effect_source(&self.project.document, id)
+            {
                 continue;
             }
             if let Some(node) = self.project.nodes.get(id) {
-                let does_hit = if self.node_uses_extended_bounds(id) {
-                    let eb = crate::document::get_effective_bounds(
-                        node,
-                        &self.project.document,
-                        &self.project.nodes,
-                    );
-                    let pt = kurbo::Point::new(doc.0, doc.1);
-                    eb.inflate(slop, slop).contains(pt)
-                } else {
-                    node.hit_test_with_store(&self.project.nodes, doc.0, doc.1, slop)
-                };
-                if does_hit {
-                    let pt = kurbo::Point::new(doc.0, doc.1);
-                    let precise = if self.node_uses_extended_bounds(id) {
-                        true
-                    } else {
-                        node.bez_path().contains(pt)
-                            || matches!(node.kind, NodeKind::Text { .. })
-                            || matches!(node.kind, NodeKind::Image { .. })
-                    };
-                    if precise {
-                        hit = Some(id);
-                        break;
-                    } else if bbox_only.is_none() && !matches!(node.kind, NodeKind::Image { .. }) {
-                        bbox_only = Some(id);
-                    }
+                if !self.hit_test_node_for_pick(id, node, doc, slop) {
+                    continue;
+                }
+                if self.precise_hit_for_pick(id, node, doc, slop) {
+                    precise.push(id);
+                } else if !matches!(node.kind, NodeKind::Image { .. }) {
+                    bbox_only.push(id);
                 }
             }
         }
-        if hit.is_none() {
-            hit = bbox_only;
+        if precise.is_empty() {
+            bbox_only
+        } else {
+            precise
         }
-        (hit, bbox_only)
     }
 
     /// Load (or reload) texture for an Image node from its embedded bytes.
@@ -5844,8 +6278,9 @@ fn run_video_decode_thread(
             }
 
             if let Some(drag) = &self.tools.drag_shape {
+                let ctrl_angle = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command);
                 match drag.kind {
-                    Some(ToolKind::Rectangle) => {
+                    Some(ToolKind::Rectangle) | Some(ToolKind::Plotter) => {
                         let (x, y, w, h) =
                             tools::normalize_rect(drag.origin_doc, drag.current_doc);
                         render::draw_preview_rect(&painter, &self.viewport, origin, x, y, w, h);
@@ -5876,7 +6311,11 @@ fn run_video_decode_thread(
                             .map_or(false, |l| l.kind == crate::document::LayerKind::Flowchart);
                         if is_flowchart {
                             let origin_pt = drag.origin_doc;
-                            let current_pt = drag.current_doc;
+                            let current_pt = if ctrl_angle {
+                                tools::snap_angle_15deg(drag.origin_doc, drag.current_doc)
+                            } else {
+                                drag.current_doc
+                            };
                             let active_idx = self.project.document.active_layer_index;
                             if let Some(layer) = self.project.document.layers.get(active_idx) {
                                 let store = &self.project.nodes;
@@ -5935,12 +6374,17 @@ fn run_video_decode_thread(
                                 render::draw_preview_bezier(&painter, &self.viewport, origin, &bez);
                             }
                         } else {
+                            let end_pt = if ctrl_angle {
+                                tools::snap_angle_15deg(drag.origin_doc, drag.current_doc)
+                            } else {
+                                drag.current_doc
+                            };
                             render::draw_preview_line(
                                 &painter,
                                 &self.viewport,
                                 origin,
                                 drag.origin_doc,
-                                drag.current_doc,
+                                end_pt,
                             );
                         }
                     }
@@ -6178,16 +6622,33 @@ fn run_video_decode_thread(
             return;
         }
 
-        let Some(doc) = self.cursor_doc else {
+        let Some(doc_snapped) = self.cursor_doc else {
             self.gradient_flow_drag = None;
             return;
         };
-        let pos = self.viewport.doc_to_screen(doc, origin);
+        // Raw pointer (unsnapped) — required for CircularClone yellow handles under Snap to Grid.
+        let (raw_screen, raw_doc) = response
+            .interact_pointer_pos()
+            .or_else(|| response.hover_pos())
+            .or_else(|| response.ctx.input(|i| i.pointer.hover_pos()))
+            .filter(|p| {
+                self.canvas_screen_rect
+                    .map(|r| r.contains(*p))
+                    .unwrap_or(true)
+            })
+            .map(|p| (p, self.viewport.screen_to_doc(p, origin)))
+            .unwrap_or_else(|| {
+                (
+                    self.viewport.doc_to_screen(doc_snapped, origin),
+                    doc_snapped,
+                )
+            });
+        let pos = self.viewport.doc_to_screen(doc_snapped, origin);
 
         if self.handle_gradient_flow_input(
             origin,
             pos,
-            doc,
+            doc_snapped,
             primary_pressed,
             primary_down,
             primary_released,
@@ -6211,9 +6672,9 @@ fn run_video_decode_thread(
         });
         match self.tools.active {
             ToolKind::Select => self.tool_select(
-                pos,
+                raw_screen,
                 origin,
-                doc,
+                raw_doc,
                 shift || ctrl,
                 ghost_pick,
                 primary_pressed,
@@ -6226,21 +6687,23 @@ fn run_video_decode_thread(
             | ToolKind::Ellipse
             | ToolKind::Line
             | ToolKind::Polygon
-            | ToolKind::Arc => {
-                self.tool_drag_shape(doc, primary_down, primary_released);
+            | ToolKind::Arc
+            | ToolKind::Plotter => {
+                let ctrl = response.ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                self.tool_drag_shape(doc_snapped, primary_down, primary_released, ctrl);
             }
             ToolKind::Pen => {
                 let ctrl = response.ctx.input(|i| i.modifiers.ctrl);
                 let primary_released_pen = primary_released_anywhere;
                 self.tool_pen(
-                    doc,
+                    doc_snapped,
                     primary_pressed,
                     primary_down,
                     primary_released_pen,
                     ctrl,
                 );
             }
-            ToolKind::Text => self.tool_text(doc, primary_pressed),
+            ToolKind::Text => self.tool_text(doc_snapped, primary_pressed),
             ToolKind::Brush => {
                 let time = response.ctx.input(|i| i.time);
                 let pressure = response.ctx.input(|i| {
@@ -6252,7 +6715,7 @@ fn run_video_decode_thread(
                     None
                 });
                 self.tool_brush(
-                    doc,
+                    doc_snapped,
                     time,
                     primary_pressed,
                     primary_down,
@@ -6264,7 +6727,7 @@ fn run_video_decode_thread(
             ToolKind::Node => self.tool_node(
                 pos,
                 origin,
-                doc,
+                doc_snapped,
                 shift,
                 ctrl,
                 primary_pressed,
@@ -6311,7 +6774,9 @@ fn run_video_decode_thread(
         // Keep animation keyframes in sync so position does not snap back on apply.
         for id in moved_ids {
             self.sync_anim_transform_from_node(id);
+            self.sync_circular_ui_from_effect_id(id);
         }
+        self.tools.select.circular_ring_drag_start.clear();
         self.tools.select.drag_mode = None;
         self.tools.select.node_edit_target = None;
         self.tools.select.node_drag_origin = None;
@@ -6927,11 +7392,14 @@ fn run_video_decode_thread(
     }
 
     pub fn sync_tiling_ui_from_selection(&mut self) {
-        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
-        if let Some(&oid) = objs.first() {
-            if let Some(effect) = self.project.document.tiling_effects.values().find(|e| e.source_id == oid) {
+        if let Some(&oid) = self.selection.first() {
+            if let Some(effect) = self
+                .project
+                .document
+                .tiling_effects
+                .values()
+                .find(|e| e.source_id == oid)
+            {
                 self.ui_tiling_rows = effect.count_y;
                 self.ui_tiling_cols = effect.count_x;
                 self.ui_tiling_offset_x = effect.offset_x;
@@ -6947,15 +7415,19 @@ fn run_video_decode_thread(
     }
 
     pub fn sync_circular_ui_from_selection(&mut self) {
-        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
-        if let Some(&oid) = objs.first() {
-            if let Some(effect) = self.project.document.circular_effects.values().find(|e| e.source_id == oid) {
+        if let Some(&oid) = self.selection.first() {
+            if let Some(effect) = self
+                .project
+                .document
+                .circular_effects
+                .values()
+                .find(|e| e.source_id == oid)
+            {
                 self.ui_circular_copies = effect.copies;
                 self.ui_circular_angle_offset = effect.angle_offset;
                 self.ui_circular_origin_x = effect.origin_x;
                 self.ui_circular_origin_y = effect.origin_y;
+                self.ui_circular_rotate_mode = effect.rotate_mode;
             }
         }
     }
@@ -6975,17 +7447,105 @@ fn run_video_decode_thread(
 
     fn get_circular_gizmo_points(&self, id: NodeId) -> Option<[(f64, f64); 3]> {
         if let Some(e) = self.project.document.circular_effects.values().find(|e| e.source_id == id) {
+            // 0 = base (first instance on ring), 1 = origin (center), 2 = angle tip (next copy).
             let p0 = (e.base_x, e.base_y);
             let p1 = (e.origin_x, e.origin_y);
-            let dx = e.base_x - e.origin_x;
-            let dy = e.base_y - e.origin_y;
-            let r = dx.hypot(dy).max(1.0);
-            let base_ang = dy.atan2(dx);
-            let ang1 = base_ang + (std::f64::consts::TAU / e.copies.max(3) as f64) + e.angle_offset.to_radians();
-            let p2 = (e.origin_x + r * ang1.cos(), e.origin_y + r * ang1.sin());
+            let p2 = e.placement_xy(1);
             return Some([p0, p1, p2]);
         }
         None
+    }
+
+    /// Hit circular gizmo in **screen space** (handles stay easy to grab at any zoom).
+    /// Returns handle index: 0 base, 1 origin, 2 angle tip; or None.
+    fn hit_circular_gizmo(
+        &self,
+        id: NodeId,
+        screen: Pos2,
+        origin: Pos2,
+    ) -> Option<usize> {
+        let pts = self.get_circular_gizmo_points(id)?;
+        let slop = 14.0_f32; // px
+        // Prefer points over lines (check closest point first).
+        let mut best: Option<(usize, f32)> = None;
+        for (i, &(px, py)) in pts.iter().enumerate() {
+            let sp = self.viewport.doc_to_screen((px, py), origin);
+            let d = screen.distance(sp);
+            if d <= slop && best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((i, d));
+            }
+        }
+        if let Some((i, _)) = best {
+            return Some(i);
+        }
+        // Lines: base↔origin (radius), origin↔angle tip
+        let line_slop = 10.0_f32;
+        let s0 = self.viewport.doc_to_screen(pts[0], origin);
+        let s1 = self.viewport.doc_to_screen(pts[1], origin);
+        let s2 = self.viewport.doc_to_screen(pts[2], origin);
+        if Self::dist_point_to_segment_screen(screen, s0, s1) <= line_slop {
+            // Near radius line: pick nearer endpoint.
+            return if screen.distance(s0) <= screen.distance(s1) {
+                Some(0)
+            } else {
+                Some(1)
+            };
+        }
+        if Self::dist_point_to_segment_screen(screen, s1, s2) <= line_slop {
+            return if screen.distance(s2) <= screen.distance(s1) {
+                Some(2)
+            } else {
+                Some(1)
+            };
+        }
+        None
+    }
+
+    fn dist_point_to_segment_screen(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+        let ab = b - a;
+        let len_sq = ab.length_sq();
+        if len_sq < 1e-8 {
+            return p.distance(a);
+        }
+        let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+        let proj = a + ab * t;
+        p.distance(proj)
+    }
+
+    fn sync_circular_ui_from_effect_id(&mut self, source_id: NodeId) {
+        if let Some(effect) = self
+            .project
+            .document
+            .circular_effects
+            .values()
+            .find(|e| e.source_id == source_id)
+        {
+            self.ui_circular_copies = effect.copies;
+            self.ui_circular_angle_offset = effect.angle_offset;
+            self.ui_circular_origin_x = effect.origin_x;
+            self.ui_circular_origin_y = effect.origin_y;
+            self.ui_circular_rotate_mode = effect.rotate_mode;
+        }
+    }
+
+    /// Keep circular base/origin locked to the source object when it is translated.
+    fn translate_circular_effect_for_source(&mut self, source_id: NodeId, dx: f64, dy: f64) {
+        if dx.abs() < 1e-15 && dy.abs() < 1e-15 {
+            return;
+        }
+        if let Some((_, e)) = self
+            .project
+            .document
+            .circular_effects
+            .iter_mut()
+            .find(|(_, e)| e.source_id == source_id)
+        {
+            e.base_x += dx;
+            e.base_y += dy;
+            e.origin_x += dx;
+            e.origin_y += dy;
+            e.radius = (e.base_x - e.origin_x).hypot(e.base_y - e.origin_y).max(1.0);
+        }
     }
 
     fn build_on_path_effect(&self, effect_id: uuid::Uuid, source_id: NodeId, path_id: NodeId) -> ObjectOnPathEffect {
@@ -7059,18 +7619,193 @@ fn run_video_decode_thread(
         has_effect_for_objects(&self.project.document.path_effects, &objects, path_id)
     }
 
+    /// Shapes eligible for Tiling / CircularClone (includes Path; excludes Group).
+    pub fn is_tiling_circular_source(node: &Node) -> bool {
+        !matches!(node.kind, NodeKind::Group { .. })
+            && !matches!(node.kind, NodeKind::Image { .. })
+            && !matches!(node.kind, NodeKind::Text { .. })
+            && !matches!(node.kind, NodeKind::BrushStroke { .. })
+            && !matches!(node.kind, NodeKind::FlowchartNode { .. })
+            && !matches!(node.kind, NodeKind::FlowchartPath { .. })
+    }
+
+    pub fn selection_tiling_circular_sources(&self) -> Vec<NodeId> {
+        self.selection
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.project
+                    .nodes
+                    .get(*id)
+                    .is_some_and(Self::is_tiling_circular_source)
+            })
+            .collect()
+    }
+
     pub fn selection_has_tiling_effect(&self) -> bool {
-        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
-        objs.iter().any(|&oid| self.project.document.tiling_effects.values().any(|e| e.source_id == oid))
+        self.selection.iter().any(|&oid| {
+            self.project
+                .document
+                .tiling_effects
+                .values()
+                .any(|e| e.source_id == oid)
+        })
     }
 
     pub fn selection_has_circular_effect(&self) -> bool {
-        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
-        objs.iter().any(|&oid| self.project.document.circular_effects.values().any(|e| e.source_id == oid))
+        self.selection.iter().any(|&oid| {
+            self.project
+                .document
+                .circular_effects
+                .values()
+                .any(|e| e.source_id == oid)
+        })
+    }
+
+    /// Convert selected shapes (rect/circle/ellipse/chord/polygon/arc/…) to editable paths.
+    pub fn convert_selection_to_path(&mut self) {
+        let ids: Vec<NodeId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.project.nodes.get(*id).is_some_and(|n| {
+                    !matches!(
+                        n.kind,
+                        NodeKind::Path { .. }
+                            | NodeKind::Group { .. }
+                            | NodeKind::Image { .. }
+                            | NodeKind::Text { .. }
+                            | NodeKind::BrushStroke { .. }
+                            | NodeKind::FlowchartNode { .. }
+                            | NodeKind::FlowchartPath { .. }
+                    )
+                })
+            })
+            .collect();
+        if ids.is_empty() {
+            self.status_message =
+                "Select circle/rect/ellipse/chord/polygon/arc to convert to path".into();
+            return;
+        }
+        let mut count = 0usize;
+        for id in ids {
+            let Some(before) = self.project.nodes.get(id).cloned() else {
+                continue;
+            };
+            let bez = before.bez_path();
+            if bez.elements().is_empty() {
+                continue;
+            }
+            let mut after = before.clone();
+            let name = before.name.clone();
+            let style = before.style.clone();
+            after.kind = NodeKind::Path {
+                path: PathData::from_bez(&bez),
+            };
+            after.name = if name.is_empty() {
+                "Path".into()
+            } else {
+                format!("{name} path")
+            };
+            after.style = style;
+            // Ensure closed flag when shape was closed.
+            if let NodeKind::Path { path } = &mut after.kind {
+                if !path.is_closed() {
+                    path.set_closed(true);
+                }
+            }
+            if before != after {
+                self.history.push(
+                    &mut self.project,
+                    ProjectEdit::PatchNode { id, before, after },
+                );
+                count += 1;
+            }
+        }
+        self.status_message = if count > 0 {
+            format!("Converted {count} shape(s) to path")
+        } else {
+            "Nothing converted".into()
+        };
+    }
+
+    /// Snap a free point (gizmo handle) to magnets then grid.
+    fn snap_gizmo_point(&mut self, doc: (f64, f64), exclude: Option<NodeId>) -> (f64, f64) {
+        let mut snapped = doc;
+        let mut mag_x = false;
+        let mut mag_y = false;
+        self.live_snap_guides.clear();
+        if self.snap_magnet {
+            let threshold = (10.0 / self.viewport.zoom as f64).max(0.5);
+            let mut target_pts = self.get_canvas_snap_points();
+            for (id, node) in &self.project.nodes.map {
+                if exclude == Some(*id) {
+                    continue;
+                }
+                target_pts.extend(self.get_node_snap_points(node));
+            }
+            for e in self.project.document.circular_effects.values() {
+                if exclude == Some(e.source_id) {
+                    continue;
+                }
+                target_pts.push((e.base_x, e.base_y));
+                target_pts.push((e.origin_x, e.origin_y));
+                target_pts.push(e.placement_xy(1));
+            }
+            let mut best_dx = threshold;
+            let mut best_dy = threshold;
+            let mut snap_x = None;
+            let mut snap_y = None;
+            for &tpt in &target_pts {
+                let dx = tpt.0 - doc.0;
+                let dy = tpt.1 - doc.1;
+                if dx.abs() < best_dx.abs() {
+                    best_dx = dx;
+                    snap_x = Some(tpt);
+                }
+                if dy.abs() < best_dy.abs() {
+                    best_dy = dy;
+                    snap_y = Some(tpt);
+                }
+            }
+            if let Some(tpt) = snap_x {
+                snapped.0 = tpt.0;
+                mag_x = true;
+                self.live_snap_guides.push(SnapGuide {
+                    start: tpt,
+                    end: (tpt.0, snapped.1),
+                    is_tangent: false,
+                });
+            }
+            if let Some(tpt) = snap_y {
+                snapped.1 = tpt.1;
+                mag_y = true;
+                self.live_snap_guides.push(SnapGuide {
+                    start: tpt,
+                    end: (snapped.0, tpt.1),
+                    is_tangent: false,
+                });
+            }
+        }
+        // Grid snap on free axes only (magnet wins when active).
+        if self.viewport.snap_grid {
+            let g = self.viewport.grid_step as f64;
+            if g > 0.0 {
+                if !mag_x {
+                    snapped.0 = (snapped.0 / g).round() * g;
+                }
+                if !mag_y {
+                    snapped.1 = (snapped.1 / g).round() * g;
+                }
+            }
+        }
+        if self.pixel_art_mode {
+            let cell = self.pixel_cell_size as f64;
+            snapped.0 = (snapped.0 / cell).round() * cell;
+            snapped.1 = (snapped.1 / cell).round() * cell;
+        }
+        snapped
     }
 
     fn node_has_tiling_or_circular(&self, id: NodeId) -> bool {
@@ -7085,6 +7820,62 @@ fn run_video_decode_thread(
 
     fn node_uses_extended_bounds(&self, id: NodeId) -> bool {
         node_uses_extended_pick_bounds(&self.project.document, id)
+    }
+
+    /// Hit-test including circular/tiling placement footprints (not only source bbox).
+    fn hit_test_node_for_pick(
+        &self,
+        id: NodeId,
+        node: &Node,
+        doc: (f64, f64),
+        slop: f64,
+    ) -> bool {
+        if let Some(e) = self
+            .project
+            .document
+            .circular_effects
+            .values()
+            .find(|e| e.source_id == id)
+        {
+            return crate::document::hit_test_circular_clone(node, e, doc.0, doc.1, slop);
+        }
+        if self.node_uses_extended_bounds(id) {
+            let eb = crate::document::get_effective_bounds(
+                node,
+                &self.project.document,
+                &self.project.nodes,
+            );
+            let pt = kurbo::Point::new(doc.0, doc.1);
+            return eb.inflate(slop, slop).contains(pt);
+        }
+        node.hit_test_with_store(&self.project.nodes, doc.0, doc.1, slop)
+    }
+
+    fn precise_hit_for_pick(
+        &self,
+        id: NodeId,
+        node: &Node,
+        doc: (f64, f64),
+        slop: f64,
+    ) -> bool {
+        if self
+            .project
+            .document
+            .circular_effects
+            .values()
+            .any(|e| e.source_id == id)
+        {
+            // hit_test_circular_clone already tested instances.
+            return true;
+        }
+        if self.node_uses_extended_bounds(id) {
+            return true;
+        }
+        let pt = kurbo::Point::new(doc.0, doc.1);
+        node.bez_path().contains(pt)
+            || matches!(node.kind, NodeKind::Text { .. })
+            || matches!(node.kind, NodeKind::Image { .. })
+            || node.hit_test_with_store(&self.project.nodes, doc.0, doc.1, slop)
     }
 
     fn expand_drag_ids_for_path_effects(&self, ids: &[NodeId]) -> Vec<NodeId> {
@@ -7258,9 +8049,7 @@ fn run_video_decode_thread(
     }
 
     pub fn update_tiling_effects_live(&mut self) {
-        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
+        let objs = self.selection_tiling_circular_sources();
         for oid in objs {
             if let Some(existing) = self.project.document.tiling_effects.values().find(|e| e.source_id == oid).cloned() {
                 let mut effect = existing;
@@ -7280,9 +8069,7 @@ fn run_video_decode_thread(
     }
 
     pub fn update_circular_effects_live(&mut self) {
-        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
+        let objs = self.selection_tiling_circular_sources();
         for oid in objs {
             if let Some(existing) = self.project.document.circular_effects.values().find(|e| e.source_id == oid).cloned() {
                 let mut effect = existing;
@@ -7290,6 +8077,7 @@ fn run_video_decode_thread(
                 effect.angle_offset = self.ui_circular_angle_offset;
                 effect.origin_x = self.ui_circular_origin_x;
                 effect.origin_y = self.ui_circular_origin_y;
+                effect.rotate_mode = self.ui_circular_rotate_mode;
                 self.project.document.circular_effects.insert(effect.id, effect);
             }
         }
@@ -7331,10 +8119,19 @@ fn run_video_decode_thread(
                     .active_layer()
                     .map(|l| l.nodes.clone())
                     .unwrap_or_default();
+                let removed_anims = self
+                    .project
+                    .anim_timeline
+                    .nodes
+                    .get(&fid)
+                    .cloned()
+                    .map(|a| vec![(fid, a)])
+                    .unwrap_or_default();
                 self.history.push(
                     &mut self.project,
                     ProjectEdit::RemoveNodes {
                         removed: vec![(fid, node)],
+                        removed_anims,
                         layer_index,
                         layer_nodes_before,
                     },
@@ -7431,11 +8228,10 @@ fn run_video_decode_thread(
     }
 
     pub fn apply_tiling_magic(&mut self) {
-        let objects: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
+        let objects = self.selection_tiling_circular_sources();
         if objects.is_empty() {
-            self.status_message = "Select object(s) to apply Tiling".into();
+            self.status_message =
+                "Select path/circle/rect/ellipse/chord/… to apply Tiling".into();
             return;
         }
         let before_doc = snapshot_document(&self.project.document);
@@ -7491,11 +8287,10 @@ fn run_video_decode_thread(
     }
 
     pub fn apply_circular_clone_magic(&mut self) {
-        let objects: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
+        let objects = self.selection_tiling_circular_sources();
         if objects.is_empty() {
-            self.status_message = "Select object(s) to apply CircularClone".into();
+            self.status_message =
+                "Select path/circle/rect/ellipse/chord/… to apply CircularClone".into();
             return;
         }
         let before_doc = snapshot_document(&self.project.document);
@@ -7519,9 +8314,11 @@ fn run_video_decode_thread(
                 radius: r,
                 copies: 6,
                 angle_offset: 0.0,
-                base_x: ref_x,
+                // Place base on the ring (not on the origin) so radius is usable immediately.
+                base_x: ref_x + r,
                 base_y: ref_y,
                 hide_source: true,
+                rotate_mode: self.ui_circular_rotate_mode,
             };
             after_doc.circular_effects.insert(effect_id, effect);
             created.push(source_id);
@@ -7946,6 +8743,7 @@ fn run_video_decode_thread(
         let Some(effect) = after.document.boolean_effects.swap_remove(&eid) else { return };
         if let Some(rid) = effect.result_node_id {
             after.nodes.remove(rid);
+            after.anim_timeline.nodes.remove(&rid);
             for layer in &mut after.document.layers {
                 layer.nodes.retain(|id| *id != rid);
             }
@@ -8249,41 +9047,263 @@ fn run_video_decode_thread(
         }
     }
 
+    /// Convert placement instance to a stable path node (unique id, geometric bez).
+    fn bake_instance_to_path_node(source: &Node, pl: &PathPlacement, name: String) -> Node {
+        let mut node = node_at_placement(source as &dyn FaceRenderable, pl);
+        let bez = node.bez_path();
+        let style = node.style.clone();
+        let mut out = Node::path_from_bez(bez, name);
+        out.style = style;
+        out.id = uuid::Uuid::new_v4();
+        out
+    }
+
+    /// Collect placed circular copies for one source (path nodes, unique ids).
+    fn circular_bake_instances(
+        source: &Node,
+        effect: &CircularCloneEffect,
+    ) -> Vec<Node> {
+        let n = effect.copies.max(3);
+        (0..n)
+            .map(|i| {
+                let pl = effect.path_placement(i);
+                Self::bake_instance_to_path_node(
+                    source,
+                    &pl,
+                    format!("{} #c{}", source.name, i + 1),
+                )
+            })
+            .collect()
+    }
+
+    /// Bake CircularClone → group. Children live **only** under the group (not top-level layer
+    /// entries), so selection bounds track the group and deleting the group removes all copies.
     pub fn bake_circular(&mut self) {
-        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
-        let mut child_ids = Vec::new();
+        let objs: Vec<NodeId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.project
+                    .document
+                    .circular_effects
+                    .values()
+                    .any(|e| e.source_id == id)
+            })
+            .collect();
+        if objs.is_empty() {
+            self.status_message = "Select a CircularClone object to bake".into();
+            return;
+        }
+
+        let before = snapshot_project(&self.project);
+        let mut after = before.clone();
+        let mut all_child_ids: Vec<NodeId> = Vec::new();
+        let mut group_ids: Vec<NodeId> = Vec::new();
+        let mut total_copies = 0usize;
+
         for &oid in &objs {
-            if let Some(effect) = self.project.document.circular_effects.values().find(|e| e.source_id == oid).cloned() {
-                if let Some(source) = self.project.nodes.get(oid).cloned() {
-                    let src_face: &dyn FaceRenderable = &source;
-                    let dx = effect.base_x - effect.origin_x;
-                    let dy = effect.base_y - effect.origin_y;
-                    let r = dx.hypot(dy).max(1.0);
-                    let base_ang = dy.atan2(dx);
-                    let n = effect.copies.max(3);
-                    for i in 0..n {
-                        let ang = base_ang + (i as f64 / n as f64) * std::f64::consts::TAU + effect.angle_offset.to_radians();
-                        let x = effect.origin_x + r * ang.cos();
-                        let y = effect.origin_y + r * ang.sin();
-                        let pl = PathPlacement { x, y, angle_rad: ang, scale: 1.0, opacity_mul: 1.0 };
-                        let mut node = node_at_placement(src_face, &pl);
-                        node.name = format!("{} #c{}", source.name, i + 1);
-                        let id = node.id;
-                        self.history.push(&mut self.project, ProjectEdit::InsertNode { node });
-                        child_ids.push(id);
-                    }
-                }
+            let Some(effect) = after
+                .document
+                .circular_effects
+                .values()
+                .find(|e| e.source_id == oid)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(source) = after.nodes.get(oid).cloned() else {
+                continue;
+            };
+            let instances = Self::circular_bake_instances(&source, &effect);
+            if instances.is_empty() {
+                continue;
             }
-        }
-        if !child_ids.is_empty() {
-            let group = Node::group(child_ids.clone(), "Circular group".to_string());
+            total_copies += instances.len();
+            let mut child_ids = Vec::with_capacity(instances.len());
+            for node in instances {
+                let id = node.id;
+                // Store only — do **not** append to layer (group is the sole layer entry).
+                after.nodes.insert(node);
+                child_ids.push(id);
+                all_child_ids.push(id);
+            }
+            let group = Node::group(
+                child_ids,
+                format!("{} circular", source.name),
+            );
             let gid = group.id;
-            self.history.push(&mut self.project, ProjectEdit::InsertNode { node: group });
-            self.selection = vec![gid];
-            self.status_message = format!("Baked {} circles", child_ids.len());
+            after.nodes.insert(group);
+            after.document.append_to_active_layer(gid);
+            group_ids.push(gid);
+
+            after.document.circular_effects.swap_remove(&effect.id);
+            // Remove hidden source from store + layers + orphaned keyframes.
+            after.remove_node_and_animation(oid);
         }
+
+        if group_ids.is_empty() {
+            self.status_message = "No CircularClone effect to bake".into();
+            return;
+        }
+
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::SetDocument { before, after },
+        );
+        self.selection = group_ids;
+        self.status_message = format!(
+            "Baked {total_copies} copies into {} group(s)",
+            self.selection.len()
+        );
+    }
+
+    /// Bake CircularClone → single path (each copy → path, boolean-union all).
+    /// Multi-contour result is preserved via verb-faithful path storage.
+    pub fn bake_circular_as_path(&mut self) {
+        let objs: Vec<NodeId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.project
+                    .document
+                    .circular_effects
+                    .values()
+                    .any(|e| e.source_id == id)
+            })
+            .collect();
+        if objs.is_empty() {
+            self.status_message = "Select a CircularClone object to bake".into();
+            return;
+        }
+
+        let before = snapshot_project(&self.project);
+        let mut after = before.clone();
+        let mut result_ids = Vec::new();
+
+        for &oid in &objs {
+            let Some(effect) = after
+                .document
+                .circular_effects
+                .values()
+                .find(|e| e.source_id == oid)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(source) = after.nodes.get(oid).cloned() else {
+                continue;
+            };
+            let instances = Self::circular_bake_instances(&source, &effect);
+            if instances.is_empty() {
+                continue;
+            }
+
+            // Fold union: path0 ∪ path1 ∪ … (shutter / overlapping chords stay clean multi-contour)
+            let mut acc = instances[0].clone();
+            for other in instances.iter().skip(1) {
+                let Some(bez) =
+                    compute_boolean_bez(&acc, other, BooleanOpKind::Union, 0.5)
+                else {
+                    self.status_message =
+                        "Bake as path failed (boolean union could not convert shapes)".into();
+                    return;
+                };
+                if bez.elements().is_empty() {
+                    continue;
+                }
+                let style = acc.style.clone();
+                acc = Node::path_from_bez(bez, format!("{} union", source.name));
+                acc.style = style;
+                acc.id = uuid::Uuid::new_v4();
+            }
+            acc.name = format!("{} circular path", source.name);
+            let rid = acc.id;
+            after.nodes.insert(acc);
+            after.document.append_to_active_layer(rid);
+            result_ids.push(rid);
+
+            after.document.circular_effects.swap_remove(&effect.id);
+            after.remove_node_and_animation(oid);
+        }
+
+        if result_ids.is_empty() {
+            self.status_message = "No CircularClone effect to bake".into();
+            return;
+        }
+
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::SetDocument { before, after },
+        );
+        self.selection = result_ids;
+        self.status_message = format!(
+            "Baked circular clone(s) as {} path(s)",
+            self.selection.len()
+        );
+    }
+
+    /// Split CircularClone into many independent top-level path objects (no group).
+    pub fn split_circular(&mut self) {
+        let objs: Vec<NodeId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.project
+                    .document
+                    .circular_effects
+                    .values()
+                    .any(|e| e.source_id == id)
+            })
+            .collect();
+        if objs.is_empty() {
+            self.status_message = "Select a CircularClone object to split".into();
+            return;
+        }
+
+        let before = snapshot_project(&self.project);
+        let mut after = before.clone();
+        let mut result_ids = Vec::new();
+        let mut total = 0usize;
+
+        for &oid in &objs {
+            let Some(effect) = after
+                .document
+                .circular_effects
+                .values()
+                .find(|e| e.source_id == oid)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(source) = after.nodes.get(oid).cloned() else {
+                continue;
+            };
+            let instances = Self::circular_bake_instances(&source, &effect);
+            for node in instances {
+                let id = node.id;
+                after.nodes.insert(node);
+                after.document.append_to_active_layer(id);
+                result_ids.push(id);
+                total += 1;
+            }
+            after.document.circular_effects.swap_remove(&effect.id);
+            after.remove_node_and_animation(oid);
+        }
+
+        if result_ids.is_empty() {
+            self.status_message = "No CircularClone effect to split".into();
+            return;
+        }
+
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::SetDocument { before, after },
+        );
+        self.selection = result_ids;
+        self.status_message = format!("Split into {total} separate objects");
     }
 
     pub fn close_open_paths_in_selection(&mut self) {
@@ -8498,6 +9518,26 @@ fn run_video_decode_thread(
         }
     }
 
+    /// Expand groups so deleting a group also deletes its children (store-only members too).
+    fn expand_ids_for_delete(&self, ids: &[NodeId]) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack: Vec<NodeId> = ids.to_vec();
+        while let Some(id) = stack.pop() {
+            if out.contains(&id) {
+                continue;
+            }
+            out.push(id);
+            if let Some(NodeKind::Group { children }) =
+                self.project.nodes.get(id).map(|n| &n.kind)
+            {
+                for &c in children {
+                    stack.push(c);
+                }
+            }
+        }
+        out
+    }
+
     pub fn delete_nodes(&mut self, ids: &[NodeId]) {
         if ids.is_empty() {
             return;
@@ -8515,6 +9555,7 @@ fn run_video_decode_thread(
         if !self.layer_editable() {
             return;
         }
+        let expanded = self.expand_ids_for_delete(ids);
         let layer_index = self.project.document.active_layer_index;
         let layer_nodes_before = self
             .project
@@ -8523,20 +9564,28 @@ fn run_video_decode_thread(
             .map(|l| l.nodes.clone())
             .unwrap_or_default();
         let mut removed = Vec::new();
-        for id in ids {
+        let mut removed_anims = Vec::new();
+        for id in &expanded {
             if let Some(node) = self.project.nodes.get(*id).cloned() {
                 removed.push((*id, node));
             }
+            if let Some(anim) = self.project.anim_timeline.nodes.get(id).cloned() {
+                removed_anims.push((*id, anim));
+            }
+        }
+        if removed.is_empty() {
+            return;
         }
         self.history.push(
             &mut self.project,
             ProjectEdit::RemoveNodes {
                 removed,
+                removed_anims,
                 layer_index,
                 layer_nodes_before,
             },
         );
-        self.selection.retain(|id| !ids.contains(id));
+        self.selection.retain(|id| !expanded.contains(id));
     }
 
     pub fn delete_on_page_text_node(&mut self, id: NodeId) {
@@ -8567,10 +9616,19 @@ fn run_video_decode_thread(
                 .map(|l| l.nodes.clone())
                 .unwrap_or_default();
             if let Some(node) = self.project.nodes.get(id).cloned() {
+                let removed_anims = self
+                    .project
+                    .anim_timeline
+                    .nodes
+                    .get(&id)
+                    .cloned()
+                    .map(|a| vec![(id, a)])
+                    .unwrap_or_default();
                 self.history.push(
                     &mut self.project,
                     ProjectEdit::RemoveNodes {
                         removed: vec![(id, node)],
+                        removed_anims,
                         layer_index,
                         layer_nodes_before,
                     },
@@ -9010,8 +10068,22 @@ fn run_video_decode_thread(
                                     }
                                 } else {
                                     self.tools.select.drag_mode = Some(SelectDrag::Resize(handle));
-                                    self.tools.select.resize_anchor = node.bounds();
-                                    self.tools.select.drag_snapshot = vec![(id, node.clone())];
+                                    // Groups: use child-union bounds, not ZERO.
+                                    self.tools.select.resize_anchor =
+                                        node.bounds_with_store(&self.project.nodes);
+                                    // Don't drag-snapshot a group shell alone — expand children.
+                                    if let NodeKind::Group { children } = &node.kind {
+                                        let mut snap = Vec::new();
+                                        for &cid in children {
+                                            if let Some(c) = self.project.nodes.get(cid) {
+                                                snap.push((cid, c.clone()));
+                                            }
+                                        }
+                                        self.tools.select.drag_snapshot = snap;
+                                    } else {
+                                        self.tools.select.drag_snapshot =
+                                            vec![(id, node.clone())];
+                                    }
                                     self.tools.select.last_doc = doc;
                                     self.sync_inspector_from_selection();
                                     return;
@@ -9030,20 +10102,22 @@ fn run_video_decode_thread(
                         for (i, &(px, py)) in pts.iter().enumerate() {
                             if i == 0 { continue; } // Skip offset handle
                             if (px - doc.0).hypot(py - doc.1) < slop {
+                                self.tools.select.effect_drag_doc_before =
+                                    Some(self.project.document.clone());
                                 self.tools.select.drag_mode = Some(SelectDrag::TilingGizmo(i));
                                 self.tools.select.last_doc = doc;
                                 return;
                             }
                         }
                     }
-                    if let Some(pts) = self.get_circular_gizmo_points(id) {
-                        for (i, &(px, py)) in pts.iter().enumerate() {
-                            if (px - doc.0).hypot(py - doc.1) < slop {
-                                self.tools.select.drag_mode = Some(SelectDrag::CircularGizmo(i));
-                                self.tools.select.last_doc = doc;
-                                return;
-                            }
-                        }
+                    // Screen-space hit so yellow handles stay grabbable at any zoom.
+                    if let Some(handle) = self.hit_circular_gizmo(id, screen, origin) {
+                        self.tools.select.effect_drag_doc_before =
+                            Some(self.project.document.clone());
+                        self.tools.select.drag_mode = Some(SelectDrag::CircularGizmo(handle));
+                        self.tools.select.last_doc = doc;
+                        self.tools.select.drag_start_doc = Some(doc);
+                        return;
                     }
                 }
             }
@@ -9145,7 +10219,8 @@ fn run_video_decode_thread(
                 }
                 if !self.selection.is_empty() {
                     self.tools.select.drag_mode = Some(SelectDrag::Move);
-                    self.tools.select.drag_start_doc = Some(doc);
+                    self.tools.select.drag_start_doc = Some(doc); // raw pointer (unsnapped)
+                    self.tools.select.move_drag_engaged = false;
                     self.tools.select.resize_anchor = hit_layer_rect.unwrap();
                 }
                 self.tools.select.last_doc = doc;
@@ -9153,14 +10228,59 @@ fn run_video_decode_thread(
                 return;
             }
 
-            let hit =
-                self.pick_node_at_opts(doc, 4.0 / self.viewport.zoom as f64, ghost_pick);
+            let slop = 4.0 / self.viewport.zoom as f64;
+            let hits = self.pick_all_nodes_at(doc, slop, ghost_pick);
+            let hit = hits.first().copied();
             if let Some(edit_id) = self.on_page_text_edit {
                 let keep_editing = hit == Some(edit_id);
                 if !keep_editing {
                     self.finish_on_page_text_edit();
                 }
             }
+
+            // Sticky selection: with an active selection, ignore clicks on other objects
+            // until Esc / empty space deselects (shift still allows multi-select).
+            if self.selection_sticky
+                && !self.selection.is_empty()
+                && !shift
+                && !ghost_pick
+            {
+                if let Some(id) = hit {
+                    if !self.selection.contains(&id) {
+                        // Clicked something else — keep current selection (allow drag of current).
+                        // If pointer is on current selection, proceed to move.
+                        // If not on selection at all, block switch.
+                        let on_current = self.selection.iter().any(|&sid| {
+                            self.project.nodes.get(sid).is_some_and(|n| {
+                                self.hit_test_node_for_pick(sid, n, doc, slop)
+                            })
+                        });
+                        if !on_current {
+                            self.tools.select.last_doc = doc;
+                            self.sync_inspector_from_selection();
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Multi-hit at same place: show object picker instead of guessing topmost.
+            if !ghost_pick
+                && !shift
+                && hits.len() > 1
+                && (self.selection.is_empty() || !self.selection_sticky)
+            {
+                // If any hit is already selected, keep it (sticky / re-click).
+                if !hits.iter().any(|id| self.selection.contains(id)) {
+                    self.hit_pick_menu = Some((screen, hits));
+                    self.tools.select.drag_mode = None;
+                    self.tools.select.marquee = None;
+                    self.tools.select.last_doc = doc;
+                    return;
+                }
+            }
+            self.hit_pick_menu = None;
+
             if let Some(id) = hit {
                 self.tools.select.marquee = None;
                 self.tools.select.clear_path_point_selection();
@@ -9170,23 +10290,28 @@ fn run_video_decode_thread(
                 if ghost_pick {
                     self.selection = vec![id];
                     self.tools.select.select_rotation_mode = false;
+                    self.selection_sticky = true;
                 } else if let Some((source, mask)) = self.clip_pair_for(id) {
                     // Clicking the visible clipped composite selects image + mask as a unit.
                     self.selection = vec![source, mask];
                     self.tools.select.select_rotation_mode = false;
+                    self.selection_sticky = true;
                 } else if shift {
                     if self.selection.contains(&id) {
                         self.selection.retain(|s| *s != id);
                     } else {
                         self.selection.push(id);
                     }
+                    self.selection_sticky = !self.selection.is_empty();
                 } else if !self.selection.contains(&id) {
                     self.selection = vec![id];
                     self.tools.select.select_rotation_mode = false;
+                    self.selection_sticky = true;
                 }
                 if !self.selection.is_empty() {
                     self.tools.select.drag_mode = Some(SelectDrag::Move);
-                    self.tools.select.drag_start_doc = Some(doc);
+                    self.tools.select.drag_start_doc = Some(doc); // raw — threshold must not mix with grid snap
+                    self.tools.select.move_drag_engaged = false;
                     let selection = self.selection.clone();
                     self.setup_bulk_drag_if_needed(&selection);
                     if self.tools.select.bulk_drag.is_none() {
@@ -9222,11 +10347,37 @@ fn run_video_decode_thread(
                             }
                         }
                         self.tools.select.drag_snapshot = nodes_to_snapshot;
+                        // Snapshot circular ring so Move can translate it rigidly with the object.
+                        self.tools.select.circular_ring_drag_start.clear();
+                        for &sid in &drag_ids {
+                            if let Some(e) = self
+                                .project
+                                .document
+                                .circular_effects
+                                .values()
+                                .find(|e| e.source_id == sid)
+                            {
+                                self.tools.select.circular_ring_drag_start.push((
+                                    sid,
+                                    e.base_x,
+                                    e.base_y,
+                                    e.origin_x,
+                                    e.origin_y,
+                                ));
+                            }
+                        }
                     }
                 }
             } else {
+                // Empty space: clear selection and sticky lock.
                 self.tools.select.drag_mode = None;
                 self.tools.select.clear_path_point_selection();
+                self.hit_pick_menu = None;
+                if !shift {
+                    self.selection.clear();
+                    self.tools.select.select_rotation_mode = false;
+                    self.selection_sticky = false;
+                }
                 self.tools.select.marquee = Some(MarqueeSelect {
                     origin_doc: doc,
                     current_doc: doc,
@@ -9236,17 +10387,35 @@ fn run_video_decode_thread(
             self.tools.select.last_doc = doc;
             self.sync_inspector_from_selection();
         } else if down {
+            // Keep raw pointer for Move threshold (grid snap of `doc` used to cause instant jumps).
+            let raw_doc = doc;
+            // Grid-snap for resize/marquee; CircularGizmo uses raw + snap_gizmo_point.
+            let doc = if matches!(
+                self.tools.select.drag_mode,
+                Some(SelectDrag::CircularGizmo(_)) | Some(SelectDrag::Move)
+            ) {
+                doc
+            } else {
+                self.viewport.snap(doc)
+            };
             if let Some(marquee) = self.tools.select.marquee.as_mut() {
                 marquee.current_doc = doc;
             } else if let Some(mode) = self.tools.select.drag_mode {
                 match mode {
                     SelectDrag::Move => {
-                        let drag_start = self.tools.select.drag_start_doc.unwrap_or(self.tools.select.last_doc);
-                        let total_dx = doc.0 - drag_start.0;
-                        let total_dy = doc.1 - drag_start.1;
-                        let screen_dist = (total_dx.hypot(total_dy) * self.viewport.zoom as f64).abs();
+                        // Always measure click-vs-drag in raw pointer space.
+                        let drag_start = self
+                            .tools
+                            .select
+                            .drag_start_doc
+                            .unwrap_or(self.tools.select.last_doc);
+                        let total_dx = raw_doc.0 - drag_start.0;
+                        let total_dy = raw_doc.1 - drag_start.1;
+                        let screen_dist =
+                            (total_dx.hypot(total_dy) * self.viewport.zoom as f64).abs();
 
-                        if screen_dist > 4.0 {
+                        if screen_dist > tools::SELECT_MOVE_THRESHOLD_PX {
+                            self.tools.select.move_drag_engaged = true;
                             let selection_ids = self.selection.clone();
                             let (snapped_dx, snapped_dy) = self.apply_snapping((total_dx, total_dy), &selection_ids);
 
@@ -9267,11 +10436,30 @@ fn run_video_decode_thread(
                                         node.translate(snapped_dx, snapped_dy);
                                     }
                                 }
+                                // Circular ring rides with the source (rigid) so bbox size stays stable.
+                                let ring_starts = self.tools.select.circular_ring_drag_start.clone();
+                                for &(sid, bx, by, ox, oy) in &ring_starts {
+                                    if let Some((_, e)) = self
+                                        .project
+                                        .document
+                                        .circular_effects
+                                        .iter_mut()
+                                        .find(|(_, e)| e.source_id == sid)
+                                    {
+                                        e.base_x = bx + snapped_dx;
+                                        e.base_y = by + snapped_dy;
+                                        e.origin_x = ox + snapped_dx;
+                                        e.origin_y = oy + snapped_dy;
+                                        e.radius = (e.base_x - e.origin_x)
+                                            .hypot(e.base_y - e.origin_y)
+                                            .max(1.0);
+                                    }
+                                }
                                 // Lively update attached flowchart connectors while dragging nodes
                                 self.sync_flowchart_paths_if_active_layer();
                             }
                         }
-                        self.tools.select.last_doc = doc;
+                        self.tools.select.last_doc = raw_doc;
                     }
                     SelectDrag::Resize(handle) => {
                         if let Some(id) = self.selection.first().copied() {
@@ -9304,18 +10492,60 @@ fn run_video_decode_thread(
                         }
                     }
                     SelectDrag::CircularGizmo(pt_idx) => {
-                        let dx = doc.0 - self.tools.select.last_doc.0;
-                        let dy = doc.1 - self.tools.select.last_doc.1;
-                        self.tools.select.last_doc = doc;
+                        // `doc` is raw (unsnapped) pointer so handles track the mouse under Snap to Grid.
                         if let Some(id) = self.selection.first().copied() {
-                            if let Some((_, e)) = self.project.document.circular_effects.iter_mut().find(|(_, e)| e.source_id == id) {
+                            let snapped = self.snap_gizmo_point(doc, Some(id));
+                            if let Some((_, e)) = self
+                                .project
+                                .document
+                                .circular_effects
+                                .iter_mut()
+                                .find(|(_, e)| e.source_id == id)
+                            {
                                 match pt_idx {
-                                    0 => { e.base_x += dx; e.base_y += dy; }
-                                    1 => { e.origin_x += dx; e.origin_y += dy; }
+                                    // Base (object on ring): absolute snapped position.
+                                    0 => {
+                                        e.base_x = snapped.0;
+                                        e.base_y = snapped.1;
+                                        e.radius = (e.base_x - e.origin_x)
+                                            .hypot(e.base_y - e.origin_y)
+                                            .max(1.0);
+                                        e.angle_offset = 0.0;
+                                    }
+                                    // Origin (center): absolute snap, rigid move of base.
+                                    1 => {
+                                        let dx = snapped.0 - e.origin_x;
+                                        let dy = snapped.1 - e.origin_y;
+                                        e.origin_x = snapped.0;
+                                        e.origin_y = snapped.1;
+                                        e.base_x += dx;
+                                        e.base_y += dy;
+                                        e.radius = (e.base_x - e.origin_x)
+                                            .hypot(e.base_y - e.origin_y)
+                                            .max(1.0);
+                                    }
+                                    // Angle tip: snap pointer, then set angle_offset (fixed radius).
+                                    2 => {
+                                        let ox = e.origin_x;
+                                        let oy = e.origin_y;
+                                        let r = e.ring_radius();
+                                        let base_ang = e.base_angle_rad();
+                                        let pointer_ang =
+                                            (snapped.1 - oy).atan2(snapped.0 - ox);
+                                        let n = e.copies.max(3) as f64;
+                                        let step = std::f64::consts::TAU / n;
+                                        e.angle_offset =
+                                            (pointer_ang - base_ang - step).to_degrees();
+                                        e.base_x = ox + r * base_ang.cos();
+                                        e.base_y = oy + r * base_ang.sin();
+                                        e.radius = r;
+                                    }
                                     _ => {}
                                 }
                             }
+                            self.sync_circular_ui_from_effect_id(id);
                         }
+                        self.tools.select.last_doc = doc;
                     }
                     SelectDrag::Rotate => {
                         if let Some(id) = self.selection.first().copied() {
@@ -9358,7 +10588,13 @@ fn run_video_decode_thread(
                             .ordered_node_ids()
                             .into_iter()
                             .filter(|id| {
-                                if hidden.contains(id) {
+                                // Circular/tiling/on-path sources stay marquee-pickable.
+                                if hidden.contains(id)
+                                    && !crate::document::is_pickable_effect_source(
+                                        &self.project.document,
+                                        *id,
+                                    )
+                                {
                                     return false;
                                 }
                                 self.project.nodes.get(*id).is_some_and(|n| {
@@ -9389,17 +10625,40 @@ fn run_video_decode_thread(
                 } else if !m.shift {
                     self.selection.clear();
                     self.tools.select.select_rotation_mode = false;
+                    self.selection_sticky = false;
+                    self.hit_pick_menu = None;
                 }
                 self.sync_inspector_if_needed();
             } else if let Some(mode) = self.tools.select.drag_mode.take() {
-                if !matches!(mode, SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_)) {
+                if matches!(mode, SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_)) {
+                    // Commit circular/tiling gizmo edits so undo works.
+                    if let Some(before) = self.tools.select.effect_drag_doc_before.take() {
+                        let after = self.project.document.clone();
+                        let changed = before.circular_effects != after.circular_effects
+                            || before.tiling_effects != after.tiling_effects;
+                        if changed {
+                            self.history.push(
+                                &mut self.project,
+                                ProjectEdit::PatchDocument { before, after },
+                            );
+                        }
+                    }
+                    self.tools.select.drag_snapshot.clear();
+                } else {
                     if matches!(mode, SelectDrag::Move) {
-                        let drag_start = self.tools.select.drag_start_doc.unwrap_or(self.tools.select.last_doc);
+                        let drag_start = self
+                            .tools
+                            .select
+                            .drag_start_doc
+                            .unwrap_or(self.tools.select.last_doc);
                         let total_dx = doc.0 - drag_start.0;
                         let total_dy = doc.1 - drag_start.1;
-                        let doc_dist = total_dx.hypot(total_dy);
-                        let screen_dist = doc_dist * self.viewport.zoom as f64;
-                        if screen_dist < 2.0 {
+                        let screen_dist =
+                            total_dx.hypot(total_dy) * self.viewport.zoom as f64;
+                        let was_click = !self.tools.select.move_drag_engaged
+                            || screen_dist < tools::SELECT_MOVE_THRESHOLD_PX;
+                        if was_click {
+                            // Pure click: restore pose, never commit a tiny move.
                             if self.tools.select.bulk_drag.is_some() {
                                 self.revert_bulk_move_preview();
                                 self.tools.select.bulk_drag = None;
@@ -9409,11 +10668,35 @@ fn run_video_decode_thread(
                                         *node = orig_node.clone();
                                     }
                                 }
+                                // Restore circular ring snapshot if any.
+                                let ring_starts =
+                                    self.tools.select.circular_ring_drag_start.clone();
+                                for &(sid, bx, by, ox, oy) in &ring_starts {
+                                    if let Some((_, e)) = self
+                                        .project
+                                        .document
+                                        .circular_effects
+                                        .iter_mut()
+                                        .find(|(_, e)| e.source_id == sid)
+                                    {
+                                        e.base_x = bx;
+                                        e.base_y = by;
+                                        e.origin_x = ox;
+                                        e.origin_y = oy;
+                                        e.radius = (e.base_x - e.origin_x)
+                                            .hypot(e.base_y - e.origin_y)
+                                            .max(1.0);
+                                    }
+                                }
                             }
-                            // Restore any flowchart connector routes
                             self.sync_flowchart_paths_if_active_layer();
-                            if self.selection.len() == 1 && self.tools.select.clicked_already_selected {
-                                self.tools.select.select_rotation_mode = !self.tools.select.select_rotation_mode;
+                            self.tools.select.drag_snapshot.clear();
+                            // Second click on already-selected object → toggle rotate mode.
+                            if self.selection.len() == 1
+                                && self.tools.select.clicked_already_selected
+                            {
+                                self.tools.select.select_rotation_mode =
+                                    !self.tools.select.select_rotation_mode;
                             }
                         } else if self.tools.select.bulk_drag.is_some() {
                             let selection_ids = self.selection.clone();
@@ -9421,13 +10704,14 @@ fn run_video_decode_thread(
                                 self.apply_snapping((total_dx, total_dy), &selection_ids);
                             self.revert_bulk_move_preview();
                             self.commit_bulk_drag(snapped_dx, snapped_dy);
+                        } else {
+                            self.commit_drag_edits();
                         }
-                    }
-                    if self.tools.select.bulk_drag.is_none() {
+                        self.tools.select.move_drag_engaged = false;
+                        self.tools.select.drag_start_doc = None;
+                    } else if self.tools.select.bulk_drag.is_none() {
                         self.commit_drag_edits();
                     }
-                } else {
-                    self.tools.select.drag_snapshot.clear();
                 }
             }
         }
@@ -9936,7 +11220,7 @@ fn run_video_decode_thread(
         node
     }
 
-    fn tool_drag_shape(&mut self, doc: (f64, f64), down: bool, released: bool) {
+    fn tool_drag_shape(&mut self, doc: (f64, f64), down: bool, released: bool, ctrl: bool) {
         if self.tools.drag_shape.is_none() && down {
             let snapped_origin = self.snap_cursor(doc);
             self.tools.drag_shape = Some(DragNewShape {
@@ -9945,7 +11229,16 @@ fn run_video_decode_thread(
                 kind: Some(self.tools.active),
             });
         } else if self.tools.drag_shape.is_some() {
-            let snapped_current = self.snap_cursor(doc);
+            let mut snapped_current = self.snap_cursor(doc);
+            // Line tool: Ctrl locks angle to 15° steps about the origin.
+            if ctrl {
+                if let Some(drag) = &self.tools.drag_shape {
+                    if drag.kind == Some(ToolKind::Line) {
+                        snapped_current =
+                            tools::snap_angle_15deg(drag.origin_doc, snapped_current);
+                    }
+                }
+            }
             if let Some(drag) = &mut self.tools.drag_shape {
                 drag.current_doc = snapped_current;
             }
@@ -9953,7 +11246,10 @@ fn run_video_decode_thread(
                 let drag = self.tools.drag_shape.take().unwrap();
                 let kind = drag.kind;
                 let origin = drag.origin_doc;
-                let current = drag.current_doc;
+                let mut current = drag.current_doc;
+                if ctrl && kind == Some(ToolKind::Line) {
+                    current = tools::snap_angle_15deg(origin, current);
+                }
 
                 let Some(kind) = kind else {
                     return;
@@ -10131,6 +11427,13 @@ fn run_video_decode_thread(
                             self.build_ui_fill(),
                         ))
                     }
+                    ToolKind::Plotter => {
+                        let (x, y, w, h) = tools::normalize_rect(origin, current);
+                        if w <= 2.0 || h <= 2.0 {
+                            return;
+                        }
+                        self.styled_shape_node(Node::plotter(x, y, w, h, self.build_ui_fill()))
+                    }
                     _ => return,
                 };
                 self.insert_node(node);
@@ -10231,7 +11534,14 @@ fn run_video_decode_thread(
                 }
             }
 
-            self.pen_push_anchor(doc, ctrl);
+            // Second point of a path: Ctrl locks angle to 15° about the first point
+            // (only for 2-point paths — once a 3rd point is added, no angle lock).
+            let mut place = doc;
+            if self.tools.pen.anchors.len() == 1 && ctrl {
+                place = tools::snap_angle_15deg(self.tools.pen.anchors[0], doc);
+            }
+            // Ctrl also enables smooth handles (existing); combine with angle lock above.
+            self.pen_push_anchor(place, ctrl);
         }
 
         if down {
@@ -10959,6 +12269,27 @@ fn run_video_decode_thread(
                             use_doc = self.snap_cursor(use_doc);
                         }
                     }
+                    // Ctrl: 15° angle lock when editing a 2-point path (line), relative to the other end.
+                    if ctrl && matches!(target, PathEditTarget::Anchor(_)) && !is_yellow {
+                        if let Some(node) = self.project.nodes.get(id) {
+                            if let NodeKind::Path { path } = &node.kind {
+                                let anchors = path.anchor_positions();
+                                if anchors.len() == 2 {
+                                    let pi = target.anchor_index();
+                                    if let Some(&other) = anchors.get(1 - pi.min(1)) {
+                                        use_doc = tools::snap_angle_15deg(other, use_doc);
+                                    }
+                                }
+                            } else if let NodeKind::FlowchartPath { path } = &node.kind {
+                                if path.points.len() == 2 {
+                                    let pi = target.anchor_index();
+                                    if let Some(&other) = path.points.get(1 - pi.min(1)) {
+                                        use_doc = tools::snap_angle_15deg(other, use_doc);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let indices = self.tools.select.points_on_path(id);
                     if matches!(target, PathEditTarget::Anchor(_)) && indices.len() > 1 {
                         let dx = use_doc.0 - self.tools.select.last_doc.0;
@@ -11071,6 +12402,7 @@ fn run_video_decode_thread(
             crate::document::NodeKind::Text { .. } => "text",
             crate::document::NodeKind::Group { .. } => "group",
             crate::document::NodeKind::Image { .. } => "image",
+            crate::document::NodeKind::Plotter { .. } => "plotter",
             crate::document::NodeKind::Arc { .. } => "arc",
             crate::document::NodeKind::BrushStroke { .. } => "brush",
         }
@@ -11762,25 +13094,35 @@ fn run_video_decode_thread(
             })
             .unwrap_or_default();
         let starts = args.get("starts");
+        let live_geom = self.get_node_geom_floats(id);
         let before = self.project.anim_timeline.clone();
         let entry = self.project.anim_timeline.nodes.entry(id).or_default();
         // Ensure geom track slots exist if needed
         for t in &tracks {
-            if t.starts_with("geom_") {
-                if let Ok(idx) = t["geom_".len()..].parse::<usize>() {
-                    while entry.geom_tracks.len() <= idx {
-                        entry.geom_tracks.push(crate::document::KeyframeTrack::default());
-                    }
-                }
-            }
+            entry.ensure_track(t);
         }
         let end = start_frame.saturating_add(duration_frames);
         let mut channels = Vec::new();
         for (i, track) in tracks.iter().enumerate() {
+            let _ = i;
+            let geom_def = if let Some(gidx) = track
+                .strip_prefix("geom_")
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                live_geom.get(gidx).copied().unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            // Prefer exact key at start_frame; else live geom — not distant interpolate.
             let def = entry
                 .get_track(track)
-                .and_then(|tr| tr.interpolate(start_frame))
-                .unwrap_or(0.0);
+                .and_then(|tr| {
+                    tr.keyframes
+                        .iter()
+                        .find(|k| k.frame == start_frame)
+                        .map(|k| k.value)
+                })
+                .unwrap_or(geom_def);
             let start_value = Self::mcp_resolve_start_const(starts, track, def);
             let expr = exprs.get(i).cloned().unwrap_or_default();
             if !expr.trim().is_empty() {
@@ -11919,7 +13261,7 @@ fn run_video_decode_thread(
             .nodes
             .get_mut(&id)
             .ok_or_else(|| format!("No animation for {id_str}"))?;
-        if !entry.remove_stack_function(stack_id) {
+        if !entry.remove_stack_function_with_keyframes(stack_id) {
             return Err(format!("stack_id not found: {stack_id_str}"));
         }
         let after = self.project.anim_timeline.clone();
@@ -11994,6 +13336,11 @@ fn run_video_decode_thread(
             "color_g".into(),
             "color_b".into(),
             "color_a".into(),
+            "stroke_width".into(),
+            "stroke_r".into(),
+            "stroke_g".into(),
+            "stroke_b".into(),
+            "stroke_a".into(),
         ];
         let n_geom = node.get_geom_floats().len();
         for i in 0..n_geom {
@@ -12048,7 +13395,19 @@ fn run_video_decode_thread(
                 }));
             };
             for prop in [
-                "pos_x", "pos_y", "rotation", "opacity", "color_r", "color_g", "color_b", "color_a",
+                "pos_x",
+                "pos_y",
+                "rotation",
+                "opacity",
+                "color_r",
+                "color_g",
+                "color_b",
+                "color_a",
+                "stroke_width",
+                "stroke_r",
+                "stroke_g",
+                "stroke_b",
+                "stroke_a",
             ] {
                 if let Some(t) = anim.get_track(prop) {
                     push_track(prop, t, &mut tracks);
@@ -12121,7 +13480,8 @@ fn run_video_decode_thread(
             },
             "geometry": geom,
             "animatable": [
-                "pos_x","pos_y","rotation","opacity","color_r","color_g","color_b","color_a"
+                "pos_x","pos_y","rotation","opacity","color_r","color_g","color_b","color_a",
+                "stroke_width","stroke_r","stroke_g","stroke_b","stroke_a"
             ],
         }))
         .unwrap_or_default())
@@ -12135,6 +13495,7 @@ fn run_video_decode_thread(
             NodeKind::Path { .. } => "path",
             NodeKind::Text { .. } => "text",
             NodeKind::Image { .. } => "image",
+            NodeKind::Plotter { .. } => "plotter",
             NodeKind::Arc { .. } => "arc",
             NodeKind::Group { .. } => "group",
             NodeKind::BrushStroke { .. } => "brush",
@@ -12299,8 +13660,21 @@ fn run_video_decode_thread(
         let props = if let Some(p) = property {
             vec![p.to_string()]
         } else {
-            vec!["pos_x".into(), "pos_y".into(), "rotation".into(), "opacity".into(),
-                 "color_r".into(), "color_g".into(), "color_b".into(), "color_a".into()]
+            vec![
+                "pos_x".into(),
+                "pos_y".into(),
+                "rotation".into(),
+                "opacity".into(),
+                "color_r".into(),
+                "color_g".into(),
+                "color_b".into(),
+                "color_a".into(),
+                "stroke_width".into(),
+                "stroke_r".into(),
+                "stroke_g".into(),
+                "stroke_b".into(),
+                "stroke_a".into(),
+            ]
         };
         for prop in &props {
             if let Some(track) = anim.get_track(prop) {
@@ -12919,6 +14293,7 @@ fn run_video_decode_thread(
                         NodeKind::FlowchartNode { .. } => "flowchart_node",
                         NodeKind::Polygon { .. } => "polygon",
                         NodeKind::Image { .. } => "image",
+                        NodeKind::Plotter { .. } => "plotter",
                         NodeKind::Group { .. } => "group",
                         NodeKind::Arc { .. } => "arc",
                         NodeKind::BrushStroke { .. } => "brush",
@@ -13079,6 +14454,8 @@ impl eframe::App for VadadeeBerryApp {
                         rotation: node.get_rotation(),
                         opacity: node.get_opacity(),
                         color: node.get_color(),
+                        stroke_width: node.get_stroke_width(),
+                        stroke_color: node.get_stroke_color(),
                         geom_floats: gf,
                         fill: node.style.fill.clone(),
                     });
@@ -13094,6 +14471,8 @@ impl eframe::App for VadadeeBerryApp {
                         rotation: node.get_rotation(),
                         opacity: node.get_opacity(),
                         color: node.get_color(),
+                        stroke_width: node.get_stroke_width(),
+                        stroke_color: node.get_stroke_color(),
                         geom_floats: gf,
                         fill: node.style.fill.clone(),
                     });
@@ -13103,6 +14482,8 @@ impl eframe::App for VadadeeBerryApp {
                         rotation: layer.rotation as f64,
                         opacity: 1.0,
                         color: [1.0, 1.0, 1.0, 1.0],
+                        stroke_width: 0.0,
+                        stroke_color: [0.0, 0.0, 0.0, 0.0],
                         geom_floats: vec![],
                         fill: Fill::default(),
                     });
@@ -13117,6 +14498,8 @@ impl eframe::App for VadadeeBerryApp {
                     let rot = node.get_rotation();
                     let op = node.get_opacity();
                     let color = node.get_color();
+                    let stroke_w = node.get_stroke_width();
+                    let stroke_col = node.get_stroke_color();
                     let geom = self.get_node_geom_floats(*id);
                     
                     let last_state = self.anim_last_applied_states.get(id);
@@ -13125,6 +14508,8 @@ impl eframe::App for VadadeeBerryApp {
                         let mut changed_rot = false;
                         let mut changed_op = false;
                         let mut changed_col = false;
+                        let mut changed_stroke_w = false;
+                        let mut changed_stroke_col = false;
                         let mut changed_geom = false;
                         
                         let mut temp_node = node.clone();
@@ -13149,6 +14534,14 @@ impl eframe::App for VadadeeBerryApp {
                         for i in 0..4 {
                             if (color[i] - last.color[i]).abs() > 1e-6 {
                                 changed_col = true;
+                            }
+                        }
+                        if (stroke_w - last.stroke_width).abs() > 1e-6 {
+                            changed_stroke_w = true;
+                        }
+                        for i in 0..4 {
+                            if (stroke_col[i] - last.stroke_color[i]).abs() > 1e-6 {
+                                changed_stroke_col = true;
                             }
                         }
                         
@@ -13196,7 +14589,14 @@ impl eframe::App for VadadeeBerryApp {
                             changed_geom = true;
                         }
                         
-                        if changed_pos || changed_rot || changed_op || changed_col || changed_geom {
+                        if changed_pos
+                            || changed_rot
+                            || changed_op
+                            || changed_col
+                            || changed_stroke_w
+                            || changed_stroke_col
+                            || changed_geom
+                        {
                             let before_timeline = self.project.anim_timeline.clone();
                             let entry = self.project.anim_timeline.nodes.entry(*id).or_default();
                             
@@ -13238,6 +14638,39 @@ impl eframe::App for VadadeeBerryApp {
                                 entry.color_g.insert(self.anim_current_frame, color[1] as f64);
                                 entry.color_b.insert(self.anim_current_frame, color[2] as f64);
                                 entry.color_a.insert(self.anim_current_frame, color[3] as f64);
+                            }
+                            if changed_stroke_w {
+                                if entry.stroke_width.keyframes.is_empty()
+                                    && self.anim_current_frame > 0
+                                {
+                                    entry
+                                        .stroke_width
+                                        .insert(0, last.stroke_width as f64);
+                                }
+                                entry
+                                    .stroke_width
+                                    .insert(self.anim_current_frame, stroke_w as f64);
+                            }
+                            if changed_stroke_col {
+                                if entry.stroke_r.keyframes.is_empty() && self.anim_current_frame > 0
+                                {
+                                    entry.stroke_r.insert(0, last.stroke_color[0] as f64);
+                                    entry.stroke_g.insert(0, last.stroke_color[1] as f64);
+                                    entry.stroke_b.insert(0, last.stroke_color[2] as f64);
+                                    entry.stroke_a.insert(0, last.stroke_color[3] as f64);
+                                }
+                                entry
+                                    .stroke_r
+                                    .insert(self.anim_current_frame, stroke_col[0] as f64);
+                                entry
+                                    .stroke_g
+                                    .insert(self.anim_current_frame, stroke_col[1] as f64);
+                                entry
+                                    .stroke_b
+                                    .insert(self.anim_current_frame, stroke_col[2] as f64);
+                                entry
+                                    .stroke_a
+                                    .insert(self.anim_current_frame, stroke_col[3] as f64);
                             }
                             if changed_geom {
                                 while entry.geom_tracks.len() < geom.len() {
@@ -13323,6 +14756,8 @@ impl eframe::App for VadadeeBerryApp {
                             rotation: node.get_rotation(),
                             opacity: node.get_opacity(),
                             color: node.get_color(),
+                            stroke_width: node.get_stroke_width(),
+                            stroke_color: node.get_stroke_color(),
                             geom_floats: gf,
                             fill: node.style.fill.clone(),
                         });
@@ -13332,6 +14767,8 @@ impl eframe::App for VadadeeBerryApp {
                             rotation: layer.rotation as f64,
                             opacity: 1.0,
                             color: [1.0, 1.0, 1.0, 1.0],
+                            stroke_width: 0.0,
+                            stroke_color: [0.0, 0.0, 0.0, 0.0],
                             geom_floats: vec![],
                             fill: Fill::default(),
                         });
@@ -13624,6 +15061,10 @@ mod tests {
                 anim_graph_stack_drag: None,
                 anim_stack_formula_dialog: None,
                 anim_stack_formula_draft: String::new(),
+                plotter_formula_dialog: None,
+                plotter_formula_draft: String::new(),
+                plotter_inline_expr: None,
+                plotter_expr_edit_before: None,
                 object_rename_dialog: None,
                 anim_graph_scroll: 0.0,
                 anim_graph_visible_frames: 100.0,
@@ -13664,6 +15105,8 @@ mod tests {
                     ..Default::default()
                 },
                 selection: vec![],
+                hit_pick_menu: None,
+                selection_sticky: false,
                 history: History::default(),
                 ui_fill_stops: default_gradient_stops(),
                 ui_fill_stop_sel: 0,
@@ -13749,6 +15192,7 @@ mod tests {
                 ui_circular_angle_offset: 0.0,
                 ui_circular_origin_x: 0.0,
                 ui_circular_origin_y: 0.0,
+                ui_circular_rotate_mode: CircularRotateMode::ReferenceOrigin,
                 ui_anim: {
                     let mut anim = UiAnimation::new();
                     anim.seed_status_board("Idle", 80.0, 56.0);

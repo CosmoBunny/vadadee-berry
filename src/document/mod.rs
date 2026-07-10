@@ -620,4 +620,30 @@ impl ProjectFile {
             anim_timeline: AnimationTimeline::default(),
         }
     }
+
+    /// True if `id` is a living node or a document layer (AV layers can hold tracks).
+    pub fn owns_animation_id(&self, id: NodeId) -> bool {
+        self.nodes.get(id).is_some() || self.document.layers.iter().any(|l| l.id == id)
+    }
+
+    /// Drop timeline entries whose node/layer no longer exists (orphans after delete/bake).
+    pub fn prune_orphan_animation_tracks(&mut self) -> usize {
+        let live: std::collections::HashSet<NodeId> = self
+            .nodes
+            .map
+            .keys()
+            .copied()
+            .chain(self.document.layers.iter().map(|l| l.id))
+            .collect();
+        let before = self.anim_timeline.nodes.len();
+        self.anim_timeline.nodes.retain(|id, _| live.contains(id));
+        before.saturating_sub(self.anim_timeline.nodes.len())
+    }
+
+    /// Remove a node from the store/layers and its animation tracks.
+    pub fn remove_node_and_animation(&mut self, id: NodeId) {
+        self.nodes.remove(id);
+        self.document.remove_from_layers(id);
+        self.anim_timeline.nodes.remove(&id);
+    }
 }

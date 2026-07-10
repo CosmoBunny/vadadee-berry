@@ -34,6 +34,10 @@ pub struct ExportJobConfig {
     pub total_frames: usize,
     pub anim_fps: u32,
     pub max_anim_frame: usize,
+    /// Frames in one animation cycle (for looping export).
+    pub cycle_frame_count: usize,
+    /// How many times the cycle is repeated in `total_frames`.
+    pub export_cycles: u32,
 }
 
 /// Readiness phases — worker only advances when the previous step is complete.
@@ -338,7 +342,10 @@ impl<'a> ExportSession<'a> {
         for f in 0..self.config.total_frames {
             self.check_cancel()?;
 
-            let timeline_sec = f as f32 / self.export_fps;
+            // Map export frame into one animation cycle (supports multi-cycle loop exports).
+            let cycle_len = self.config.cycle_frame_count.max(1);
+            let f_in_cycle = f % cycle_len;
+            let timeline_sec = f_in_cycle as f32 / self.export_fps;
             let anim_frame = ((timeline_sec * self.anim_fps).round() as usize)
                 .min(self.config.max_anim_frame);
             apply_animation_for_frame_project(self.project, anim_frame);
@@ -646,49 +653,113 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
 }
 
 /// Apply timeline at `frame` to a detached project clone (export thread).
+///
+/// Must match live preview: **stack animation functions** win inside their span
+/// (via [`crate::document::NodeAnimation::sample_mut`]), then keyframe interpolation.
+/// Using keyframe-only sampling would export linear start→end ramps instead of f(t).
 pub fn apply_animation_for_frame_project(project: &mut ProjectFile, frame: usize) {
-    let updates: Vec<(
+    let node_ids: Vec<NodeId> = project.anim_timeline.nodes.keys().copied().collect();
+    let mut updates: Vec<(
         NodeId,
         Option<f64>,
         Option<f64>,
         Option<f64>,
         Option<f32>,
         Option<[f32; 4]>,
+        Option<f32>,
+        Option<[f32; 4]>,
         Option<Vec<f64>>,
-    )> = project
-        .anim_timeline
-        .nodes
-        .iter()
-        .map(|(node_id, track)| {
-            let x = track.pos_x.interpolate(frame);
-            let y = track.pos_y.interpolate(frame);
-            let rot = track.rotation.interpolate(frame);
-            let opacity = track.opacity.interpolate(frame).map(|o| o as f32);
-            let r = track.color_r.interpolate(frame);
-            let g = track.color_g.interpolate(frame);
-            let b = track.color_b.interpolate(frame);
-            let a = track.color_a.interpolate(frame);
-            let color = if let (Some(r), Some(g), Some(b), Some(a)) = (r, g, b, a) {
-                Some([r as f32, g as f32, b as f32, a as f32])
-            } else {
-                None
-            };
-            let geom = if !track.geom_tracks.is_empty() {
-                let mut g_vals = Vec::new();
-                let current_geom = get_node_geom_floats_project(project, *node_id);
-                for (idx, t) in track.geom_tracks.iter().enumerate() {
-                    let def_val = current_geom.get(idx).copied().unwrap_or(0.0);
-                    g_vals.push(t.interpolate(frame).unwrap_or(def_val));
-                }
-                Some(g_vals)
-            } else {
-                None
-            };
-            (*node_id, x, y, rot, opacity, color, geom)
-        })
-        .collect();
+    )> = Vec::with_capacity(node_ids.len());
 
-    for (node_id, target_x, target_y, target_rot, target_op, target_color, target_geom) in updates {
+    for node_id in node_ids {
+        // Snapshot geom before mutably borrowing the timeline entry.
+        let current_geom = get_node_geom_floats_project(project, node_id);
+        let Some(track) = project.anim_timeline.nodes.get_mut(&node_id) else {
+            continue;
+        };
+        // sample_mut: stack formulas (f(t)) override keyframes inside the span — same as UI.
+        let x = track.sample_mut("pos_x", frame);
+        let y = track.sample_mut("pos_y", frame);
+        let rot = track.sample_mut("rotation", frame);
+        let opacity = track.sample_mut("opacity", frame).map(|o| o as f32);
+        let r = track.sample_mut("color_r", frame);
+        let g = track.sample_mut("color_g", frame);
+        let b = track.sample_mut("color_b", frame);
+        let a = track.sample_mut("color_a", frame);
+        let color = if let (Some(r), Some(g), Some(b), Some(a)) = (r, g, b, a) {
+            Some([r as f32, g as f32, b as f32, a as f32])
+        } else {
+            None
+        };
+        let stroke_w = track.sample_mut("stroke_width", frame).map(|w| w as f32);
+        let sr = track.sample_mut("stroke_r", frame);
+        let sg = track.sample_mut("stroke_g", frame);
+        let sb = track.sample_mut("stroke_b", frame);
+        let sa = track.sample_mut("stroke_a", frame);
+        let stroke_color = if let (Some(r), Some(g), Some(b), Some(a)) = (sr, sg, sb, sa) {
+            Some([r as f32, g as f32, b as f32, a as f32])
+        } else {
+            None
+        };
+
+        let need_geom = track.geom_tracks.iter().any(|t| !t.keyframes.is_empty())
+            || track.stack_functions.iter().any(|sf| {
+                sf.channels.iter().any(|c| c.track.starts_with("geom_"))
+            });
+        let geom = if need_geom {
+            // Grow geom track slots if stack targets higher indices.
+            for ch in &track.stack_functions {
+                for c in &ch.channels {
+                    if let Some(idx) = c
+                        .track
+                        .strip_prefix("geom_")
+                        .and_then(|s| s.parse::<usize>().ok())
+                    {
+                        if track.geom_tracks.len() <= idx {
+                            track
+                                .geom_tracks
+                                .resize_with(idx + 1, Default::default);
+                        }
+                    }
+                }
+            }
+            let n = track.geom_tracks.len().max(current_geom.len());
+            let mut g_vals = Vec::with_capacity(n);
+            for idx in 0..n {
+                let def_val = current_geom.get(idx).copied().unwrap_or(0.0);
+                let lbl = format!("geom_{idx}");
+                g_vals.push(track.sample_mut(&lbl, frame).unwrap_or(def_val));
+            }
+            Some(g_vals)
+        } else {
+            None
+        };
+
+        updates.push((
+            node_id,
+            x,
+            y,
+            rot,
+            opacity,
+            color,
+            stroke_w,
+            stroke_color,
+            geom,
+        ));
+    }
+
+    for (
+        node_id,
+        target_x,
+        target_y,
+        target_rot,
+        target_op,
+        target_color,
+        target_stroke_w,
+        target_stroke_col,
+        target_geom,
+    ) in updates
+    {
         if let Some(node) = project.nodes.get_mut(node_id) {
             let (curr_x, curr_y) = node.get_pos();
             let dx = target_x.map(|tx| tx - curr_x).unwrap_or(0.0);
@@ -737,12 +808,51 @@ pub fn apply_animation_for_frame_project(project: &mut ProjectFile, frame: usize
                     node.set_color(color);
                 }
             }
+            if let Some(sw) = target_stroke_w {
+                node.set_stroke_width(sw);
+            }
+            if let Some(color) = target_stroke_col {
+                let mut base_stroke = project
+                    .anim_timeline
+                    .nodes
+                    .get(&node_id)
+                    .and_then(|track| track.base_stroke.clone());
+                if base_stroke.is_none() {
+                    base_stroke = Some(node.style.stroke.style.clone());
+                    if let Some(track) = project.anim_timeline.nodes.get_mut(&node_id) {
+                        track.base_stroke = base_stroke.clone();
+                    }
+                }
+                if let Some(mut bs) = base_stroke {
+                    match &mut bs {
+                        Fill::Solid(paint) => {
+                            paint.rgba = color;
+                            node.style.stroke.style = Fill::Solid(*paint);
+                        }
+                        Fill::LinearGradient { stops, .. } | Fill::RadialGradient { stops, .. } => {
+                            for stop in stops {
+                                stop.color.rgba = [
+                                    stop.color.rgba[0] * color[0],
+                                    stop.color.rgba[1] * color[1],
+                                    stop.color.rgba[2] * color[2],
+                                    stop.color.rgba[3] * color[3],
+                                ];
+                            }
+                            node.style.stroke.style = bs;
+                        }
+                        Fill::None => {
+                            node.set_stroke_color(color);
+                        }
+                    }
+                } else {
+                    node.set_stroke_color(color);
+                }
+            }
             if let Some(geom) = target_geom {
                 set_node_geom_floats_project(project, node_id, &geom);
             }
         } else if let Some(layer) = project.document.layers.iter_mut().find(|l| {
-            l.id == node_id
-                && l.kind == crate::document::LayerKind::AV
+            l.id == node_id && l.kind == crate::document::LayerKind::AV
         }) {
             if let Some(x) = target_x {
                 layer.x = x as f32;

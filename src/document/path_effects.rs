@@ -74,6 +74,26 @@ impl Default for TilingEffect {
     }
 }
 
+/// How each CircularClone instance is oriented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CircularRotateMode {
+    /// Keep the source orientation for every copy (translate only around the ring).
+    Static,
+    /// Rotate each copy by its step around the origin, relative to the base instance
+    /// (good for chord / fan layouts — base keeps its angle; others follow the ring).
+    #[default]
+    ReferenceOrigin,
+}
+
+impl CircularRotateMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Static => "Static",
+            Self::ReferenceOrigin => "Origin",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CircularCloneEffect {
     pub id: Uuid,
@@ -86,6 +106,9 @@ pub struct CircularCloneEffect {
     pub base_x: f64,
     pub base_y: f64,
     pub hide_source: bool,
+    /// Instance orientation around the origin.
+    #[serde(default)]
+    pub rotate_mode: CircularRotateMode,
 }
 
 impl Default for CircularCloneEffect {
@@ -101,6 +124,61 @@ impl Default for CircularCloneEffect {
             base_x: 0.0,
             base_y: 0.0,
             hide_source: false,
+            rotate_mode: CircularRotateMode::ReferenceOrigin,
+        }
+    }
+}
+
+impl CircularCloneEffect {
+    pub fn ring_radius(&self) -> f64 {
+        let dx = self.base_x - self.origin_x;
+        let dy = self.base_y - self.origin_y;
+        dx.hypot(dy).max(1.0)
+    }
+
+    pub fn base_angle_rad(&self) -> f64 {
+        let dx = self.base_x - self.origin_x;
+        let dy = self.base_y - self.origin_y;
+        dy.atan2(dx)
+    }
+
+    /// Absolute polar angle of copy `i` on the ring (includes angle_offset).
+    pub fn copy_angle_rad(&self, i: usize) -> f64 {
+        let n = self.copies.max(3) as f64;
+        self.base_angle_rad()
+            + (i as f64 / n) * std::f64::consts::TAU
+            + self.angle_offset.to_radians()
+    }
+
+    pub fn placement_xy(&self, i: usize) -> (f64, f64) {
+        let r = self.ring_radius();
+        let ang = self.copy_angle_rad(i);
+        (
+            self.origin_x + r * ang.cos(),
+            self.origin_y + r * ang.sin(),
+        )
+    }
+
+    /// Rotation applied to the instance after placing at ring position.
+    /// - Static: 0 (source orientation preserved)
+    /// - ReferenceOrigin: delta from base ray so base stays unrotated and copies fan around origin
+    pub fn instance_rotation_rad(&self, i: usize) -> f64 {
+        match self.rotate_mode {
+            CircularRotateMode::Static => 0.0,
+            CircularRotateMode::ReferenceOrigin => {
+                self.copy_angle_rad(i) - self.base_angle_rad()
+            }
+        }
+    }
+
+    pub fn path_placement(&self, i: usize) -> PathPlacement {
+        let (x, y) = self.placement_xy(i);
+        PathPlacement {
+            x,
+            y,
+            angle_rad: self.instance_rotation_rad(i),
+            scale: 1.0,
+            opacity_mul: 1.0,
         }
     }
 }
@@ -690,24 +768,10 @@ pub fn compute_tiling_whole_bounds(source: &Node, effect: &TilingEffect) -> kurb
 }
 
 pub fn compute_circular_whole_bounds(source: &Node, effect: &CircularCloneEffect) -> kurbo::Rect {
-    let b = source.bounds();
     let mut acc: Option<kurbo::Rect> = None;
-    let dx = effect.base_x - effect.origin_x;
-    let dy = effect.base_y - effect.origin_y;
-    let r = dx.hypot(dy).max(1.0);
-    let base_ang = dy.atan2(dx);
     let n = effect.copies.max(3);
     for i in 0..n {
-        let ang = base_ang + (i as f64 / n as f64) * std::f64::consts::TAU + effect.angle_offset.to_radians();
-        let x = effect.origin_x + r * ang.cos();
-        let y = effect.origin_y + r * ang.sin();
-        let pl = PathPlacement {
-            x,
-            y,
-            angle_rad: ang,
-            scale: 1.0,
-            opacity_mul: 1.0,
-        };
+        let pl = effect.path_placement(i);
         let inst = node_at_placement(source as &dyn FaceRenderable, &pl);
         let bb = inst.bounds();
         acc = Some(match acc {
@@ -715,7 +779,50 @@ pub fn compute_circular_whole_bounds(source: &Node, effect: &CircularCloneEffect
             None => bb,
         });
     }
-    acc.unwrap_or(b)
+    acc.unwrap_or_else(|| source.bounds())
+}
+
+/// True if `doc` hits any circular-clone instance (or the source bounds with slop).
+pub fn hit_test_circular_clone(
+    source: &Node,
+    effect: &CircularCloneEffect,
+    doc_x: f64,
+    doc_y: f64,
+    slop: f64,
+) -> bool {
+    let n = effect.copies.max(3);
+    for i in 0..n {
+        let pl = effect.path_placement(i);
+        let inst = node_at_placement(source as &dyn FaceRenderable, &pl);
+        if inst.hit_test(doc_x, doc_y, slop) {
+            return true;
+        }
+    }
+    // Also allow picking the gizmo segment origin↔base (small slop).
+    let ox = effect.origin_x;
+    let oy = effect.origin_y;
+    let bx = effect.base_x;
+    let by = effect.base_y;
+    let dx = bx - ox;
+    let dy = by - oy;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq > 1e-12 {
+        let t = ((doc_x - ox) * dx + (doc_y - oy) * dy) / len_sq;
+        let t = t.clamp(0.0, 1.0);
+        let px = ox + t * dx;
+        let py = oy + t * dy;
+        let dist = (doc_x - px).hypot(doc_y - py);
+        if dist <= slop.max(4.0) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sources that are hidden from canvas draw but still pickable via effect footprints
+/// (circular / tiling / object-on-path). Boolean/clip ghosts stay non-pickable.
+pub fn is_pickable_effect_source(document: &super::Document, id: NodeId) -> bool {
+    node_uses_extended_pick_bounds(document, id)
 }
 
 pub fn bez_path_from_rect(r: kurbo::Rect) -> BezPath {
@@ -866,7 +973,7 @@ pub fn spatial_index_bounds(
     if node_uses_extended_pick_bounds(document, node.id) {
         get_effective_bounds(node, document, nodes)
     } else {
-        node.bounds()
+        node.bounds_with_store(nodes)
     }
 }
 
@@ -875,12 +982,24 @@ pub fn get_effective_bounds(
     document: &super::Document,
     nodes: &NodeStore,
 ) -> kurbo::Rect {
-    let mut b = node.bounds();
+    // Groups have bounds() == ZERO; always walk children via store.
+    let mut b = node.bounds_with_store(nodes);
     if let Some(e) = document.tiling_effects.values().find(|e| e.source_id == node.id) {
-        b = b.union(compute_tiling_whole_bounds(node, e));
+        let whole = compute_tiling_whole_bounds(node, e);
+        // Hidden source must not keep a "stuck" original bbox edge in the selection box.
+        b = if e.hide_source {
+            whole
+        } else {
+            b.union(whole)
+        };
     }
     if let Some(e) = document.circular_effects.values().find(|e| e.source_id == node.id) {
-        b = b.union(compute_circular_whole_bounds(node, e));
+        let whole = compute_circular_whole_bounds(node, e);
+        b = if e.hide_source {
+            whole
+        } else {
+            b.union(whole)
+        };
     }
     if let Some(e) = document.path_effects.values().find(|e| e.source_id == node.id) {
         if let Some(path) = path_data_for_id(nodes, e.path_id) {
@@ -1134,11 +1253,10 @@ pub fn node_at_placement(source: &dyn FaceRenderable, placement: &PathPlacement)
     inst.set_opacity(new_op);
 
     // Recover concrete Node (all objects are Nodes in current light-A model)
-    if let Some(n) = inst.as_any().downcast_ref::<Node>() {
-        return n.clone();
-    }
-    // Fallback: clone original source and re-apply (should not happen)
-    if let Some(orig) = source.as_any().downcast_ref::<Node>() {
+    let mut n = if let Some(n) = inst.as_any().downcast_ref::<Node>() {
+        n.clone()
+    } else if let Some(orig) = source.as_any().downcast_ref::<Node>() {
+        // Fallback: clone original source and re-apply (should not happen)
         let mut n = orig.clone();
         let b = n.bounds();
         let cx = (b.x0 + b.x1) * 0.5;
@@ -1151,10 +1269,22 @@ pub fn node_at_placement(source: &dyn FaceRenderable, placement: &PathPlacement)
             n.rotate_about_center(placement.angle_rad);
         }
         n.style.opacity = (n.style.opacity * placement.opacity_mul).clamp(0.0, 1.0);
-        return n;
-    }
-    // Last resort dummy
-    Node::new(NodeKind::Rect { x: 0.0, y: 0.0, w: 8.0, h: 8.0, rx: 0.0 }, "dyn-fallback")
+        n
+    } else {
+        Node::new(
+            NodeKind::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 8.0,
+                h: 8.0,
+                rx: 0.0,
+            },
+            "dyn-fallback",
+        )
+    };
+    // Always unique id — bake/tiling insert many instances; reusing source id overwrites.
+    n.id = Uuid::new_v4();
+    n
 }
 
 pub fn find_effect_for_pair<'a>(

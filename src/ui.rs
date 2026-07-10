@@ -163,6 +163,8 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     video_export_progress_window(app, ui.ctx());
     shader_editor_window(app, ui.ctx());
     object_rename_dialog(app, ui.ctx());
+    plotter_formula_dialog(app, ui.ctx());
+    hit_pick_menu_overlay(app, ui.ctx());
     status_bar_layout_reserve(ui);
 
     let canvas_alpha = app.ui_anim.canvas_alpha();
@@ -305,11 +307,19 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     }
                     ui.separator();
                     ui.menu_button("Flip", |ui| {
-                        if ui.button("⟺  Flip Horizontal").clicked() {
+                        if ui
+                            .button("⟺  Flip Horizontal")
+                            .on_hover_text("Ctrl+Shift+H")
+                            .clicked()
+                        {
                             app.flip_selection(true);
                             ui.close();
                         }
-                        if ui.button("⟻  Flip Vertical").clicked() {
+                        if ui
+                            .button("⟹  Flip Vertical")
+                            .on_hover_text("Ctrl+Shift+V")
+                            .clicked()
+                        {
                             app.flip_selection(false);
                             ui.close();
                         }
@@ -443,6 +453,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Line,
             ToolKind::Polygon,
             ToolKind::Arc,
+            ToolKind::Plotter,
             ToolKind::Text,
             ToolKind::Brush,
             ToolKind::Eyedropper,
@@ -460,6 +471,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Line => icons::LINE,
             ToolKind::Polygon => icons::polygon_icon(polygon_sides),
             ToolKind::Arc => icons::ARC,
+            ToolKind::Plotter => icons::PLOTTER,
             ToolKind::Text => icons::TEXT,
             ToolKind::Brush => icons::BRUSH,
             ToolKind::Eyedropper => icons::EYE_DROPPER,
@@ -477,6 +489,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Line => "Line (L)",
             ToolKind::Polygon => "Polygon (G)",
             ToolKind::Arc => "Arc / Chord (A)",
+            ToolKind::Plotter => "Plotter f(x)/f(y) (M)",
             ToolKind::Text => "Text (T)",
             ToolKind::Brush => "Brush (B)",
             ToolKind::Eyedropper => "Eyedropper (I)",
@@ -1139,62 +1152,180 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
     // CircularClone container
     if app.selection_has_circular_effect() {
+        use crate::document::CircularRotateMode;
         ui.separator();
         ui.label(RichText::new("CircularClone").strong());
         let mut changed = false;
+        // Keep rows short so the Path Magic panel does not overflow horizontally.
         ui.horizontal(|ui| {
-            ui.label("Copies");
-            changed |= ui.add(decimal_drag(&mut app.ui_circular_copies).range(3..=32)).changed();
-            ui.label("Angle °");
-            changed |= ui.add(decimal_drag(&mut app.ui_circular_angle_offset).speed(1.0)).changed();
+            ui.label(RichText::new("Copies").small());
+            changed |= ui
+                .add(decimal_drag(&mut app.ui_circular_copies).range(3..=32).speed(1.0))
+                .changed();
+            ui.label(RichText::new("Off°").small())
+                .on_hover_text("Angle offset (degrees)");
+            changed |= ui
+                .add(
+                    decimal_drag(&mut app.ui_circular_angle_offset)
+                        .speed(1.0)
+                        .range(-360.0..=360.0),
+                )
+                .changed();
         });
         ui.horizontal(|ui| {
-            ui.label("Origin X");
-            changed |= ui.add(decimal_drag(&mut app.ui_circular_origin_x).speed(1.0)).changed();
-            ui.label("Y");
-            changed |= ui.add(decimal_drag(&mut app.ui_circular_origin_y).speed(1.0)).changed();
+            ui.label(RichText::new("Origin").small());
+            changed |= ui
+                .add(decimal_drag(&mut app.ui_circular_origin_x).speed(1.0).prefix("X "))
+                .changed();
+            changed |= ui
+                .add(decimal_drag(&mut app.ui_circular_origin_y).speed(1.0).prefix("Y "))
+                .changed();
         });
-        ui.horizontal(|ui| {
-            if ui.button("Bake as group").clicked() {
-                app.bake_circular();
+        ui.label(RichText::new("Rotate").small().color(colors::TEXT_MUTED));
+        ui.horizontal_wrapped(|ui| {
+            for mode in [
+                CircularRotateMode::Static,
+                CircularRotateMode::ReferenceOrigin,
+            ] {
+                let selected = app.ui_circular_rotate_mode == mode;
+                let tip = match mode {
+                    CircularRotateMode::Static => {
+                        "Static: every copy keeps the source orientation (translate only)"
+                    }
+                    CircularRotateMode::ReferenceOrigin => {
+                        "Origin: each copy rotates by its step around the origin (fan / chord)"
+                    }
+                };
+                if ui
+                    .selectable_label(selected, mode.label())
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    app.ui_circular_rotate_mode = mode;
+                    changed = true;
+                }
             }
-            if ui.button("Remove").clicked() {
-                app.remove_circular_effect();
-                ui.ctx().request_repaint();
-            }
         });
+        // One primary action per row — avoids Path Magic panel horizontal overflow.
+        if ui
+            .add_sized(
+                [ui.available_width(), 24.0],
+                egui::Button::new("Bake as group"),
+            )
+            .on_hover_text("Group owns all copies; delete group removes every copy")
+            .clicked()
+        {
+            app.bake_circular();
+        }
+        if ui
+            .add_sized(
+                [ui.available_width(), 24.0],
+                egui::Button::new("Bake as path"),
+            )
+            .on_hover_text("Union all copies into one path (shutter / multi-contour OK)")
+            .clicked()
+        {
+            app.bake_circular_as_path();
+        }
+        if ui
+            .add_sized(
+                [ui.available_width(), 24.0],
+                egui::Button::new("Split it"),
+            )
+            .on_hover_text("Turn each copy into its own independent path object")
+            .clicked()
+        {
+            app.split_circular();
+        }
+        if ui
+            .add_sized([ui.available_width(), 24.0], egui::Button::new("Remove"))
+            .clicked()
+        {
+            app.remove_circular_effect();
+            ui.ctx().request_repaint();
+        }
         if changed {
             app.update_circular_effects_live();
             ui.ctx().request_repaint();
         }
     }
 
-    if path_ids.is_empty() && app.object_on_path_panel_context().is_none() {
-        // Show Tiling and CircularClone apply when only facial objects (e.g. Circle) selected, and not yet enabled
-        let facial_objects: Vec<_> = app.selection.iter().filter(|&&id| {
-            app.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. } | NodeKind::Group { .. }))
-        }).cloned().collect();
-        let has_t_or_c = app.selection_has_tiling_effect() || app.selection_has_circular_effect();
-        let has_bool = app.selection_has_boolean_effect() || app.selection_has_clip_mask();
-        if !facial_objects.is_empty() && !has_t_or_c {
-            ui.label(RichText::new("Path Magic (separate traits)").strong());
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Tiling (size gap)").clicked() {
-                    app.apply_tiling_magic();
-                }
-                if ui.button("CircularClone (6 sides)").clicked() {
-                    app.apply_circular_clone_magic();
-                }
-            });
-            ui.add_space(8.0);
+    // Convert non-path shapes → path (always offer when applicable).
+    let convertible: Vec<_> = app
+        .selection
+        .iter()
+        .filter(|&&id| {
+            app.project.nodes.get(id).is_some_and(|n| {
+                !matches!(
+                    n.kind,
+                    NodeKind::Path { .. }
+                        | NodeKind::Group { .. }
+                        | NodeKind::Image { .. }
+                        | NodeKind::Text { .. }
+                        | NodeKind::BrushStroke { .. }
+                        | NodeKind::FlowchartNode { .. }
+                        | NodeKind::FlowchartPath { .. }
+                )
+            })
+        })
+        .copied()
+        .collect();
+    if !convertible.is_empty() {
+        ui.separator();
+        if ui
+            .add_sized(
+                [ui.available_width(), 24.0],
+                egui::Button::new("Convert to path"),
+            )
+            .on_hover_text("Circle / rect / ellipse / chord / polygon / arc → editable path")
+            .clicked()
+        {
+            app.convert_selection_to_path();
         }
-        if !has_t_or_c && !has_bool && app.selection.len() < 2 {
+    }
+
+    let eligible = app.selection_tiling_circular_sources();
+    let has_t_or_c = app.selection_has_tiling_effect() || app.selection_has_circular_effect();
+    let has_bool = app.selection_has_boolean_effect() || app.selection_has_clip_mask();
+
+    // Tiling / Circular on any eligible shape including Path.
+    if !eligible.is_empty() && !has_t_or_c {
+        ui.separator();
+        ui.label(RichText::new("Clone effects").strong());
+        if ui
+            .add_sized(
+                [ui.available_width(), 24.0],
+                egui::Button::new("Tiling (size gap)"),
+            )
+            .clicked()
+        {
+            app.apply_tiling_magic();
+        }
+        if ui
+            .add_sized(
+                [ui.available_width(), 24.0],
+                egui::Button::new("CircularClone (6 sides)"),
+            )
+            .clicked()
+        {
+            app.apply_circular_clone_magic();
+        }
+        ui.add_space(6.0);
+    }
+
+    if path_ids.is_empty() && app.object_on_path_panel_context().is_none() {
+        if !has_t_or_c && !has_bool && app.selection.len() < 2 && eligible.is_empty() {
             ui.label(
-                RichText::new("Select path(s), path + object(s), or two shapes for Boolean.")
-                    .color(colors::TEXT_MUTED),
+                RichText::new(
+                    "Select shape(s) or path(s) for Tiling/CircularClone, or two shapes for Boolean.",
+                )
+                .color(colors::TEXT_MUTED),
             );
         }
-        return;
+        // Don't return early if tiling/circular panel already shown above via has_t_or_c containers.
+        if !has_t_or_c {
+            return;
+        }
     }
 
     if !path_ids.is_empty() {
@@ -1867,6 +1998,36 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             }
         });
 
+        ui.horizontal(|ui| {
+            ui.label("Cycles");
+            let mut cycles = app.video_export.export_cycles.max(1) as i32;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut cycles)
+                        .range(1..=100)
+                        .speed(0.2)
+                        .suffix("×"),
+                )
+                .on_hover_text(
+                    "Repeat the animation this many times in the export (loop / cyclic copy).",
+                )
+                .changed()
+            {
+                app.video_export.export_cycles = cycles.clamp(1, 100) as u32;
+            }
+            let cycle_n = app.video_export.export_cycles.max(1);
+            let one = if app.video_export.export_duration_secs > 0.05 {
+                app.video_export.export_duration_secs
+            } else {
+                content_secs
+            };
+            ui.label(
+                RichText::new(format!("→ {:.1}s total", one * cycle_n as f32))
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+        });
+
         // Frame rate (integer)
         ui.horizontal(|ui| {
             ui.label("Frame rate");
@@ -1972,6 +2133,203 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 fn dialog_escape_close(ctx: &egui::Context, open: &mut bool) {
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         *open = false;
+    }
+}
+
+/// Overlay list when multiple objects share the same click hit.
+fn hit_pick_menu_overlay(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
+    let Some((screen, candidates)) = app.hit_pick_menu.clone() else {
+        return;
+    };
+    if candidates.is_empty() {
+        app.hit_pick_menu = None;
+        return;
+    }
+    let mut open = true;
+    let mut picked: Option<crate::document::NodeId> = None;
+    let mut dismiss = false;
+    egui::Area::new(egui::Id::new("hit_pick_menu_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen + egui::vec2(8.0, 8.0))
+        .constrain(true)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .fill(colors::BG_PANEL)
+                .stroke(egui::Stroke::new(1.0, colors::ACCENT.gamma_multiply(0.6)))
+                .inner_margin(egui::Margin::same(6))
+                .show(ui, |ui| {
+                    ui.set_max_width(220.0);
+                    ui.label(
+                        RichText::new("Select object")
+                            .strong()
+                            .color(colors::ACCENT)
+                            .small(),
+                    );
+                    ui.separator();
+                    for &id in &candidates {
+                        let (icon, name) = app
+                            .project
+                            .nodes
+                            .get(id)
+                            .map(|n| {
+                                (
+                                    node_icon(&n.kind),
+                                    if n.name.trim().is_empty() {
+                                        format!("{:.8}", id)
+                                    } else {
+                                        n.name.clone()
+                                    },
+                                )
+                            })
+                            .unwrap_or_else(|| (icons::OBJECT, id.to_string()));
+                        let label = format!("{icon}  {name}");
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(label)
+                                        .font(nerd_font_id(13.0))
+                                        .color(colors::TEXT),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .min_size(egui::vec2(200.0, 22.0)),
+                            )
+                            .clicked()
+                        {
+                            picked = Some(id);
+                        }
+                    }
+                    ui.add_space(2.0);
+                    if ui
+                        .small_button(RichText::new("Cancel").color(colors::TEXT_MUTED))
+                        .clicked()
+                    {
+                        dismiss = true;
+                    }
+                });
+            // Click outside-ish: if pointer released not over this area, dismiss later.
+            if ui.input(|i| i.pointer.any_click()) && !ui.rect_contains_pointer(ui.min_rect().expand(4.0)) {
+                // Keep menu if still interacting — only dismiss on explicit cancel / pick.
+                let _ = open;
+            }
+        });
+    if let Some(id) = picked {
+        app.select_from_hit_picker(id);
+    } else if dismiss {
+        app.hit_pick_menu = None;
+    }
+}
+
+fn plotter_formula_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
+    let Some(id) = app.plotter_formula_dialog else {
+        return;
+    };
+    let Some(node) = app.project.nodes.get(id) else {
+        app.plotter_formula_dialog = None;
+        return;
+    };
+    let (axis_label, is_fx) = match &node.kind {
+        crate::document::NodeKind::Plotter { ref_axis, .. } => {
+            (ref_axis.label(), matches!(ref_axis, crate::document::PlotterRef::Fx))
+        }
+        _ => {
+            app.plotter_formula_dialog = None;
+            return;
+        }
+    };
+    let mut open = true;
+    let mut close = false;
+    let mut apply = false;
+    let mut cancel = false;
+    let draft_err = {
+        let d = app.plotter_formula_draft.trim();
+        if d.is_empty() {
+            Some("empty expression".into())
+        } else {
+            let mut v = crate::document::ExprVars::simple(0.5, 0.0, 0.0);
+            if is_fx {
+                v.x = 0.0;
+            } else {
+                v.y = 0.0;
+            }
+            crate::document::eval_expr_vars(d, v).err().map(|e| e.0)
+        }
+    };
+    dialog_escape_close(ctx, &mut open);
+    let mut typed = false;
+    egui::Window::new(format!("Plotter formula — {axis_label}"))
+        .id(egui::Id::new(("plotter_formula_dialog", id)))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(420.0)
+        .show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let (pre, post) = if is_fx {
+                    ("f(x) ", " y. Use x (independent), t in [0,1]. e.g. sin(x)")
+                } else {
+                    ("f(y) ", " x. Use y (independent), t in [0,1]. e.g. sin(y)")
+                };
+                ui.label(RichText::new(pre).small().color(colors::TEXT_MUTED));
+                ui.label(
+                    RichText::new(icons::ARROW_RIGHT)
+                        .font(nerd_font_id(12.0))
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
+                ui.label(RichText::new(post).small().color(colors::TEXT_MUTED));
+            });
+            ui.add_space(4.0);
+            let mut te = egui::TextEdit::multiline(&mut app.plotter_formula_draft)
+                .id_source(("plotter_formula_edit", id))
+                .desired_width(f32::INFINITY)
+                .desired_rows(6)
+                .font(egui::TextStyle::Monospace);
+            if draft_err.is_some() {
+                te = te
+                    .text_color(egui::Color32::from_rgb(255, 180, 180))
+                    .background_color(egui::Color32::from_rgb(60, 16, 16));
+            }
+            if ui.add(te).changed() {
+                typed = true;
+            }
+            if let Some(ref e) = draft_err {
+                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), e);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Apply").clicked() {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                    close = true;
+                }
+            });
+        });
+    if typed {
+        app.begin_plotter_expr_edit(id);
+        let draft = app.plotter_formula_draft.clone();
+        app.set_plotter_expr_live(id, draft.clone());
+        app.plotter_inline_expr = Some((id, draft));
+    }
+    if apply {
+        // Live already updated the curve; one undo step for the whole edit session.
+        app.commit_plotter_expr_edit(id);
+        let draft = app.plotter_formula_draft.clone();
+        app.plotter_inline_expr = Some((id, draft));
+        close = true;
+    } else if cancel || !open {
+        // Dismiss without Apply: restore expression from before the dialog edit.
+        app.cancel_plotter_expr_edit(id);
+        if let Some(node) = app.project.nodes.get(id) {
+            if let crate::document::NodeKind::Plotter { expr, .. } = &node.kind {
+                app.plotter_inline_expr = Some((id, expr.clone()));
+            }
+        }
+        close = true;
+    }
+    if close {
+        app.plotter_formula_dialog = None;
+        app.plotter_formula_draft.clear();
     }
 }
 
@@ -5443,8 +5801,20 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 app.set_line_geometry(id, x0, y0, x1, y1);
             }
         }
-        GeometryProfile::ClosedPath { vertices, cyclic } => {
+        GeometryProfile::ClosedPath {
+            origin_x,
+            origin_y,
+            vertices,
+            cyclic,
+        } => {
             ui.label(RichText::new("Closed path").strong());
+            let mut ox = origin_x;
+            let mut oy = origin_y;
+            let mut changed = false;
+            constraint_origin(ui, &mut ox, &mut oy, &mut changed);
+            if changed {
+                app.set_path_origin(id, ox, oy);
+            }
             ui.label(format!("Vertices: {vertices}"));
             ui.label(format!("Cyclic: {cyclic}"));
             ui.label(
@@ -5453,8 +5823,20 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     .color(colors::TEXT_MUTED),
             );
         }
-        GeometryProfile::OpenPath { vertices, cyclic } => {
+        GeometryProfile::OpenPath {
+            origin_x,
+            origin_y,
+            vertices,
+            cyclic,
+        } => {
             ui.label(RichText::new("Open path").strong());
+            let mut ox = origin_x;
+            let mut oy = origin_y;
+            let mut changed = false;
+            constraint_origin(ui, &mut ox, &mut oy, &mut changed);
+            if changed {
+                app.set_path_origin(id, ox, oy);
+            }
             ui.label(format!("Vertices: {vertices}"));
             ui.label(format!("Cyclic: {cyclic}"));
             ui.label(
@@ -5462,6 +5844,260 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     .small()
                     .color(colors::TEXT_MUTED),
             );
+        }
+        GeometryProfile::Plotter {
+            origin_x,
+            origin_y,
+            width,
+            height,
+            expr,
+            ref_axis,
+            domain_min,
+            domain_max,
+            range_min,
+            range_max,
+            auto_range,
+            margin_pct,
+            plot_stroke_width,
+            plot_stroke_rgba,
+        } => {
+            ui.label(
+                RichText::new(format!("{} Plotter", icons::PLOTTER))
+                    .font(nerd_font_id(14.0))
+                    .strong(),
+            );
+            let mut x = origin_x;
+            let mut y = origin_y;
+            let mut w = width;
+            let mut h = height;
+            let mut axis = ref_axis;
+            let mut d0 = domain_min;
+            let mut d1 = domain_max;
+            let mut r0 = range_min;
+            let mut r1 = range_max;
+            let mut auto_r = auto_range;
+            let mut margin = margin_pct;
+            let mut psw = plot_stroke_width;
+            let mut pcol = plot_stroke_rgba;
+            // Keep a stable draft buffer while typing so Geometry doesn't reset the field every frame.
+            let need_seed = !matches!(
+                app.plotter_inline_expr.as_ref(),
+                Some((nid, _)) if *nid == id
+            );
+            if need_seed {
+                // Leaving another plotter's edit: commit its expr history first.
+                if let Some((prev_id, _)) = app.plotter_expr_edit_before {
+                    if prev_id != id {
+                        app.commit_plotter_expr_edit(prev_id);
+                    }
+                }
+                app.plotter_inline_expr = Some((id, expr.clone()));
+            }
+            let mut changed = false;
+            let mut commit_expr = false;
+            let mut expr_typed = false;
+
+            constraint_origin(ui, &mut x, &mut y, &mut changed);
+            theme::constraint_block(ui, |ui| {
+                ui.label(RichText::new("Size").small().color(colors::TEXT_MUTED));
+                changed |= ui.add(decimal_drag(&mut w).prefix("W:")).changed();
+                changed |= ui.add(decimal_drag(&mut h).prefix("H:")).changed();
+            });
+
+            theme::constraint_block(ui, |ui| {
+                ui.label(RichText::new("Plot line").small().color(colors::TEXT_MUTED));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Width").small().color(colors::TEXT_MUTED));
+                    changed |= ui
+                        .add(
+                            decimal_drag(&mut psw)
+                                .speed(0.1)
+                                .range(0.5..=48.0)
+                                .suffix(" px"),
+                        )
+                        .changed();
+                });
+                let mut c = egui::Color32::from_rgba_unmultiplied(
+                    (pcol[0] * 255.0) as u8,
+                    (pcol[1] * 255.0) as u8,
+                    (pcol[2] * 255.0) as u8,
+                    (pcol[3] * 255.0) as u8,
+                );
+                if ui.color_edit_button_srgba(&mut c).changed() {
+                    let [r, g, b, a] = c.to_array();
+                    pcol = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0];
+                    changed = true;
+                }
+            });
+
+            theme::constraint_block(ui, |ui| {
+                ui.label(RichText::new("Reference").small().color(colors::TEXT_MUTED));
+                ui.horizontal(|ui| {
+                    let fx_lbl = RichText::new(format!("f(x) {} y", icons::ARROW_RIGHT))
+                        .font(nerd_font_id(13.0));
+                    let fy_lbl = RichText::new(format!("f(y) {} x", icons::ARROW_RIGHT))
+                        .font(nerd_font_id(13.0));
+                    if ui
+                        .selectable_label(matches!(axis, crate::document::PlotterRef::Fx), fx_lbl)
+                        .clicked()
+                    {
+                        axis = crate::document::PlotterRef::Fx;
+                        changed = true;
+                    }
+                    if ui
+                        .selectable_label(matches!(axis, crate::document::PlotterRef::Fy), fy_lbl)
+                        .clicked()
+                    {
+                        axis = crate::document::PlotterRef::Fy;
+                        changed = true;
+                    }
+                });
+                ui.label(
+                    RichText::new(if matches!(axis, crate::document::PlotterRef::Fx) {
+                        "expr uses x (and t 0..1)"
+                    } else {
+                        "expr uses y (and t 0..1)"
+                    })
+                    .small()
+                    .color(colors::TEXT_MUTED),
+                );
+                let draft = app
+                    .plotter_inline_expr
+                    .as_mut()
+                    .map(|(_, s)| s)
+                    .expect("plotter_inline_expr seeded");
+                let te = ui.add(
+                    egui::TextEdit::multiline(draft)
+                        .id(egui::Id::new(("plotter_inline_expr", id)))
+                        .desired_rows(2)
+                        .desired_width(ui.available_width().min(220.0))
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text(if matches!(axis, crate::document::PlotterRef::Fx) {
+                            "sin(x)"
+                        } else {
+                            "sin(y)"
+                        }),
+                );
+                if te.changed() {
+                    expr_typed = true;
+                }
+                if te.double_clicked() {
+                    let cur = app
+                        .plotter_inline_expr
+                        .as_ref()
+                        .map(|(_, s)| s.clone())
+                        .unwrap_or_else(|| expr.clone());
+                    app.begin_plotter_expr_edit(id);
+                    app.plotter_formula_dialog = Some(id);
+                    app.plotter_formula_draft = cur;
+                }
+                if te.lost_focus() {
+                    commit_expr = true;
+                }
+                let draft_ref = app
+                    .plotter_inline_expr
+                    .as_ref()
+                    .map(|(_, s)| s.as_str())
+                    .unwrap_or("");
+                let probe = if matches!(axis, crate::document::PlotterRef::Fx) {
+                    let mut v = crate::document::ExprVars::simple(0.5, 0.0, 0.0);
+                    v.x = 0.0;
+                    crate::document::eval_expr_vars(draft_ref, v)
+                } else {
+                    let mut v = crate::document::ExprVars::simple(0.5, 0.0, 0.0);
+                    v.y = 0.0;
+                    crate::document::eval_expr_vars(draft_ref, v)
+                };
+                if let Err(e) = probe {
+                    ui.label(RichText::new(e.0).small().color(egui::Color32::from_rgb(220, 90, 90)));
+                }
+            });
+
+            // Live preview: push draft expr onto the node every keystroke (no undo spam).
+            if expr_typed {
+                let draft_now = app
+                    .plotter_inline_expr
+                    .as_ref()
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_default();
+                app.begin_plotter_expr_edit(id);
+                app.set_plotter_expr_live(id, draft_now);
+            }
+
+            theme::constraint_block(ui, |ui| {
+                let (dom_label, rng_label) = if matches!(axis, crate::document::PlotterRef::Fx) {
+                    ("X domain", "Y range")
+                } else {
+                    ("Y domain", "X range")
+                };
+                ui.label(RichText::new(dom_label).small().color(colors::TEXT_MUTED));
+                ui.horizontal(|ui| {
+                    changed |= ui.add(decimal_drag(&mut d0).prefix("min ")).changed();
+                    changed |= ui.add(decimal_drag(&mut d1).prefix("max ")).changed();
+                });
+                ui.label(RichText::new(rng_label).small().color(colors::TEXT_MUTED));
+                changed |= ui.checkbox(&mut auto_r, "Auto range").changed();
+                ui.add_enabled_ui(!auto_r, |ui| {
+                    ui.horizontal(|ui| {
+                        changed |= ui.add(decimal_drag(&mut r0).prefix("min ")).changed();
+                        changed |= ui.add(decimal_drag(&mut r1).prefix("max ")).changed();
+                    });
+                });
+                if auto_r {
+                    if let Some(node) = app.project.nodes.get(id) {
+                        if let Some((_, cr0, cr1)) = node.plotter_polyline() {
+                            ui.label(
+                                RichText::new(format!("Auto view: [{cr0:.3}, {cr1:.3}]"))
+                                    .small()
+                                    .color(colors::TEXT_MUTED),
+                            );
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Margin").small().color(colors::TEXT_MUTED));
+                        changed |= ui
+                            .add(
+                                decimal_drag(&mut margin)
+                                    .speed(0.5)
+                                    .range(0.0..=50.0)
+                                    .suffix(" %"),
+                            )
+                            .changed();
+                    });
+                }
+            });
+
+            let expr_now = app
+                .plotter_inline_expr
+                .as_ref()
+                .map(|(_, s)| s.clone())
+                .unwrap_or_else(|| expr.clone());
+            if changed {
+                // Geometry/range/etc. — include current draft expr so undo stays coherent.
+                app.set_plotter_geometry(
+                    id,
+                    x,
+                    y,
+                    w,
+                    h,
+                    expr_now.clone(),
+                    axis,
+                    d0,
+                    d1,
+                    r0,
+                    r1,
+                    auto_r,
+                    margin,
+                    psw,
+                    pcol,
+                );
+                // Geometry push already recorded full node; drop pending expr-only snapshot.
+                app.plotter_expr_edit_before = None;
+            }
+            if commit_expr {
+                app.commit_plotter_expr_edit(id);
+                app.plotter_inline_expr = Some((id, expr_now));
+            }
         }
         GeometryProfile::Arc {
             origin_x,
@@ -5940,6 +6576,7 @@ fn node_icon(kind: &NodeKind) -> &'static str {
         NodeKind::Text { .. } => icons::TEXT,
         NodeKind::Group { .. } => icons::OBJECT,
         NodeKind::Image { .. } => icons::OBJECT,
+        NodeKind::Plotter { .. } => icons::PLOTTER,
         NodeKind::Arc { .. } => icons::ARC,
         NodeKind::BrushStroke { .. } => icons::BRUSH,
         NodeKind::FlowchartNode { .. } => icons::RECT,
@@ -6687,6 +7324,8 @@ fn draw_timeline_track(
 
 fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     app.sync_stale_media_layer_durations();
+    // Ghost End frames come from keyframes on deleted objects.
+    let _ = app.prune_orphan_animation_tracks();
     let content_max_frame = app.get_max_animation_frame();
 
     ui.vertical(|ui| {
@@ -6964,6 +7603,11 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             || !anim.color_g.keyframes.is_empty() 
                             || !anim.color_b.keyframes.is_empty() 
                             || !anim.color_a.keyframes.is_empty();
+                        let has_stroke_w = !anim.stroke_width.keyframes.is_empty();
+                        let has_stroke_col = !anim.stroke_r.keyframes.is_empty()
+                            || !anim.stroke_g.keyframes.is_empty()
+                            || !anim.stroke_b.keyframes.is_empty()
+                            || !anim.stroke_a.keyframes.is_empty();
                         
                         ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 6.0;
@@ -7078,7 +7722,71 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             ];
                             draw_timeline_track(
                                 ui,
-                                "Color",
+                                "Fill Color",
+                                Some(node_id),
+                                &mut plots,
+                                &mut curr_frame,
+                                &mut scroll,
+                                &mut app.anim_timeline_follow,
+                                content_max_frame,
+                                edit_mode,
+                                &mut dragged,
+                                &mut temp_selected_kf,
+                                &mut temp_graph_track,
+                                &mut temp_target_track,
+                                app.anim_timeline_visible_frames,
+                            );
+                        }
+
+                        if has_stroke_w {
+                            let mut plots = vec![TrackPlotInfo {
+                                label: "stroke_width",
+                                track: &mut anim.stroke_width,
+                                color: egui::Color32::from_rgb(200, 160, 80),
+                                default_val: 2.0,
+                            }];
+                            draw_timeline_track(
+                                ui,
+                                "Stroke Width",
+                                Some(node_id),
+                                &mut plots,
+                                &mut curr_frame,
+                                &mut scroll,
+                                &mut app.anim_timeline_follow,
+                                content_max_frame,
+                                edit_mode,
+                                &mut dragged,
+                                &mut temp_selected_kf,
+                                &mut temp_graph_track,
+                                &mut temp_target_track,
+                                app.anim_timeline_visible_frames,
+                            );
+                        }
+
+                        if has_stroke_col {
+                            let mut plots = vec![
+                                TrackPlotInfo {
+                                    label: "stroke_r",
+                                    track: &mut anim.stroke_r,
+                                    color: egui::Color32::from_rgb(220, 80, 80),
+                                    default_val: 0.1,
+                                },
+                                TrackPlotInfo {
+                                    label: "stroke_g",
+                                    track: &mut anim.stroke_g,
+                                    color: egui::Color32::from_rgb(80, 220, 80),
+                                    default_val: 0.1,
+                                },
+                                TrackPlotInfo {
+                                    label: "stroke_b",
+                                    track: &mut anim.stroke_b,
+                                    color: egui::Color32::from_rgb(80, 80, 220),
+                                    default_val: 0.18,
+                                },
+                            ];
+                            draw_timeline_track(
+                                ui,
+                                "Stroke Color",
                                 Some(node_id),
                                 &mut plots,
                                 &mut curr_frame,
@@ -7118,9 +7826,9 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                                 continue;
                                             }
                                             let pairs: [(usize, &str, egui::Color32, egui::Color32); 3] = [
-                                                (0, "Pt {} (X/Y)", egui::Color32::from_rgb(0, 200, 0), egui::Color32::from_rgb(200, 0, 0)),
-                                                (2, "Pt {} Out (X/Y)", egui::Color32::from_rgb(0, 200, 200), egui::Color32::from_rgb(200, 0, 200)),
-                                                (4, "Pt {} In (X/Y)", egui::Color32::from_rgb(100, 200, 100), egui::Color32::from_rgb(200, 100, 200)),
+                                                (0, "Pt {}", egui::Color32::from_rgb(0, 200, 0), egui::Color32::from_rgb(200, 0, 0)),
+                                                (2, "Out {}", egui::Color32::from_rgb(0, 200, 200), egui::Color32::from_rgb(200, 0, 200)),
+                                                (4, "In {}", egui::Color32::from_rgb(100, 200, 100), egui::Color32::from_rgb(200, 100, 200)),
                                             ];
                                             for (off, label_tmpl, c1, c2) in pairs {
                                                 let i1 = pt_idx * 6 + off;
@@ -7357,6 +8065,11 @@ fn floating_timeline_window(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect
                 || !anim.color_g.keyframes.is_empty() 
                 || !anim.color_b.keyframes.is_empty() 
                 || !anim.color_a.keyframes.is_empty();
+            let has_stroke_w = !anim.stroke_width.keyframes.is_empty();
+            let has_stroke_col = !anim.stroke_r.keyframes.is_empty()
+                || !anim.stroke_g.keyframes.is_empty()
+                || !anim.stroke_b.keyframes.is_empty()
+                || !anim.stroke_a.keyframes.is_empty();
             let geom_row_count = if let Some(node) = app.project.nodes.get(node_id) {
                 let selected_point_indices: Vec<usize> = if app.tools.active == ToolKind::Node {
                     app.tools.select.selected_path_points
@@ -7407,6 +8120,8 @@ fn floating_timeline_window(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect
                 + (if has_rot { 1 } else { 0 })
                 + (if has_op { 1 } else { 0 })
                 + (if has_col { 1 } else { 0 })
+                + (if has_stroke_w { 1 } else { 0 })
+                + (if has_stroke_col { 1 } else { 0 })
                 + geom_row_count
         } else {
             0
@@ -7505,7 +8220,9 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
         "pos_x" | "pos_y" => "Position".to_string(),
         "rotation" => "Rotation".to_string(),
         "opacity" => "Opacity".to_string(),
-        "color_r" | "color_g" | "color_b" | "color_a" => "Color".to_string(),
+        "color_r" | "color_g" | "color_b" | "color_a" => "Fill Color".to_string(),
+        "stroke_width" => "Stroke Width".to_string(),
+        "stroke_r" | "stroke_g" | "stroke_b" | "stroke_a" => "Stroke Color".to_string(),
         _ if track_lbl.starts_with("geom_") => {
             if let Ok(idx) = track_lbl["geom_".len()..].parse::<usize>() {
                 app.get_node_geom_track_name(node_id, idx)
@@ -7604,6 +8321,26 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             node_col[2] as f64
         } else if track_lbl == "color_a" {
             node_col[3] as f64
+        } else if track_lbl == "stroke_width" {
+            app.project
+                .nodes
+                .get(node_id)
+                .map(|n| n.get_stroke_width() as f64)
+                .unwrap_or(2.0)
+        } else if track_lbl.starts_with("stroke_") {
+            let sc = app
+                .project
+                .nodes
+                .get(node_id)
+                .map(|n| n.get_stroke_color())
+                .unwrap_or([0.1, 0.1, 0.18, 1.0]);
+            match track_lbl.as_str() {
+                "stroke_r" => sc[0] as f64,
+                "stroke_g" => sc[1] as f64,
+                "stroke_b" => sc[2] as f64,
+                "stroke_a" => sc[3] as f64,
+                _ => 0.0,
+            }
         } else {
             0.0
         };
@@ -7622,6 +8359,44 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                 tracks_to_draw.push(("color_r".to_string(), egui::Color32::from_rgb(255, 100, 100), anim.color_r.clone(), node_col[0] as f64));
                 tracks_to_draw.push(("color_g".to_string(), egui::Color32::from_rgb(100, 255, 100), anim.color_g.clone(), node_col[1] as f64));
                 tracks_to_draw.push(("color_b".to_string(), egui::Color32::from_rgb(100, 100, 255), anim.color_b.clone(), node_col[2] as f64));
+            } else if track_lbl == "stroke_width" {
+                let sw = app
+                    .project
+                    .nodes
+                    .get(node_id)
+                    .map(|n| n.get_stroke_width() as f64)
+                    .unwrap_or(2.0);
+                tracks_to_draw.push((
+                    "stroke_width".to_string(),
+                    egui::Color32::from_rgb(200, 160, 80),
+                    anim.stroke_width.clone(),
+                    sw,
+                ));
+            } else if track_lbl.starts_with("stroke_") {
+                let sc = app
+                    .project
+                    .nodes
+                    .get(node_id)
+                    .map(|n| n.get_stroke_color())
+                    .unwrap_or([0.1, 0.1, 0.18, 1.0]);
+                tracks_to_draw.push((
+                    "stroke_r".to_string(),
+                    egui::Color32::from_rgb(220, 80, 80),
+                    anim.stroke_r.clone(),
+                    sc[0] as f64,
+                ));
+                tracks_to_draw.push((
+                    "stroke_g".to_string(),
+                    egui::Color32::from_rgb(80, 220, 80),
+                    anim.stroke_g.clone(),
+                    sc[1] as f64,
+                ));
+                tracks_to_draw.push((
+                    "stroke_b".to_string(),
+                    egui::Color32::from_rgb(80, 80, 220),
+                    anim.stroke_b.clone(),
+                    sc[2] as f64,
+                ));
             } else if track_lbl.starts_with("geom_") {
                 if let Ok(idx) = track_lbl["geom_".len()..].parse::<usize>() {
                     let mut grouped = false;
@@ -8002,16 +8777,48 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                     }
                 })
                 .collect();
-            let label = if parts.len() == 1 {
-                format!("f(t) = {}  [t:0→1]", parts[0])
+            // Use nerd-font arrow (); Unicode → often renders as □ in default UI fonts.
+            let arrow = icons::ARROW_RIGHT;
+            let ch_bits: Vec<String> = sf
+                .channels
+                .iter()
+                .zip(parts.iter())
+                .map(|(c, p)| {
+                    let short = match c.track.as_str() {
+                        "pos_x" => "x".to_string(),
+                        "pos_y" => "y".to_string(),
+                        "rotation" => "r".to_string(),
+                        "opacity" => "o".to_string(),
+                        "color_r" => "R".to_string(),
+                        "color_g" => "G".to_string(),
+                        "color_b" => "B".to_string(),
+                        "color_a" => "A".to_string(),
+                        "stroke_width" => "sw".to_string(),
+                        "stroke_r" => "sR".to_string(),
+                        "stroke_g" => "sG".to_string(),
+                        "stroke_b" => "sB".to_string(),
+                        "stroke_a" => "sA".to_string(),
+                        other => other.to_string(),
+                    };
+                    if c.expr.trim().is_empty() {
+                        // Constant hold: show start binding e.g. "x  54"
+                        format!("{short} {arrow} {p}")
+                    } else {
+                        format!("{short}={p}")
+                    }
+                })
+                .collect();
+            let body = if ch_bits.len() == 1 {
+                ch_bits[0].clone()
             } else {
-                format!("f(t) = ({})  [t:0→1]", parts.join(", "))
+                format!("({})", ch_bits.join(", "))
             };
+            let label = format!("f(t) = {body}  [t:0{arrow}1]");
             painter.text(
                 egui::pos2(region.left() + 6.0, region.top() + 2.0),
                 egui::Align2::LEFT_TOP,
                 label,
-                egui::FontId::new(10.0, egui::FontFamily::Proportional),
+                icons::nerd_font_id(10.0),
                 colors::TEXT_MUTED.gamma_multiply(1.2),
             );
             // End resize hover zone
@@ -8698,9 +9505,14 @@ fn graph_stack_header_controls(
         .on_hover_text("Relative length: formulas use t=0..1 and f=0..length (not global frame)")
         .changed();
     ui.label(
-        RichText::new(format!("rel 0→{}", sf_snap.duration_frames.max(1)))
-            .small()
-            .color(colors::TEXT_MUTED),
+        RichText::new(format!(
+            "rel 0{}{}",
+            icons::ARROW_RIGHT,
+            sf_snap.duration_frames.max(1)
+        ))
+        .font(nerd_font_id(11.0))
+        .small()
+        .color(colors::TEXT_MUTED),
     );
 
     ui.label(
@@ -8842,17 +9654,39 @@ fn apply_stack_animation_function(
     end: usize,
 ) {
     let duration = end.saturating_sub(start).max(1);
+    // Prefer live geometry (Pt X/Y etc.) over stale interpolated keys.
+    let live_geom = app.get_node_geom_floats(node_id);
     let before = app.project.anim_timeline.clone();
     let Some(anim) = app.project.anim_timeline.nodes.get_mut(&node_id) else {
         return;
     };
+    // Ensure geom_N slots exist before insert.
+    for label in track_labels {
+        anim.ensure_track(label);
+    }
     let mut channels = Vec::new();
     for (i, label) in track_labels.iter().enumerate() {
-        let def = defaults.get(i).copied().unwrap_or(0.0);
+        let def = if let Some(idx) = label
+            .strip_prefix("geom_")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            live_geom
+                .get(idx)
+                .copied()
+                .or_else(|| defaults.get(i).copied())
+                .unwrap_or(0.0)
+        } else {
+            defaults.get(i).copied().unwrap_or(0.0)
+        };
+        // Exact key at stack start only — do not hold/interpolate distant keys (wrong for Pt stacks).
         let start_value = anim
             .get_track(label)
-            .and_then(|t| t.interpolate(start))
-            .or_else(|| anim.sample(label, start))
+            .and_then(|t| {
+                t.keyframes
+                    .iter()
+                    .find(|k| k.frame == start)
+                    .map(|k| k.value)
+            })
             .unwrap_or(def);
         channels.push(crate::document::StackAnimChannel {
             track: label.clone(),
@@ -8899,7 +9733,7 @@ fn delete_stack_animation_function(
     let Some(anim) = app.project.anim_timeline.nodes.get_mut(&node_id) else {
         return;
     };
-    if !anim.remove_stack_function(stack_id) {
+    if !anim.remove_stack_function_with_keyframes(stack_id) {
         return;
     }
     let after = app.project.anim_timeline.clone();
@@ -8948,14 +9782,26 @@ fn graph_stack_formula_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
         .resizable(true)
         .default_width(420.0)
         .show(ctx, |ui| {
-            ui.label(
-                RichText::new(
-                    "Relative time only: t=0 at stack start → t=1 at stack end; f=0..length (not global timeline). \
-x,y / r,g,b,a / s = start constants. abs(x); mod(a,m) or a%m (always ≥0). Empty = constant start.",
-                )
-                .small()
-                .color(colors::TEXT_MUTED),
-            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("Relative time: t=0 at start ")
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
+                ui.label(
+                    RichText::new(icons::ARROW_RIGHT)
+                        .font(nerd_font_id(11.0))
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
+                ui.label(
+                    RichText::new(
+                        " t=1 at end; f=0..length. x,y,r,g,b,a,s = starts. Empty expr = hold start.",
+                    )
+                    .small()
+                    .color(colors::TEXT_MUTED),
+                );
+            });
             ui.add_space(4.0);
             let mut te = egui::TextEdit::multiline(&mut app.anim_stack_formula_draft)
                 .id_source(("stack_formula_edit", stack_id, ch_idx))
@@ -9249,6 +10095,96 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     });
 
+    // Stroke width
+    let curr_sw = app
+        .project
+        .nodes
+        .get(id)
+        .map(|n| n.get_stroke_width() as f64)
+        .unwrap_or(2.0);
+    let mut track_sw = entry.stroke_width.clone();
+    let (changed_sw, val_sw) =
+        render_prop_row(ui, "Stroke Width", &mut track_sw, curr_sw, 0.0, 64.0, 0.1);
+    if changed_sw {
+        entry.stroke_width = track_sw;
+        entry_changed = true;
+        if let Some(v) = val_sw {
+            if let Some(n) = app.project.nodes.get_mut(id) {
+                n.set_stroke_width(v as f32);
+            }
+        }
+    }
+
+    // Stroke color
+    let curr_sc = app
+        .project
+        .nodes
+        .get(id)
+        .map(|n| n.get_stroke_color())
+        .unwrap_or([0.1, 0.1, 0.18, 1.0]);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Stroke Color").strong());
+        ui.add_space(10.0);
+        let has_sr = entry.stroke_r.keyframes.iter().any(|kf| kf.frame == frame);
+        let r = entry
+            .stroke_r
+            .interpolate(frame)
+            .unwrap_or(curr_sc[0] as f64) as f32;
+        let g = entry
+            .stroke_g
+            .interpolate(frame)
+            .unwrap_or(curr_sc[1] as f64) as f32;
+        let b = entry
+            .stroke_b
+            .interpolate(frame)
+            .unwrap_or(curr_sc[2] as f64) as f32;
+        let a = entry
+            .stroke_a
+            .interpolate(frame)
+            .unwrap_or(curr_sc[3] as f64) as f32;
+        let mut c32 = egui::Color32::from_rgba_unmultiplied(
+            (r * 255.0) as u8,
+            (g * 255.0) as u8,
+            (b * 255.0) as u8,
+            (a * 255.0) as u8,
+        );
+        if has_sr {
+            if ui.color_edit_button_srgba(&mut c32).changed() {
+                let rgba = c32.to_array();
+                let rf = rgba[0] as f64 / 255.0;
+                let gf = rgba[1] as f64 / 255.0;
+                let bf = rgba[2] as f64 / 255.0;
+                let af = rgba[3] as f64 / 255.0;
+                entry.stroke_r.insert(frame, rf);
+                entry.stroke_g.insert(frame, gf);
+                entry.stroke_b.insert(frame, bf);
+                entry.stroke_a.insert(frame, af);
+                entry_changed = true;
+                if let Some(n) = app.project.nodes.get_mut(id) {
+                    n.set_stroke_color([rf as f32, gf as f32, bf as f32, af as f32]);
+                }
+            }
+            if ui.button("🗑").on_hover_text("Delete stroke color keyframe").clicked() {
+                entry.stroke_r.keyframes.retain(|kf| kf.frame != frame);
+                entry.stroke_g.keyframes.retain(|kf| kf.frame != frame);
+                entry.stroke_b.keyframes.retain(|kf| kf.frame != frame);
+                entry.stroke_a.keyframes.retain(|kf| kf.frame != frame);
+                entry_changed = true;
+            }
+        } else {
+            let mut display = c32;
+            ui.color_edit_button_srgba(&mut display);
+            ui.label(RichText::new(" (interp)").color(colors::TEXT_MUTED));
+            if ui.button("+").on_hover_text("Add stroke color keyframe").clicked() {
+                entry.stroke_r.insert(frame, r as f64);
+                entry.stroke_g.insert(frame, g as f64);
+                entry.stroke_b.insert(frame, b as f64);
+                entry.stroke_a.insert(frame, a as f64);
+                entry_changed = true;
+            }
+        }
+    });
+
     // Handle geometry tracks
     let mut geom_floats = {
         let Some(_) = app.project.nodes.get(id) else {
@@ -9277,10 +10213,16 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     
     if !geom_floats.is_empty() {
         ui.add_space(4.0);
-        ui.label(RichText::new("Geometry Properties").strong().color(colors::POWERLINE_C));
-        ui.separator();
-        ui.add_space(4.0);
-
+        // Collapsible to keep the Animation tab compact (long path point lists overflow).
+        let geom_default_open = !is_path || path_anchor_count <= 8 || !selected_point_indices.is_empty();
+        let geom_header = egui::CollapsingHeader::new(
+            RichText::new("Geometry Properties")
+                .strong()
+                .color(colors::POWERLINE_C),
+        )
+        .default_open(geom_default_open)
+        .id_salt(("anim_geom_props", id));
+        let geom_body = geom_header.show(ui, |ui| {
         if path_geom_lazy {
             ui.label(
                 RichText::new(format!(
@@ -9341,21 +10283,21 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 NodeKind::Rect { .. } => vec![
                     ("Width".to_string(), 0.0, 10000.0, 1.0),
                     ("Height".to_string(), 0.0, 10000.0, 1.0),
-                    ("Corner Radius".to_string(), 0.0, 500.0, 0.5),
+                    ("Corner".to_string(), 0.0, 500.0, 0.5),
                 ],
                 NodeKind::Ellipse { .. } => vec![
-                    ("Radius X".to_string(), 0.0, 10000.0, 1.0),
-                    ("Radius Y".to_string(), 0.0, 10000.0, 1.0),
+                    ("RX".to_string(), 0.0, 10000.0, 1.0),
+                    ("RY".to_string(), 0.0, 10000.0, 1.0),
                 ],
                 NodeKind::Polygon { .. } => vec![
-                    ("Radius".to_string(), 0.0, 10000.0, 1.0),
+                    ("R".to_string(), 0.0, 10000.0, 1.0),
                     ("Sides".to_string(), 3.0, 100.0, 1.0),
-                    ("Rotation (deg)".to_string(), -360.0, 360.0, 1.0),
+                    ("Rot°".to_string(), -360.0, 360.0, 1.0),
                 ],
                 NodeKind::Arc { .. } => vec![
-                    ("Radius".to_string(), 0.0, 10000.0, 1.0),
-                    ("Start Angle (deg)".to_string(), -360.0, 360.0, 1.0),
-                    ("Sweep Angle (deg)".to_string(), -360.0, 360.0, 1.0),
+                    ("R".to_string(), 0.0, 10000.0, 1.0),
+                    ("Start°".to_string(), -360.0, 360.0, 1.0),
+                    ("Sweep°".to_string(), -360.0, 360.0, 1.0),
                 ],
                 NodeKind::Path { path } => {
                     let mut v = Vec::new();
@@ -9365,20 +10307,18 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     for i in 0..num_anchors {
                         if !show_all && !selected_point_indices.contains(&i) {
                             // Placeholder so indices stay aligned; rows are skipped below.
-                            v.push((format!("Pt {} X", i), -10000.0, 10000.0, 1.0));
-                            v.push((format!("Pt {} Y", i), -10000.0, 10000.0, 1.0));
-                            v.push((format!("Pt {} Out X", i), -10000.0, 10000.0, 1.0));
-                            v.push((format!("Pt {} Out Y", i), -10000.0, 10000.0, 1.0));
-                            v.push((format!("Pt {} In X", i), -10000.0, 10000.0, 1.0));
-                            v.push((format!("Pt {} In Y", i), -10000.0, 10000.0, 1.0));
+                            for _ in 0..6 {
+                                v.push((String::new(), -10000.0, 10000.0, 1.0));
+                            }
                             continue;
                         }
-                        v.push((format!("Pt {} X", i), -10000.0, 10000.0, 1.0));
-                        v.push((format!("Pt {} Y", i), -10000.0, 10000.0, 1.0));
-                        v.push((format!("Pt {} Out X", i), -10000.0, 10000.0, 1.0));
-                        v.push((format!("Pt {} Out Y", i), -10000.0, 10000.0, 1.0));
-                        v.push((format!("Pt {} In X", i), -10000.0, 10000.0, 1.0));
-                        v.push((format!("Pt {} In Y", i), -10000.0, 10000.0, 1.0));
+                        // Short labels — UI shows "Pt N" with two interpolators, not long X/Y text.
+                        v.push((format!("Pt {i}"), -10000.0, 10000.0, 1.0));
+                        v.push((String::new(), -10000.0, 10000.0, 1.0));
+                        v.push((format!("Out {i}"), -10000.0, 10000.0, 1.0));
+                        v.push((String::new(), -10000.0, 10000.0, 1.0));
+                        v.push((format!("In {i}"), -10000.0, 10000.0, 1.0));
+                        v.push((String::new(), -10000.0, 10000.0, 1.0));
                     }
                     v
                 }
@@ -9457,77 +10397,115 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         if matches!(&node.kind, NodeKind::Path { .. }) {
                             let sub = i % 6;
                             if sub == 0 || sub == 2 || sub == 4 {
-                                // merge X/Y pair for 2D point to save space
+                                // One short label + two interpolators (X/Y) — no "Pt 11 (X/Y)" overflow.
                                 let pt_idx = i / 6;
                                 let base_label = match sub {
-                                    0 => format!("Pt {} (X/Y)", pt_idx),
-                                    2 => format!("Pt {} Out (X/Y)", pt_idx),
-                                    4 => format!("Pt {} In (X/Y)", pt_idx),
+                                    0 => format!("Pt {pt_idx}"),
+                                    2 => format!("Out {pt_idx}"),
+                                    4 => format!("In {pt_idx}"),
                                     _ => label.clone(),
                                 };
                                 let mut t1 = entry.geom_tracks[i].clone();
-                                let mut t2 = if i + 1 < entry.geom_tracks.len() { entry.geom_tracks[i + 1].clone() } else { crate::app::KeyframeTrack::default() };
-                                let current1 = if is_angle { geom_floats[i].to_degrees() } else { geom_floats[i] };
-                                let current2 = if i + 1 < geom_floats.len() { if is_angle { geom_floats[i + 1].to_degrees() } else { geom_floats[i + 1] } } else { 0.0 };
+                                let mut t2 = if i + 1 < entry.geom_tracks.len() {
+                                    entry.geom_tracks[i + 1].clone()
+                                } else {
+                                    crate::app::KeyframeTrack::default()
+                                };
+                                let current1 = geom_floats[i];
+                                let current2 = if i + 1 < geom_floats.len() {
+                                    geom_floats[i + 1]
+                                } else {
+                                    0.0
+                                };
+                                // Compact two-value row that stays inside the panel width.
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(base_label).strong());
-                                    ui.add_space(10.0);
-                                    // first axis
+                                    let row_w = ui.available_width().max(80.0);
+                                    ui.set_max_width(row_w);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&base_label).strong().small(),
+                                        )
+                                        .truncate(),
+                                    );
+                                    let drag_w = ((row_w - 56.0) * 0.5).clamp(40.0, 72.0);
+
                                     let has1 = t1.keyframes.iter().any(|kf| kf.frame == frame);
                                     let val1 = t1.interpolate(frame).unwrap_or(current1);
                                     let mut v1 = val1;
-                                    let d1 = ui.add(egui::DragValue::new(&mut v1).range(min..=max).speed(speed));
+                                    let d1 = ui
+                                        .add(
+                                            egui::DragValue::new(&mut v1)
+                                                .range(min..=max)
+                                                .speed(speed)
+                                                .prefix("x ")
+                                                .min_decimals(1)
+                                                .max_decimals(2),
+                                        )
+                                        .on_hover_text("X");
+                                    let _ = drag_w;
                                     if d1.changed() {
                                         t1.insert(frame, v1);
                                         entry_changed = true;
-                                        if let Some(v) = Some(v1) {
-                                            let rv = if is_angle { v.to_radians() } else { v };
-                                            geom_floats[i] = rv;
-                                            app.set_node_geom_floats(id, &geom_floats);
-                                        }
+                                        geom_floats[i] = v1;
+                                        app.set_node_geom_floats(id, &geom_floats);
                                     }
                                     if has1 {
-                                        if ui.button("🗑").on_hover_text("Delete").clicked() {
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("Delete X keyframe")
+                                            .clicked()
+                                        {
                                             t1.keyframes.retain(|kf| kf.frame != frame);
                                             entry_changed = true;
                                         }
-                                    } else {
-                                        ui.label(RichText::new(format!("{:.2} (interp)", val1)).color(colors::TEXT_MUTED));
-                                        if ui.button("+").on_hover_text("Add").clicked() {
-                                            t1.insert(frame, val1);
-                                            entry_changed = true;
-                                        }
+                                    } else if ui
+                                        .small_button("+")
+                                        .on_hover_text("Add X keyframe")
+                                        .clicked()
+                                    {
+                                        t1.insert(frame, val1);
+                                        entry_changed = true;
                                     }
-                                    // second axis
+
                                     let has2 = t2.keyframes.iter().any(|kf| kf.frame == frame);
                                     let val2 = t2.interpolate(frame).unwrap_or(current2);
                                     let mut v2 = val2;
-                                    let d2 = ui.add(egui::DragValue::new(&mut v2).range(min..=max).speed(speed));
+                                    let d2 = ui
+                                        .add(
+                                            egui::DragValue::new(&mut v2)
+                                                .range(min..=max)
+                                                .speed(speed)
+                                                .prefix("y ")
+                                                .min_decimals(1)
+                                                .max_decimals(2),
+                                        )
+                                        .on_hover_text("Y");
                                     if d2.changed() {
                                         t2.insert(frame, v2);
                                         entry_changed = true;
-                                        if let Some(v) = Some(v2) {
-                                            if i + 1 < geom_floats.len() {
-                                                let rv = if is_angle { v.to_radians() } else { v };
-                                                geom_floats[i + 1] = rv;
-                                                app.set_node_geom_floats(id, &geom_floats);
-                                            }
+                                        if i + 1 < geom_floats.len() {
+                                            geom_floats[i + 1] = v2;
+                                            app.set_node_geom_floats(id, &geom_floats);
                                         }
                                     }
                                     if has2 {
-                                        if ui.button("🗑").on_hover_text("Delete").clicked() {
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("Delete Y keyframe")
+                                            .clicked()
+                                        {
                                             t2.keyframes.retain(|kf| kf.frame != frame);
                                             entry_changed = true;
                                         }
-                                    } else {
-                                        ui.label(RichText::new(format!("{:.2} (interp)", val2)).color(colors::TEXT_MUTED));
-                                        if ui.button("+").on_hover_text("Add").clicked() {
-                                            t2.insert(frame, val2);
-                                            entry_changed = true;
-                                        }
+                                    } else if ui
+                                        .small_button("+")
+                                        .on_hover_text("Add Y keyframe")
+                                        .clicked()
+                                    {
+                                        t2.insert(frame, val2);
+                                        entry_changed = true;
                                     }
                                 });
-                                ui.add_space(4.0);
                                 entry.geom_tracks[i] = t1;
                                 if i + 1 < entry.geom_tracks.len() {
                                     entry.geom_tracks[i + 1] = t2;
@@ -9580,7 +10558,10 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         }
                     }
                 }
-            }
+        }); // end Geometry Properties collapsing header
+        // Propagate entry_changed from inner edits (already set on entry_changed flag).
+        let _ = geom_body;
+    }
     // Selected keyframe panel inside Action Bar > Animation Tab
     let mut delete_kf_target = None; // (track, frame)
     if let Some((sel_node_id, ref sel_track_lbl, sel_frame)) = app.anim_selected_keyframe.clone() {

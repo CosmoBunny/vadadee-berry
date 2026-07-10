@@ -17,6 +17,7 @@ pub enum ToolKind {
     Pen,
     Text,
     Arc,
+    Plotter,
     Brush,
     Eyedropper,
 }
@@ -34,6 +35,7 @@ impl ToolKind {
             Self::Pen => "Pen",
             Self::Text => "Text",
             Self::Arc => "Arc",
+            Self::Plotter => "Plotter",
             Self::Brush => "Brush",
             Self::Eyedropper => "Eyedropper",
         }
@@ -51,6 +53,7 @@ impl ToolKind {
             Self::Pen => Some(Key::P),
             Self::Text => Some(Key::T),
             Self::Arc => Some(Key::A),
+            Self::Plotter => Some(Key::M),
             Self::Brush => Some(Key::B),
             Self::Eyedropper => Some(Key::I),
         }
@@ -59,7 +62,13 @@ impl ToolKind {
     pub fn is_shape_drag(self) -> bool {
         matches!(
             self,
-            Self::Rectangle | Self::Circle | Self::Ellipse | Self::Line | Self::Polygon | Self::Arc
+            Self::Rectangle
+                | Self::Circle
+                | Self::Ellipse
+                | Self::Line
+                | Self::Polygon
+                | Self::Arc
+                | Self::Plotter
         )
     }
 }
@@ -235,8 +244,9 @@ pub enum SelectDrag {
     Move,
     Resize(ResizeHandle),
     Rotate,
-    TilingGizmo(usize),   // 0 = origin (first), 1 = col end, 2 = row end
-    CircularGizmo(usize), // 0 = first/base pos, 1 = origin
+    TilingGizmo(usize), // 0 = origin (first), 1 = col end, 2 = row end
+    /// CircularClone gizmo: 0 = base (ring / object), 1 = origin (center), 2 = angle handle.
+    CircularGizmo(usize),
 }
 
 /// Drag on empty canvas to select all objects intersecting the rectangle.
@@ -279,6 +289,12 @@ pub struct SelectSession {
     pub rotate_start_layer_rotation: f32,
     pub drag_start_doc: Option<(f64, f64)>,
     pub clicked_already_selected: bool,
+    /// True once pointer moved past click-threshold during SelectDrag::Move.
+    pub move_drag_engaged: bool,
+    /// CircularClone ring pose at move-drag start: (source_id, base_x, base_y, origin_x, origin_y).
+    pub circular_ring_drag_start: Vec<(NodeId, f64, f64, f64, f64)>,
+    /// Document snapshot before Tiling/Circular gizmo drag (for undo).
+    pub effect_drag_doc_before: Option<crate::document::Document>,
 }
 
 #[derive(Debug, Default)]
@@ -372,6 +388,7 @@ impl ToolState {
                 ToolKind::Pen,
                 ToolKind::Text,
                 ToolKind::Arc,
+                ToolKind::Plotter,
                 ToolKind::Brush,
                 ToolKind::Eyedropper,
             ]
@@ -412,6 +429,27 @@ pub fn screen_from_doc(
         canvas_origin.y + pan.y + doc.1 as f32 * zoom,
     )
 }
+
+/// Lock `point` to a 15° multiple relative to `origin` (…, -30, -15, 0, 15, 30, 45, …).
+/// Keeps distance from origin; used for line/2-pt path + Ctrl angle constrain.
+pub fn snap_angle_15deg(origin: (f64, f64), point: (f64, f64)) -> (f64, f64) {
+    let dx = point.0 - origin.0;
+    let dy = point.1 - origin.1;
+    let len = dx.hypot(dy);
+    if len < 1e-12 {
+        return point;
+    }
+    let ang = dy.atan2(dx);
+    let step = std::f64::consts::PI / 12.0; // 15°
+    let snapped = (ang / step).round() * step;
+    (
+        origin.0 + len * snapped.cos(),
+        origin.1 + len * snapped.sin(),
+    )
+}
+
+/// Screen-pixel threshold before a Select click becomes a move drag.
+pub const SELECT_MOVE_THRESHOLD_PX: f64 = 5.0;
 
 pub struct ToolAction {
     pub new_nodes: Vec<Node>,
