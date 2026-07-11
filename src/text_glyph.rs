@@ -169,17 +169,41 @@ fn tessellate_stroke_mesh(
     Some(mesh)
 }
 
-fn build_text_path(
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TextCacheKey {
+    content: String,
+    font_family: String,
+    bold: bool,
+    italic: bool,
+    font_size_bits: u32,
+    fill_debug: String,
+    stroke_style_debug: String,
+    stroke_width_bits: u32,
+    stroke_join: String,
+    stroke_cap: String,
+    opacity_bits: u32,
+    zoom_bits: u32,
+}
+
+#[derive(Clone)]
+struct CachedText {
+    fill_mesh: Option<Mesh>,
+    stroke_mesh: Option<Mesh>,
+    edge_mesh: Option<Mesh>,
+}
+
+thread_local! {
+    static TEXT_CACHE: std::cell::RefCell<std::collections::HashMap<TextCacheKey, CachedText>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn build_text_path_relative(
     face: &Face<'_>,
-    viewport: &Viewport,
-    origin: Pos2,
-    x: f64,
-    y: f64,
+    zoom: f32,
     style: &TextStyle,
 ) -> Option<(Path, egui::Rect)> {
     let upem = face.units_per_em() as f32;
     let scale_doc = style.font_size / upem;
-    let scale_screen = scale_doc * viewport.zoom;
+    let scale_screen = scale_doc * zoom;
     let ascender_doc = face.ascender() as f32 * scale_doc;
     let line_height_doc = style.font_size * 1.25;
 
@@ -199,17 +223,16 @@ fn build_text_path(
     };
 
     for (line_idx, line) in style.content.lines().enumerate() {
-        let baseline_doc = y + ascender_doc as f64 + line_idx as f64 * line_height_doc as f64;
+        let baseline_doc = ascender_doc as f64 + line_idx as f64 * line_height_doc as f64;
         let mut pen_x = 0.0f64;
 
         for ch in line.chars() {
             let gid = face.glyph_index(ch).unwrap_or(GlyphId(0));
             let advance_doc = face.glyph_hor_advance(gid).unwrap_or(0) as f32 * scale_doc;
 
-            let (doc_x, doc_y) = (x + pen_x, baseline_doc);
-            let screen_base = viewport.doc_to_screen((doc_x, doc_y), origin);
-            let ox = screen_base.x;
-            let oy = screen_base.y;
+            let (doc_x, doc_y) = (pen_x, baseline_doc);
+            let ox = doc_x as f32 * zoom;
+            let oy = doc_y as f32 * zoom;
 
             let mut collector = GlyphOutline {
                 builder: &mut lyon_builder,
@@ -240,20 +263,18 @@ fn build_text_path(
         lyon_builder.end(false);
     }
 
-    let bbox = if min_x <= max_x && min_y <= max_y {
-        egui::Rect::from_min_max(Pos2::new(min_x, min_y), Pos2::new(max_x, max_y))
-    } else {
-        let tl = viewport.doc_to_screen((x, y), origin);
-        let br = viewport.doc_to_screen(
-            (x + style.font_size as f64, y + style.font_size as f64),
-            origin,
-        );
-        egui::Rect::from_min_max(tl, br)
-    };
-
     if !any_glyph {
         return None;
     }
+
+    let bbox = if min_x <= max_x && min_y <= max_y {
+        egui::Rect::from_min_max(Pos2::new(min_x, min_y), Pos2::new(max_x, max_y))
+    } else {
+        egui::Rect::from_min_max(
+            Pos2::ZERO,
+            Pos2::new(style.font_size * zoom, style.font_size * zoom),
+        )
+    };
 
     Some((lyon_builder.build(), bbox))
 }
@@ -281,103 +302,141 @@ pub fn draw_text_glyphs(
         return false;
     };
 
-    let Some((path, bbox)) = build_text_path(&face, viewport, origin, x, y, style) else {
-        return false;
+    let key = TextCacheKey {
+        content: style.content.clone(),
+        font_family: style.font_family.clone(),
+        bold: style.bold,
+        italic: style.italic,
+        font_size_bits: style.font_size.to_bits(),
+        fill_debug: format!("{:?}", fill),
+        stroke_style_debug: format!("{:?}", stroke_style),
+        stroke_width_bits: stroke_width_screen.map(|w| w.to_bits()).unwrap_or(0),
+        stroke_join: format!("{:?}", stroke_join),
+        stroke_cap: format!("{:?}", stroke_cap),
+        opacity_bits: opacity.to_bits(),
+        zoom_bits: viewport.zoom.to_bits(),
     };
 
-    let tolerance = (0.15 / viewport.zoom.max(0.2)).clamp(0.02, 0.15);
+    let cached = TEXT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() > 500 {
+            cache.clear();
+        }
+        if let Some(entry) = cache.get(&key) {
+            return Some(entry.clone());
+        }
 
-    let mut stroke_mesh = if let Some(sw) = stroke_width_screen.filter(|w| stroke_style.is_visible() && *w > 0.01) {
-        tessellate_stroke_mesh(
-            &path,
-            stroke_style,
-            opacity,
-            sw,
-            stroke_join,
-            stroke_cap,
-            tolerance,
-        )
-    } else {
-        None
-    };
+        let (path, bbox) = build_text_path_relative(&face, viewport.zoom, style)?;
+        let tolerance = (0.15 / viewport.zoom.max(0.2)).clamp(0.02, 0.15);
 
-    let mut fill_mesh = if fill.is_visible() {
-        tessellate_fill_mesh(&path, fill, opacity, bbox, tolerance)
-    } else {
-        None
-    };
-
-    if rotation_rad.abs() > 1e-9 {
-        let center = bbox.center();
-        let c = rotation_rad.cos() as f32;
-        let s = rotation_rad.sin() as f32;
-        let rotate_mesh = |mesh: &mut Mesh| {
-            for v in &mut mesh.vertices {
-                let dx = v.pos.x - center.x;
-                let dy = v.pos.y - center.y;
-                v.pos.x = center.x + dx * c - dy * s;
-                v.pos.y = center.y + dx * s + dy * c;
-            }
+        let mut stroke_mesh = if let Some(sw) = stroke_width_screen.filter(|w| stroke_style.is_visible() && *w > 0.01) {
+            tessellate_stroke_mesh(
+                &path,
+                stroke_style,
+                opacity,
+                sw,
+                stroke_join,
+                stroke_cap,
+                tolerance,
+            )
+        } else {
+            None
         };
-        if let Some(m) = &mut stroke_mesh {
-            rotate_mesh(m);
-        }
-        if let Some(m) = &mut fill_mesh {
-            rotate_mesh(m);
-        }
-    }
 
-    if let Some(mesh) = stroke_mesh {
-        painter.add(Shape::mesh(mesh));
-    }
-    if let Some(mesh) = fill_mesh {
-        painter.add(Shape::mesh(mesh));
-    }
+        let mut fill_mesh = if fill.is_visible() {
+            tessellate_fill_mesh(&path, fill, opacity, bbox, tolerance)
+        } else {
+            None
+        };
 
-    // Soft anti-aliased edge: thin feathered outline of the glyph path (lyon meshes are hard-edged).
-    // Slightly expands the silhouette so text/line edges are not staircased.
-    let edge_w = 0.9_f32;
-    let edge_color = if fill.is_visible() {
-        let c = sample_paint_fill(fill, opacity * 0.55, 0.5, 0.5);
-        c
-    } else if stroke_style.is_visible() {
-        sample_paint_fill(stroke_style, opacity * 0.55, 0.5, 0.5)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    if edge_color.a() > 0 {
-        if let Some(edge) = tessellate_stroke_mesh(
-            &path,
-            &Fill::Solid(crate::document::Paint {
-                rgba: [
-                    edge_color.r() as f32 / 255.0,
-                    edge_color.g() as f32 / 255.0,
-                    edge_color.b() as f32 / 255.0,
-                    edge_color.a() as f32 / 255.0,
-                ],
-            }),
-            1.0,
-            edge_w,
-            LineJoin::Round,
-            LineCap::Round,
-            tolerance * 0.6,
-        ) {
-            let mut edge = edge;
-            if rotation_rad.abs() > 1e-9 {
-                let center = bbox.center();
-                let c = rotation_rad.cos() as f32;
-                let s = rotation_rad.sin() as f32;
-                for v in &mut edge.vertices {
+        if rotation_rad.abs() > 1e-9 {
+            let center = bbox.center();
+            let c = rotation_rad.cos() as f32;
+            let s = rotation_rad.sin() as f32;
+            let rotate_mesh = |mesh: &mut Mesh| {
+                for v in &mut mesh.vertices {
                     let dx = v.pos.x - center.x;
                     let dy = v.pos.y - center.y;
                     v.pos.x = center.x + dx * c - dy * s;
                     v.pos.y = center.y + dx * s + dy * c;
                 }
+            };
+            if let Some(m) = &mut stroke_mesh {
+                rotate_mesh(m);
             }
-            // Draw edge under fill for AA halo, after stroke so it softens both.
-            painter.add(Shape::mesh(edge));
+            if let Some(m) = &mut fill_mesh {
+                rotate_mesh(m);
+            }
         }
-    }
 
-    true
+        let edge_w = 0.9_f32;
+        let edge_color = if fill.is_visible() {
+            sample_paint_fill(fill, opacity * 0.55, 0.5, 0.5)
+        } else if stroke_style.is_visible() {
+            sample_paint_fill(stroke_style, opacity * 0.55, 0.5, 0.5)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        let mut edge_mesh = None;
+        if edge_color.a() > 0 {
+            if let Some(mut edge) = tessellate_stroke_mesh(
+                &path,
+                &Fill::Solid(crate::document::Paint {
+                    rgba: [
+                        edge_color.r() as f32 / 255.0,
+                        edge_color.g() as f32 / 255.0,
+                        edge_color.b() as f32 / 255.0,
+                        edge_color.a() as f32 / 255.0,
+                    ],
+                }),
+                1.0,
+                edge_w,
+                LineJoin::Round,
+                LineCap::Round,
+                tolerance * 0.6,
+            ) {
+                if rotation_rad.abs() > 1e-9 {
+                    let center = bbox.center();
+                    let c = rotation_rad.cos() as f32;
+                    let s = rotation_rad.sin() as f32;
+                    for v in &mut edge.vertices {
+                        let dx = v.pos.x - center.x;
+                        let dy = v.pos.y - center.y;
+                        v.pos.x = center.x + dx * c - dy * s;
+                        v.pos.y = center.y + dx * s + dy * c;
+                    }
+                }
+                edge_mesh = Some(edge);
+            }
+        }
+
+        let entry = CachedText {
+            fill_mesh,
+            stroke_mesh,
+            edge_mesh,
+        };
+        cache.insert(key.clone(), entry.clone());
+        Some(entry)
+    });
+
+    if let Some(cached) = cached {
+        let translation = viewport.doc_to_screen((x, y), origin);
+        let translation_vec = egui::vec2(translation.x, translation.y);
+
+        if let Some(mut m) = cached.stroke_mesh {
+            m.translate(translation_vec);
+            painter.add(Shape::mesh(m));
+        }
+        if let Some(mut m) = cached.fill_mesh {
+            m.translate(translation_vec);
+            painter.add(Shape::mesh(m));
+        }
+        if let Some(mut m) = cached.edge_mesh {
+            m.translate(translation_vec);
+            painter.add(Shape::mesh(m));
+        }
+        true
+    } else {
+        false
+    }
 }

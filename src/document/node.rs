@@ -3512,24 +3512,48 @@ impl Node {
 }
 
 pub fn text_display_name(content: &str) -> String {
-    let line = content.lines().next().unwrap_or("").trim();
+    // Cap scan — multi-megabyte text must not walk the whole string for a label.
+    const SCAN: usize = 512;
+    let head = if content.len() > SCAN {
+        &content[..SCAN]
+    } else {
+        content
+    };
+    let line = head.lines().next().unwrap_or("").trim();
     if line.is_empty() {
         return "Text".into();
     }
     let max = 40;
-    if line.chars().count() <= max {
-        line.to_string()
-    } else {
-        format!("{}…", line.chars().take(max).collect::<String>())
+    let mut out = String::with_capacity(max + 1);
+    for (i, ch) in line.chars().enumerate() {
+        if i >= max {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
     }
+    out
 }
 
 pub fn text_bounds(x: f64, y: f64, style: &TextStyle) -> Rect {
-    let line_count = style.content.lines().count().max(1) as f64;
-    let max_chars = style
-        .content
+    // Cap scan for huge strings so list_objects / hit-test stay O(1)-ish.
+    const MAX_SCAN: usize = 16_384;
+    let content = if style.content.len() > MAX_SCAN {
+        &style.content[..MAX_SCAN]
+    } else {
+        style.content.as_str()
+    };
+    let line_count = content.lines().count().max(1) as f64;
+    // Prefer byte-length proxy for long lines; full unicode scan is costly on megabyte text.
+    let max_chars = content
         .lines()
-        .map(|l| l.chars().count())
+        .map(|l| {
+            if l.len() > 4096 {
+                l.len() // over-estimate for CJK-safe layout width
+            } else {
+                l.chars().count()
+            }
+        })
         .max()
         .unwrap_or(1) as f64;
     let size = style.font_size as f64;

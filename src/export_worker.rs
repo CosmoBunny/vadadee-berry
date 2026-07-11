@@ -1096,7 +1096,10 @@ impl<'a> ExportSession<'a> {
                         );
                     }
                     crate::document::LayerKind::AV => {
-                        if let Some(tex) = image_textures.get(&layer.id) {
+                        // Match canvas: blank when playhead is outside all video clips.
+                        if !layer.shows_video_at(time_secs) {
+                            // skip — no freeze-frame outside clip
+                        } else if let Some(tex) = image_textures.get(&layer.id) {
                             let mut dx = layer.x as f64;
                             let mut dy = layer.y as f64;
                             let mut rot = layer.rotation as f64;

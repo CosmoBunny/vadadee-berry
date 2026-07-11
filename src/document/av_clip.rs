@@ -66,16 +66,25 @@ impl AvClip {
         }
     }
 
-    pub fn is_audio_only(&self) -> bool {
-        if self.media_path.is_empty() {
+    pub fn path_is_audio_only(path: &str) -> bool {
+        if path.is_empty() {
             return true;
         }
-        let ext = std::path::Path::new(&self.media_path)
+        let ext = std::path::Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
         AUDIO_EXTS.iter().any(|a| *a == ext)
+    }
+
+    pub fn is_audio_only(&self) -> bool {
+        Self::path_is_audio_only(&self.media_path)
+    }
+
+    /// True when playhead time is inside this clip's timeline span [start, end).
+    pub fn contains_timeline_sec(&self, t: f32) -> bool {
+        t >= self.video_timeline_start && t < self.timeline_end_secs()
     }
 
     pub fn timeline_play_secs(&self) -> f32 {

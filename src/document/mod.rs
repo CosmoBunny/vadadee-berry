@@ -90,6 +90,18 @@ pub enum LayerKind {
     Flowchart,
 }
 
+/// Role of an AV layer in the media queue (video / audio / DAW tracks stay separate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AvRole {
+    /// Timeline video clips (raster frames on canvas).
+    #[default]
+    Video,
+    /// Timeline audio-only media clips.
+    Audio,
+    /// Piano-roll / DAW music clips (no wav required).
+    Daw,
+}
+
 impl Default for LayerKind {
     fn default() -> Self {
         Self::Image
@@ -151,9 +163,12 @@ pub struct Layer {
     /// Media clips on the AV timeline (video and/or audio objects inside one layer).
     #[serde(default)]
     pub av_clips: Vec<AvClip>,
-    /// DAW-style music clips on the AV timeline (same layer as media).
+    /// DAW-style music clips on the AV timeline.
     #[serde(default)]
     pub music_clips: Vec<MusicClip>,
+    /// When `kind == AV`, which media queue this layer belongs to.
+    #[serde(default)]
+    pub av_role: AvRole,
     /// WGSL shading passes when `kind == Shading`.
     #[serde(default)]
     pub shading_passes: Vec<ShadingPass>,
@@ -214,11 +229,17 @@ impl Layer {
             media_source_duration: None,
             av_clips: Vec::new(),
             music_clips: Vec::new(),
+            av_role: AvRole::Video,
             shading_passes: Vec::new(),
         }
     }
 
     pub fn new_av_layer(id: Uuid, name: String, media_path: String) -> Self {
+        let role = if !media_path.is_empty() && AvClip::path_is_audio_only(&media_path) {
+            AvRole::Audio
+        } else {
+            AvRole::Video
+        };
         Self {
             id,
             name,
@@ -248,12 +269,19 @@ impl Layer {
             media_source_duration: None,
             av_clips: Vec::new(),
             music_clips: Vec::new(),
+            av_role: role,
             shading_passes: Vec::new(),
         }
     }
 
     pub fn new_empty_av_layer(id: Uuid, name: String) -> Self {
         Self::new_av_layer(id, name, String::new())
+    }
+
+    pub fn new_empty_av_layer_with_role(id: Uuid, name: String, role: AvRole) -> Self {
+        let mut layer = Self::new_empty_av_layer(id, name);
+        layer.av_role = role;
+        layer
     }
 
     pub fn new_shading_layer(id: Uuid, name: String) -> Self {
@@ -286,6 +314,7 @@ impl Layer {
             media_source_duration: None,
             av_clips: Vec::new(),
             music_clips: Vec::new(),
+            av_role: AvRole::Video,
             // Empty by default — callers attach the desired pass (preset / custom / MCP).
             // UI fills vignette only if still empty when the layer is inspected.
             shading_passes: Vec::new(),
@@ -322,6 +351,7 @@ impl Layer {
             media_source_duration: None,
             av_clips: Vec::new(),
             music_clips: Vec::new(),
+            av_role: AvRole::Video,
             shading_passes: Vec::new(),
         }
     }
@@ -349,28 +379,94 @@ impl Layer {
     }
 
     pub fn has_canvas_video(&self) -> bool {
-        if self.kind != LayerKind::AV {
+        if self.kind != LayerKind::AV || self.av_role == AvRole::Daw {
             return false;
         }
         if !self.av_clips.is_empty() {
             return self.av_clips.iter().any(|c| !c.is_audio_only());
         }
-        !self.video_path.is_empty() && !AvClip::from_legacy(
-            self.id,
-            String::new(),
-            self.video_path.clone(),
-            0.0,
-            0.0,
-            0.0,
-            None,
-        )
-        .is_audio_only()
+        !self.video_path.is_empty() && !AvClip::path_is_audio_only(&self.video_path)
     }
 
-    /// Copy primary clip timing into legacy layer fields (UI / preview).
+    /// Whether a video frame should be painted on the canvas at timeline time `t` (seconds).
+    pub fn shows_video_at(&self, t: f32) -> bool {
+        if self.kind != LayerKind::AV || !self.visible {
+            return false;
+        }
+        if !self.av_clips.is_empty() {
+            return self
+                .av_clips
+                .iter()
+                .any(|c| !c.is_audio_only() && !c.media_path.is_empty() && c.contains_timeline_sec(t));
+        }
+        if self.video_path.is_empty() || AvClip::path_is_audio_only(&self.video_path) {
+            return false;
+        }
+        let start = self.video_timeline_start;
+        let end = start + self.timeline_play_secs();
+        t >= start && t < end
+    }
+
+    /// Primary video clip active at `t`, with legacy single-clip fallback fields.
+    /// Returns (clip_id, path, start_offset, play_length_secs, timeline_start).
+    pub fn video_clip_at_time(&self, t: f32) -> Option<(Uuid, &str, f32, f32, f32)> {
+        if !self.shows_video_at(t) {
+            return None;
+        }
+        if !self.av_clips.is_empty() {
+            return self
+                .av_clips
+                .iter()
+                .find(|c| {
+                    !c.is_audio_only() && !c.media_path.is_empty() && c.contains_timeline_sec(t)
+                })
+                .map(|c| {
+                    (
+                        c.id,
+                        c.media_path.as_str(),
+                        c.video_start_offset,
+                        c.timeline_play_secs(),
+                        c.video_timeline_start,
+                    )
+                });
+        }
+        Some((
+            self.id,
+            self.video_path.as_str(),
+            self.video_start_offset,
+            self.timeline_play_secs(),
+            self.video_timeline_start,
+        ))
+    }
+
+    /// Copy the clip active at `t` (or first clip) into legacy layer fields for details UI.
     pub fn sync_legacy_from_primary_clip(&mut self) {
-        if let Some(clip) = self.av_clips.first() {
-            self.video_path = clip.media_path.clone();
+        // Prefer the currently timed clip if any; else first.
+        let pick = self
+            .av_clips
+            .iter()
+            .find(|c| !c.is_audio_only())
+            .or_else(|| self.av_clips.first())
+            .cloned();
+        if let Some(clip) = pick {
+            self.video_path = clip.media_path;
+            self.video_start_offset = clip.video_start_offset;
+            self.video_play_length = clip.video_play_length;
+            self.video_timeline_start = clip.video_timeline_start;
+            self.media_source_duration = clip.media_source_duration;
+        }
+    }
+
+    /// Sync legacy fields from the video clip covering timeline time `t`.
+    pub fn sync_legacy_from_clip_at(&mut self, t: f32) {
+        if let Some(clip) = self
+            .av_clips
+            .iter()
+            .find(|c| !c.is_audio_only() && c.contains_timeline_sec(t))
+            .cloned()
+            .or_else(|| self.av_clips.first().cloned())
+        {
+            self.video_path = clip.media_path;
             self.video_start_offset = clip.video_start_offset;
             self.video_play_length = clip.video_play_length;
             self.video_timeline_start = clip.video_timeline_start;
@@ -525,9 +621,15 @@ impl Document {
     }
 
     pub fn add_av_layer(&mut self, name: impl Into<String>, media_path: String) -> usize {
-        let mut layer = Layer::new_av_layer(Uuid::new_v4(), name.into(), media_path.clone());
+        let name_str = name.into();
+        let clean_name = std::path::Path::new(&name_str)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&name_str)
+            .to_string();
+        let mut layer = Layer::new_av_layer(Uuid::new_v4(), clean_name.clone(), media_path.clone());
         if !media_path.is_empty() {
-            let mut clip = AvClip::new_from_media(layer.name.clone(), media_path, 0.0);
+            let mut clip = AvClip::new_from_media(clean_name, media_path, 0.0);
             clip.id = layer.id;
             layer.av_clips.push(clip);
         }
@@ -536,9 +638,39 @@ impl Document {
     }
 
     pub fn add_empty_av_layer(&mut self, name: impl Into<String>) -> usize {
-        let layer = Layer::new_empty_av_layer(Uuid::new_v4(), name.into());
+        self.add_empty_av_layer_with_role(name, AvRole::Video)
+    }
+
+    pub fn add_empty_av_layer_with_role(
+        &mut self,
+        name: impl Into<String>,
+        role: AvRole,
+    ) -> usize {
+        let layer = Layer::new_empty_av_layer_with_role(Uuid::new_v4(), name.into(), role);
         self.layers.push(layer);
         self.layers.len() - 1
+    }
+
+    /// First layer with the given AV role, if any.
+    pub fn find_av_role_layer(&self, role: AvRole) -> Option<usize> {
+        self.layers
+            .iter()
+            .position(|l| l.kind == LayerKind::AV && l.av_role == role)
+    }
+
+    /// Prefer active layer when it matches role; else first match; else create.
+    pub fn ensure_av_role_layer(&mut self, role: AvRole, default_name: &str) -> usize {
+        if let Some(l) = self.active_layer() {
+            if l.kind == LayerKind::AV && l.av_role == role {
+                return self.active_layer_index;
+            }
+        }
+        if let Some(idx) = self.find_av_role_layer(role) {
+            return idx;
+        }
+        let idx = self.add_empty_av_layer_with_role(default_name, role);
+        self.active_layer_index = idx;
+        idx
     }
 
     pub fn add_shading_layer(&mut self, name: impl Into<String>) -> usize {

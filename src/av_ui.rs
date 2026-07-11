@@ -1,4 +1,4 @@
-//! AV / Media timeline UI: crop handles, music clips, piano roll, toolbar.
+//! AV / Media timeline UI: crop handles, DAW clips, piano roll, toolbar actions.
 
 use egui::{Color32, Context, Rect, RichText, Ui};
 use uuid::Uuid;
@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::app::VadadeeBerryApp;
 use crate::document::{AvClip, Layer, LayerKind, MusicClip};
 use crate::icons;
-use crate::theme::colors;
+
 
 const TRIM_HANDLE_W: f32 = 8.0;
 
@@ -30,14 +30,20 @@ pub enum PianoTool {
     Grab,
 }
 
+/// One row in the AV timeline = one ActionBar layer (`LayerKind::AV`).
+/// Clips (video / audio / DAW) are a **queue on that row**, not separate rows.
 #[derive(Clone)]
 pub struct AvTimelineRow {
     pub layer_idx: usize,
     pub layer_id: Uuid,
+    /// Layer name from the Layers tab (truncated for labels).
     pub layer_name: String,
     pub row_label: String,
-    pub av_clip_id: Option<Uuid>,
-    pub music_clip_id: Option<Uuid>,
+    pub av_role: crate::document::AvRole,
+    /// All media clips on this layer (queue order).
+    pub av_clip_ids: Vec<Uuid>,
+    /// All DAW / music clips on this layer.
+    pub music_clip_ids: Vec<Uuid>,
 }
 
 pub fn collect_timeline_rows(layers: &[Layer]) -> Vec<AvTimelineRow> {
@@ -48,71 +54,47 @@ pub fn collect_timeline_rows(layers: &[Layer]) -> Vec<AvTimelineRow> {
         }
         let mut layer = layer.clone();
         layer.ensure_av_clips();
-        if layer.av_clips.is_empty() && layer.music_clips.is_empty() {
-            rows.push(AvTimelineRow {
-                layer_idx: idx,
-                layer_id: layer.id,
-                layer_name: layer.name.clone(),
-                row_label: "(empty)".into(),
-                av_clip_id: None,
-                music_clip_id: None,
-            });
-            continue;
-        }
-        for clip in &layer.av_clips {
-            rows.push(AvTimelineRow {
-                layer_idx: idx,
-                layer_id: layer.id,
-                layer_name: layer.name.clone(),
-                row_label: clip.name.clone(),
-                av_clip_id: Some(clip.id),
-                music_clip_id: None,
-            });
-        }
-        for mclip in &layer.music_clips {
-            rows.push(AvTimelineRow {
-                layer_idx: idx,
-                layer_id: layer.id,
-                layer_name: layer.name.clone(),
-                row_label: mclip.name.clone(),
-                av_clip_id: None,
-                music_clip_id: Some(mclip.id),
-            });
-        }
+        let role_tag = match layer.av_role {
+            crate::document::AvRole::Video => "Video",
+            crate::document::AvRole::Audio => "Audio",
+            crate::document::AvRole::Daw => "DAW",
+        };
+        let n_media = layer.av_clips.len();
+        let n_daw = layer.music_clips.len();
+        let suffix = if n_media + n_daw == 0 {
+            "(empty)".into()
+        } else {
+            format!("{n_media}+{n_daw} clips")
+        };
+        rows.push(AvTimelineRow {
+            layer_idx: idx,
+            layer_id: layer.id,
+            layer_name: layer.name.clone(),
+            row_label: format!("{} · {} · {}", role_tag, layer.name, suffix),
+            av_role: layer.av_role,
+            av_clip_ids: layer.av_clips.iter().map(|c| c.id).collect(),
+            music_clip_ids: layer.music_clips.iter().map(|c| c.id).collect(),
+        });
     }
     rows
 }
 
-pub fn av_toolbar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
-    let is_av = app
-        .project
-        .document
-        .active_layer()
-        .is_some_and(|l| l.kind == LayerKind::AV);
-    if !is_av {
-        return;
+/// Next timeline start for a new media clip: end of the queue on this layer.
+pub fn queue_append_start_sec(layer: &Layer) -> f32 {
+    let mut end = 0.0f32;
+    for c in &layer.av_clips {
+        end = end.max(c.timeline_end_secs());
     }
+    for c in &layer.music_clips {
+        end = end.max(c.end_sec());
+    }
+    end.max(0.0)
+}
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("AV Tools").small().color(colors::TEXT_MUTED));
-        ui.separator();
-
-        if ui
-            .button(RichText::new(format!("{} Split", icons::SPLIT)).font(icons::nerd_font_id(13.0)))
-            .on_hover_text("Split/cut clip at playhead")
-            .clicked()
-        {
-            app.split_active_av_clip_at_playhead();
-        }
-
-        if ui
-            .button(RichText::new(format!("{} Music", icons::MUSIC)).font(icons::nerd_font_id(13.0)))
-            .on_hover_text("Create 1s music node at playhead (no wav required)")
-            .clicked()
-        {
-            app.create_music_clip_at_playhead();
-        }
-    });
+/// AV-only tools live on the main floating toolbar when an AV layer is selected.
+/// Kept as no-op here so interior editor no longer shows misplaced Split/DAW buttons.
+pub fn av_toolbar(_app: &mut VadadeeBerryApp, _ui: &mut Ui) {
+    // Intentionally empty — Split / DAW are on the main toolbar when AV is active.
 }
 
 pub fn paint_trim_caps(
@@ -225,28 +207,26 @@ pub fn piano_roll_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, ctx: &Context) {
         return;
     };
 
-    let layer_idx = app.project.document.active_layer_index;
-    let clip_name = app
+    // Search all layers — DAW clips live on DAW-role layers, not only the active one.
+    let Some((layer_idx, clip_name)) = app
         .project
         .document
         .layers
-        .get(layer_idx)
-        .and_then(|l| l.music_clips.iter().find(|c| c.id == clip_id))
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| "Music".into());
-    if !app
-        .project
-        .document
-        .layers
-        .get(layer_idx)
-        .is_some_and(|l| l.music_clips.iter().any(|c| c.id == clip_id))
-    {
+        .iter()
+        .enumerate()
+        .find_map(|(i, l)| {
+            l.music_clips
+                .iter()
+                .find(|c| c.id == clip_id)
+                .map(|c| (i, c.name.clone()))
+        })
+    else {
         app.piano_roll_clip = None;
         return;
-    }
+    };
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("{} Piano — {}", icons::MUSIC, clip_name)).strong());
+        ui.label(RichText::new(format!("{} DAW Piano — {}", icons::MUSIC, clip_name)).strong());
         ui.separator();
         if ui.selectable_label(app.piano_tool == PianoTool::Add, format!("{} Add", icons::ADD)).clicked() {
             app.piano_tool = PianoTool::Add;

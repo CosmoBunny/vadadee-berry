@@ -2261,15 +2261,23 @@ impl VadadeeBerryApp {
 
         let fps = self.anim_fps.max(1) as f32;
         for l in &self.project.document.layers {
-            if l.kind != crate::document::LayerKind::AV
-            {
+            if l.kind != crate::document::LayerKind::AV {
                 continue;
             }
-            if l.video_path.is_empty() {
-                continue;
+            // Include the full media queue (not only legacy primary path).
+            if !l.av_clips.is_empty() || !l.music_clips.is_empty() {
+                for c in &l.av_clips {
+                    let end_frame = (c.timeline_end_secs() * fps).ceil().max(0.0) as usize;
+                    max_f = max_f.max(end_frame);
+                }
+                for m in &l.music_clips {
+                    let end_frame = (m.end_sec() * fps).ceil().max(0.0) as usize;
+                    max_f = max_f.max(end_frame);
+                }
+            } else if !l.video_path.is_empty() {
+                let end_frame = (l.timeline_end_secs() * fps).ceil().max(0.0) as usize;
+                max_f = max_f.max(end_frame);
             }
-            let end_frame = (l.timeline_end_secs() * fps).ceil().max(0.0) as usize;
-            max_f = max_f.max(end_frame);
         }
 
         // Allow extending beyond current content (so user can set keyframes / current frame > prior max)
@@ -2765,9 +2773,13 @@ impl VadadeeBerryApp {
     }
 
     pub fn add_empty_av_layer(&mut self, name: &str) {
+        self.add_empty_av_layer_with_role(name, crate::document::AvRole::Video);
+    }
+
+    pub fn add_empty_av_layer_with_role(&mut self, name: &str, role: crate::document::AvRole) {
         let before = snapshot_document(&self.project.document);
         let mut after = before.clone();
-        let idx = after.add_empty_av_layer(name);
+        let idx = after.add_empty_av_layer_with_role(name, role);
         after.active_layer_index = idx;
         self.history.push(
             &mut self.project,
@@ -2895,21 +2907,64 @@ impl VadadeeBerryApp {
     }
 
     pub fn add_av_layer(&mut self, name: &str, media_path: String) {
+        let clean_name = std::path::Path::new(name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(name);
+        let is_audio = crate::document::AvClip::path_is_audio_only(&media_path);
+        let role = if is_audio {
+            crate::document::AvRole::Audio
+        } else {
+            crate::document::AvRole::Video
+        };
         let before = snapshot_document(&self.project.document);
         let mut after = before.clone();
         let path_for_extract = media_path.clone();
-        let idx = after.add_av_layer(name, media_path);
-        after.active_layer_index = idx;
+        // Queue onto existing role layer when present; otherwise create a dedicated layer.
+        let default_name = if is_audio { "Audio" } else { "Video" };
+        // Prefer active layer when it matches role (queue onto the selected Video/Audio layer).
+        let idx = after.ensure_av_role_layer(role, default_name);
         if let Some(layer) = after.layers.get_mut(idx) {
-            if let Some(dur) = crate::video_decode::probe_media_duration_secs(&layer.video_path) {
-                layer.media_source_duration = Some(dur);
-                layer.video_play_length = dur;
-                if let Some(clip) = layer.av_clips.first_mut() {
-                    clip.media_source_duration = Some(dur);
-                    clip.video_play_length = dur;
+            layer.av_role = role;
+            // Empty target: set primary path. Non-empty: append to end of queue (after last clip).
+            let empty = layer.av_clips.is_empty() && layer.video_path.is_empty();
+            let timeline_start = if empty {
+                0.0
+            } else {
+                crate::av_ui::queue_append_start_sec(layer)
+            };
+            if empty {
+                layer.video_path = media_path.clone();
+                layer.name = if clean_name.is_empty() {
+                    default_name.to_string()
+                } else {
+                    clean_name.to_string()
+                };
+            }
+            let clip_name = if clean_name.is_empty() {
+                default_name.to_string()
+            } else {
+                clean_name.to_string()
+            };
+            let mut clip =
+                crate::document::AvClip::new_from_media(clip_name, media_path.clone(), timeline_start);
+            // Unique id per queue item (do not reuse layer.id for later clips).
+            if empty {
+                clip.id = layer.id;
+            }
+            clip.track_row = 0; // single row per layer — queue is time-ordered, not stacked rows
+            if let Some(dur) = crate::video_decode::probe_media_duration_secs(&media_path) {
+                clip.media_source_duration = Some(dur);
+                clip.video_play_length = dur;
+                if empty {
+                    layer.media_source_duration = Some(dur);
+                    layer.video_play_length = dur;
                 }
             }
+            layer.av_clips.push(clip);
+            layer.sync_legacy_from_primary_clip();
         }
+        after.active_layer_index = idx;
         self.history.push(
             &mut self.project,
             ProjectEdit::PatchDocument { before, after },
@@ -4829,6 +4884,38 @@ impl VadadeeBerryApp {
         if self.selection.is_empty() {
             return;
         }
+
+        // Handle deleting AV clips or Music clips inside layers
+        let mut clip_removed = false;
+        let before_doc = snapshot_document(&self.project.document);
+        let mut after_doc = before_doc.clone();
+        for layer in &mut after_doc.layers {
+            let initial_av_len = layer.av_clips.len();
+            layer.av_clips.retain(|c| !self.selection.contains(&c.id));
+            if layer.av_clips.len() != initial_av_len {
+                clip_removed = true;
+                layer.sync_legacy_from_primary_clip();
+            }
+
+            let initial_music_len = layer.music_clips.len();
+            layer.music_clips.retain(|c| !self.selection.contains(&c.id));
+            if layer.music_clips.len() != initial_music_len {
+                clip_removed = true;
+            }
+        }
+        if clip_removed {
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchDocument {
+                    before: before_doc,
+                    after: after_doc,
+                },
+            );
+            self.selection.clear();
+            self.sync_inspector_from_selection();
+            return;
+        }
+
         let mut layer_positions: Vec<usize> = self
             .selection
             .iter()
@@ -5108,29 +5195,44 @@ impl VadadeeBerryApp {
     }
 
     pub fn create_music_clip_at_playhead(&mut self) {
-        let idx = self.project.document.active_layer_index;
+        self.create_daw_clip_at_playhead();
+    }
+
+    /// Create a 1s DAW node on a DAW-role AV layer (creates the layer if needed).
+    pub fn create_daw_clip_at_playhead(&mut self) {
         let play_sec = self.anim_current_frame as f32 / self.anim_fps as f32;
-        let Some(layer) = self.project.document.layers.get_mut(idx) else {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let n = after
+            .layers
+            .iter()
+            .filter(|l| l.kind == crate::document::LayerKind::AV && l.av_role == crate::document::AvRole::Daw)
+            .map(|l| l.music_clips.len())
+            .sum::<usize>()
+            + 1;
+        let idx = after.ensure_av_role_layer(
+            crate::document::AvRole::Daw,
+            &format!("DAW {}", after.layers.iter().filter(|l| l.av_role == crate::document::AvRole::Daw).count().max(1)),
+        );
+        let Some(layer) = after.layers.get_mut(idx) else {
             return;
         };
-        if layer.kind != crate::document::LayerKind::AV {
-            self.status_message = "Select an AV layer for music".into();
-            return;
-        }
+        layer.av_role = crate::document::AvRole::Daw;
         layer.ensure_av_clips();
-        let n = layer.music_clips.len() + 1;
-        let end = play_sec + 1.0;
-        let row = crate::document::assign_free_track_row(&layer.av_clips, &layer.music_clips, play_sec, end);
-        let mut clip = crate::document::MusicClip::new_empty(
-            format!("Music {n}"),
-            play_sec,
-            1.0,
-        );
-        clip.track_row = row;
+        // Append to end of DAW queue (after last media/DAW on this layer).
+        let start = crate::av_ui::queue_append_start_sec(layer).max(play_sec);
+        let mut clip =
+            crate::document::MusicClip::new_empty(format!("DAW {n}"), start, 1.0);
+        clip.track_row = 0;
         let id = clip.id;
         layer.music_clips.push(clip);
+        after.active_layer_index = idx;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
         self.piano_roll_clip = Some(id);
-        self.status_message = format!("Created 1s music node at {:.2}s", play_sec);
+        self.status_message = format!("Created 1s DAW node at {:.2}s", play_sec);
     }
 
     /// Pick topmost node at `doc`. Ghosts (boolean/clip hidden sources) are skipped unless
@@ -5349,8 +5451,11 @@ fn run_video_decode_thread(
         let fps = self.anim_fps as f32;
         let current_frame = self.anim_current_frame;
 
-        // Collect clip metadata (video clips only) without borrowing self.video_layers yet
-        let mut layers_info: Vec<(uuid::Uuid, String, f32, f32, f32, f32, f32, f32, f32)> = Vec::new();
+        // Collect clip metadata (video clips only) without borrowing self.video_layers yet.
+        // `active` is false when playhead is outside the clip span — no freeze-frame before/after.
+        let t_sec = current_frame as f32 / fps;
+        let mut layers_info: Vec<(uuid::Uuid, String, f32, f32, f32, f32, f32, f32, f32, bool)> =
+            Vec::new();
         for l in &self.project.document.layers {
             if !l.visible || l.kind != crate::document::LayerKind::AV {
                 continue;
@@ -5361,6 +5466,7 @@ fn run_video_decode_thread(
                 if c.is_audio_only() || c.media_path.is_empty() {
                     continue;
                 }
+                let active = c.contains_timeline_sec(t_sec);
                 layers_info.push((
                     c.id,
                     c.media_path.clone(),
@@ -5369,8 +5475,9 @@ fn run_video_decode_thread(
                     l.brightness,
                     l.contrast,
                     c.video_start_offset,
-                    c.video_play_length,
+                    c.timeline_play_secs(),
                     c.video_timeline_start,
+                    active,
                 ));
             }
         }
@@ -5379,7 +5486,19 @@ fn run_video_decode_thread(
         let active_ids: std::collections::HashSet<uuid::Uuid> = layers_info.iter().map(|info| info.0).collect();
         self.video_layers.retain(|id, _| active_ids.contains(id));
 
-        for (layer_id, video_path, hue, sat, bright, contrast, start_offset, play_length, timeline_start) in &layers_info {
+        for (
+            layer_id,
+            video_path,
+            hue,
+            sat,
+            bright,
+            contrast,
+            start_offset,
+            play_length,
+            timeline_start,
+            active,
+        ) in &layers_info
+        {
             let state = self.video_layers.entry(*layer_id).or_insert_with(|| {
                 let (tx_cmd, rx_cmd) = std::sync::mpsc::channel();
                 let (tx_frame, rx_frame) = std::sync::mpsc::channel();
@@ -5398,6 +5517,28 @@ fn run_video_decode_thread(
                 }
             });
 
+            // Outside clip window: drop texture so canvas stays blank (no freeze first/last frame).
+            if !*active {
+                if state.stream_active {
+                    let _ = state.tx_cmd.send(VideoCommand::StopStream);
+                    state.stream_active = false;
+                }
+                // Drain any late frames without uploading.
+                while state.rx_frame.try_recv().is_ok() {}
+                state.texture = None;
+                state.cached_frame = None;
+                state.cached_source_frame = None;
+                state.requested_frame = None;
+                if self
+                    .video_frame_cache
+                    .as_ref()
+                    .is_some_and(|c| c.layer_id == *layer_id)
+                {
+                    self.video_frame_cache = None;
+                }
+                continue;
+            }
+
             let mut latest_frame = None;
             while let Ok(data) = state.rx_frame.try_recv() {
                 latest_frame = Some(data);
@@ -5409,13 +5550,14 @@ fn run_video_decode_thread(
                     apply_color_controls(&mut img, *hue, *sat, *bright, *contrast);
                     rgba = img.into_raw();
                 }
-                let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                let color_image =
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
                 let handle = ctx.load_texture(
                     format!("vadadee-vid-{}-{}", layer_id.as_simple(), decoded_frame),
                     color_image,
                     egui::TextureOptions::default(),
                 );
-                
+
                 self.video_frame_cache = Some(VideoFrameCache {
                     layer_id: *layer_id,
                     frame: decoded_frame,
@@ -5434,7 +5576,13 @@ fn run_video_decode_thread(
                 state.stream_active = false;
             }
 
-            let elapsed_time = ((current_frame as f32 / fps) - timeline_start).max(0.0).min(*play_length);
+            let elapsed_time = (t_sec - timeline_start).clamp(0.0, *play_length);
+            // Strictly inside span already; still clamp so source never past play length.
+            if elapsed_time >= *play_length && *play_length > 0.0 {
+                // At exact end boundary — treat as inactive (half-open interval).
+                state.texture = None;
+                continue;
+            }
             let source_time = start_offset + elapsed_time;
             let source_frame_idx = (source_time * fps) as usize;
 
@@ -5444,16 +5592,14 @@ fn run_video_decode_thread(
                 already_cached = true;
             }
             let already_requested = state.requested_frame == Some(current_frame);
-            
+
             let now = ctx.input(|i| i.time);
             let throttle = if self.anim_is_playing {
                 false
+            } else if let Some(last) = state.last_req_time {
+                (now - last) < 0.080 // limit to ~12.5 fps when scrubbing
             } else {
-                if let Some(last) = state.last_req_time {
-                    (now - last) < 0.080 // limit to ~12.5 fps when scrubbing
-                } else {
-                    false
-                }
+                false
             };
 
             if !already_cached && !already_requested && !throttle {
@@ -5830,13 +5976,23 @@ fn run_video_decode_thread(
                         if !layer.has_canvas_video() {
                             continue;
                         }
+                        let t_sec = self.anim_current_frame as f32 / self.anim_fps as f32;
+                        // Hide video before clip start and after clip end (no freeze-frame).
+                        if !layer.shows_video_at(t_sec) {
+                            continue;
+                        }
                         let mut layer_clips = layer.clone();
                         layer_clips.ensure_av_clips();
-                        let primary_id = layer_clips
-                            .av_clips
-                            .iter()
-                            .find(|c| !c.is_audio_only())
-                            .map(|c| c.id)
+                        let primary_id = layer
+                            .video_clip_at_time(t_sec)
+                            .map(|(id, _, _, _, _)| id)
+                            .or_else(|| {
+                                layer_clips
+                                    .av_clips
+                                    .iter()
+                                    .find(|c| !c.is_audio_only())
+                                    .map(|c| c.id)
+                            })
                             .unwrap_or(layer.id);
                         let tex = self.video_layers.get(&primary_id)
                             .and_then(|s| s.texture.as_ref())
@@ -5898,7 +6054,7 @@ fn run_video_decode_thread(
                             );
                             
                             // Selection highlight outline
-                            if self.selection.contains(&layer.id) {
+                            if self.selection.contains(&layer.id) || self.selection.contains(&primary_id) {
                                 let mut points = [
                                     rect.left_top(),
                                     rect.right_top(),
@@ -6089,48 +6245,81 @@ fn run_video_decode_thread(
                                 sr,
                                 self.tools.select.select_rotation_mode,
                             );
-                        } else if let Some(l) = self.project.document.layers.iter().find(|l| l.id == *id) {
-                            if l.kind == crate::document::LayerKind::AV {
-                                let mut dx = l.x as f64;
-                                let mut dy = l.y as f64;
-                                if let Some(track) = self.project.anim_timeline.nodes.get(&l.id) {
-                                    if let Some(x) = track.pos_x.interpolate(self.anim_current_frame) {
-                                        dx = x;
-                                    }
-                                    if let Some(y) = track.pos_y.interpolate(self.anim_current_frame) {
-                                        dy = y;
+                        } else {
+                            let mut layer_found = None;
+                            for layer in &self.project.document.layers {
+                                if layer.id == *id {
+                                    layer_found = Some(layer);
+                                    break;
+                                }
+                                if layer.kind == crate::document::LayerKind::AV {
+                                    let mut l_clips = layer.clone();
+                                    l_clips.ensure_av_clips();
+                                    if l_clips.av_clips.iter().any(|c| c.id == *id) {
+                                        layer_found = Some(layer);
+                                        break;
                                     }
                                 }
-                                let aspect = self.video_layers.get(&l.id)
-                                    .and_then(|s| s.texture.as_ref())
-                                    .map(|tex| {
-                                        let tex_w = tex.size()[0] as f32;
-                                        let tex_h = tex.size()[1] as f32;
-                                        if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
-                                    })
-                                    .or_else(|| {
-                                        self.video_frame_cache.as_ref()
-                                            .filter(|c| c.layer_id == l.id)
-                                            .map(|c| {
-                                                let tex_w = c.texture.size()[0] as f32;
-                                                let tex_h = c.texture.size()[1] as f32;
-                                                if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
-                                            })
-                                    })
-                                    .unwrap_or(1.0);
-                                let mut w = l.width as f64;
-                                let mut h = l.height as f64;
-                                if l.aspect_ratio_locked {
-                                    if w / h > aspect {
-                                        w = h * aspect;
-                                    } else {
-                                        h = w / aspect;
+                            }
+                            if let Some(l) = layer_found {
+                                if l.kind == crate::document::LayerKind::AV {
+                                    let mut dx = l.x as f64;
+                                    let mut dy = l.y as f64;
+                                    if let Some(track) = self.project.anim_timeline.nodes.get(&l.id) {
+                                        if let Some(x) = track.pos_x.interpolate(self.anim_current_frame) {
+                                            dx = x;
+                                        }
+                                        if let Some(y) = track.pos_y.interpolate(self.anim_current_frame) {
+                                            dy = y;
+                                        }
                                     }
+                                    let t_sec = self.anim_current_frame as f32 / self.anim_fps as f32;
+                                    let mut l_clips = l.clone();
+                                    l_clips.ensure_av_clips();
+                                    let primary_id = l
+                                        .video_clip_at_time(t_sec)
+                                        .map(|(cid, _, _, _, _)| cid)
+                                        .or_else(|| {
+                                            l_clips
+                                                .av_clips
+                                                .iter()
+                                                .find(|c| !c.is_audio_only())
+                                                .map(|c| c.id)
+                                        })
+                                        .unwrap_or(l.id);
+
+                                    let aspect = self.video_layers.get(&primary_id)
+                                        .or_else(|| self.video_layers.get(&l.id))
+                                        .and_then(|s| s.texture.as_ref())
+                                        .map(|tex| {
+                                            let tex_w = tex.size()[0] as f32;
+                                            let tex_h = tex.size()[1] as f32;
+                                            if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                        })
+                                        .or_else(|| {
+                                            self.video_frame_cache.as_ref()
+                                                .filter(|c| c.layer_id == primary_id || c.layer_id == l.id)
+                                                .map(|c| {
+                                                    let tex_w = c.texture.size()[0] as f32;
+                                                    let tex_h = c.texture.size()[1] as f32;
+                                                    if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                                })
+                                        })
+                                        .unwrap_or(1.0);
+                                    let mut w = l.width as f64;
+                                    let mut h = l.height as f64;
+                                    if l.aspect_ratio_locked {
+                                        if w / h > aspect {
+                                            w = h * aspect;
+                                        } else {
+                                            h = w / aspect;
+                                        }
+                                    }
+                                    let tl = self.viewport.doc_to_screen((dx, dy), origin);
+                                    let br = self.viewport.doc_to_screen((dx + w, dy + h), origin);
+                                    let sr = egui::Rect::from_min_max(tl, br);
+                                    render::draw_transform_handles(&painter, sr, self.tools.select.select_rotation_mode);
                                 }
-                                let tl = self.viewport.doc_to_screen((dx, dy), origin);
-                                let br = self.viewport.doc_to_screen((dx + w, dy + h), origin);
-                                let sr = egui::Rect::from_min_max(tl, br);
-                                render::draw_transform_handles(&painter, sr, self.tools.select.select_rotation_mode);
                             }
                         }
                     }
@@ -6997,16 +7186,29 @@ fn run_video_decode_thread(
         }
 
         let playhead_time = self.anim_current_frame as f32 / self.anim_fps as f32;
-        let mut active_layer_ids = std::collections::HashSet::new();
+        let mut active_clip_ids = std::collections::HashSet::new();
+        let mut clip_info_map = std::collections::HashMap::new();
+
         for layer in &self.project.document.layers {
-            if layer.visible
-                && layer.kind == crate::document::LayerKind::AV
-                && !layer.video_path.is_empty()
-            {
-                let start = layer.video_timeline_start;
-                let duration = layer.video_play_length;
+            if !layer.visible || layer.kind != crate::document::LayerKind::AV {
+                continue;
+            }
+            let mut l = layer.clone();
+            l.ensure_av_clips();
+            for clip in &l.av_clips {
+                if clip.media_path.is_empty() {
+                    continue;
+                }
+                let start = clip.video_timeline_start;
+                let duration = clip.video_play_length;
                 if playhead_time >= start && playhead_time < start + duration {
-                    active_layer_ids.insert(layer.id);
+                    active_clip_ids.insert(clip.id);
+                    clip_info_map.insert(clip.id, (
+                        clip.media_path.clone(),
+                        start,
+                        clip.video_start_offset,
+                        layer.volume,
+                    ));
                 }
             }
         }
@@ -7022,27 +7224,27 @@ fn run_video_decode_thread(
         let mut prepared: Vec<(uuid::Uuid, crate::audio_extract::AudioPrepareResult)> =
             Vec::new();
         let mut prepare_failed: Vec<uuid::Uuid> = Vec::new();
-        self.audio_prepare_rx.retain(|layer_id, rx| {
+        self.audio_prepare_rx.retain(|clip_id, rx| {
             match rx.try_recv() {
                 Ok(Some(p)) => {
-                    prepared.push((*layer_id, p));
+                    prepared.push((*clip_id, p));
                     false
                 }
                 Ok(None) => {
-                    prepare_failed.push(*layer_id);
+                    prepare_failed.push(*clip_id);
                     false
                 }
-                Err(_) => active_layer_ids.contains(layer_id),
+                Err(_) => active_clip_ids.contains(clip_id),
             }
         });
         for id in prepare_failed {
             self.audio_layers_skip.insert(id);
             self.audio_player_buffer_offset.remove(&id);
         }
-        for (layer_id, p) in prepared {
+        for (clip_id, p) in prepared {
             if p.samples.is_empty() {
-                self.audio_layers_skip.insert(layer_id);
-                self.audio_player_buffer_offset.remove(&layer_id);
+                self.audio_layers_skip.insert(clip_id);
+                self.audio_player_buffer_offset.remove(&clip_id);
                 continue;
             }
             if let (Some(ch), Some(rate)) =
@@ -7050,116 +7252,102 @@ fn run_video_decode_thread(
             {
                 let source = rodio::buffer::SamplesBuffer::new(ch, rate, p.samples);
                 let player = rodio::Player::connect_new(mixer);
-                if let Some(layer) = self
-                    .project
-                    .document
-                    .layers
-                    .iter()
-                    .find(|l| l.id == layer_id)
-                {
-                    player.set_volume(layer.volume);
-                    let start = layer.video_timeline_start;
-                    let file_pos = (playhead_time - start) + layer.video_start_offset;
+                if let Some(&(ref _path, start, start_offset, volume)) = clip_info_map.get(&clip_id) {
+                    player.set_volume(volume);
+                    let file_pos = (playhead_time - start) + start_offset;
                     let fp = file_pos.max(0.0);
-                    self.audio_player_last_file_pos.insert(layer_id, fp);
+                    self.audio_player_last_file_pos.insert(clip_id, fp);
                 }
                 player.append(source);
-                self.audio_players.insert(layer_id, player);
+                self.audio_players.insert(clip_id, player);
             } else {
-                self.audio_layers_skip.insert(layer_id);
-                self.audio_player_buffer_offset.remove(&layer_id);
+                self.audio_layers_skip.insert(clip_id);
+                self.audio_player_buffer_offset.remove(&clip_id);
             }
         }
 
-        for layer in &self.project.document.layers {
-            if layer.visible
-                && layer.kind == crate::document::LayerKind::AV
-                && !layer.video_path.is_empty()
-            {
-                let start = layer.video_timeline_start;
-                let duration = layer.video_play_length;
-                if playhead_time >= start && playhead_time < start + duration {
-                    if self.audio_layers_skip.contains(&layer.id) {
-                        if resolve_audio_path_for_rodio(
-                            &layer.video_path,
-                            &self.audio_extract_status,
-                            &self.audio_pcm_cache,
-                        )
-                        .is_some()
-                        {
-                            self.audio_layers_skip.remove(&layer.id);
-                        } else {
-                            continue;
-                        }
-                    }
+        for &clip_id in &active_clip_ids {
+            let Some(&(ref media_path, start, start_offset, volume)) = clip_info_map.get(&clip_id) else {
+                continue;
+            };
 
-                    let file_pos =
-                        (playhead_time - start) + layer.video_start_offset;
-                    let frame_time = 1.0 / self.anim_fps.max(1) as f32;
-                    let jump_threshold = (frame_time * 4.0).max(0.35);
-                    let mut need_create = !self.audio_players.contains_key(&layer.id);
-                    if let Some(player) = self.audio_players.get(&layer.id) {
-                        let last_pos = self
-                            .audio_player_last_file_pos
-                            .get(&layer.id)
-                            .copied()
-                            .unwrap_or(file_pos);
-                        let delta = (file_pos - last_pos).abs();
-                        // Resync only on timeline scrub/jump, not during steady playback.
-                        if delta > jump_threshold {
-                            self.audio_players.remove(&layer.id);
-                            self.audio_player_buffer_offset.remove(&layer.id);
-                            self.audio_player_last_file_pos.remove(&layer.id);
-                            self.audio_prepare_rx.remove(&layer.id);
-                            need_create = true;
-                        } else {
-                            player.set_volume(layer.volume);
-                            self.audio_player_last_file_pos.insert(layer.id, file_pos);
-                        }
-                    }
+            if self.audio_layers_skip.contains(&clip_id) {
+                if resolve_audio_path_for_rodio(
+                    media_path,
+                    &self.audio_extract_status,
+                    &self.audio_pcm_cache,
+                )
+                .is_some()
+                {
+                    self.audio_layers_skip.remove(&clip_id);
+                } else {
+                    continue;
+                }
+            }
 
-                    if need_create && !self.audio_prepare_rx.contains_key(&layer.id) {
-                        if let Some(audio_path) = resolve_audio_path_for_rodio(
-                            &layer.video_path,
-                            &self.audio_extract_status,
-                            &self.audio_pcm_cache,
-                        ) {
-                            let offset = file_pos.max(0.0);
-                            self.audio_player_buffer_offset.insert(layer.id, offset);
-                            self.audio_player_last_file_pos.insert(layer.id, offset);
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            self.audio_prepare_rx.insert(layer.id, rx);
-                            let path = audio_path.clone();
-                            let cache = self.audio_pcm_cache.clone();
-                            let spawned = std::thread::Builder::new()
-                                .name("vadadee-audio-prepare".into())
-                                .spawn(move || {
-                                    let msg = crate::audio_extract::prepare_samples_at_offset(
-                                        &path,
-                                        offset,
-                                        &cache,
-                                    );
-                                    let _ = tx.send(msg);
-                                })
-                                .is_ok();
-                            if !spawned {
-                                self.audio_prepare_rx.remove(&layer.id);
-                                self.audio_player_buffer_offset.remove(&layer.id);
-                            }
-                        }
+            let file_pos = (playhead_time - start) + start_offset;
+            let frame_time = 1.0 / self.anim_fps.max(1) as f32;
+            let jump_threshold = (frame_time * 4.0).max(0.35);
+            let mut need_create = !self.audio_players.contains_key(&clip_id);
+            if let Some(player) = self.audio_players.get(&clip_id) {
+                let last_pos = self
+                    .audio_player_last_file_pos
+                    .get(&clip_id)
+                    .copied()
+                    .unwrap_or(file_pos);
+                let delta = (file_pos - last_pos).abs();
+                if delta > jump_threshold {
+                    self.audio_players.remove(&clip_id);
+                    self.audio_player_buffer_offset.remove(&clip_id);
+                    self.audio_player_last_file_pos.remove(&clip_id);
+                    self.audio_prepare_rx.remove(&clip_id);
+                    need_create = true;
+                } else {
+                    player.set_volume(volume);
+                    self.audio_player_last_file_pos.insert(clip_id, file_pos);
+                }
+            }
+
+            if need_create && !self.audio_prepare_rx.contains_key(&clip_id) {
+                if let Some(audio_path) = resolve_audio_path_for_rodio(
+                    media_path,
+                    &self.audio_extract_status,
+                    &self.audio_pcm_cache,
+                ) {
+                    let offset = file_pos.max(0.0);
+                    self.audio_player_buffer_offset.insert(clip_id, offset);
+                    self.audio_player_last_file_pos.insert(clip_id, offset);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.audio_prepare_rx.insert(clip_id, rx);
+                    let path = audio_path.clone();
+                    let cache = self.audio_pcm_cache.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("vadadee-audio-prepare".into())
+                        .spawn(move || {
+                            let msg = crate::audio_extract::prepare_samples_at_offset(
+                                &path,
+                                offset,
+                                &cache,
+                            );
+                            let _ = tx.send(msg);
+                        })
+                        .is_ok();
+                    if !spawned {
+                        self.audio_prepare_rx.remove(&clip_id);
+                        self.audio_player_buffer_offset.remove(&clip_id);
                     }
                 }
             }
         }
 
         self.audio_players
-            .retain(|id, _| active_layer_ids.contains(id));
+            .retain(|id, _| active_clip_ids.contains(id));
         self.audio_player_buffer_offset
-            .retain(|id, _| active_layer_ids.contains(id));
+            .retain(|id, _| active_clip_ids.contains(id));
         self.audio_player_last_file_pos
-            .retain(|id, _| active_layer_ids.contains(id));
+            .retain(|id, _| active_clip_ids.contains(id));
         self.audio_prepare_rx
-            .retain(|id, _| active_layer_ids.contains(id));
+            .retain(|id, _| active_clip_ids.contains(id));
     }
 
     pub fn set_path_handle_mode(&mut self, id: NodeId, anchor_idx: usize, mode: BezierHandleMode) {
@@ -9964,7 +10152,22 @@ fn run_video_decode_thread(
             if self.selection.len() == 1 {
                 if let Some(id) = self.selection.first().copied() {
                     let mut layer_doc_rect = None;
-                    if let Some(l) = self.project.document.layers.iter().find(|l| l.id == id) {
+                    let mut layer_found = None;
+                    for layer in &self.project.document.layers {
+                        if layer.id == id {
+                            layer_found = Some(layer);
+                            break;
+                        }
+                        if layer.kind == crate::document::LayerKind::AV {
+                            let mut l_clips = layer.clone();
+                            l_clips.ensure_av_clips();
+                            if l_clips.av_clips.iter().any(|c| c.id == id) {
+                                layer_found = Some(layer);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(l) = layer_found {
                         if l.kind == crate::document::LayerKind::AV {
                             let mut dx = l.x as f64;
                             let mut dy = l.y as f64;
@@ -9976,7 +10179,23 @@ fn run_video_decode_thread(
                                     dy = y;
                                 }
                             }
-                             let aspect = self.video_layers.get(&l.id)
+                            let t_sec = self.anim_current_frame as f32 / self.anim_fps as f32;
+                            let mut l_clips = l.clone();
+                            l_clips.ensure_av_clips();
+                            let primary_id = l
+                                .video_clip_at_time(t_sec)
+                                .map(|(cid, _, _, _, _)| cid)
+                                .or_else(|| {
+                                    l_clips
+                                        .av_clips
+                                        .iter()
+                                        .find(|c| !c.is_audio_only())
+                                        .map(|c| c.id)
+                                })
+                                .unwrap_or(l.id);
+
+                            let aspect = self.video_layers.get(&primary_id)
+                                .or_else(|| self.video_layers.get(&l.id))
                                 .and_then(|s| s.texture.as_ref())
                                 .map(|tex| {
                                     let tex_w = tex.size()[0] as f32;
@@ -9985,7 +10204,7 @@ fn run_video_decode_thread(
                                 })
                                 .or_else(|| {
                                     self.video_frame_cache.as_ref()
-                                        .filter(|c| c.layer_id == l.id)
+                                        .filter(|c| c.layer_id == primary_id || c.layer_id == l.id)
                                         .map(|c| {
                                             let tex_w = c.texture.size()[0] as f32;
                                             let tex_h = c.texture.size()[1] as f32;
@@ -10017,7 +10236,18 @@ fn run_video_decode_thread(
                                     let cy = (r.y0 + r.y1) * 0.5;
                                     self.tools.select.rotate_center = Some((cx, cy));
                                     self.tools.select.rotate_start_angle = (doc.1 - cy).atan2(doc.0 - cx);
-                                    if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == id) {
+                                    let mut layer_pos = None;
+                                    for (pos, l) in self.project.document.layers.iter().enumerate() {
+                                        if l.id == id || (l.kind == crate::document::LayerKind::AV && {
+                                            let mut lc = l.clone();
+                                            lc.ensure_av_clips();
+                                            lc.av_clips.iter().any(|c| c.id == id)
+                                        }) {
+                                            layer_pos = Some(pos);
+                                            break;
+                                        }
+                                    }
+                                    if let Some(pos) = layer_pos {
                                         self.tools.select.rotate_start_layer_rotation = self.project.document.layers[pos].rotation;
                                     }
                                     self.tools.select.last_doc = doc;
@@ -10143,11 +10373,16 @@ fn run_video_decode_thread(
                 return;
             }
 
-            // Hit check visible Video Layers first
+            // Hit check visible Video Layers first (only while playhead is inside a clip)
             let mut hit_layer_id = None;
             let mut hit_layer_rect = None;
+            let t_sec = self.anim_current_frame as f32 / self.anim_fps as f32;
             for layer in self.project.document.layers.iter().rev() {
-                if layer.visible && layer.kind == crate::document::LayerKind::AV && layer.has_canvas_video() {
+                if layer.visible
+                    && layer.kind == crate::document::LayerKind::AV
+                    && layer.has_canvas_video()
+                    && layer.shows_video_at(t_sec)
+                {
                     let mut dx = layer.x as f64;
                     let mut dy = layer.y as f64;
                     let mut rot = layer.rotation as f64;
@@ -10420,7 +10655,18 @@ fn run_video_decode_thread(
                             let (snapped_dx, snapped_dy) = self.apply_snapping((total_dx, total_dy), &selection_ids);
 
                             for &sid in &selection_ids {
-                                if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == sid) {
+                                let mut layer_pos = None;
+                                for (pos, l) in self.project.document.layers.iter().enumerate() {
+                                    if l.id == sid || (l.kind == crate::document::LayerKind::AV && {
+                                        let mut lc = l.clone();
+                                        lc.ensure_av_clips();
+                                        lc.av_clips.iter().any(|c| c.id == sid)
+                                    }) {
+                                        layer_pos = Some(pos);
+                                        break;
+                                    }
+                                }
+                                if let Some(pos) = layer_pos {
                                     let layer = &mut self.project.document.layers[pos];
                                     layer.x = (self.tools.select.resize_anchor.x0 + snapped_dx) as f32;
                                     layer.y = (self.tools.select.resize_anchor.y0 + snapped_dy) as f32;
@@ -10465,7 +10711,18 @@ fn run_video_decode_thread(
                         if let Some(id) = self.selection.first().copied() {
                             let new_bounds =
                                 tools::resize_bounds(self.tools.select.resize_anchor, handle, doc);
-                            if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == id) {
+                            let mut layer_pos = None;
+                            for (pos, l) in self.project.document.layers.iter().enumerate() {
+                                if l.id == id || (l.kind == crate::document::LayerKind::AV && {
+                                    let mut lc = l.clone();
+                                    lc.ensure_av_clips();
+                                    lc.av_clips.iter().any(|c| c.id == id)
+                                }) {
+                                    layer_pos = Some(pos);
+                                    break;
+                                }
+                            }
+                            if let Some(pos) = layer_pos {
                                 let layer = &mut self.project.document.layers[pos];
                                 layer.x = new_bounds.x0 as f32;
                                 layer.y = new_bounds.y0 as f32;
@@ -12420,6 +12677,25 @@ fn run_video_decode_thread(
         None
     }
 
+    fn mcp_truncate_str(s: &str, max_chars: usize) -> String {
+        // Byte pre-cap avoids scanning multi-megabyte text just to truncate a preview.
+        let s = if s.len() > max_chars.saturating_mul(4).max(256) {
+            match s.char_indices().nth(max_chars) {
+                Some((i, _)) => &s[..i],
+                None => s,
+            }
+        } else {
+            s
+        };
+        let mut it = s.chars();
+        let head: String = it.by_ref().take(max_chars.saturating_sub(1)).collect();
+        if it.next().is_some() {
+            format!("{head}…")
+        } else {
+            head
+        }
+    }
+
     fn mcp_list_all_objects_json(&self) -> Result<String, String> {
         let mut items = Vec::new();
         for (layer_idx, layer) in self.project.document.layers.iter().enumerate() {
@@ -12433,8 +12709,8 @@ fn run_video_decode_thread(
                 items.push(serde_json::json!({
                     "id": id.to_string(),
                     "layer_index": layer_idx,
-                    "layer_name": layer.name,
-                    "name": node.name,
+                    "layer_name": Self::mcp_truncate_str(&layer.name, 64),
+                    "name": Self::mcp_truncate_str(&node.name, 64),
                     "kind": Self::mcp_kind_label(&node.kind),
                     "editable": layer_editable,
                     "bounds": { "x": b.x0, "y": b.y0, "w": b.width(), "h": b.height() },
@@ -12535,9 +12811,9 @@ fn run_video_decode_thread(
                 continue;
             };
             let b = node.bounds();
-            items.push(serde_json::json!({
+            let mut item = serde_json::json!({
                 "id": id.to_string(),
-                "name": node.name,
+                "name": Self::mcp_truncate_str(&node.name, 64),
                 "kind": Self::mcp_kind_label(&node.kind),
                 "editable": layer_editable,
                 "fill_color": Self::mcp_paint_hex(node),
@@ -12547,7 +12823,18 @@ fn run_video_decode_thread(
                     "w": b.width(),
                     "h": b.height(),
                 }
-            }));
+            });
+            // Never dump multi-megabyte text content into list responses.
+            if let crate::document::NodeKind::Text { style, .. } = &node.kind {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("text_bytes".into(), serde_json::json!(style.content.len()));
+                    obj.insert(
+                        "text_preview".into(),
+                        serde_json::json!(Self::mcp_truncate_str(&style.content, 48)),
+                    );
+                }
+            }
+            items.push(item);
         }
         serde_json::to_string_pretty(&items).map_err(|e| e.to_string())
     }
@@ -14281,13 +14568,23 @@ fn run_video_decode_thread(
                 }
             }
             crate::mcp::McpHostRequest::UiHealth => {
-                // Count by kind for diagnosis
-                let mut kind_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                // Count by kind for diagnosis — never materialize full text content.
+                let mut kind_counts: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                let mut max_text_chars: usize = 0;
+                let mut total_text_chars: usize = 0;
+                let mut max_name_chars: usize = 0;
                 for node in self.project.nodes.map.values() {
                     let k = match &node.kind {
                         NodeKind::Rect { .. } => "rect",
                         NodeKind::Ellipse { .. } => "ellipse",
-                        NodeKind::Text { .. } => "text",
+                        NodeKind::Text { style, .. } => {
+                            // len() is O(1); avoid chars().count() on multi-MB strings every health poll.
+                            let n = style.content.len();
+                            max_text_chars = max_text_chars.max(n);
+                            total_text_chars = total_text_chars.saturating_add(n);
+                            "text"
+                        }
                         NodeKind::Path { .. } => "path",
                         NodeKind::FlowchartPath { .. } => "flowchart_path",
                         NodeKind::FlowchartNode { .. } => "flowchart_node",
@@ -14297,20 +14594,29 @@ fn run_video_decode_thread(
                         NodeKind::Group { .. } => "group",
                         NodeKind::Arc { .. } => "arc",
                         NodeKind::BrushStroke { .. } => "brush",
-                    }.to_string();
+                    }
+                    .to_string();
                     *kind_counts.entry(k).or_default() += 1;
+                    max_name_chars = max_name_chars.max(node.name.len());
                 }
                 let path_count = *kind_counts.get("path").unwrap_or(&0);
                 let text_count = *kind_counts.get("text").unwrap_or(&0);
                 let rect_count = *kind_counts.get("rect").unwrap_or(&0);
                 let object_count = self.project.nodes.map.len();
                 let fps = self.ui_fps;
-                let cpu_stress = fps < 25.0 && object_count > 150;
+                let long_text = max_text_chars > 8_192;
+                let cpu_stress = fps < 25.0 && (object_count > 150 || long_text);
                 let path_heavy = path_count > 80;
                 let mut hints: Vec<String> = Vec::new();
                 if cpu_stress {
                     hints.push(format!(
                         "Low UI FPS ({fps:.1}) with {object_count} objects — CPU-bound canvas paint."
+                    ));
+                }
+                if long_text {
+                    hints.push(format!(
+                        "Very long text object (~{max_text_chars} bytes). Prefer shorter labels or split; \
+                         list_objects truncates names/previews to avoid JSON bloat."
                     ));
                 }
                 if path_heavy {
@@ -14352,6 +14658,9 @@ fn run_video_decode_thread(
                     "path_count": path_count,
                     "text_count": text_count,
                     "rect_count": rect_count,
+                    "max_text_bytes": max_text_chars,
+                    "total_text_bytes": total_text_chars,
+                    "max_name_bytes": max_name_chars,
                     "current_anim_frame": self.anim_current_frame,
                     "anim_playing": self.anim_is_playing,
                     "num_animated_nodes": self.project.anim_timeline.nodes.len(),
