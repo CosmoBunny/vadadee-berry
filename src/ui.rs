@@ -5092,6 +5092,20 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 }
 
 
+/// Snapshot row for a graph node in the Objects tab (P6a).
+struct NeGraphRow {
+    id: uuid::Uuid,
+    name: String,
+    kind_title: String,
+    category: String,
+    is_output: bool,
+    /// Short status: path basename, param, or empty.
+    detail: String,
+    has_image: bool,
+    has_sound: bool,
+    icon: &'static str,
+}
+
 fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label(format!("{} selected", app.selection.len()));
@@ -5116,12 +5130,72 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         });
     });
     // Snapshot only cheap fields — never clone full Text content via nodes for labels.
+    // NE graph rows: (node_id, name, kind title, category, is_output, detail, has_img, has_snd)
+    // + output eval summary for the layer.
     let layers_meta: Vec<_> = app
         .project
         .document
         .layers
         .iter()
         .map(|l| {
+            let mut ne_nodes: Vec<NeGraphRow> = Vec::new();
+            let mut out_img = String::new();
+            let mut out_snd = String::new();
+            if l.kind == crate::document::LayerKind::NodeEditor {
+                if let Some(g) = l.node_graph.as_ref() {
+                    let eval = g.resolve_output_image();
+                    out_img = match &eval.image {
+                        crate::document::GraphImageSource::Empty => "image: —".into(),
+                        crate::document::GraphImageSource::FilePath(p) => {
+                            let name = std::path::Path::new(p)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("file");
+                            format!("image: {name}")
+                        }
+                        crate::document::GraphImageSource::AppObjects(ids) => {
+                            format!("image: {} app obj", ids.len())
+                        }
+                    };
+                    if eval.blur_px > 0.01 {
+                        out_img = format!("{out_img} · blur {:.1}", eval.blur_px);
+                    }
+                    let snd = g.resolve_output_sound();
+                    out_snd = match snd.path() {
+                        Some(p) => {
+                            let name = std::path::Path::new(p)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("audio");
+                            format!("sound: {name}")
+                        }
+                        None => "sound: —".into(),
+                    };
+                    // Objects tab: only Output Object(s) — internal graph nodes stay in NE.
+                    for n in g.nodes.values() {
+                        if !matches!(n.kind, crate::document::GraphNodeKind::OutputObject) {
+                            continue;
+                        }
+                        let img_ok = !matches!(
+                            eval.image,
+                            crate::document::GraphImageSource::Empty
+                        );
+                        let snd_ok = snd.path().is_some();
+                        let detail = format!("{out_img}  ·  {out_snd}");
+                        ne_nodes.push(NeGraphRow {
+                            id: n.id,
+                            name: safe_trunc_label(&n.name, 24),
+                            kind_title: "Output Object".into(),
+                            category: "Object".into(),
+                            is_output: true,
+                            detail,
+                            has_image: img_ok,
+                            has_sound: snd_ok,
+                            icon: icons::NODE_EDITOR,
+                        });
+                    }
+                }
+            }
             (
                 l.id,
                 safe_trunc_label(&l.name, 32),
@@ -5136,13 +5210,26 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     .iter()
                     .map(|c| (c.id, safe_trunc_label(&c.name, 32)))
                     .collect::<Vec<_>>(),
+                ne_nodes,
+                out_img,
+                out_snd,
             )
         })
         .collect();
 
     // List all layers and their objects in rendering order (top-most first)
-    for (_layer_id, layer_name, layer_kind, av_role, layer_nodes, av_clips, music_clips) in
-        layers_meta.into_iter().rev()
+    for (
+        layer_id,
+        layer_name,
+        layer_kind,
+        av_role,
+        layer_nodes,
+        av_clips,
+        music_clips,
+        ne_nodes,
+        out_img,
+        out_snd,
+    ) in layers_meta.into_iter().rev()
     {
         match layer_kind {
             crate::document::LayerKind::Shading => {
@@ -5152,10 +5239,133 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 ui.label(RichText::new(format!("{} Flowchart", icons::FLOWCHART)).font(nerd_font_id(12.0)));
             }
             crate::document::LayerKind::NodeEditor => {
-                ui.label(
-                    RichText::new(format!("{} Node graph", icons::NODE_EDITOR))
-                        .font(nerd_font_id(12.0)),
-                );
+                // P6a: layer + Output Object only (not internal graph nodes).
+                let layer_sel = app.selection.contains(&layer_id)
+                    || app.node_editor_ui.open_layer_id == Some(layer_id);
+                let header = format!("{} {}", icons::NODE_EDITOR, layer_name);
+                ui.horizontal(|ui| {
+                    let resp = ui.selectable_label(
+                        layer_sel,
+                        RichText::new(header).font(nerd_font_id(12.0)),
+                    );
+                    if resp.clicked() {
+                        app.selection = vec![layer_id];
+                        if let Some(idx) = app
+                            .project
+                            .document
+                            .layers
+                            .iter()
+                            .position(|l| l.id == layer_id)
+                        {
+                            app.set_active_layer(idx);
+                        }
+                    }
+                    if resp.double_clicked() {
+                        app.selection = vec![layer_id];
+                        if let Some(idx) = app
+                            .project
+                            .document
+                            .layers
+                            .iter()
+                            .position(|l| l.id == layer_id)
+                        {
+                            app.set_active_layer(idx);
+                        }
+                        app.node_editor_ui.open(layer_id);
+                        promote_action_tab(app, ActionTab::Parameter);
+                    }
+                    resp.on_hover_text(
+                        "Click: select layer · Double-click: open Node Editor",
+                    );
+                    if ui
+                        .small_button(if app.node_editor_ui.open_layer_id == Some(layer_id) {
+                            "Hide"
+                        } else {
+                            "Open"
+                        })
+                        .on_hover_text("Toggle Node Editor window")
+                        .clicked()
+                    {
+                        if app.node_editor_ui.open_layer_id == Some(layer_id) {
+                            app.node_editor_ui.close();
+                        } else {
+                            if let Some(idx) = app
+                                .project
+                                .document
+                                .layers
+                                .iter()
+                                .position(|l| l.id == layer_id)
+                            {
+                                app.set_active_layer(idx);
+                            }
+                            app.selection = vec![layer_id];
+                            app.node_editor_ui.open(layer_id);
+                            promote_action_tab(app, ActionTab::Parameter);
+                        }
+                    }
+                });
+                if ne_nodes.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("no Output Object").small().weak());
+                    });
+                }
+                for row in ne_nodes {
+                    let g_sel = app.selection.contains(&layer_id)
+                        && (app.node_editor_ui.selected == Some(row.id)
+                            || app.node_editor_ui.open_layer_id == Some(layer_id));
+                    let label_txt = format!("{} Output Object", row.icon);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        let resp = ui.selectable_label(
+                            g_sel,
+                            RichText::new(label_txt).font(nerd_font_id(13.0)),
+                        );
+                        if resp.clicked() {
+                            if let Some(idx) = app
+                                .project
+                                .document
+                                .layers
+                                .iter()
+                                .position(|l| l.id == layer_id)
+                            {
+                                app.set_active_layer(idx);
+                            }
+                            app.selection = vec![layer_id];
+                            if app.node_editor_ui.open_layer_id != Some(layer_id) {
+                                app.node_editor_ui.open(layer_id);
+                            }
+                            app.node_editor_ui.selected = Some(row.id);
+                            app.node_editor_ui.selected_link = None;
+                            promote_action_tab(app, ActionTab::Parameter);
+                        }
+                        if resp.double_clicked() {
+                            if let Some(idx) = app
+                                .project
+                                .document
+                                .layers
+                                .iter()
+                                .position(|l| l.id == layer_id)
+                            {
+                                app.set_active_layer(idx);
+                            }
+                            app.node_editor_ui.open(layer_id);
+                            app.node_editor_ui.selected = Some(row.id);
+                        }
+                        resp.on_hover_text(format!(
+                            "Output Object\n{}\nClick: select · Double-click: open Node Editor",
+                            row.detail
+                        ));
+                        if !row.detail.is_empty() {
+                            ui.label(
+                                RichText::new(&row.detail)
+                                    .small()
+                                    .weak()
+                                    .color(egui::Color32::from_rgb(180, 190, 120)),
+                            );
+                        }
+                    });
+                }
             }
             crate::document::LayerKind::AV => {
                 let icon = match av_role {

@@ -763,6 +763,23 @@ impl GraphOutputEval {
             || self.blur_px > 0.01
     }
 
+    /// Brightness alone can be applied as a vertex tint (free every frame).
+    /// Contrast / sat / hue / blur still need a texture bake.
+    pub fn only_brightness_fx(&self) -> bool {
+        self.blur_px <= 0.01
+            && (self.contrast - 1.0).abs() < 1e-3
+            && (self.saturation - 1.0).abs() < 1e-3
+            && self.hue_shift.abs() < 1e-3
+    }
+
+    /// Needs a new baked texture (not free paint-time multiply).
+    pub fn needs_texture_bake(&self) -> bool {
+        self.blur_px > 0.01
+            || (self.contrast - 1.0).abs() > 1e-3
+            || (self.saturation - 1.0).abs() > 1e-3
+            || self.hue_shift.abs() > 1e-3
+    }
+
     /// Cache key for processed file textures.
     /// Blur uses **2 decimal places** so each animation frame can get its own look (10→0 over 60f).
     pub fn fx_cache_key(&self, path: &str) -> String {
@@ -1580,7 +1597,7 @@ impl NodeGraph {
                 let amount = self
                     .real_input_source(node_id, "amount")
                     .and_then(|id| self.last_real_out(id))
-                    .unwrap_or(2.0);
+                    .unwrap_or(0.0);
                 let mut inner = self.resolve_image_chain(node_id, "in", 0);
                 inner.blur_px += amount.max(0.0).min(128.0);
                 inner.effects_on_path = true;
@@ -1717,10 +1734,11 @@ impl NodeGraph {
                 return inner;
             }
             GraphNodeKind::LinearBlur => {
+                // Default 0 when amount unconnected (was 2.0 → looked “stuck blurred”).
                 let amount = self
                     .real_input_source(src_id, "amount")
                     .and_then(|id| self.last_real_out(id))
-                    .unwrap_or(2.0);
+                    .unwrap_or(0.0);
                 let mut inner = self.resolve_image_chain(src_id, "in", depth + 1);
                 // Treat amount as blur radius in "document px"; clamp wild Value nodes.
                 inner.blur_px += amount.max(0.0).min(128.0);

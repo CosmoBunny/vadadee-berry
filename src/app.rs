@@ -6040,7 +6040,7 @@ impl VadadeeBerryApp {
     }
 
     /// Load path texture with FX. **Blur is GPU-baked** (native texture, no CPU readback).
-    /// While playing, reuses one live TextureId per path; skips re-bake when blur/color unchanged.
+    /// Brightness-only is paint-time tint (no per-frame rebake — Param anim stays smooth).
     fn ensure_graph_fx_texture(
         &mut self,
         path: &str,
@@ -6050,17 +6050,20 @@ impl VadadeeBerryApp {
         let animating = self.anim_is_playing;
         let q = eval.quantized_for_cache(animating);
 
-        let needs_bake = q.needs_pixel_fx() || (q.brightness - 1.0).abs() > 1e-3;
-        if !needs_bake {
+        // Identity **or brightness-only** → sharp base texture (tint applied when painting).
+        if !q.needs_texture_bake() {
+            self.invalidate_graph_gpu_live(path);
+            if q.brightness < 0.99 || q.brightness > 1.01 {
+                // Still drop soft GPU mips when leaving blur.
+                self.invalidate_graph_gpu_path_prefix(path);
+            }
             return self.ensure_graph_path_texture(path, ctx);
         }
 
-        let key = if animating {
-            // One live GPU slot per path while playing — reblur in place (smooth, no thrash).
-            format!("{path}|live")
-        } else {
-            q.fx_cache_key(path)
-        };
+        // Always key by full FX state (incl. blur). Live-only key caused: blur→0 still
+        // painting the previous blurred GPU texture when only brightness changed.
+        let key = q.fx_cache_key(path);
+        let live_key = format!("{path}|live");
 
         let br = q.blur_px.clamp(0.0, 64.0) as f32;
         let color_key = format!(
@@ -6068,18 +6071,50 @@ impl VadadeeBerryApp {
             q.brightness, q.contrast, q.saturation, q.hue_shift
         );
 
-        // Exact CPU-handle hit (color-only / fallback path).
+        // --- Sharp path with contrast/sat/hue (still no blur) ---
         if br < 0.05 {
+            self.invalidate_graph_gpu_live(path);
+            self.invalidate_graph_gpu_path_prefix(path);
             if let Some(t) = self.graph_path_textures.get(&key) {
                 return Some(t.clone());
             }
-        } else if let Some(e) = self.graph_gpu_fx.get(&key) {
-            // Hit when blur+color match (critical while playing: don't re-GPU every UI tick).
-            if e.color_key == color_key && (e.blur_px - br).abs() < 0.015 {
-                return None;
+            if !self.graph_base_rgba.contains_key(path) {
+                let dyn_img = image::open(path).ok()?;
+                self.graph_base_rgba
+                    .insert(path.to_string(), dyn_img.to_rgba8());
             }
-            if !animating {
-                // Idle scrub: exact key already in map but values differ → fall through to rebake.
+            // Medium res for rare sat/hue/contrast bakes (not brightness-only).
+            let max_side = if animating { 512u32 } else { 1024u32 };
+            let base = self.graph_base_rgba.get(path)?;
+            let mut rgba = crate::document::downscale_rgba_max_side(base, max_side);
+            let mut color_only = q.clone();
+            color_only.blur_px = 0.0;
+            crate::document::apply_graph_image_fx(&mut rgba, &color_only);
+            let (w, h) = rgba.dimensions();
+            let pixels = rgba.into_raw();
+            let color_image =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+            let handle = ctx.load_texture(
+                format!("vadadee-berry-gfx-sharp-{key}"),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.graph_path_textures.insert(key, handle.clone());
+            return Some(handle);
+        }
+
+        // --- Blurred path ---
+        if let Some(e) = self.graph_gpu_fx.get(&key) {
+            if e.color_key == color_key && (e.blur_px - br).abs() < 0.015 {
+                return None; // paint uses graph_gpu_fx
+            }
+        }
+        // Also check live slot only if it matches this blur+color exactly.
+        if animating {
+            if let Some(e) = self.graph_gpu_fx.get(&live_key) {
+                if e.color_key == color_key && (e.blur_px - br).abs() < 0.015 {
+                    return None;
+                }
             }
         }
 
@@ -6089,7 +6124,6 @@ impl VadadeeBerryApp {
                 .insert(path.to_string(), dyn_img.to_rgba8());
         }
 
-        // Tiny while playing so UI can stay near real-time; larger when scrubbing.
         let max_side = if animating { 128u32 } else { 256u32 };
         let preview_key = format!("{path}|{max_side}");
         if !self.graph_preview_rgba.contains_key(&preview_key) {
@@ -6099,95 +6133,74 @@ impl VadadeeBerryApp {
         }
         let preview = self.graph_preview_rgba.get(&preview_key)?.clone();
 
-        if br >= 0.05 {
-            let color_cache_key = format!("{path}|{color_key}|{max_side}");
-            let rgba = if let Some(c) = self.graph_color_rgba.get(&color_cache_key) {
-                c.clone()
-            } else {
-                let mut color_only = q.clone();
-                color_only.blur_px = 0.0;
-                let mut rgba = preview;
-                crate::document::apply_graph_image_fx(&mut rgba, &color_only);
-                self.graph_color_rgba
-                    .insert(color_cache_key, rgba.clone());
-                // Cap color cache.
-                if self.graph_color_rgba.len() > 32 {
-                    self.graph_color_rgba.clear();
-                }
-                rgba
-            };
+        let color_cache_key = format!("{path}|{color_key}|{max_side}");
+        let rgba = if let Some(c) = self.graph_color_rgba.get(&color_cache_key) {
+            c.clone()
+        } else {
+            let mut color_only = q.clone();
+            color_only.blur_px = 0.0;
+            let mut rgba = preview;
+            crate::document::apply_graph_image_fx(&mut rgba, &color_only);
+            self.graph_color_rgba.insert(color_cache_key, rgba.clone());
+            if self.graph_color_rgba.len() > 32 {
+                self.graph_color_rgba.clear();
+            }
+            rgba
+        };
 
-            // --- GPU blur (preferred) ---
-            if let Some(rs) = self.wgpu_render.clone() {
-                if let Some((tex, view, w, h)) =
-                    crate::shading::graph_blur::GraphBlurEngine::blur_to_texture(
-                        &rs.device,
-                        &rs.queue,
-                        &rgba,
-                        br,
-                    )
+        let gpu_key = if animating { live_key.clone() } else { key.clone() };
+
+        if let Some(rs) = self.wgpu_render.clone() {
+            if let Some((tex, view, w, h)) =
+                crate::shading::graph_blur::GraphBlurEngine::blur_to_texture(
+                    &rs.device,
+                    &rs.queue,
+                    &rgba,
+                    br,
+                )
+            {
+                let existing = self.graph_gpu_fx.get(&gpu_key).map(|e| e.id);
+                if let Some(id) =
+                    crate::shading::graph_blur::register_or_update_native(&rs, &view, existing)
                 {
-                    let existing = self.graph_gpu_fx.get(&key).map(|e| e.id);
-                    if let Some(id) =
-                        crate::shading::graph_blur::register_or_update_native(&rs, &view, existing)
-                    {
-                        // Evict old non-live GPU slots for this path.
-                        if !animating {
-                            let prefix = format!("{path}|");
-                            let mut drop_keys: Vec<String> = self
-                                .graph_gpu_fx
-                                .keys()
-                                .filter(|k| {
-                                    k.starts_with(&prefix) && *k != &key && !k.ends_with("|live")
-                                })
-                                .cloned()
-                                .collect();
-                            if drop_keys.len() > 48 {
-                                drop_keys.sort();
-                                let n = drop_keys.len() - 48;
-                                for old in drop_keys.into_iter().take(n) {
-                                    if let Some(e) = self.graph_gpu_fx.remove(&old) {
-                                        crate::shading::graph_blur::free_native_texture(&rs, e.id);
-                                    }
+                    if !animating {
+                        let prefix = format!("{path}|");
+                        let mut drop_keys: Vec<String> = self
+                            .graph_gpu_fx
+                            .keys()
+                            .filter(|k| {
+                                k.starts_with(&prefix) && *k != &gpu_key && !k.ends_with("|live")
+                            })
+                            .cloned()
+                            .collect();
+                        if drop_keys.len() > 48 {
+                            drop_keys.sort();
+                            let n = drop_keys.len() - 48;
+                            for old in drop_keys.into_iter().take(n) {
+                                if let Some(e) = self.graph_gpu_fx.remove(&old) {
+                                    crate::shading::graph_blur::free_native_texture(&rs, e.id);
                                 }
                             }
                         }
-                        self.graph_gpu_fx.insert(
-                            key,
-                            GraphGpuFxEntry {
-                                id,
-                                size: [w as usize, h as usize],
-                                blur_px: br,
-                                color_key,
-                                _tex: std::sync::Arc::new(tex),
-                            },
-                        );
-                        return None; // draw uses graph_gpu_fx
                     }
+                    self.graph_gpu_fx.insert(
+                        gpu_key,
+                        GraphGpuFxEntry {
+                            id,
+                            size: [w as usize, h as usize],
+                            blur_px: br,
+                            color_key,
+                            _tex: std::sync::Arc::new(tex),
+                        },
+                    );
+                    return None;
                 }
             }
-
-            // CPU fallback if GPU unavailable (keep cheap).
-            let mut rgba = rgba;
-            crate::document::continuous_preview_blur_rgba(&mut rgba, br);
-            let (w, h) = rgba.dimensions();
-            let pixels = rgba.into_raw();
-            let color_image =
-                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
-            let handle = ctx.load_texture(
-                format!(
-                    "vadadee-berry-gfx-{}",
-                    key.len().wrapping_mul(2654435761) ^ (br.to_bits() as usize)
-                ),
-                color_image,
-                egui::TextureOptions::LINEAR,
-            );
-            self.graph_path_textures.insert(key, handle.clone());
-            return Some(handle);
         }
 
-        let mut rgba = preview;
-        crate::document::apply_graph_image_fx(&mut rgba, &q);
+        // CPU fallback.
+        let mut rgba = rgba;
+        crate::document::continuous_preview_blur_rgba(&mut rgba, br);
         let (w, h) = rgba.dimensions();
         let pixels = rgba.into_raw();
         let color_image =
@@ -6195,7 +6208,7 @@ impl VadadeeBerryApp {
         let handle = ctx.load_texture(
             format!(
                 "vadadee-berry-gfx-{}",
-                key.len().wrapping_mul(2654435761) ^ (q.blur_px.to_bits() as usize)
+                key.len().wrapping_mul(2654435761) ^ (br.to_bits() as usize)
             ),
             color_image,
             egui::TextureOptions::LINEAR,
@@ -6204,7 +6217,36 @@ impl VadadeeBerryApp {
         Some(handle)
     }
 
+    /// Drop GPU live blur for a path so sharp frames are not painted from stale soft mips.
+    fn invalidate_graph_gpu_live(&mut self, path: &str) {
+        let live = format!("{path}|live");
+        if let Some(e) = self.graph_gpu_fx.remove(&live) {
+            if let Some(rs) = self.wgpu_render.as_ref() {
+                crate::shading::graph_blur::free_native_texture(rs, e.id);
+            }
+        }
+    }
+
+    /// Free every GPU FX texture for this file path (blur keys + live).
+    fn invalidate_graph_gpu_path_prefix(&mut self, path: &str) {
+        let prefix = format!("{path}|");
+        let keys: Vec<String> = self
+            .graph_gpu_fx
+            .keys()
+            .filter(|k| k.starts_with(&prefix) || *k == path)
+            .cloned()
+            .collect();
+        for k in keys {
+            if let Some(e) = self.graph_gpu_fx.remove(&k) {
+                if let Some(rs) = self.wgpu_render.as_ref() {
+                    crate::shading::graph_blur::free_native_texture(rs, e.id);
+                }
+            }
+        }
+    }
+
     /// Resolve a graph file (+FX) texture for canvas paint: GPU native or egui handle.
+    /// Brightness-only uses the sharp base texture; multiply is applied in paint.
     fn graph_fx_paint_tex(
         &self,
         path: &str,
@@ -6212,16 +6254,33 @@ impl VadadeeBerryApp {
     ) -> Option<(egui::TextureId, [usize; 2])> {
         let animating = self.anim_is_playing;
         let q = eval.quantized_for_cache(animating);
-        let needs_bake = q.needs_pixel_fx() || (q.brightness - 1.0).abs() > 1e-3;
-        if !needs_bake {
+        if !q.needs_texture_bake() {
             let t = self.graph_path_textures.get(path)?;
             return Some((t.id(), t.size()));
         }
-        let key = if animating {
-            format!("{path}|live")
-        } else {
-            q.fx_cache_key(path)
-        };
+        let br = q.blur_px.clamp(0.0, 64.0) as f32;
+        let key = q.fx_cache_key(path);
+        let live_key = format!("{path}|live");
+
+        // Sharp non-brightness FX (sat/hue/contrast): CPU cache; never stale GPU blur.
+        if br < 0.05 {
+            if let Some(t) = self.graph_path_textures.get(&key) {
+                return Some((t.id(), t.size()));
+            }
+            return self
+                .graph_path_textures
+                .get(path)
+                .map(|t| (t.id(), t.size()));
+        }
+
+        // Blurred: prefer matching live slot while playing, else exact key.
+        if animating {
+            if let Some(e) = self.graph_gpu_fx.get(&live_key) {
+                if (e.blur_px - br).abs() < 0.02 {
+                    return Some((e.id, e.size));
+                }
+            }
+        }
         if let Some(e) = self.graph_gpu_fx.get(&key) {
             return Some((e.id, e.size));
         }
@@ -7183,12 +7242,20 @@ fn run_video_decode_thread(
                                         let rect = egui::Rect::from_min_max(tl, br);
                                         let rot_rad = (rot_deg as f32).to_radians();
                                         let mirror = eval.geo_mirror.round() as i32;
-                                        paint_rotated_image_mirrored(
+                                        // Brightness-only: free vertex tint (Param anim does not rebake).
+                                        let mul = layer_opacity.clamp(0.0, 1.0);
+                                        let rgb_mul = if eval.only_brightness_fx() {
+                                            (eval.brightness as f32).clamp(0.0, 8.0)
+                                        } else {
+                                            1.0
+                                        };
+                                        paint_rotated_image_mirrored_tint(
                                             &painter,
                                             tex_id,
                                             rect,
                                             rot_rad,
-                                            layer_opacity.clamp(0.0, 1.0),
+                                            mul,
+                                            rgb_mul,
                                             mirror & 1 != 0,
                                             mirror & 2 != 0,
                                         );
@@ -17467,8 +17534,28 @@ fn paint_rotated_image_mirrored(
     flip_h: bool,
     flip_v: bool,
 ) {
+    paint_rotated_image_mirrored_tint(
+        painter, texture_id, rect, rotation_rad, opacity, 1.0, flip_h, flip_v,
+    );
+}
+
+/// Like [`paint_rotated_image_mirrored`] with optional RGB multiply (brightness).
+fn paint_rotated_image_mirrored_tint(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    rect: egui::Rect,
+    rotation_rad: f32,
+    opacity: f32,
+    rgb_mul: f32,
+    flip_h: bool,
+    flip_v: bool,
+) {
     let mut mesh = egui::Mesh::with_texture(texture_id);
-    let color = egui::Color32::WHITE.gamma_multiply(opacity);
+    // Vertex tint ≈ brightness: RGB *= m (m>1 clamps to white in egui).
+    let m = rgb_mul.clamp(0.0, 8.0);
+    let a = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let v = ((m.min(1.0)) * 255.0).round() as u8;
+    let color = egui::Color32::from_rgba_unmultiplied(v, v, v, a);
 
     let mut points = [
         rect.left_top(),

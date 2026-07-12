@@ -77,9 +77,14 @@ impl Default for NodeEditorUiState {
 
 impl NodeEditorUiState {
     pub fn open(&mut self, layer_id: Uuid) {
+        // Keep selection if re-opening the same layer (Objects tab click).
+        let same = self.open_layer_id == Some(layer_id);
         self.open_layer_id = Some(layer_id);
-        self.tool = NodeEditorToolMode::Idle;
-        self.preview_node = None;
+        if !same {
+            self.tool = NodeEditorToolMode::Idle;
+            self.selected = None;
+            self.preview_node = None;
+        }
         self.selected_link = None;
     }
 
