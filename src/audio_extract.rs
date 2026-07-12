@@ -123,23 +123,105 @@ fn load_pcm_via_rodio(path: &Path) -> Option<CachedPcm> {
     })
 }
 
+/// In-flight preload keys — prevents spawning a decode thread every UI frame
+/// (that OOM'd laptops: N threads × full-song f32 PCM).
+fn preload_inflight() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Max full-file PCM entries (each can be 50–200MB for long tracks).
+const PCM_CACHE_MAX_ENTRIES: usize = 2;
+/// Refuse to fully decode files larger than this many bytes on disk (~prevents RAM bomb).
+const PCM_MAX_FILE_BYTES: u64 = 12 * 1024 * 1024; // 12 MiB compressed ≈ still large decoded
+/// Cap decoded samples (~90s stereo @ 44.1k) if something still fully decodes.
+const PCM_MAX_SAMPLES: usize = 44_100 * 2 * 90;
+
+/// Preload is **opt-in and rate-limited**. Prefer [`stream_file_to_player`] for playback
+/// so we never hold whole songs in RAM.
 pub fn spawn_preload_pcm(cache: AudioPcmCache, key: String, path: std::path::PathBuf) {
+    // Skip huge files — decoded f32 would be many× compressed size.
+    if path
+        .metadata()
+        .map(|m| m.len() > PCM_MAX_FILE_BYTES)
+        .unwrap_or(true)
+    {
+        return;
+    }
     if cache.lock().ok().is_some_and(|c| c.contains_key(&key)) {
         return;
+    }
+    {
+        let Ok(mut inflight) = preload_inflight().lock() else {
+            return;
+        };
+        if !inflight.insert(key.clone()) {
+            return; // already decoding this path
+        }
     }
     std::thread::Builder::new()
         .name("vadadee-audio-pcm-cache".into())
         .spawn(move || {
-            if let Some(pcm) = load_pcm_from_file(&path) {
-                if let Ok(mut map) = cache.lock() {
-                    map.insert(key, std::sync::Arc::new(pcm));
+            let pcm = load_pcm_from_file(&path).map(|mut p| {
+                // Hard cap decoded length.
+                if p.samples.len() > PCM_MAX_SAMPLES {
+                    let mut v = (*p.samples).clone();
+                    v.truncate(PCM_MAX_SAMPLES);
+                    p.samples = std::sync::Arc::new(v);
                 }
+                p
+            });
+            if let Some(pcm) = pcm {
+                if let Ok(mut map) = cache.lock() {
+                    // LRU-ish: drop oldest if over cap.
+                    while map.len() >= PCM_CACHE_MAX_ENTRIES {
+                        if let Some(k) = map.keys().next().cloned() {
+                            map.remove(&k);
+                        } else {
+                            break;
+                        }
+                    }
+                    map.insert(key.clone(), std::sync::Arc::new(pcm));
+                }
+            }
+            if let Ok(mut inflight) = preload_inflight().lock() {
+                inflight.remove(&key);
             }
         })
         .ok();
 }
 
-/// Decode / slice audio off the UI thread (uses PCM cache when available).
+/// Stream a file into a rodio player (seek + append). **Does not load whole file into RAM.**
+pub fn stream_file_to_player(
+    player: &rodio::Player,
+    path: &Path,
+    offset_secs: f32,
+    volume: f32,
+) -> Result<(), String> {
+    use rodio::Source;
+    let file = File::open(path).map_err(|e| format!("open audio: {e}"))?;
+    let mut decoder =
+        rodio::Decoder::try_from(file).map_err(|e| format!("decode audio: {e}"))?;
+    if offset_secs > 0.05 {
+        let _ = decoder.try_seek(std::time::Duration::from_secs_f32(offset_secs.max(0.0)));
+    }
+    player.set_volume(volume.clamp(0.0, 4.0));
+    player.append(decoder);
+    player.play();
+    Ok(())
+}
+
+/// True when full-file PCM is already in the cache (instant slice, no decode).
+pub fn pcm_cache_has(cache: &AudioPcmCache, path: &str) -> bool {
+    cache
+        .lock()
+        .ok()
+        .is_some_and(|m| m.contains_key(path))
+}
+
+/// Decode / slice audio (uses PCM cache when available). Prefer calling after
+/// [`spawn_preload_pcm`] so the first play is a cheap slice.
 pub fn prepare_samples_at_offset(
     path: &Path,
     offset_secs: f32,
@@ -148,29 +230,15 @@ pub fn prepare_samples_at_offset(
     let key = path.to_string_lossy().to_string();
     if let Ok(map) = cache.lock() {
         if let Some(cached) = map.get(&key) {
-            let ch = cached.channels.max(1) as f32;
-            let skip =
-                (offset_secs.max(0.0) * cached.sample_rate as f32 * ch).round() as usize;
-            let skip = skip.min(cached.samples.len());
-            return Some(AudioPrepareResult {
-                channels: cached.channels,
-                sample_rate: cached.sample_rate,
-                samples: cached.samples[skip..].to_vec(),
-            });
+            return Some(slice_cached(cached, offset_secs));
         }
     }
     if let Some(pcm) = load_pcm_from_file(path) {
+        let arc = std::sync::Arc::new(pcm);
         if let Ok(mut map) = cache.lock() {
-            map.insert(key.clone(), std::sync::Arc::new(pcm.clone()));
+            map.insert(key.clone(), arc.clone());
         }
-        let ch = pcm.channels.max(1) as f32;
-        let skip = (offset_secs.max(0.0) * pcm.sample_rate as f32 * ch).round() as usize;
-        let skip = skip.min(pcm.samples.len());
-        return Some(AudioPrepareResult {
-            channels: pcm.channels,
-            sample_rate: pcm.sample_rate,
-            samples: pcm.samples[skip..].to_vec(),
-        });
+        return Some(slice_cached(&arc, offset_secs));
     }
 
     use rodio::Source;
@@ -198,6 +266,57 @@ pub fn prepare_samples_at_offset(
         sample_rate: sample_rate.get(),
         samples,
     })
+}
+
+fn slice_cached(cached: &CachedPcm, offset_secs: f32) -> AudioPrepareResult {
+    let ch = cached.channels.max(1) as f32;
+    let skip = (offset_secs.max(0.0) * cached.sample_rate as f32 * ch).round() as usize;
+    let skip = skip.min(cached.samples.len());
+    // Never clone multi-minute tails into a new Vec for SamplesBuffer — cap ahead window.
+    let max_ahead = PCM_MAX_SAMPLES;
+    let end = (skip + max_ahead).min(cached.samples.len());
+    AudioPrepareResult {
+        channels: cached.channels,
+        sample_rate: cached.sample_rate,
+        samples: cached.samples[skip..end].to_vec(),
+    }
+}
+
+/// Simple 3-band EQ (bass / mid / treble in “dB-ish” units, −12…+12).
+/// Audible bass shelf so LinearBlur-style Param → Equalizer.bass is felt.
+pub fn apply_eq_stereo_inplace(
+    samples: &mut [f32],
+    channels: u16,
+    bass: f32,
+    mid: f32,
+    treble: f32,
+) {
+    if samples.is_empty() {
+        return;
+    }
+    let ch = channels.max(1) as usize;
+    let gb = 10f32.powf((bass.clamp(-18.0, 18.0)) / 20.0);
+    let gm = 10f32.powf((mid.clamp(-18.0, 18.0)) / 20.0);
+    let gt = 10f32.powf((treble.clamp(-18.0, 18.0)) / 20.0);
+    // Unity → no work.
+    if (gb - 1.0).abs() < 0.02 && (gm - 1.0).abs() < 0.02 && (gt - 1.0).abs() < 0.02 {
+        return;
+    }
+    // One-pole low / high state per channel (≈200 Hz low, ≈3 kHz high at 44.1k).
+    let a_low = 0.04_f32;
+    let a_high = 0.25_f32;
+    let mut low = vec![0.0_f32; ch];
+    let mut high_lp = vec![0.0_f32; ch];
+    for (i, s) in samples.iter_mut().enumerate() {
+        let c = i % ch;
+        let x = *s;
+        low[c] += a_low * (x - low[c]);
+        high_lp[c] += a_high * (x - high_lp[c]);
+        let low_b = low[c];
+        let high_b = x - high_lp[c];
+        let mid_b = x - low_b - high_b;
+        *s = (low_b * gb + mid_b * gm + high_b * gt).clamp(-1.0, 1.0);
+    }
 }
 
 /// Decode video/container audio directly to a lossless WAV file (perfect quality, zero compression artifacts).

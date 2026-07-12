@@ -2330,16 +2330,17 @@ impl VadadeeBerryApp {
             }
         }
 
+        // Empty project: short scrub room only (NOT 300 — that made play loop to 300).
         if max_f == 0 {
-            max_f = 300; // default room (~5s @60fps) when project is empty
+            max_f = 60; // ~1s @60fps / 2s @30fps default
         }
         max_f
     }
 
     pub fn get_max_animation_frame(&self) -> usize {
-        // Scrub room: allow playhead past last keyframe without stretching loop mid-play.
+        // Timeline end = content only. Do not grow with playhead scrub (that
+        // stretched loops to 300 when the user dragged past the last keyframe).
         self.get_content_max_animation_frame()
-            .max(self.anim_current_frame)
     }
 
     /// Drop animation tracks for nodes/layers that no longer exist.
@@ -8270,23 +8271,53 @@ fn run_video_decode_thread(
             .retain(|id| active_layer_ids.contains(id));
     }
 
-    pub fn sync_audio_playback(&mut self) {
-        use std::num::{NonZeroU16, NonZeroU32};
-
+    /// Returns true if the UI should repaint soon (audio prepare in flight only).
+    pub fn sync_audio_playback(&mut self) -> bool {
+        // Pause: keep players, only pause rodio (instant resume). Never full-file re-decode.
         if !self.anim_is_playing {
-            self.audio_players.clear();
-            self.audio_player_buffer_offset.clear();
-            self.audio_player_last_file_pos.clear();
-            self.audio_layers_skip.clear();
+            for p in self.audio_players.values() {
+                p.pause();
+            }
             self.audio_prepare_rx.clear();
-            return;
+            return false;
         }
 
         let playhead_time = self.anim_current_frame as f32 / self.anim_fps as f32;
+        // (path, timeline_start, file_offset, volume, bass)
         let mut active_clip_ids = std::collections::HashSet::new();
-        let mut clip_info_map = std::collections::HashMap::new();
+        let mut clip_info_map: std::collections::HashMap<
+            uuid::Uuid,
+            (String, f32, f32, f32, f32),
+        > = std::collections::HashMap::new();
 
         for layer in &self.project.document.layers {
+            // P5: Node Editor Output Object sound.
+            if layer.visible && layer.kind == crate::document::LayerKind::NodeEditor {
+                if let Some(g) = layer.node_graph.as_ref() {
+                    let snd = g.resolve_output_sound();
+                    if let Some(path) = snd.path() {
+                        let playable = crate::document::AvClip::path_is_audio_only(path)
+                            || is_video_container_ext(path);
+                        if playable && std::path::Path::new(path).is_file() {
+                            let id = layer.id;
+                            // Bass as mild gain boost (streaming path has no full-buffer EQ).
+                            let bass_boost =
+                                (1.0 + (snd.eq_bass as f32).clamp(-6.0, 12.0) * 0.08).max(0.05);
+                            let vol = ((layer.volume as f64 * snd.volume) as f32 * bass_boost)
+                                .clamp(0.0, 4.0);
+                            self.audio_layers_skip.remove(&id);
+                            // Do NOT spawn_preload here — that was called every frame and
+                            // forked N full-file decode threads until the machine OOM'd.
+                            active_clip_ids.insert(id);
+                            clip_info_map.insert(
+                                id,
+                                (path.to_string(), 0.0_f32, 0.0_f32, vol, snd.eq_bass as f32),
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             if !layer.visible || layer.kind != crate::document::LayerKind::AV {
                 continue;
             }
@@ -8296,7 +8327,6 @@ fn run_video_decode_thread(
                 if clip.media_path.is_empty() || clip.is_still_image() {
                     continue;
                 }
-                // Audio layer: pure audio. Video layer: demux audio from video containers only.
                 let path = &clip.media_path;
                 let playable = crate::document::AvClip::path_is_audio_only(path)
                     || is_video_container_ext(path);
@@ -8314,6 +8344,7 @@ fn run_video_decode_thread(
                             start,
                             clip.video_start_offset,
                             layer.volume,
+                            0.0,
                         ),
                     );
                 }
@@ -8321,81 +8352,36 @@ fn run_video_decode_thread(
         }
 
         if !self.ensure_audio_output() {
-            return;
+            return true;
         }
         let Some(device) = self.audio_device.as_ref() else {
-            return;
+            return true;
         };
         let mixer = device.mixer();
 
-        let mut prepared: Vec<(uuid::Uuid, crate::audio_extract::AudioPrepareResult)> =
-            Vec::new();
-        let mut prepare_failed: Vec<uuid::Uuid> = Vec::new();
+        // Drain any legacy prepare threads (no longer started for NE stream path).
         self.audio_prepare_rx.retain(|clip_id, rx| {
             match rx.try_recv() {
-                Ok(Some(p)) => {
-                    prepared.push((*clip_id, p));
-                    false
-                }
-                Ok(None) => {
-                    prepare_failed.push(*clip_id);
-                    false
-                }
-                Err(_) => active_clip_ids.contains(clip_id),
+                Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+                Err(std::sync::mpsc::TryRecvError::Empty) => active_clip_ids.contains(clip_id),
             }
         });
-        for id in prepare_failed {
-            self.audio_layers_skip.insert(id);
-            self.audio_player_buffer_offset.remove(&id);
-        }
-        for (clip_id, p) in prepared {
-            if p.samples.is_empty() {
-                self.audio_layers_skip.insert(clip_id);
-                self.audio_player_buffer_offset.remove(&clip_id);
-                continue;
-            }
-            if let (Some(ch), Some(rate)) =
-                (NonZeroU16::new(p.channels), NonZeroU32::new(p.sample_rate))
-            {
-                let source = rodio::buffer::SamplesBuffer::new(ch, rate, p.samples);
-                let player = rodio::Player::connect_new(mixer);
-                if let Some(&(ref _path, start, start_offset, volume)) = clip_info_map.get(&clip_id) {
-                    player.set_volume(volume);
-                    let file_pos = (playhead_time - start) + start_offset;
-                    let fp = file_pos.max(0.0);
-                    self.audio_player_last_file_pos.insert(clip_id, fp);
-                }
-                player.append(source);
-                self.audio_players.insert(clip_id, player);
-            } else {
-                self.audio_layers_skip.insert(clip_id);
-                self.audio_player_buffer_offset.remove(&clip_id);
-            }
-        }
 
         for &clip_id in &active_clip_ids {
-            let Some(&(ref media_path, start, start_offset, volume)) = clip_info_map.get(&clip_id) else {
+            let Some(&(ref media_path, start, start_offset, volume, _bass)) =
+                clip_info_map.get(&clip_id)
+            else {
                 continue;
             };
-
             if self.audio_layers_skip.contains(&clip_id) {
-                if resolve_audio_path_for_rodio(
-                    media_path,
-                    &self.audio_extract_status,
-                    &self.audio_pcm_cache,
-                )
-                .is_some()
-                {
-                    self.audio_layers_skip.remove(&clip_id);
-                } else {
-                    continue;
-                }
+                continue;
             }
 
-            let file_pos = (playhead_time - start) + start_offset;
+            let file_pos = ((playhead_time - start) + start_offset).max(0.0);
             let frame_time = 1.0 / self.anim_fps.max(1) as f32;
-            let jump_threshold = (frame_time * 4.0).max(0.35);
+            let jump_threshold = (frame_time * 8.0).max(0.75);
             let mut need_create = !self.audio_players.contains_key(&clip_id);
+
             if let Some(player) = self.audio_players.get(&clip_id) {
                 let last_pos = self
                     .audio_player_last_file_pos
@@ -8403,46 +8389,50 @@ fn run_video_decode_thread(
                     .copied()
                     .unwrap_or(file_pos);
                 let delta = (file_pos - last_pos).abs();
-                if delta > jump_threshold {
+                let looped = file_pos + 0.5 < last_pos;
+                if delta > jump_threshold || looped {
                     self.audio_players.remove(&clip_id);
                     self.audio_player_buffer_offset.remove(&clip_id);
                     self.audio_player_last_file_pos.remove(&clip_id);
-                    self.audio_prepare_rx.remove(&clip_id);
                     need_create = true;
                 } else {
                     player.set_volume(volume);
+                    player.play();
                     self.audio_player_last_file_pos.insert(clip_id, file_pos);
                 }
             }
 
-            if need_create && !self.audio_prepare_rx.contains_key(&clip_id) {
+            if need_create {
                 if let Some(audio_path) = resolve_audio_path_for_rodio(
                     media_path,
                     &self.audio_extract_status,
                     &self.audio_pcm_cache,
                 ) {
-                    let offset = file_pos.max(0.0);
-                    self.audio_player_buffer_offset.insert(clip_id, offset);
-                    self.audio_player_last_file_pos.insert(clip_id, offset);
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    self.audio_prepare_rx.insert(clip_id, rx);
-                    let path = audio_path.clone();
-                    let cache = self.audio_pcm_cache.clone();
-                    let spawned = std::thread::Builder::new()
-                        .name("vadadee-audio-prepare".into())
-                        .spawn(move || {
-                            let msg = crate::audio_extract::prepare_samples_at_offset(
-                                &path,
-                                offset,
-                                &cache,
-                            );
-                            let _ = tx.send(msg);
-                        })
-                        .is_ok();
-                    if !spawned {
-                        self.audio_prepare_rx.remove(&clip_id);
-                        self.audio_player_buffer_offset.remove(&clip_id);
+                    // Stream from disk — never load whole song into RAM as f32.
+                    let player = rodio::Player::connect_new(mixer);
+                    match crate::audio_extract::stream_file_to_player(
+                        &player,
+                        &audio_path,
+                        file_pos,
+                        volume,
+                    ) {
+                        Ok(()) => {
+                            self.audio_player_last_file_pos.insert(clip_id, file_pos);
+                            self.audio_player_buffer_offset.insert(clip_id, file_pos);
+                            self.audio_players.insert(clip_id, player);
+                        }
+                        Err(e) => {
+                            log::warn!("audio stream failed {media_path}: {e}");
+                            self.audio_layers_skip.insert(clip_id);
+                        }
                     }
+                } else {
+                    // Video extract not ready — one background extract is enough.
+                    spawn_video_audio_extract(
+                        media_path,
+                        &self.audio_extract_status,
+                        &self.audio_pcm_cache,
+                    );
                 }
             }
         }
@@ -8455,6 +8445,9 @@ fn run_video_decode_thread(
             .retain(|id, _| active_clip_ids.contains(id));
         self.audio_prepare_rx
             .retain(|id, _| active_clip_ids.contains(id));
+
+        // Only repaint for in-flight prepare (streaming path rarely needs this).
+        !self.audio_prepare_rx.is_empty()
     }
 
     pub fn set_path_handle_mode(&mut self, id: NodeId, anchor_idx: usize, mode: BezierHandleMode) {
@@ -14228,9 +14221,23 @@ fn run_video_decode_thread(
                         })
                     }
                 };
+                let snd = g.resolve_output_sound();
+                let sound = match &snd.sound {
+                    crate::document::GraphSoundSource::Empty => {
+                        serde_json::json!({ "type": "empty" })
+                    }
+                    crate::document::GraphSoundSource::FilePath(p) => {
+                        serde_json::json!({ "type": "file", "path": p })
+                    }
+                };
                 serde_json::to_string_pretty(&serde_json::json!({
                     "layer_id": layer.id.to_string(),
                     "image": image,
+                    "sound": sound,
+                    "sound_volume": snd.volume,
+                    "sound_eq_bass": snd.eq_bass,
+                    "sound_eq_mid": snd.eq_mid,
+                    "sound_eq_treble": snd.eq_treble,
                     "blur_px": eval.blur_px,
                     "brightness": eval.brightness,
                     "contrast": eval.contrast,
@@ -15245,10 +15252,14 @@ fn run_video_decode_thread(
             for (i, t) in anim.geom_tracks.iter().enumerate() {
                 push_track(&format!("geom_{i}"), t, &mut tracks);
             }
+            for (lbl, t) in &anim.param_tracks {
+                push_track(lbl, t, &mut tracks);
+            }
         }
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "current_frame": self.anim_current_frame,
             "playing": self.anim_is_playing,
+            "content_max_frame": self.get_content_max_animation_frame(),
             "tracks": tracks,
         }))
         .unwrap_or_default())
@@ -16276,55 +16287,62 @@ impl eframe::App for VadadeeBerryApp {
 
         // --- ANIMATION TIMELINE PLAYBACK & RECORDING ---
         // Wall-clock advance so play continues when the window is unfocused / another workspace.
-        // Unfocused: request 1 FPS UI refresh only (idle render); clock still advances each tick.
         let mut frame_changed = false;
         let window_focused = ctx.input(|i| i.focused);
+        // NE graph audio free-runs in rodio at real time — playhead must match wall clock
+        // or audio drifts ahead of the timeline (or restarts late after prepare).
+        let ne_audio_playing = self.anim_is_playing
+            && self.project.document.layers.iter().any(|l| {
+                l.visible
+                    && l.kind == crate::document::LayerKind::NodeEditor
+                    && l.node_graph
+                        .as_ref()
+                        .and_then(|g| g.resolve_output_sound().path().map(|p| !p.is_empty()))
+                        .unwrap_or(false)
+            });
         if self.anim_is_playing {
             let now = std::time::Instant::now();
-            // Hybrid playhead:
-            // - Track wall-clock "ideal" frame for real-time intent
-            // - Advance at most 1–2 frames per UI tick so a 2 FPS hitch never jumps 4→34
-            // - Rebase origin after steps so backlog is dropped without visual teleport
             if self.anim_play_origin.is_none() {
                 self.anim_play_origin = Some((now, self.anim_current_frame));
             }
             let (origin_t, origin_f) = self.anim_play_origin.unwrap();
-            let wall_dt = match self.anim_playback_wall {
-                Some(prev) => now.duration_since(prev).as_secs_f32(),
-                None => ctx.input(|i| i.stable_dt),
-            };
             self.anim_playback_wall = Some(now);
 
             let fps = (self.anim_fps as f32).max(1.0);
-            // Content loop only — do not use playhead-inflated max mid-play.
             let max_frame = self.get_content_max_animation_frame();
             let span = max_frame.saturating_add(1).max(1);
             let elapsed = now.duration_since(origin_t).as_secs_f32().clamp(0.0, 3600.0);
             let ideal = (origin_f.saturating_add((elapsed * fps).floor() as usize)) % span;
             let cur = self.anim_current_frame % span;
-            let behind = if ideal >= cur {
-                ideal - cur
+
+            if ne_audio_playing {
+                // Absolute wall-clock: timeline tracks audio real-time (may skip visual frames).
+                // Do NOT rebase origin each tick — that slowed the playhead while audio ran free.
+                if ideal != cur {
+                    self.anim_current_frame = ideal;
+                    frame_changed = true;
+                }
             } else {
-                (span - cur) + ideal
-            };
-
-            if behind > 0 {
-                // Cap steps so low UI FPS never skips the whole timeline in one paint.
-                // At 30 UI fps → up to 60 anim fps; at 2 UI fps → 4 anim fps (slow but smooth).
-                let steps = behind.min(2);
-                self.anim_current_frame = (cur + steps) % span;
-                frame_changed = true;
-                // Drop time debt: pretend we are on-time at the displayed frame.
-                self.anim_play_origin = Some((now, self.anim_current_frame));
+                // No graph audio: cap steps so a slow UI never teleports 4→34 in one paint.
+                let behind = if ideal >= cur {
+                    ideal - cur
+                } else {
+                    (span - cur) + ideal
+                };
+                if behind > 0 {
+                    let steps = behind.min(2);
+                    self.anim_current_frame = (cur + steps) % span;
+                    frame_changed = true;
+                    self.anim_play_origin = Some((now, self.anim_current_frame));
+                }
             }
-
-            // Quiet unused warning if wall_dt needed later for diagnostics.
-            let _ = wall_dt;
 
             if window_focused {
                 ctx.request_repaint();
+            } else if ne_audio_playing {
+                // Keep audio+timeline alive off-workspace (~30 Hz) so resume isn't cold.
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
             } else {
-                // Idle: ~1 UI frame/sec; origin rebase still keeps playhead moving slowly.
                 ctx.request_repaint_after(std::time::Duration::from_millis(1000));
             }
         } else {
@@ -16731,7 +16749,9 @@ impl eframe::App for VadadeeBerryApp {
         self.poll_video_export(ctx);
         self.keyboard_shortcuts(ctx);
         self.canvas_wheel_zoom(ctx);
-        self.sync_audio_playback();
+        if self.sync_audio_playback() {
+            ctx.request_repaint();
+        }
         self.tick_live_collaboration_poll(ctx);
         self.poll_mcp_bridge();
         self.process_pending_mcp_bulk_rects();

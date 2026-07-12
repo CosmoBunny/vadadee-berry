@@ -304,6 +304,30 @@ impl GraphNodeKind {
                     dir: Input,
                 },
                 PortDef {
+                    id: "bass".into(),
+                    name: "Bass".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "mid".into(),
+                    name: "Mid".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "treble".into(),
+                    name: "Treble".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "volume".into(),
+                    name: "Volume".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
                     id: "out".into(),
                     name: "Sound".into(),
                     ty: RawSound,
@@ -636,6 +660,46 @@ pub enum GraphImageSource {
     FilePath(String),
     /// Nothing connected or unresolved.
     Empty,
+}
+
+/// Sound source resolved from Output Object `sound` input (P5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphSoundSource {
+    FilePath(String),
+    Empty,
+}
+
+/// Canvas/export evaluation of the Output Object sound chain (P5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphOutputSound {
+    pub sound: GraphSoundSource,
+    /// Linear gain (Equalizer.volume or default 1.0).
+    pub volume: f64,
+    /// Shelf gains in dB-ish units (−12..+12), stacked from Equalizer nodes.
+    pub eq_bass: f64,
+    pub eq_mid: f64,
+    pub eq_treble: f64,
+}
+
+impl Default for GraphOutputSound {
+    fn default() -> Self {
+        Self {
+            sound: GraphSoundSource::Empty,
+            volume: 1.0,
+            eq_bass: 0.0,
+            eq_mid: 0.0,
+            eq_treble: 0.0,
+        }
+    }
+}
+
+impl GraphOutputSound {
+    pub fn path(&self) -> Option<&str> {
+        match &self.sound {
+            GraphSoundSource::FilePath(p) if !p.trim().is_empty() => Some(p.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// Canvas-facing evaluation of the Output Object image chain (P2/P4).
@@ -1138,11 +1202,26 @@ impl NodeGraph {
     pub fn add_node(&mut self, kind: GraphNodeKind, x: f32, y: f32) -> Uuid {
         let node = GraphNode::new(kind, x, y);
         let id = node.id;
-        if matches!(node.kind, GraphNodeKind::OutputObject) {
+        // Keep the first Output Object as the primary sink — a second one must not
+        // steal image/sound resolve (users often spawn extras by accident).
+        if matches!(node.kind, GraphNodeKind::OutputObject) && self.output_node_id.is_none() {
             self.output_node_id = Some(id);
         }
         self.nodes.insert(id, node);
         id
+    }
+
+    /// Primary Output Object, or any Output Object that has links if primary is unset.
+    fn primary_output_id(&self) -> Option<Uuid> {
+        if let Some(id) = self.output_node_id {
+            if self.nodes.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        self.nodes
+            .values()
+            .find(|n| matches!(n.kind, GraphNodeKind::OutputObject))
+            .map(|n| n.id)
     }
 
     pub fn remove_node(&mut self, id: Uuid) {
@@ -1285,16 +1364,117 @@ impl NodeGraph {
     /// Resolve Output Object image input for canvas compositing (P2).
     /// Walks pass-through effect/geometry nodes; applies Brightness.amount from last Real eval.
     pub fn resolve_output_image(&self) -> GraphOutputEval {
-        let out_id = self.output_node_id.or_else(|| {
-            self.nodes
-                .values()
-                .find(|n| matches!(n.kind, GraphNodeKind::OutputObject))
-                .map(|n| n.id)
-        });
-        let Some(out_id) = out_id else {
-            return GraphOutputEval::default();
+        // Prefer primary Output; if its image is empty, try other Output Objects
+        // (legacy graphs may have image on one sink and sound on another).
+        let mut tried = std::collections::HashSet::new();
+        if let Some(out_id) = self.primary_output_id() {
+            tried.insert(out_id);
+            let ev = self.resolve_image_chain(out_id, "image", 0);
+            if !matches!(ev.image, GraphImageSource::Empty) {
+                return ev;
+            }
+        }
+        for n in self.nodes.values() {
+            if matches!(n.kind, GraphNodeKind::OutputObject) && tried.insert(n.id) {
+                let ev = self.resolve_image_chain(n.id, "image", 0);
+                if !matches!(ev.image, GraphImageSource::Empty) {
+                    return ev;
+                }
+            }
+        }
+        GraphOutputEval::default()
+    }
+
+    /// Resolve Output Object sound input for playback / export (P5).
+    pub fn resolve_output_sound(&self) -> GraphOutputSound {
+        let mut tried = std::collections::HashSet::new();
+        if let Some(out_id) = self.primary_output_id() {
+            tried.insert(out_id);
+            let s = self.resolve_sound_chain(out_id, "sound", 0);
+            if s.path().is_some() {
+                return s;
+            }
+        }
+        for n in self.nodes.values() {
+            if matches!(n.kind, GraphNodeKind::OutputObject) && tried.insert(n.id) {
+                let s = self.resolve_sound_chain(n.id, "sound", 0);
+                if s.path().is_some() {
+                    return s;
+                }
+            }
+        }
+        GraphOutputSound::default()
+    }
+
+    fn resolve_sound_chain(&self, to_node: Uuid, to_port: &str, depth: usize) -> GraphOutputSound {
+        let mut out = GraphOutputSound::default();
+        if depth > 64 {
+            return out;
+        }
+        let Some(src_id) = self.input_source_node(to_node, to_port) else {
+            return out;
         };
-        self.resolve_image_chain(out_id, "image", 0)
+        let Some(node) = self.nodes.get(&src_id) else {
+            return out;
+        };
+        match &node.kind {
+            GraphNodeKind::ObjectAudio { path } => {
+                if path.trim().is_empty() {
+                    out.sound = GraphSoundSource::Empty;
+                } else {
+                    out.sound = GraphSoundSource::FilePath(path.clone());
+                }
+            }
+            GraphNodeKind::ObjectVideo { path } => {
+                // Video containers may carry demuxable audio.
+                if path.trim().is_empty() {
+                    out.sound = GraphSoundSource::Empty;
+                } else {
+                    out.sound = GraphSoundSource::FilePath(path.clone());
+                }
+            }
+            GraphNodeKind::Equalizer => {
+                let bass = self
+                    .real_input_source(src_id, "bass")
+                    .and_then(|id| self.last_real_out(id))
+                    .unwrap_or(0.0);
+                let mid = self
+                    .real_input_source(src_id, "mid")
+                    .and_then(|id| self.last_real_out(id))
+                    .unwrap_or(0.0);
+                let treble = self
+                    .real_input_source(src_id, "treble")
+                    .and_then(|id| self.last_real_out(id))
+                    .unwrap_or(0.0);
+                let vol = self
+                    .real_input_source(src_id, "volume")
+                    .and_then(|id| self.last_real_out(id))
+                    .unwrap_or(1.0);
+                let mut inner = self.resolve_sound_chain(src_id, "in", depth + 1);
+                inner.eq_bass += bass;
+                inner.eq_mid += mid;
+                inner.eq_treble += treble;
+                inner.volume *= vol.max(0.0);
+                return inner;
+            }
+            // Pass-through anything that only has image (ignore).
+            _ => {
+                // If a node has a sound "out", try its primary sound input.
+                let ports = node.ports();
+                if ports
+                    .iter()
+                    .any(|p| p.dir == PortDir::Output && p.ty == PortType::RawSound)
+                {
+                    if let Some(inp) = ports
+                        .iter()
+                        .find(|p| p.dir == PortDir::Input && p.ty == PortType::RawSound)
+                    {
+                        return self.resolve_sound_chain(src_id, &inp.id, depth + 1);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Resolve the image produced *at* `node_id` (for preview).
@@ -2141,6 +2321,41 @@ mod tests {
         assert!((ev.saturation - 1.5).abs() < 1e-9);
         assert!((ev.speed - 2.0).abs() < 1e-9);
         assert!(ev.needs_pixel_fx());
+    }
+
+    #[test]
+    fn resolve_output_sound_via_equalizer() {
+        let mut g = NodeGraph {
+            nodes: IndexMap::new(),
+            links: Vec::new(),
+            view: GraphView::default(),
+            parameters: Vec::new(),
+            output_node_id: None,
+            root_error: None,
+            last_real_values: Default::default(),
+        };
+        let audio = g.add_node(
+            GraphNodeKind::ObjectAudio {
+                path: "/tmp/a.mp3".into(),
+            },
+            0.0,
+            0.0,
+        );
+        let eq = g.add_node(GraphNodeKind::Equalizer, 100.0, 0.0);
+        let bass = g.add_node(GraphNodeKind::Value { value: 3.0 }, 50.0, 80.0);
+        let vol = g.add_node(GraphNodeKind::Value { value: 0.5 }, 50.0, 120.0);
+        let out = g.add_node(GraphNodeKind::OutputObject, 200.0, 0.0);
+        g.output_node_id = Some(out);
+        g.try_add_link(audio, "out", eq, "in").unwrap();
+        g.try_add_link(bass, "out", eq, "bass").unwrap();
+        g.try_add_link(vol, "out", eq, "volume").unwrap();
+        g.try_add_link(eq, "out", out, "sound").unwrap();
+        g.eval_reals(0, 30.0);
+        let s = g.resolve_output_sound();
+        assert_eq!(s.sound, GraphSoundSource::FilePath("/tmp/a.mp3".into()));
+        assert!((s.eq_bass - 3.0).abs() < 1e-9);
+        assert!((s.volume - 0.5).abs() < 1e-9);
+        assert_eq!(s.path(), Some("/tmp/a.mp3"));
     }
 
     #[test]

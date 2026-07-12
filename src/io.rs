@@ -296,8 +296,28 @@ pub fn document_svg_string(
             crate::document::LayerKind::Shading => {}
             crate::document::LayerKind::Flowchart => {}
             crate::document::LayerKind::NodeEditor => {
-                // Node Editor Output Object: app-object sources are drawn as normal
-                // document nodes; file-path sources are not yet inlined into SVG.
+                // P5: note file-path Output as image reference when path is absolute PNG/JPG.
+                if let Some(g) = layer.node_graph.as_ref() {
+                    let eval = g.resolve_output_image();
+                    if let crate::document::GraphImageSource::FilePath(path) = &eval.image {
+                        let lower = path.to_ascii_lowercase();
+                        if lower.ends_with(".png")
+                            || lower.ends_with(".jpg")
+                            || lower.ends_with(".jpeg")
+                        {
+                            let dx = layer.x as f64 + eval.geo_off_x;
+                            let dy = layer.y as f64 + eval.geo_off_y;
+                            let w = layer.width as f64 * eval.geo_scale_w;
+                            let h = layer.height as f64 * eval.geo_scale_h;
+                            // External href — exporters that resolve paths can embed later.
+                            svg.push_str(&format!(
+                                r#"<image href="{}" x="{dx}" y="{dy}" width="{w}" height="{h}" opacity="1"/>"#,
+                                path.replace('&', "&amp;").replace('"', "&quot;")
+                            ));
+                            svg.push('\n');
+                        }
+                    }
+                }
             }
         }
     }

@@ -38,7 +38,7 @@ pub enum NodeEditorToolMode {
 }
 
 /// UI state for the node editor (not serialized into the project).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct NodeEditorUiState {
     pub open_layer_id: Option<Uuid>,
     pub tool: NodeEditorToolMode,
@@ -54,6 +54,25 @@ pub struct NodeEditorUiState {
     pub node_drag: Option<(Uuid, Vec2)>,
     /// Node whose image stream is shown in the floating preview popup.
     pub preview_node: Option<Uuid>,
+    /// Last user-chosen window size (prevents content from “sticking” full height).
+    pub window_size: Vec2,
+}
+
+impl Default for NodeEditorUiState {
+    fn default() -> Self {
+        Self {
+            open_layer_id: None,
+            tool: NodeEditorToolMode::default(),
+            selected: None,
+            selected_link: None,
+            wire_drag: None,
+            wire_cursor: None,
+            add_menu_at: None,
+            node_drag: None,
+            preview_node: None,
+            window_size: Vec2::new(920.0, 560.0),
+        }
+    }
 }
 
 impl NodeEditorUiState {
@@ -110,35 +129,84 @@ pub fn show_node_editor_dialog(app: &mut VadadeeBerryApp, ctx: &Context) {
         format!("{} Node Editor — {}", icons::NODE_EDITOR, name)
     };
 
-    egui::Window::new(title)
-        .id(egui::Id::new(("node_editor_dlg", layer_id)))
+    // Resizable window with *user-controlled* size. Node drag must never grow it:
+    // canvas is painter-only + hard clip; no ui.interact off the canvas rect.
+    let max_h = ctx.content_rect().height() * 0.92;
+    let max_w = ctx.content_rect().width() * 0.96;
+    let mut win_size = app.node_editor_ui.window_size;
+    win_size.x = win_size.x.clamp(480.0, max_w);
+    win_size.y = win_size.y.clamp(280.0, max_h);
+
+    let win_resp = egui::Window::new(title)
+        // v4: toolbar always allocated first with fixed strip height.
+        .id(egui::Id::new(("node_editor_dlg_v4", layer_id)))
         .open(&mut open)
-        .default_size([920.0, 560.0])
-        .min_width(480.0)
+        .default_size(win_size)
+        .min_width(520.0)
         .min_height(320.0)
-        .max_height(ctx.screen_rect().height() * 0.92)
-        .max_width(ctx.screen_rect().width() * 0.96)
+        .max_height(max_h)
+        .max_width(max_w)
         .resizable(true)
         .collapsible(false)
         .constrain(true)
         .show(ctx, |ui| {
-            // Lock the window content rect for this frame. Children (nodes) must not
-            // grow desired size beyond this — that was expanding the dialog height.
-            let full = ui.available_size();
-            let (content_rect, _resp) = ui.allocate_exact_size(full, Sense::hover());
+            let outer = ui.max_rect();
+            ui.set_clip_rect(outer);
+
+            // Fixed-height mode strip so Idle/Add/Edit/View never get clipped by canvas.
+            const TOOLBAR_H: f32 = 36.0;
+            let toolbar_rect = Rect::from_min_size(
+                outer.min,
+                Vec2::new(outer.width(), TOOLBAR_H),
+            );
+            // scope_builder (not allocate_new_ui) — avoids "overflow grows parent".
             ui.scope_builder(
                 egui::UiBuilder::new()
-                    .max_rect(content_rect)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                    .max_rect(toolbar_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 |ui| {
-                    ui.set_clip_rect(content_rect);
-                    ui.set_max_size(content_rect.size());
+                    ui.set_clip_rect(toolbar_rect);
+                    ui.set_max_size(toolbar_rect.size());
+                    ui.painter().rect_filled(
+                        toolbar_rect,
+                        0.0,
+                        Color32::from_rgb(40, 44, 58),
+                    );
                     node_editor_toolbar(app, ui, layer_idx);
-                    ui.separator();
-                    node_editor_canvas(app, ui, layer_idx);
                 },
             );
+
+            // Canvas = rest of the window under the toolbar.
+            let canvas_rect = Rect::from_min_max(
+                Pos2::new(outer.min.x, toolbar_rect.max.y),
+                outer.max,
+            );
+            if canvas_rect.height() > 8.0 && canvas_rect.width() > 8.0 {
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(canvas_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                    |ui| {
+                        ui.set_clip_rect(canvas_rect);
+                        ui.set_max_size(canvas_rect.size());
+                        node_editor_canvas(app, ui, layer_idx);
+                    },
+                );
+            }
         });
+
+    // Sync size from the window frame so *user* resize is kept; ignore content inflation
+    // by clamping to max and never growing from a drag that is not on the resize border.
+    if let Some(inner) = win_resp {
+        let r = inner.response.rect;
+        let new_size = r.size();
+        // Accept size changes only when they stay within bounds (user resize grip).
+        // If something tried to blow past max, snap back next frame via default_size.
+        app.node_editor_ui.window_size = Vec2::new(
+            new_size.x.clamp(480.0, max_w),
+            new_size.y.clamp(280.0, max_h),
+        );
+    }
 
     // Only the window [x] / hide control closes the editor — not Esc.
     if !open {
@@ -204,79 +272,101 @@ fn node_editor_mode_keys(app: &mut VadadeeBerryApp, ctx: &Context) {
 fn node_editor_toolbar(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
     let mut add_btn_rect = Rect::NOTHING;
     let mut view_btn_rect = Rect::NOTHING;
+    let tool = app.node_editor_ui.tool;
 
-    ui.horizontal(|ui| {
-        let tool = app.node_editor_ui.tool;
+    // Mode buttons as explicit selectable buttons (always readable labels).
+    let mode_btn = |ui: &mut Ui, on: bool, label: &str| -> egui::Response {
+        ui.add(
+            egui::Button::new(RichText::new(label).strong().color(if on {
+                Color32::from_rgb(40, 44, 58)
+            } else {
+                Color32::from_rgb(220, 225, 235)
+            }))
+            .fill(if on {
+                Color32::from_rgb(120, 170, 255)
+            } else {
+                Color32::from_rgb(55, 60, 78)
+            })
+            .stroke(egui::Stroke::new(
+                1.0,
+                if on {
+                    Color32::from_rgb(160, 200, 255)
+                } else {
+                    Color32::from_rgb(80, 88, 110)
+                },
+            ))
+            .min_size(Vec2::new(56.0, 26.0)),
+        )
+    };
 
-        if ui
-            .selectable_label(tool == NodeEditorToolMode::Idle, "Idle")
-            .on_hover_text("Idle — pan only (Esc)")
-            .clicked()
-        {
-            app.node_editor_ui.tool = NodeEditorToolMode::Idle;
+    ui.add_space(6.0);
+    if mode_btn(ui, tool == NodeEditorToolMode::Idle, "Idle")
+        .on_hover_text("Idle — pan only (Esc)")
+        .clicked()
+    {
+        app.node_editor_ui.tool = NodeEditorToolMode::Idle;
+        app.node_editor_ui.node_drag = None;
+        app.node_editor_ui.wire_drag = None;
+    }
+    let add_r = mode_btn(ui, tool == NodeEditorToolMode::Add, "Add");
+    add_btn_rect = add_r.rect;
+    if add_r.on_hover_text("Add nodes — catalog (A)").clicked() {
+        app.node_editor_ui.tool = if tool == NodeEditorToolMode::Add {
+            NodeEditorToolMode::Idle
+        } else {
+            NodeEditorToolMode::Add
+        };
+    }
+    let edit_on = tool == NodeEditorToolMode::Edit;
+    if mode_btn(ui, edit_on, "Edit")
+        .on_hover_text("Edit — move / wire / values (E)")
+        .clicked()
+    {
+        app.node_editor_ui.tool = if edit_on {
+            NodeEditorToolMode::Idle
+        } else {
+            NodeEditorToolMode::Edit
+        };
+        if app.node_editor_ui.tool != NodeEditorToolMode::Edit {
             app.node_editor_ui.node_drag = None;
             app.node_editor_ui.wire_drag = None;
         }
+    }
+    let view_r = mode_btn(ui, tool == NodeEditorToolMode::View, "View");
+    view_btn_rect = view_r.rect;
+    if view_r.on_hover_text("View — zoom / fit (V)").clicked() {
+        app.node_editor_ui.tool = if tool == NodeEditorToolMode::View {
+            NodeEditorToolMode::Idle
+        } else {
+            NodeEditorToolMode::View
+        };
+    }
 
-        let add_r = ui.selectable_label(tool == NodeEditorToolMode::Add, format!("{} Add", icons::ADD));
-        add_btn_rect = add_r.rect;
-        if add_r
-            .on_hover_text("Add nodes — floating catalog (A)")
-            .clicked()
-        {
-            app.node_editor_ui.tool = if tool == NodeEditorToolMode::Add {
-                NodeEditorToolMode::Idle
-            } else {
-                NodeEditorToolMode::Add
-            };
-        }
-
-        // Edit is a pure toggler — no overlay menu.
-        let edit_on = tool == NodeEditorToolMode::Edit;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.add_space(6.0);
         if ui
-            .selectable_label(edit_on, format!("{} Edit", icons::EDIT))
-            .on_hover_text("Toggle edit: move nodes, wire ports, edit values (E)")
+            .button(RichText::new("Hide").color(Color32::from_rgb(200, 200, 210)))
+            .on_hover_text("Hide node editor")
             .clicked()
         {
-            app.node_editor_ui.tool = if edit_on {
-                NodeEditorToolMode::Idle
-            } else {
-                NodeEditorToolMode::Edit
-            };
-            if app.node_editor_ui.tool != NodeEditorToolMode::Edit {
-                app.node_editor_ui.node_drag = None;
-                app.node_editor_ui.wire_drag = None;
-            }
+            app.node_editor_ui.close();
         }
-
-        let view_r = ui.selectable_label(
-            tool == NodeEditorToolMode::View,
-            format!("{} View", icons::ACTION_SHOW),
+        ui.label(
+            RichText::new(match tool {
+                NodeEditorToolMode::Idle => "mode: Idle",
+                NodeEditorToolMode::Add => "mode: Add",
+                NodeEditorToolMode::Edit => "mode: Edit",
+                NodeEditorToolMode::View => "mode: View",
+            })
+            .small()
+            .color(Color32::from_rgb(160, 170, 190)),
         );
-        view_btn_rect = view_r.rect;
-        if view_r.on_hover_text("View — zoom / fit overlay (V)").clicked() {
-            app.node_editor_ui.tool = if tool == NodeEditorToolMode::View {
-                NodeEditorToolMode::Idle
-            } else {
-                NodeEditorToolMode::View
-            };
-        }
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .button(RichText::new(icons::NODE_EDITOR_HIDE).font(nerd_font_id(14.0)))
-                .on_hover_text("Hide node editor")
-                .clicked()
-            {
-                app.node_editor_ui.close();
-            }
-        });
     });
 
     // Only Add / View use floating overlays. Edit never does.
     match app.node_editor_ui.tool {
         NodeEditorToolMode::Add => {
-            let anchor = Pos2::new(add_btn_rect.left(), add_btn_rect.bottom() + 6.0);
+            let anchor = Pos2::new(add_btn_rect.left(), ui.max_rect().bottom() + 4.0);
             show_tool_overlay(ui.ctx(), "ne_add_overlay", anchor, |ui| {
                 add_menu_strip(app, ui, layer_idx);
             });
@@ -579,11 +669,11 @@ fn flat_text_button(ui: &mut Ui, label: &str) -> egui::Response {
 
 fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
     let avail = ui.available_size();
-    // Fixed canvas footprint — off-screen node widgets must not resize the window.
+    // Fixed canvas footprint — must equal available only (no min grow).
     let (rect, response) = ui.allocate_exact_size(avail, Sense::click_and_drag());
-    let painter = ui.painter_at(rect);
-    // Clip all child interactables to the canvas.
+    // Hard clip for every paint call — labels (Prev/Browse) must not leak outside.
     let canvas_clip = rect.intersect(ui.clip_rect());
+    let painter = ui.painter().with_clip_rect(canvas_clip);
 
     // Background
     painter.rect_filled(rect, 4.0, Color32::from_rgb(22, 24, 30));
@@ -841,17 +931,13 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
             Pos2::new(r.max.x - del_size * 0.7, r.min.y + title_h * 0.5),
             Vec2::splat(del_size),
         );
-        let title_hover = title_rect.contains(ptr) || del_rect.contains(ptr);
-        // Interact only inside the canvas clip so the Window never grows.
+        // Delete via canvas pointer only — never ui.interact (expands layout / window).
         let del_hit = del_rect.intersect(canvas_clip);
-        let del_resp = if del_hit.width() > 1.0 && del_hit.height() > 1.0 {
-            let del_id = ui.make_persistent_id(("ne_del", nid));
-            ui.interact(del_hit, del_id, Sense::click())
-        } else {
-            // Dummy non-interacting response
-            ui.allocate_response(Vec2::ZERO, Sense::hover())
-        };
-        if title_hover || del_resp.hovered() {
+        let del_hover = del_hit.width() > 1.0
+            && del_hit.height() > 1.0
+            && del_hit.contains(ptr);
+        let title_hover = title_rect.intersect(canvas_clip).contains(ptr) || del_hover;
+        if title_hover && canvas_clip.contains(del_rect.center()) {
             painter.text(
                 del_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -859,12 +945,11 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 nerd_font_id(12.0 * view.zoom.max(0.85)),
                 Color32::from_rgb(255, 100, 110),
             );
-            if del_resp.hovered() {
+            if del_hover {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
         }
-        // Allow delete whenever trash is clicked (not only in Edit mode).
-        if del_resp.clicked() {
+        if response.clicked() && del_hover {
             delete_id = Some(nid);
         }
 
@@ -887,41 +972,43 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 pr_r,
                 egui::Stroke::new(1.0, Color32::from_gray(40)),
             );
-            // Port name labels (inside card near the pin) — scale with zoom.
+            // Port name labels — only when pin center is inside canvas (no bleed).
             let label_font =
                 egui::FontId::proportional((9.0 * view.zoom).clamp(7.0, 15.0));
             let label_col = Color32::from_rgb(160, 168, 184);
-            match port.dir {
-                PortDir::Input => {
-                    painter.text(
-                        pr.center() + Vec2::new(8.0 * view.zoom.max(0.7), 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        &port.name,
-                        label_font.clone(),
-                        label_col,
-                    );
-                }
-                PortDir::Output => {
-                    let out_label = if port.ty == PortType::Real {
-                        if let Some(v) = live_real {
-                            format!("{}={:.3}", port.name, v)
+            if canvas_clip.contains(pr.center()) {
+                match port.dir {
+                    PortDir::Input => {
+                        painter.text(
+                            pr.center() + Vec2::new(8.0 * view.zoom.max(0.7), 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            &port.name,
+                            label_font.clone(),
+                            label_col,
+                        );
+                    }
+                    PortDir::Output => {
+                        let out_label = if port.ty == PortType::Real {
+                            if let Some(v) = live_real {
+                                format!("{}={:.3}", port.name, v)
+                            } else {
+                                port.name.clone()
+                            }
                         } else {
                             port.name.clone()
-                        }
-                    } else {
-                        port.name.clone()
-                    };
-                    painter.text(
-                        pr.center() - Vec2::new(8.0 * view.zoom.max(0.7), 0.0),
-                        egui::Align2::RIGHT_CENTER,
-                        out_label,
-                        label_font,
-                        if port.ty == PortType::Real {
-                            Color32::from_rgb(240, 210, 100)
-                        } else {
-                            label_col
-                        },
-                    );
+                        };
+                        painter.text(
+                            pr.center() - Vec2::new(8.0 * view.zoom.max(0.7), 0.0),
+                            egui::Align2::RIGHT_CENTER,
+                            out_label,
+                            label_font,
+                            if port.ty == PortType::Real {
+                                Color32::from_rgb(240, 210, 100)
+                            } else {
+                                label_col
+                            },
+                        );
+                    }
                 }
             }
             // Half-cut unconnected look: dark wedge
@@ -1070,7 +1157,10 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                     font.clone(),
                     muted,
                 );
-                if edit || path.is_empty() {
+                if (edit || path.is_empty())
+                    && browse_rect.width() > 20.0
+                    && canvas_clip.contains(browse_rect.left_center())
+                {
                     painter.text(
                         browse_rect.left_center(),
                         egui::Align2::LEFT_CENTER,
@@ -1202,7 +1292,13 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 }
             }
 
-            if can_preview && prev_rect.width() > 4.0 {
+            // Prev only when the control is fully usable inside the canvas —
+            // no floating "Prev" when the node is clipped at any edge.
+            if can_preview
+                && prev_rect.width() > 18.0
+                && prev_rect.height() > 10.0
+                && canvas_clip.contains(prev_rect.center())
+            {
                 let plabel = if preview_open { "Hide" } else { "Prev" };
                 painter.text(
                     prev_rect.center(),
@@ -1265,55 +1361,74 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
             let _ = edit; // Value/Expr inline editors only when selected+edit below
         }
 
-        // Value / Expr editable fields — only for the selected node, clipped (no window grow).
+        // Value / Expr: only when the field fully fits inside the canvas (no edge bleed,
+        // no Area outside the window that fights layout).
         if edit && app.node_editor_ui.selected == Some(nid) {
             if matches!(node_clone.kind, GraphNodeKind::Value { .. }) {
                 let edit_rect = Rect::from_min_size(
                     Pos2::new(r.min.x + 10.0 * view.zoom.max(0.7), r.min.y + 26.0 * view.zoom.max(0.7)),
                     Vec2::new((r.width() - 20.0).max(20.0), (18.0 * view.zoom).clamp(16.0, 28.0)),
-                )
-                .intersect(canvas_clip);
-                if edit_rect.width() > 12.0 && edit_rect.height() > 12.0 {
-                    ui.allocate_ui_at_rect(edit_rect, |ui| {
-                        ui.set_max_size(edit_rect.size());
-                        ui.set_clip_rect(edit_rect);
-                        let mut v = match node_clone.kind {
-                            GraphNodeKind::Value { value } => value,
-                            _ => 0.0,
-                        };
-                        let resp = ui.add(egui::DragValue::new(&mut v).speed(0.1).prefix("v="));
-                        if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            resp.surrender_focus();
-                        }
-                        if resp.changed() {
-                            value_edits.push((nid, v));
-                        }
-                    });
+                );
+                if canvas_clip.contains(edit_rect.min)
+                    && canvas_clip.contains(edit_rect.max - Vec2::splat(0.5))
+                {
+                    let mut v = match node_clone.kind {
+                        GraphNodeKind::Value { value } => value,
+                        _ => 0.0,
+                    };
+                    // Painter readout only when partially clipped; full editor when fully inside.
+                    let resp = egui::Area::new(egui::Id::new(("ne_val_area", nid)))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(edit_rect.min)
+                        .constrain_to(canvas_clip)
+                        .interactable(true)
+                        .show(ui.ctx(), |ui| {
+                            ui.set_max_size(edit_rect.size());
+                            ui.add_sized(
+                                edit_rect.size(),
+                                egui::DragValue::new(&mut v).speed(0.1).prefix("v="),
+                            )
+                        })
+                        .inner;
+                    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        resp.surrender_focus();
+                    }
+                    if resp.changed() {
+                        value_edits.push((nid, v));
+                    }
                 }
             }
             if let GraphNodeKind::Expr { ref expr } = node_clone.kind {
                 let edit_rect = Rect::from_min_size(
                     Pos2::new(r.min.x + 8.0 * view.zoom.max(0.7), r.min.y + 26.0 * view.zoom.max(0.7)),
                     Vec2::new((r.width() - 16.0).max(20.0), (18.0 * view.zoom).clamp(16.0, 28.0)),
-                )
-                .intersect(canvas_clip);
-                if edit_rect.width() > 12.0 && edit_rect.height() > 12.0 {
-                    ui.allocate_ui_at_rect(edit_rect, |ui| {
-                        ui.set_max_size(edit_rect.size());
-                        ui.set_clip_rect(edit_rect);
-                        let mut e = expr.clone();
-                        let te = egui::TextEdit::singleline(&mut e)
-                            .id(egui::Id::new(("ne_expr", nid)))
-                            .desired_width(edit_rect.width())
-                            .font(egui::TextStyle::Monospace);
-                        let resp = ui.add(te);
-                        if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            resp.surrender_focus();
-                        }
-                        if resp.changed() {
-                            expr_edits.push((nid, e));
-                        }
-                    });
+                );
+                if canvas_clip.contains(edit_rect.min)
+                    && canvas_clip.contains(edit_rect.max - Vec2::splat(0.5))
+                {
+                    let mut e = expr.clone();
+                    let resp = egui::Area::new(egui::Id::new(("ne_expr_area", nid)))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(edit_rect.min)
+                        .constrain_to(canvas_clip)
+                        .interactable(true)
+                        .show(ui.ctx(), |ui| {
+                            ui.set_max_size(edit_rect.size());
+                            ui.add_sized(
+                                edit_rect.size(),
+                                egui::TextEdit::singleline(&mut e)
+                                    .id(egui::Id::new(("ne_expr", nid)))
+                                    .desired_width(edit_rect.width())
+                                    .font(egui::TextStyle::Monospace),
+                            )
+                        })
+                        .inner;
+                    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        resp.surrender_focus();
+                    }
+                    if resp.changed() {
+                        expr_edits.push((nid, e));
+                    }
                 }
             }
         }
@@ -1471,8 +1586,13 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                     GraphNodeKind::ObjectImage { path: p }
                     | GraphNodeKind::ObjectVideo { path: p }
                     | GraphNodeKind::ObjectAudio { path: p } => {
-                        *p = path;
+                        *p = path.clone();
                         app.status_message = "Media path set".into();
+                        // Streaming playback — do not full-decode into RAM on Browse
+                        // (that OOM'd machines for long MP3s / thread storms).
+                        if matches!(n.kind, GraphNodeKind::ObjectAudio { .. }) && !path.is_empty() {
+                            app.status_message = "Audio path set (streams on Play)".into();
+                        }
                     }
                     _ => {}
                 }

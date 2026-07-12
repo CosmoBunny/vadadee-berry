@@ -114,7 +114,7 @@ pub fn node_editor_tools() -> Vec<Value> {
         ),
         tool(
             "get_graph_output",
-            "Resolve Output Object chain: image source, blur, brightness, geometry summary.",
+            "Resolve Output Object chain: image + sound sources, blur, EQ, geometry summary (P5).",
             json!({
                 "layer_id": { "type": "string" },
                 "layer_index": { "type": "integer" }

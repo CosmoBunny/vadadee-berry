@@ -865,6 +865,71 @@ pub fn apply_animation_for_frame_project(project: &mut ProjectFile, frame: usize
             }
         }
     }
+
+    // P5: sample Node Editor param tracks + eval Reals so blur/FX match the playhead.
+    apply_node_editor_params_project(project, frame);
+}
+
+/// Apply `param:{uuid}` animation into GraphParam values and `eval_reals` for export.
+fn apply_node_editor_params_project(project: &mut ProjectFile, frame: usize) {
+    let fps = 30.0_f32; // frame/time nodes; wall anim_fps not critical for export consistency
+    let layer_ids: Vec<uuid::Uuid> = project
+        .document
+        .layers
+        .iter()
+        .filter(|l| l.kind == crate::document::LayerKind::NodeEditor)
+        .map(|l| l.id)
+        .collect();
+    for layer_id in layer_ids {
+        let mut samples: Vec<(uuid::Uuid, Option<usize>, f64)> = Vec::new();
+        if let Some(anim) = project.anim_timeline.nodes.get(&layer_id) {
+            if let Some(layer) = project.document.layers.iter().find(|l| l.id == layer_id) {
+                if let Some(g) = layer.node_graph.as_ref() {
+                    for p in &g.parameters {
+                        let labels: Vec<(String, Option<usize>)> = match p.kind {
+                            crate::document::GraphParamKind::Real => {
+                                vec![(format!("param:{}", p.id), None)]
+                            }
+                            crate::document::GraphParamKind::Color => (0..4)
+                                .map(|i| (format!("param:{}:{i}", p.id), Some(i)))
+                                .collect(),
+                            crate::document::GraphParamKind::Position => (0..2)
+                                .map(|i| (format!("param:{}:{i}", p.id), Some(i)))
+                                .collect(),
+                        };
+                        for (lbl, comp) in labels {
+                            if let Some(v) = anim.sample(&lbl, frame) {
+                                samples.push((p.id, comp, v));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let Some(layer) = project
+            .document
+            .layers
+            .iter_mut()
+            .find(|l| l.id == layer_id)
+        else {
+            continue;
+        };
+        let Some(g) = layer.node_graph.as_mut() else {
+            continue;
+        };
+        for (pid, comp, v) in samples {
+            if let Some(p) = g.parameters.iter_mut().find(|p| p.id == pid) {
+                match comp {
+                    None | Some(0) => p.v0 = v,
+                    Some(1) => p.v1 = v,
+                    Some(2) => p.v2 = v,
+                    Some(3) => p.v3 = v,
+                    _ => {}
+                }
+            }
+        }
+        g.eval_reals(frame, fps);
+    }
 }
 
 pub fn get_node_geom_floats_project(project: &ProjectFile, id: NodeId) -> Vec<f64> {
@@ -1148,7 +1213,117 @@ impl<'a> ExportSession<'a> {
                         );
                     }
                     crate::document::LayerKind::NodeEditor => {
-                        // Continuous graph output not yet evaluated in export (P2+).
+                        // P5: composite Output Object image chain into export frames.
+                        if let Some(g) = &layer.node_graph {
+                            let eval = g.resolve_output_image();
+                            match &eval.image {
+                                crate::document::GraphImageSource::AppObjects(ids) => {
+                                    if !ids.is_empty() {
+                                        let order: Vec<uuid::Uuid> = draw_order
+                                            .iter()
+                                            .copied()
+                                            .filter(|id| ids.contains(id))
+                                            .chain(
+                                                ids.iter()
+                                                    .copied()
+                                                    .filter(|id| !draw_order.contains(id)),
+                                            )
+                                            .collect();
+                                        if !order.is_empty() {
+                                            let mut hide = hidden_sources.clone();
+                                            for id in &order {
+                                                hide.remove(id);
+                                            }
+                                            crate::render::draw_nodes(
+                                                &painter,
+                                                &self.project.nodes,
+                                                &order,
+                                                &viewport,
+                                                origin,
+                                                self.project.document.width as f32,
+                                                self.project.document.height as f32,
+                                                &[],
+                                                &hide,
+                                                &loft_paths,
+                                                &fonts,
+                                                &image_textures,
+                                            );
+                                        }
+                                    }
+                                }
+                                crate::document::GraphImageSource::FilePath(path) => {
+                                    let max_side = 512u32;
+                                    if let Ok(dyn_img) = image::open(path) {
+                                        let base = dyn_img.to_rgba8();
+                                        let mut rgba = crate::document::downscale_rgba_max_side(
+                                            &base, max_side,
+                                        );
+                                        let mut color_only = eval.clone();
+                                        let br = eval.blur_px.clamp(0.0, 64.0) as f32;
+                                        color_only.blur_px = 0.0;
+                                        crate::document::apply_graph_image_fx(
+                                            &mut rgba,
+                                            &color_only,
+                                        );
+                                        if br >= 0.05 {
+                                            crate::document::gaussian_blur_rgba(&mut rgba, br);
+                                        }
+                                        let (tw, th) = rgba.dimensions();
+                                        let pixels = rgba.into_raw();
+                                        let color_image =
+                                            egui::ColorImage::from_rgba_unmultiplied(
+                                                [tw as usize, th as usize],
+                                                &pixels,
+                                            );
+                                        let tex = ctx.load_texture(
+                                            format!(
+                                                "export-ne-fx-{}-{}",
+                                                layer.id,
+                                                current_frame
+                                            ),
+                                            color_image,
+                                            egui::TextureOptions::LINEAR,
+                                        );
+                                        let mut dx = layer.x as f64 + eval.geo_off_x;
+                                        let mut dy = layer.y as f64 + eval.geo_off_y;
+                                        let rot =
+                                            layer.rotation as f64 + eval.geo_rot_deg;
+                                        let aspect = if th > 0 {
+                                            tw as f32 / th as f32
+                                        } else {
+                                            1.0
+                                        };
+                                        let mut w =
+                                            layer.width * eval.geo_scale_w as f32;
+                                        let mut h =
+                                            layer.height * eval.geo_scale_h as f32;
+                                        if layer.aspect_ratio_locked {
+                                            if w / h > aspect {
+                                                w = h * aspect;
+                                            } else {
+                                                h = w / aspect;
+                                            }
+                                        }
+                                        let tl = viewport
+                                            .doc_to_screen((dx, dy), origin);
+                                        let br = viewport.doc_to_screen(
+                                            (dx + w as f64, dy + h as f64),
+                                            origin,
+                                        );
+                                        let rect =
+                                            egui::Rect::from_min_max(tl, br);
+                                        paint_rotated_image(
+                                            &painter,
+                                            tex.id(),
+                                            rect,
+                                            (rot as f32).to_radians(),
+                                            1.0,
+                                        );
+                                    }
+                                }
+                                crate::document::GraphImageSource::Empty => {}
+                            }
+                        }
                     }
                 }
             }

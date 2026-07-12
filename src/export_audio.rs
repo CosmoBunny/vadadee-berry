@@ -106,6 +106,27 @@ pub fn export_mux_with_audio(
 fn collect_export_audio_layers(project: &ProjectFile) -> Vec<ExportAudioLayer> {
     let mut out = Vec::new();
     for layer in &project.document.layers {
+        // P5: Node Editor Output Object sound chain.
+        if layer.visible
+            && layer.is_renderer
+            && matches!(layer.kind, LayerKind::NodeEditor)
+        {
+            if let Some(g) = layer.node_graph.as_ref() {
+                let snd = g.resolve_output_sound();
+                if let Some(path) = snd.path() {
+                    let vol = (layer.volume as f64 * snd.volume).clamp(0.0, 4.0) as f32;
+                    // Full export span: start at 0, play entire export window (trim later by mux).
+                    out.push(ExportAudioLayer {
+                        path: path.to_string(),
+                        timeline_start: 0.0,
+                        start_offset: 0.0,
+                        play_secs: 3600.0, // clipped by export duration in mixer
+                        volume: vol,
+                    });
+                }
+            }
+            continue;
+        }
         if !layer.visible || !layer.is_renderer || !matches!(layer.kind, LayerKind::AV) {
             continue;
         }
