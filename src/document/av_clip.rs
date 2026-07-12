@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const AUDIO_EXTS: &[&str] = &["mp3", "wav", "aac", "m4a", "flac", "ogg", "opus", "wma"];
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"];
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mkv", "avi", "mov", "webm", "m4v", "wmv", "flv", "mpeg", "mpg", "ts",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvClip {
@@ -16,6 +20,9 @@ pub struct AvClip {
     /// Sub-track row inside the parent AV layer (avoids overlap on the same row).
     #[serde(default)]
     pub track_row: u32,
+    /// Live link to document object(s). When set, the track re-rasterizes when those nodes change.
+    #[serde(default)]
+    pub source_node_ids: Vec<Uuid>,
 }
 
 impl AvClip {
@@ -29,6 +36,7 @@ impl AvClip {
             video_timeline_start: timeline_start,
             media_source_duration: None,
             track_row: 0,
+            source_node_ids: Vec::new(),
         }
     }
 
@@ -42,6 +50,7 @@ impl AvClip {
             video_timeline_start: timeline_start,
             media_source_duration: None,
             track_row: 0,
+            source_node_ids: Vec::new(),
         }
     }
 
@@ -63,23 +72,67 @@ impl AvClip {
             video_timeline_start,
             media_source_duration,
             track_row: 0,
+            source_node_ids: Vec::new(),
         }
+    }
+
+    pub fn is_object_linked(&self) -> bool {
+        !self.source_node_ids.is_empty()
+    }
+
+    fn path_ext(path: &str) -> String {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
     }
 
     pub fn path_is_audio_only(path: &str) -> bool {
         if path.is_empty() {
-            return true;
+            return false;
         }
-        let ext = std::path::Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let ext = Self::path_ext(path);
         AUDIO_EXTS.iter().any(|a| *a == ext)
+    }
+
+    /// Static / animated image files (PNG, GIF, WebP, …) — shown on the Video queue.
+    pub fn path_is_still_image(path: &str) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        let ext = Self::path_ext(path);
+        IMAGE_EXTS.iter().any(|a| *a == ext)
+    }
+
+    pub fn path_is_video_container(path: &str) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        let ext = Self::path_ext(path);
+        VIDEO_EXTS.iter().any(|a| *a == ext)
+    }
+
+    /// Visual media for the Video layer queue (video file or image).
+    pub fn path_is_visual_media(path: &str) -> bool {
+        Self::path_is_video_container(path) || Self::path_is_still_image(path)
     }
 
     pub fn is_audio_only(&self) -> bool {
         Self::path_is_audio_only(&self.media_path)
+    }
+
+    pub fn is_still_image(&self) -> bool {
+        Self::path_is_still_image(&self.media_path)
+    }
+
+    /// Compatible with a Video-role layer (video or image, not pure audio).
+    pub fn path_fits_video_role(path: &str) -> bool {
+        Self::path_is_visual_media(path)
+    }
+
+    pub fn path_fits_audio_role(path: &str) -> bool {
+        Self::path_is_audio_only(path)
     }
 
     /// True when playhead time is inside this clip's timeline span [start, end).

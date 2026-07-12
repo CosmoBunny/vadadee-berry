@@ -26,6 +26,8 @@ pub enum ActionTab {
     Geometry,
     PathMagic,
     Animation,
+    /// Graph parameters for Node Editor layers (animatable).
+    Parameter,
 }
 
 impl ActionTab {
@@ -39,6 +41,7 @@ impl ActionTab {
             Self::Geometry => "geometry",
             Self::PathMagic => "path_magic",
             Self::Animation => "animation",
+            Self::Parameter => "parameter",
         }
     }
 
@@ -51,6 +54,7 @@ impl ActionTab {
             "geometry" => Some(Self::Geometry),
             "path_magic" => Some(Self::PathMagic),
             "animation" => Some(Self::Animation),
+            "parameter" => Some(Self::Parameter),
             _ => None,
         }
     }
@@ -64,6 +68,7 @@ impl ActionTab {
             Self::Geometry,
             Self::PathMagic,
             Self::Animation,
+            Self::Parameter,
         ]
     }
 
@@ -76,6 +81,7 @@ impl ActionTab {
             Self::Geometry => "Geometry",
             Self::PathMagic => "Path magic",
             Self::Animation => "Animation",
+            Self::Parameter => "Parameter",
         }
     }
 
@@ -95,6 +101,20 @@ impl ActionTab {
                 return true; // AV acts like Video for color (merged from Audio/Video)
             }
         }
+        if self == Self::Parameter {
+            // Active Node Editor layer is enough (do not require layer id in selection).
+            if app
+                .project
+                .document
+                .active_layer()
+                .is_some_and(|l| l.kind == crate::document::LayerKind::NodeEditor)
+            {
+                return true;
+            }
+            return app
+                .selected_layer_kind()
+                .is_some_and(|k| k == crate::document::LayerKind::NodeEditor);
+        }
         true
     }
 
@@ -107,6 +127,7 @@ impl ActionTab {
             Self::Geometry => icons::RECT,
             Self::PathMagic => icons::PATH_MAGIC,
             Self::Animation => "",
+            Self::Parameter => icons::PARAMETER,
         }
     }
 }
@@ -165,6 +186,7 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     object_rename_dialog(app, ui.ctx());
     plotter_formula_dialog(app, ui.ctx());
     daw_piano_dialog(app, ui.ctx());
+    crate::node_editor_ui::show_node_editor_dialog(app, ui.ctx());
     hit_pick_menu_overlay(app, ui.ctx());
     status_bar_layout_reserve(ui);
 
@@ -400,17 +422,24 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     let margin_x = 8.0;
     let margin_y = 10.0;
 
+    // Collapsed = active tool only. Chat/Collab live in a separate rail under the toolbar.
     let collapsed_inner_w = btn_size;
-    let collapsed_inner_h = 3.0 * btn_size + 2.0 * spacing;
+    let collapsed_inner_h = btn_size;
 
     let is_video_or_audio_layer = app.project.document.active_layer()
         .map_or(false, |l| l.kind == crate::document::LayerKind::AV);
     let is_flowchart_layer = app.project.document.active_layer()
         .map_or(false, |l| l.kind == crate::document::LayerKind::Flowchart);
+    let is_node_editor_layer = app.project.document.active_layer()
+        .map_or(false, |l| l.kind == crate::document::LayerKind::NodeEditor);
     if is_video_or_audio_layer && app.tools.active != ToolKind::Select && app.tools.active != ToolKind::Eyedropper {
         app.tools.active = ToolKind::Select;
     }
     if is_flowchart_layer && matches!(app.tools.active, ToolKind::Text | ToolKind::Brush | ToolKind::Pen) {
+        app.tools.active = ToolKind::Select;
+    }
+    // Node Editor: no drawing tools (Circle/Rect/Pen/…).
+    if is_node_editor_layer && app.tools.active != ToolKind::Select {
         app.tools.active = ToolKind::Select;
     }
 
@@ -420,6 +449,8 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Select,
             ToolKind::Eyedropper,
         ]
+    } else if is_node_editor_layer {
+        vec![ToolKind::Select]
     } else if is_flowchart_layer {
         vec![
             ToolKind::Select,
@@ -776,11 +807,17 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             }
         }
 
-        let chat_y = egui::lerp(
-            (btn_size + spacing)..=(5.0 * (btn_size + spacing)),
-            expand_t,
-        );
-        let collab_y = chat_y + btn_size + spacing;
+    });
+
+    // Live Chat + Collab: separate container, left-aligned under the toolbar (not inside it).
+    let collab_gap = 8.0;
+    let collab_inner_h = 2.0 * btn_size + spacing;
+    let collab_rect = Rect::from_min_size(
+        egui::pos2(rect.min.x, rect.max.y + collab_gap),
+        egui::vec2(btn_size + 2.0 * margin_x, collab_inner_h + 2.0 * margin_y),
+    );
+    theme::show_overlay_area(ctx, "float_collab_rail", collab_rect, alpha, |ui| {
+        let origin = ui.max_rect().min;
         let collab_buttons: [(&str, crate::left_dock::LeftDockPanel, &str); 2] = [
             (icons::CHAT, crate::left_dock::LeftDockPanel::Chat, "Live chat"),
             (
@@ -790,28 +827,27 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ),
         ];
         for (i, (icon, panel, tip)) in collab_buttons.iter().enumerate() {
-            let cy = if i == 0 { chat_y } else { collab_y };
-            let center = egui::Pos2::new(btn_size / 2.0, cy + btn_size / 2.0);
-            let button_screen_rect =
-                Rect::from_center_size(center, egui::vec2(btn_size, btn_size))
-                    .translate(local_origin.to_vec2());
+            let cy = i as f32 * (btn_size + spacing);
+            let button_screen_rect = Rect::from_min_size(
+                origin + egui::vec2(0.0, cy),
+                egui::vec2(btn_size, btn_size),
+            );
             let selected = app.left_dock.active == Some(*panel);
             let is_hovered = pointer_pos.map_or(false, |pos| button_screen_rect.contains(pos));
-            let button_alpha = alpha * expand_t.max(0.35);
             let fill = if selected {
-                colors::ACCENT_DIM.gamma_multiply(button_alpha)
+                colors::ACCENT_DIM.gamma_multiply(alpha)
             } else if is_hovered {
-                colors::BG_HOVER.gamma_multiply(button_alpha)
+                colors::BG_HOVER.gamma_multiply(alpha)
             } else {
-                colors::BG_ELEVATED.gamma_multiply(button_alpha)
+                colors::BG_ELEVATED.gamma_multiply(alpha)
             };
             ui.painter().rect(
                 button_screen_rect,
-                egui::CornerRadius::same(6),
+                egui::CornerRadius::same(if is_android { 8 } else { 6 }),
                 fill,
                 egui::Stroke::new(
-                    if selected { 1.5 } else { 1.0 },
-                    colors::BORDER.gamma_multiply(button_alpha),
+                    if selected || is_hovered { 1.5 } else { 1.0 },
+                    colors::BORDER.gamma_multiply(alpha),
                 ),
                 egui::StrokeKind::Inside,
             );
@@ -819,8 +855,8 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                 button_screen_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 *icon,
-                icons::nerd_font_id(18.0),
-                colors::TEXT.gamma_multiply(button_alpha),
+                icons::nerd_font_id(if is_android { 20.0 } else { 18.0 }),
+                colors::TEXT.gamma_multiply(alpha),
             );
             if is_hovered && !is_android {
                 egui::show_tooltip::<()>(
@@ -1031,6 +1067,7 @@ fn action_bar_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ActionTab::Geometry => geometry_section(app, ui),
                     ActionTab::PathMagic => path_magic_section(app, ui),
                     ActionTab::Animation => animation_section(app, ui),
+                    ActionTab::Parameter => crate::node_editor_ui::parameter_tab_ui(app, ui),
                 }
             });
     });
@@ -3230,11 +3267,40 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
             scroll_area = scroll_area.max_height(5.0 * 36.0);
         }
 
-        let mut dragged_av_clip: Option<(usize, uuid::Uuid, f32)> = None;
-        let mut trim_av: Option<(usize, uuid::Uuid, crate::av_ui::AvClipHit, f32, f32)> = None;
-        let mut music_drag: Option<(usize, uuid::Uuid, crate::av_ui::AvClipHit, f32)> = None;
         let mut scroll_delta_timeline = 0.0;
         let mut scroll_follow_disable = false;
+        // Primary press starts a sticky clip/trim drag; release clears it.
+        let pointer_primary_down = ui.input(|i| i.pointer.primary_down());
+        let pointer_primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+        let pointer_primary_released = ui.input(|i| i.pointer.primary_released());
+        if pointer_primary_released {
+            app.av_timeline_drag = None;
+        }
+        let pointer_x_now = ui.input(|i| i.pointer.hover_pos().map(|p| p.x));
+
+        // Apply sticky drag with absolute pointer mapping (no mid-drag mode flip).
+        if let (Some(drag), Some(px)) = (app.av_timeline_drag, pointer_x_now) {
+            if pointer_primary_down {
+                let (start, len, offset) = crate::av_ui::apply_sticky_drag(&drag, px);
+                if let Some(l) = app.project.document.layers.get_mut(drag.layer_idx) {
+                    if drag.is_music {
+                        if let Some(clip) = l.music_clips.iter_mut().find(|c| c.id == drag.clip_id) {
+                            clip.timeline_start_sec = start;
+                            clip.duration_sec = len;
+                            clip.track_row = 0;
+                        }
+                    } else if let Some(clip) = l.av_clips.iter_mut().find(|c| c.id == drag.clip_id) {
+                        // Only this clip — never sync length onto other queue items.
+                        clip.video_timeline_start = start;
+                        clip.video_play_length = len.max(0.1);
+                        clip.video_start_offset = offset.max(0.0);
+                        clip.track_row = 0;
+                        let id = clip.id;
+                        l.sync_legacy_from_clip_id(id);
+                    }
+                }
+            }
+        }
 
         scroll_area.show(ui, |ui| {
             for row in &timeline_rows {
@@ -3259,7 +3325,7 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                     label_resp.on_hover_text(safe_trunc_label(&row.row_label, 96));
 
                     let (track_resp, track_painter) =
-                        ui.allocate_painter(egui::vec2(track_w, 32.0), egui::Sense::drag());
+                        ui.allocate_painter(egui::vec2(track_w, 32.0), egui::Sense::click_and_drag());
                     let track_rect = track_resp.rect;
 
                     track_painter.rect(
@@ -3287,8 +3353,10 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
 
                     let clip_painter = track_painter.with_clip_rect(track_rect);
                     let mouse_pos = ui.input(|i| i.pointer.hover_pos());
-                    let is_down = ui.input(|i| i.pointer.any_down());
+                    let is_down = pointer_primary_down;
                     let l = &app.project.document.layers[idx];
+                    let active_drag = app.av_timeline_drag;
+                    let mut hit_on_press: Option<crate::av_ui::AvTimelineDrag> = None;
 
                     // Paint entire media queue on this single layer row.
                     for clip_id in &row.av_clip_ids {
@@ -3300,11 +3368,22 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                         if clip_rect.max.x <= track_rect.min.x || clip_rect.min.x >= track_rect.max.x {
                             continue;
                         }
-                        let av_hit = mouse_pos
-                            .filter(|mp| track_rect.contains(*mp))
-                            .map(|mp| crate::av_ui::hit_test_clip(clip_rect, mp, None))
-                            .unwrap_or_default();
-                        let is_hovered = !matches!(av_hit, crate::av_ui::AvClipHit::None);
+                        // While sticky-dragging this clip, force highlight of locked mode.
+                        let av_hit = if let Some(d) = active_drag.filter(|d| d.clip_id == *clip_id && !d.is_music)
+                        {
+                            match d.mode {
+                                crate::av_ui::AvDragMode::Move => crate::av_ui::AvClipHit::Body,
+                                crate::av_ui::AvDragMode::TrimStart => crate::av_ui::AvClipHit::TrimStart,
+                                crate::av_ui::AvDragMode::TrimEnd => crate::av_ui::AvClipHit::TrimEnd,
+                            }
+                        } else {
+                            mouse_pos
+                                .filter(|mp| track_rect.contains(*mp))
+                                .map(|mp| crate::av_ui::hit_test_clip(clip_rect, mp, None))
+                                .unwrap_or_default()
+                        };
+                        let is_hovered = !matches!(av_hit, crate::av_ui::AvClipHit::None)
+                            || active_drag.is_some_and(|d| d.clip_id == *clip_id);
                         let audio_only = clip.is_audio_only();
 
                         if audio_only {
@@ -3360,32 +3439,68 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                             egui::Color32::from_rgb(80, 140, 255),
                             egui::Color32::WHITE,
                         );
+                        // Always draw handle edges faintly for grab affordance.
+                        {
+                            let handle = 14.0f32.min(clip_rect.width() * 0.35).max(10.0);
+                            let left = Rect::from_min_size(
+                                clip_rect.min,
+                                egui::vec2(handle, clip_rect.height()),
+                            );
+                            let right = Rect::from_min_size(
+                                egui::pos2(clip_rect.max.x - handle, clip_rect.min.y),
+                                egui::vec2(handle, clip_rect.height()),
+                            );
+                            let cap_col = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50);
+                            clip_painter.rect_filled(left, egui::CornerRadius::same(2), cap_col);
+                            clip_painter.rect_filled(right, egui::CornerRadius::same(2), cap_col);
+                        }
                         let short = safe_trunc_label(&clip.name, 24);
+                        let link = if clip.is_object_linked() { "*" } else { "" };
                         clip_painter.text(
                             clip_rect.center(),
                             egui::Align2::CENTER_CENTER,
                             format!(
-                                "{} ({:.1}-{:.1}s)",
-                                short,
+                                "{short}{link} ({:.1}-{:.1}s)",
                                 clip.video_timeline_start,
                                 clip.timeline_end_secs()
                             ),
                             egui::FontId::proportional(9.0),
                             egui::Color32::WHITE,
                         );
-                        if track_resp.dragged() {
-                            if let Some(press_origin) = ui.input(|i| i.pointer.press_origin()) {
-                                if clip_rect.contains(press_origin) {
-                                    let delta_sec =
-                                        (track_resp.drag_delta().x / track_rect.width()) * visible_sec;
-                                    if matches!(av_hit, crate::av_ui::AvClipHit::Body) {
-                                        dragged_av_clip = Some((idx, *clip_id, delta_sec));
-                                    } else if matches!(
-                                        av_hit,
-                                        crate::av_ui::AvClipHit::TrimStart | crate::av_ui::AvClipHit::TrimEnd
-                                    ) {
-                                        trim_av =
-                                            Some((idx, *clip_id, av_hit, delta_sec, visible_sec));
+
+                        // Start sticky drag only on primary press (not every drag frame).
+                        if pointer_primary_pressed && app.av_timeline_drag.is_none() {
+                            if let Some(mp) = mouse_pos {
+                                if track_rect.contains(mp) {
+                                    let hit = crate::av_ui::hit_test_clip(clip_rect, mp, None);
+                                    let mode = match hit {
+                                        crate::av_ui::AvClipHit::Body => {
+                                            Some(crate::av_ui::AvDragMode::Move)
+                                        }
+                                        crate::av_ui::AvClipHit::TrimStart => {
+                                            Some(crate::av_ui::AvDragMode::TrimStart)
+                                        }
+                                        crate::av_ui::AvClipHit::TrimEnd => {
+                                            Some(crate::av_ui::AvDragMode::TrimEnd)
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(mode) = mode {
+                                        hit_on_press = Some(crate::av_ui::AvTimelineDrag {
+                                            layer_idx: idx,
+                                            clip_id: *clip_id,
+                                            is_music: false,
+                                            mode,
+                                            origin_start_sec: clip.video_timeline_start,
+                                            origin_len_sec: clip
+                                                .timeline_play_secs()
+                                                .max(clip.video_play_length)
+                                                .max(0.1),
+                                            origin_offset_sec: clip.video_start_offset,
+                                            origin_pointer_x: mp.x,
+                                            origin_track_w: track_rect.width(),
+                                            origin_visible_sec: visible_sec,
+                                        });
                                     }
                                 }
                             }
@@ -3407,10 +3522,26 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                         if mrect.max.x <= track_rect.min.x || mrect.min.x >= track_rect.max.x {
                             continue;
                         }
-                        let m_hit = mouse_pos
-                            .filter(|mp| track_rect.contains(*mp))
-                            .map(|mp| crate::av_ui::hit_test_clip(mrect, mp, Some(mclip.id)))
-                            .unwrap_or_default();
+                        let m_hit = if let Some(d) =
+                            active_drag.filter(|d| d.clip_id == *mclip_id && d.is_music)
+                        {
+                            match d.mode {
+                                crate::av_ui::AvDragMode::Move => {
+                                    crate::av_ui::AvClipHit::MusicBody(*mclip_id)
+                                }
+                                crate::av_ui::AvDragMode::TrimStart => {
+                                    crate::av_ui::AvClipHit::MusicTrimStart(*mclip_id)
+                                }
+                                crate::av_ui::AvDragMode::TrimEnd => {
+                                    crate::av_ui::AvClipHit::MusicTrimEnd(*mclip_id)
+                                }
+                            }
+                        } else {
+                            mouse_pos
+                                .filter(|mp| track_rect.contains(*mp))
+                                .map(|mp| crate::av_ui::hit_test_clip(mrect, mp, Some(mclip.id)))
+                                .unwrap_or_default()
+                        };
                         clip_painter.rect(
                             mrect,
                             egui::CornerRadius::same(3),
@@ -3425,6 +3556,18 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                             egui::Color32::from_rgb(180, 90, 255),
                             egui::Color32::WHITE,
                         );
+                        {
+                            let handle = 14.0f32.min(mrect.width() * 0.35).max(10.0);
+                            let left =
+                                Rect::from_min_size(mrect.min, egui::vec2(handle, mrect.height()));
+                            let right = Rect::from_min_size(
+                                egui::pos2(mrect.max.x - handle, mrect.min.y),
+                                egui::vec2(handle, mrect.height()),
+                            );
+                            let cap_col = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50);
+                            clip_painter.rect_filled(left, egui::CornerRadius::same(2), cap_col);
+                            clip_painter.rect_filled(right, egui::CornerRadius::same(2), cap_col);
+                        }
                         let short = safe_trunc_label(&mclip.name, 24);
                         clip_painter.text(
                             mrect.center(),
@@ -3440,26 +3583,97 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                                 }
                             }
                         }
-                        if track_resp.dragged() {
-                            if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
-                                if mrect.contains(origin) {
-                                    let delta_sec =
-                                        (track_resp.drag_delta().x / track_rect.width()) * visible_sec;
-                                    music_drag = Some((idx, mclip.id, m_hit, delta_sec));
+                        if pointer_primary_pressed && app.av_timeline_drag.is_none() {
+                            if let Some(mp) = mouse_pos {
+                                if track_rect.contains(mp) {
+                                    let hit =
+                                        crate::av_ui::hit_test_clip(mrect, mp, Some(mclip.id));
+                                    let mode = match hit {
+                                        crate::av_ui::AvClipHit::MusicBody(_) => {
+                                            Some(crate::av_ui::AvDragMode::Move)
+                                        }
+                                        crate::av_ui::AvClipHit::MusicTrimStart(_) => {
+                                            Some(crate::av_ui::AvDragMode::TrimStart)
+                                        }
+                                        crate::av_ui::AvClipHit::MusicTrimEnd(_) => {
+                                            Some(crate::av_ui::AvDragMode::TrimEnd)
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(mode) = mode {
+                                        hit_on_press = Some(crate::av_ui::AvTimelineDrag {
+                                            layer_idx: idx,
+                                            clip_id: mclip.id,
+                                            is_music: true,
+                                            mode,
+                                            origin_start_sec: mclip.timeline_start_sec,
+                                            origin_len_sec: mclip.duration_sec.max(0.1),
+                                            origin_offset_sec: 0.0,
+                                            origin_pointer_x: mp.x,
+                                            origin_track_w: track_rect.width(),
+                                            origin_visible_sec: visible_sec,
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
 
-                    // Empty track drag scrolls timeline.
-                    if track_resp.dragged()
-                        && dragged_av_clip.is_none()
-                        && trim_av.is_none()
-                        && music_drag.is_none()
-                    {
-                        scroll_delta_timeline =
-                            track_resp.drag_delta().x / track_rect.width() * visible_frames;
-                        scroll_follow_disable = true;
+                    if let Some(drag) = hit_on_press {
+                        app.av_timeline_drag = Some(drag);
+                        app.anim_timeline_follow = false;
+                    }
+
+                    // Empty track drag scrolls timeline — only when not grabbing a clip.
+                    if track_resp.dragged() && app.av_timeline_drag.is_none() {
+                        if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+                            // Only scroll if press was on empty track (not a clip).
+                            let pressed_on_clip = {
+                                let l = &app.project.document.layers[idx];
+                                let mut hit = false;
+                                for c in &l.av_clips {
+                                    let r = crate::av_ui::av_clip_rect(
+                                        track_rect,
+                                        c,
+                                        start_frame,
+                                        visible_frames,
+                                        fps,
+                                    );
+                                    if !matches!(
+                                        crate::av_ui::hit_test_clip(r, origin, None),
+                                        crate::av_ui::AvClipHit::None
+                                    ) {
+                                        hit = true;
+                                        break;
+                                    }
+                                }
+                                if !hit {
+                                    for m in &l.music_clips {
+                                        let r = crate::av_ui::music_clip_rect(
+                                            track_rect,
+                                            m,
+                                            start_frame,
+                                            visible_frames,
+                                            fps,
+                                        );
+                                        if !matches!(
+                                            crate::av_ui::hit_test_clip(r, origin, Some(m.id)),
+                                            crate::av_ui::AvClipHit::None
+                                        ) {
+                                            hit = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                hit
+                            };
+                            if !pressed_on_clip {
+                                scroll_delta_timeline = track_resp.drag_delta().x
+                                    / track_rect.width()
+                                    * visible_frames;
+                                scroll_follow_disable = true;
+                            }
+                        }
                     }
 
                     let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
@@ -3468,7 +3682,8 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                     } else {
                         scroll_delta.y
                     };
-                    if wheel_delta != 0.0 && track_resp.hovered() {
+                    if wheel_delta != 0.0 && track_resp.hovered() && app.av_timeline_drag.is_none()
+                    {
                         scroll_delta_timeline = wheel_delta * 0.1;
                         scroll_follow_disable = true;
                     }
@@ -3484,168 +3699,195 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                             egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 165, 0)),
                         );
                     }
+
+                    // Cursor feedback
+                    if app.av_timeline_drag.is_some()
+                        || mouse_pos.is_some_and(|mp| {
+                            let l = &app.project.document.layers[idx];
+                            l.av_clips.iter().any(|c| {
+                                let r = crate::av_ui::av_clip_rect(
+                                    track_rect,
+                                    c,
+                                    start_frame,
+                                    visible_frames,
+                                    fps,
+                                );
+                                !matches!(
+                                    crate::av_ui::hit_test_clip(r, mp, None),
+                                    crate::av_ui::AvClipHit::None
+                                )
+                            }) || l.music_clips.iter().any(|m| {
+                                let r = crate::av_ui::music_clip_rect(
+                                    track_rect,
+                                    m,
+                                    start_frame,
+                                    visible_frames,
+                                    fps,
+                                );
+                                !matches!(
+                                    crate::av_ui::hit_test_clip(r, mp, Some(m.id)),
+                                    crate::av_ui::AvClipHit::None
+                                )
+                            })
+                        })
+                    {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                        if app.av_timeline_drag.is_some() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        }
+                    }
                 });
             }
         });
 
-        if let Some((idx, clip_id, delta)) = dragged_av_clip {
-            if let Some(l) = app.project.document.layers.get_mut(idx) {
-                if let Some(clip) = l.av_clips.iter_mut().find(|c| c.id == clip_id) {
-                    clip.video_timeline_start = (clip.video_timeline_start + delta).max(0.0);
-                    clip.track_row = 0;
-                }
-                l.sync_legacy_from_primary_clip();
-            }
-        }
-        if let Some((idx, clip_id, hit, delta_sec, visible_sec)) = trim_av {
-            if let Some(l) = app.project.document.layers.get_mut(idx) {
-                if let Some(clip) = l.av_clips.iter_mut().find(|c| c.id == clip_id) {
-                    match hit {
-                        crate::av_ui::AvClipHit::TrimStart => {
-                            let new_start = (clip.video_timeline_start + delta_sec).max(0.0);
-                            let shift = new_start - clip.video_timeline_start;
-                            if shift > 0.0 {
-                                clip.video_timeline_start = new_start;
-                                clip.video_start_offset += shift;
-                                clip.video_play_length = (clip.video_play_length - shift).max(0.1);
-                            }
-                        }
-                        crate::av_ui::AvClipHit::TrimEnd => {
-                            clip.video_play_length = (clip.video_play_length + delta_sec).max(0.1);
-                        }
-                        _ => {}
-                    }
-                }
-                l.sync_legacy_from_primary_clip();
-                let _ = visible_sec;
-            }
-        }
-        if let Some((idx, clip_id, hit, delta_sec)) = music_drag {
-            if let Some(l) = app.project.document.layers.get_mut(idx) {
-                if let Some(clip) = l.music_clips.iter_mut().find(|c| c.id == clip_id) {
-                    match hit {
-                        crate::av_ui::AvClipHit::MusicBody(_) => {
-                            clip.timeline_start_sec =
-                                (clip.timeline_start_sec + delta_sec).max(0.0);
-                            clip.track_row = 0;
-                        }
-                        crate::av_ui::AvClipHit::MusicTrimStart(_) => {
-                            let ns = (clip.timeline_start_sec + delta_sec).max(0.0);
-                            let shift = ns - clip.timeline_start_sec;
-                            clip.timeline_start_sec = ns;
-                            clip.duration_sec = (clip.duration_sec - shift).max(0.1);
-                        }
-                        crate::av_ui::AvClipHit::MusicTrimEnd(_) => {
-                            clip.duration_sec = (clip.duration_sec + delta_sec).max(0.1);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        if scroll_delta_timeline != 0.0 {
+        if scroll_delta_timeline != 0.0 && app.av_timeline_drag.is_none() {
             if scroll_follow_disable {
                 app.anim_timeline_follow = false;
             }
             scroll = (scroll - scroll_delta_timeline).max(0.0);
         }
 
-        // Active Track Details
-        if let Some(layer) = app.project.document.active_layer_mut() {
-            if layer.kind == crate::document::LayerKind::AV {
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
+        // Active Track Details — edit the **selected** clip only (never other queue items).
+        let active_layer_idx = app.project.document.active_layer_index;
+        let selected_clip_id = {
+            let layer = app.project.document.layers.get(active_layer_idx);
+            layer.and_then(|l| {
+                if l.kind != crate::document::LayerKind::AV {
+                    return None;
+                }
+                // Prefer selected clip on this layer; else clip under playhead; else first.
+                let t = app.anim_current_frame as f32 / app.anim_fps as f32;
+                l.av_clips
+                    .iter()
+                    .find(|c| app.selection.contains(&c.id))
+                    .map(|c| c.id)
+                    .or_else(|| {
+                        l.av_clips
+                            .iter()
+                            .find(|c| c.contains_timeline_sec(t))
+                            .map(|c| c.id)
+                    })
+                    .or_else(|| l.av_clips.first().map(|c| c.id))
+            })
+        };
 
-                ui.horizontal(|ui| {
-                    let display_active_name = if layer.name.chars().count() > 18 {
-                        let mut res: String = layer.name.chars().take(15).collect();
-                        res.push_str("...");
-                        res
-                    } else {
-                        layer.name.clone()
-                    };
-                    ui.label(RichText::new(format!("Active Track Details: {}", display_active_name)).strong().color(colors::ACCENT));
-                    ui.add_space(16.0);
-
-                    ui.label("Volume:");
-                    let mut vol_percent = (layer.volume * 100.0) as i32;
-                    if ui.add(egui::Slider::new(&mut vol_percent, 0..=100).suffix("%")).changed() {
-                        layer.volume = vol_percent as f32 / 100.0;
-                    }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-
-                    // Ensure a primary clip exists so Trim Start / Play Duration mux correctly.
+        if let Some(clip_id) = selected_clip_id {
+            if let Some(layer) = app.project.document.layers.get_mut(active_layer_idx) {
+                if layer.kind == crate::document::LayerKind::AV {
                     layer.ensure_av_clips();
+                    // Pull this clip into layer fields for the editors.
+                    layer.sync_legacy_from_clip_id(clip_id);
 
-                    let source_cap = layer
-                        .media_source_duration
-                        .filter(|d| *d > 0.05)
-                        .unwrap_or(3600.0);
-                    let trim_max = source_cap.max(0.1);
-
-                    ui.label("Trim Start:");
-                    if layer.video_start_offset > trim_max {
-                        layer.video_start_offset = 0.0;
-                        layer.sync_primary_clip_from_legacy();
-                    }
-                    let mut trim_start = layer.video_start_offset.clamp(0.0, trim_max);
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut trim_start)
-                                .speed(0.1)
-                                .range(0.0..=trim_max)
-                                .suffix("s"),
-                        )
-                        .changed()
-                    {
-                        layer.video_start_offset = trim_start;
-                        // Remaining media after new in-point.
-                        let remaining = (source_cap - trim_start).max(0.1);
-                        if layer.video_play_length > remaining {
-                            layer.video_play_length = remaining;
-                        }
-                        // Push into primary clip — export/mux reads clips, not layer alone.
-                        layer.sync_primary_clip_from_legacy();
-                    }
-
-                    ui.add_space(8.0);
-
-                    ui.label("Play Duration:");
-                    let remaining_after_trim =
-                        (source_cap - layer.video_start_offset.max(0.0)).max(0.1);
-                    let mut play_len = layer.video_play_length;
-                    if play_len >= 3599.0 {
-                        play_len = remaining_after_trim;
-                    }
-                    let play_max = remaining_after_trim;
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut play_len)
-                                .speed(0.1)
-                                .range(0.1..=play_max)
-                                .suffix("s"),
-                        )
-                        .changed()
-                    {
-                        layer.video_play_length = play_len.min(play_max);
-                        layer.sync_primary_clip_from_legacy();
-                    }
-
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     ui.separator();
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
 
-                    ui.label("Bass:");
-                    ui.add(egui::DragValue::new(&mut layer.eq_bass).speed(0.1).range(-12.0..=12.0).suffix("dB"));
-                    ui.label("Mid:");
-                    ui.add(egui::DragValue::new(&mut layer.eq_mid).speed(0.1).range(-12.0..=12.0).suffix("dB"));
-                    ui.label("Treble:");
-                    ui.add(egui::DragValue::new(&mut layer.eq_treble).speed(0.1).range(-12.0..=12.0).suffix("dB"));
-                });
+                    ui.horizontal(|ui| {
+                        let clip_label = layer
+                            .av_clips
+                            .iter()
+                            .find(|c| c.id == clip_id)
+                            .map(|c| safe_trunc_label(&c.name, 24))
+                            .unwrap_or_else(|| "clip".into());
+                        ui.label(
+                            RichText::new(format!("Active Clip: {clip_label}"))
+                                .strong()
+                                .color(colors::ACCENT),
+                        );
+                        ui.add_space(16.0);
+
+                        ui.label("Volume:");
+                        let mut vol_percent = (layer.volume * 100.0) as i32;
+                        if ui
+                            .add(egui::Slider::new(&mut vol_percent, 0..=100).suffix("%"))
+                            .changed()
+                        {
+                            layer.volume = vol_percent as f32 / 100.0;
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        let source_cap = layer
+                            .media_source_duration
+                            .filter(|d| *d > 0.05)
+                            .unwrap_or(3600.0);
+                        let trim_max = source_cap.max(0.1);
+
+                        ui.label("Trim Start:");
+                        if layer.video_start_offset > trim_max {
+                            layer.video_start_offset = 0.0;
+                            layer.sync_clip_from_legacy(clip_id);
+                        }
+                        let mut trim_start = layer.video_start_offset.clamp(0.0, trim_max);
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut trim_start)
+                                    .speed(0.1)
+                                    .range(0.0..=trim_max)
+                                    .suffix("s"),
+                            )
+                            .changed()
+                        {
+                            layer.video_start_offset = trim_start;
+                            let remaining = (source_cap - trim_start).max(0.1);
+                            if layer.video_play_length > remaining {
+                                layer.video_play_length = remaining;
+                            }
+                            layer.sync_clip_from_legacy(clip_id);
+                        }
+
+                        ui.add_space(8.0);
+
+                        ui.label("Play Duration:");
+                        let remaining_after_trim =
+                            (source_cap - layer.video_start_offset.max(0.0)).max(0.1);
+                        let mut play_len = layer.video_play_length;
+                        if play_len >= 3599.0 {
+                            play_len = remaining_after_trim;
+                        }
+                        let play_max = remaining_after_trim;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut play_len)
+                                    .speed(0.1)
+                                    .range(0.1..=play_max)
+                                    .suffix("s"),
+                            )
+                            .changed()
+                        {
+                            layer.video_play_length = play_len.min(play_max);
+                            layer.sync_clip_from_legacy(clip_id);
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        ui.label("Bass:");
+                        ui.add(
+                            egui::DragValue::new(&mut layer.eq_bass)
+                                .speed(0.1)
+                                .range(-12.0..=12.0)
+                                .suffix("dB"),
+                        );
+                        ui.label("Mid:");
+                        ui.add(
+                            egui::DragValue::new(&mut layer.eq_mid)
+                                .speed(0.1)
+                                .range(-12.0..=12.0)
+                                .suffix("dB"),
+                        );
+                        ui.label("Treble:");
+                        ui.add(
+                            egui::DragValue::new(&mut layer.eq_treble)
+                                .speed(0.1)
+                                .range(-12.0..=12.0)
+                                .suffix("dB"),
+                        );
+                    });
+                }
             }
         }
 
@@ -3875,7 +4117,14 @@ fn status_bar_body(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     let btn_play = ui.button(RichText::new(play_icon).font(nerd_font_id(12.0)));
                     if btn_play.clicked() {
                         app.anim_is_playing = !app.anim_is_playing;
-                        if !app.anim_is_playing {
+                        if app.anim_is_playing {
+                            let now = std::time::Instant::now();
+                            app.anim_playback_wall = Some(now);
+                            app.anim_play_origin = Some((now, app.anim_current_frame));
+                            app.anim_time_accumulator = 0.0;
+                        } else {
+                            app.anim_playback_wall = None;
+                            app.anim_play_origin = None;
                             app.stop_all_video_streams();
                         }
                     }
@@ -3891,6 +4140,8 @@ fn status_bar_body(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     if btn_rewind.clicked() {
                         app.anim_current_frame = 0;
                         app.anim_is_playing = false;
+                        app.anim_playback_wall = None;
+                        app.anim_play_origin = None;
                         app.stop_all_video_streams();
                     }
                     btn_rewind.on_hover_text("Back to start");
@@ -4042,6 +4293,64 @@ fn truncate_path_display(path: &str, max_chars: usize) -> String {
     safe_trunc_label(file, max_chars)
 }
 
+/// Track row with a hover-to-show delete control that stays hittable.
+/// Always reserves delete-button space so the pointer can move onto it without the icon vanishing.
+/// Returns true if the label was clicked (select).
+fn track_row_with_hover_delete(
+    ui: &mut Ui,
+    selected: bool,
+    label: RichText,
+    hover_text: &str,
+    delete_tip: &str,
+    clip_id: uuid::Uuid,
+    double_opens_daw: bool,
+    delete_clip: &mut Option<uuid::Uuid>,
+    piano_roll_clip: &mut Option<uuid::Uuid>,
+) -> bool {
+    let mut select = false;
+    let hover_id = ui.make_persistent_id(("track_row_hover", clip_id));
+    let show_del = ui.ctx().data(|d| d.get_temp::<bool>(hover_id)).unwrap_or(false);
+
+    ui.horizontal(|ui| {
+        let resp = ui.selectable_label(selected, label);
+        if resp.clicked() {
+            select = true;
+        }
+        if double_opens_daw && resp.double_clicked() {
+            select = true;
+            *piano_roll_clip = Some(clip_id);
+        }
+        let label_rect = resp.rect;
+
+        // Fixed-size hit target always allocated — no layout gap when icon is hidden.
+        let del_size = egui::vec2(22.0, 18.0);
+        let (del_rect, del_resp) = ui.allocate_exact_size(del_size, egui::Sense::click());
+        let row_rect = label_rect.union(del_rect);
+        let row_hot = ui.rect_contains_pointer(row_rect);
+        ui.ctx().data_mut(|d| d.insert_temp(hover_id, row_hot));
+
+        // Paint on same frame as hover so the icon is reachable immediately.
+        if row_hot || show_del {
+            ui.painter().text(
+                del_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icons::DELETE,
+                nerd_font_id(12.0),
+                egui::Color32::from_rgb(255, 95, 110),
+            );
+            if del_resp.clicked() {
+                *delete_clip = Some(clip_id);
+            }
+            if del_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                del_resp.on_hover_text(delete_tip);
+            }
+        }
+        resp.on_hover_text(hover_text);
+    });
+    select
+}
+
 /// Truncate UI labels without full Unicode scans on multi-megabyte strings.
 /// Caps at `max_chars` chars using a byte pre-limit (O(max_chars), not O(len)).
 fn safe_trunc_label(s: &str, max_chars: usize) -> String {
@@ -4128,11 +4437,35 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             app.add_flowchart_layer(&format!("Flowchart {n}"));
             ui.close();
         }
+        if ui
+            .button(
+                RichText::new(format!("{} Node Editor", icons::NODE_EDITOR))
+                    .font(nerd_font_id(12.0)),
+            )
+            .clicked()
+        {
+            let n = app
+                .project
+                .document
+                .layers
+                .iter()
+                .filter(|l| l.kind == crate::document::LayerKind::NodeEditor)
+                .count()
+                + 1;
+            app.add_node_editor_layer(&format!("Node Editor {n}"));
+            ui.close();
+        }
         #[cfg(not(target_os = "android"))]
         {
-            if ui.button("Video/Audio from file…").clicked() {
+            if ui.button("Media from file… (auto Video/Audio layer)").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Media (AV)", &["mp4", "mkv", "avi", "mov", "webm", "mp3", "wav", "aac", "m4a", "flac", "ogg"])
+                    .add_filter(
+                        "Media",
+                        &[
+                            "mp4", "mkv", "avi", "mov", "webm", "png", "jpg", "jpeg", "webp",
+                            "gif", "mp3", "wav", "aac", "m4a", "flac", "ogg",
+                        ],
+                    )
                     .pick_file()
                 {
                     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -4178,6 +4511,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 crate::document::LayerKind::Image => icons::IMAGE,
                 crate::document::LayerKind::Shading => icons::SHADING,
                 crate::document::LayerKind::Flowchart => icons::FLOWCHART,
+                crate::document::LayerKind::NodeEditor => icons::NODE_EDITOR,
             };
             ui.label(RichText::new(icon).font(nerd_font_id(13.0)));
             let name_w = (ui.available_width() - 28.0).max(48.0);
@@ -4208,39 +4542,128 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             app.delete_layer(i);
             continue;
         }
+        if kind == crate::document::LayerKind::NodeEditor {
+            let layer_id = app.project.document.layers[i].id;
+            app.project.document.layers[i].ensure_node_graph();
+            ui.horizontal(|ui| {
+                if ui
+                    .button(format!("{} New node", icons::ADD))
+                    .on_hover_text("Add a Value node to the graph")
+                    .clicked()
+                {
+                    app.set_active_layer(i);
+                    app.add_graph_node_to_active(crate::document::GraphNodeKind::Value {
+                        value: 0.0,
+                    });
+                }
+                let open = app.node_editor_ui.open_layer_id == Some(layer_id);
+                if ui
+                    .button(
+                        RichText::new(if open {
+                            icons::NODE_EDITOR_HIDE
+                        } else {
+                            icons::NODE_EDITOR_OPEN
+                        })
+                        .font(nerd_font_id(14.0)),
+                    )
+                    .on_hover_text(if open {
+                        "Hide node editor"
+                    } else {
+                        "Open node editor"
+                    })
+                    .clicked()
+                {
+                    if open {
+                        app.node_editor_ui.close();
+                    } else {
+                        app.set_active_layer(i);
+                        app.selection = vec![layer_id];
+                        app.node_editor_ui.open(layer_id);
+                        promote_action_tab(app, ActionTab::Parameter);
+                    }
+                }
+            });
+            if let Some(g) = app.project.document.layers[i].node_graph.as_ref() {
+                ui.label(
+                    RichText::new(format!(
+                        "     {} nodes · {} links",
+                        g.nodes.len(),
+                        g.links.len()
+                    ))
+                    .small()
+                    .weak(),
+                );
+                if let Some(err) = &g.root_error {
+                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), err);
+                }
+            }
+        }
         if kind == crate::document::LayerKind::AV {
             let mut l = app.project.document.layers[i].clone();
             l.ensure_av_clips();
+            let mut delete_clip: Option<uuid::Uuid> = None;
             for clip in l.av_clips.iter().rev() {
                 let selected = app.selection.contains(&clip.id);
-                let cicon = if clip.is_audio_only() { icons::AUDIO } else { icons::VIDEO };
-                let label = RichText::new(format!("     {} {}", cicon, safe_trunc_label(&clip.name, 16)))
-                    .font(nerd_font_id(12.0))
-                    .weak();
-                ui.horizontal(|ui| {
-                    let resp = ui.selectable_label(selected, label);
-                    if resp.clicked() {
-                        app.set_selection(vec![clip.id]);
-                    }
-                    resp.on_hover_text(format!("{}\nPath: {}", clip.name, clip.media_path));
-                });
+                let cicon = if clip.is_audio_only() {
+                    icons::AUDIO
+                } else if clip.is_still_image() {
+                    icons::IMAGE
+                } else {
+                    icons::VIDEO
+                };
+                let label = RichText::new(format!(
+                    "     {} {}",
+                    cicon,
+                    safe_trunc_label(&clip.name, 16)
+                ))
+                .font(nerd_font_id(12.0))
+                .weak();
+                if track_row_with_hover_delete(
+                    ui,
+                    selected,
+                    label,
+                    &format!(
+                        "{}\n{}",
+                        safe_trunc_label(&clip.name, 48),
+                        safe_trunc_label(&clip.media_path, 64)
+                    ),
+                    "Delete track",
+                    clip.id,
+                    false,
+                    &mut delete_clip,
+                    &mut app.piano_roll_clip,
+                ) {
+                    app.set_selection(vec![clip.id]);
+                }
             }
             for mclip in l.music_clips.iter().rev() {
                 let selected = app.selection.contains(&mclip.id);
-                let label = RichText::new(format!("     {} {}", icons::MUSIC, safe_trunc_label(&mclip.name, 16)))
-                    .font(nerd_font_id(12.0))
-                    .weak();
-                ui.horizontal(|ui| {
-                    let resp = ui.selectable_label(selected, label);
-                    if resp.clicked() {
-                        app.set_selection(vec![mclip.id]);
-                    }
-                    if resp.double_clicked() {
-                        app.set_selection(vec![mclip.id]);
-                        app.piano_roll_clip = Some(mclip.id);
-                    }
-                    resp.on_hover_text(format!("{}\nDouble-click to open DAW piano", mclip.name));
-                });
+                let label = RichText::new(format!(
+                    "     {} {}",
+                    icons::MUSIC,
+                    safe_trunc_label(&mclip.name, 16)
+                ))
+                .font(nerd_font_id(12.0))
+                .weak();
+                if track_row_with_hover_delete(
+                    ui,
+                    selected,
+                    label,
+                    &format!(
+                        "{}\nDouble-click to open DAW piano",
+                        safe_trunc_label(&mclip.name, 48)
+                    ),
+                    "Delete DAW track",
+                    mclip.id,
+                    true,
+                    &mut delete_clip,
+                    &mut app.piano_roll_clip,
+                ) {
+                    app.set_selection(vec![mclip.id]);
+                }
+            }
+            if let Some(cid) = delete_clip {
+                app.delete_av_clip(i, cid);
             }
         }
         i += 1;
@@ -4266,16 +4689,28 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     crate::document::LayerKind::AV => format!("{} AV", icons::VIDEO),
                     crate::document::LayerKind::Shading => format!("{} Shading", icons::SHADING),
                     crate::document::LayerKind::Flowchart => format!("{} Flowchart", icons::FLOWCHART),
+                    crate::document::LayerKind::NodeEditor => {
+                        format!("{} Node Editor", icons::NODE_EDITOR)
+                    }
                 };
                 egui::ComboBox::from_id_salt("layer_kind_combo")
                     .selected_text(RichText::new(current_label).font(nerd_font_id(12.0)))
-                    .width(100.0)
+                    .width(120.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut l.kind, crate::document::LayerKind::Image, RichText::new(format!("{} Image", icons::IMAGE)).font(nerd_font_id(12.0)));
                         ui.selectable_value(&mut l.kind, crate::document::LayerKind::AV, RichText::new(format!("{} AV Layer", icons::VIDEO)).font(nerd_font_id(12.0)));
                         ui.selectable_value(&mut l.kind, crate::document::LayerKind::Shading, RichText::new(format!("{} Shading", icons::SHADING)).font(nerd_font_id(12.0)));
                         ui.selectable_value(&mut l.kind, crate::document::LayerKind::Flowchart, RichText::new(format!("{} Flowchart", icons::FLOWCHART)).font(nerd_font_id(12.0)));
+                        ui.selectable_value(
+                            &mut l.kind,
+                            crate::document::LayerKind::NodeEditor,
+                            RichText::new(format!("{} Node Editor", icons::NODE_EDITOR))
+                                .font(nerd_font_id(12.0)),
+                        );
                     });
+                if l.kind == crate::document::LayerKind::NodeEditor {
+                    l.ensure_node_graph();
+                }
             });
 
             if l.kind == crate::document::LayerKind::Shading {
@@ -4417,42 +4852,129 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             }
 
             if l.kind == crate::document::LayerKind::AV {
-                ui.horizontal(|ui| {
-                    ui.label("Path:");
-                    #[cfg(not(target_os = "android"))]
-                    if ui.button("Browse...").clicked() {
-                        let dlg = rfd::FileDialog::new()
-                            .add_filter("Media (AV)", &["mp4", "mkv", "avi", "mov", "webm", "mp3", "wav", "aac", "m4a", "flac", "ogg"]);
-                        if let Some(path) = dlg.pick_file() {
-                            l.video_path = path.to_string_lossy().into_owned();
-                            probe_media_at = Some(active_idx);
-                        }
-                    }
-                });
-                let path_w = ui.available_width().min(220.0).max(80.0);
-                let path_resp = ui.add(
-                    egui::TextEdit::singleline(&mut l.video_path)
-                        .desired_width(path_w)
-                        .hint_text("media file path"),
+                let role = l.av_role;
+                ui.label(
+                    RichText::new(match role {
+                        crate::document::AvRole::Video => "Video track queue",
+                        crate::document::AvRole::Audio => "Audio track queue",
+                        crate::document::AvRole::Daw => "DAW track queue",
+                    })
+                    .small()
+                    .weak(),
                 );
-                if path_resp.lost_focus() {
-                    probe_media_at = Some(active_idx);
-                }
-                if !l.video_path.is_empty() {
-                    let display = truncate_path_display(&l.video_path, 36);
-                    ui.label(
-                        RichText::new(display)
-                            .small()
-                            .color(colors::TEXT_MUTED),
-                    )
-                    .on_hover_text(&l.video_path);
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Volume:");
-                    ui.add(egui::Slider::new(&mut l.volume, 0.0..=1.0));
-                });
+                ui.add_space(4.0);
+                // Capture role before nested mut borrows end; actions after block.
+                let _ = role;
             }
         });
+    }
+
+    // AV "Add track" actions (outside mut borrow of layer).
+    if let Some(l) = app.project.document.layers.get(active_idx) {
+        if l.kind == crate::document::LayerKind::AV {
+            let role = l.av_role;
+            theme::constraint_block(ui, |ui| {
+                ui.label(RichText::new("Add track").strong());
+                ui.add_space(4.0);
+                match role {
+                    crate::document::AvRole::Video => {
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            if ui
+                                .button(format!("{} From path… (video/image)", icons::VIDEO))
+                                .on_hover_text(
+                                    "Queue a video or image file on this Video layer only",
+                                )
+                                .clicked()
+                            {
+                                let dlg = rfd::FileDialog::new().add_filter(
+                                    "Video / Image",
+                                    &[
+                                        "mp4", "mkv", "avi", "mov", "webm", "m4v", "png", "jpg",
+                                        "jpeg", "webp", "gif", "bmp",
+                                    ],
+                                );
+                                if let Some(path) = dlg.pick_file() {
+                                    let name = path
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned();
+                                    match app.push_media_clip(
+                                        &name,
+                                        path.to_string_lossy().into_owned(),
+                                        true,
+                                    ) {
+                                        Ok(m) => app.status_message = m,
+                                        Err(e) => app.status_message = e,
+                                    }
+                                }
+                            }
+                        }
+                        if ui
+                            .button(format!("{} From object…", icons::IMAGE))
+                            .on_hover_text(
+                                "Rasterize selection / Image object onto this Video layer",
+                            )
+                            .clicked()
+                        {
+                            match app.push_selection_as_av_image_clip() {
+                                Ok(m) => app.status_message = m,
+                                Err(e) => app.status_message = e,
+                            }
+                        }
+                    }
+                    crate::document::AvRole::Audio => {
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            if ui
+                                .button(format!("{} From path… (audio)", icons::AUDIO))
+                                .on_hover_text("Queue an audio file on this Audio layer only")
+                                .clicked()
+                            {
+                                let dlg = rfd::FileDialog::new().add_filter(
+                                    "Audio",
+                                    &["mp3", "wav", "aac", "m4a", "flac", "ogg", "opus"],
+                                );
+                                if let Some(path) = dlg.pick_file() {
+                                    let name = path
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned();
+                                    match app.push_media_clip(
+                                        &name,
+                                        path.to_string_lossy().into_owned(),
+                                        true,
+                                    ) {
+                                        Ok(m) => app.status_message = m,
+                                        Err(e) => app.status_message = e,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    crate::document::AvRole::Daw => {
+                        if ui
+                            .button(format!("{} DAW node (1s)", icons::MUSIC))
+                            .on_hover_text("Create a 1s DAW clip on this layer")
+                            .clicked()
+                        {
+                            app.create_daw_clip_at_playhead();
+                        }
+                    }
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Volume:");
+                    if let Some(layer) = app.project.document.layers.get_mut(active_idx) {
+                        ui.add(egui::Slider::new(&mut layer.volume, 0.0..=1.0));
+                    }
+                })
+                .response
+                .on_hover_text("Layer mix volume (also in Active Track Details)");
+            });
+        }
     }
 
     // Selected Clip Properties Panel
@@ -4554,7 +5076,8 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 });
             }
             if sync_needed {
-                l.sync_legacy_from_primary_clip();
+                // Only refresh layer fields from the clip we edited.
+                l.sync_legacy_from_clip_id(clip_id);
             }
         }
     }
@@ -4627,6 +5150,12 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             }
             crate::document::LayerKind::Flowchart => {
                 ui.label(RichText::new(format!("{} Flowchart", icons::FLOWCHART)).font(nerd_font_id(12.0)));
+            }
+            crate::document::LayerKind::NodeEditor => {
+                ui.label(
+                    RichText::new(format!("{} Node graph", icons::NODE_EDITOR))
+                        .font(nerd_font_id(12.0)),
+                );
             }
             crate::document::LayerKind::AV => {
                 let icon = match av_role {
@@ -8552,6 +9081,35 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                 track_lbl.clone()
             }
         }
+        _ if track_lbl.starts_with("param:") => {
+            // param:{uuid} or param:{uuid}:N
+            let rest = &track_lbl["param:".len()..];
+            let (id_str, comp) = rest
+                .split_once(':')
+                .map(|(a, b)| (a, Some(b)))
+                .unwrap_or((rest, None));
+            let pname = uuid::Uuid::parse_str(id_str)
+                .ok()
+                .and_then(|pid| {
+                    app.project
+                        .document
+                        .layers
+                        .iter()
+                        .find(|l| l.id == node_id)
+                        .and_then(|l| l.node_graph.as_ref())
+                        .and_then(|g| g.parameters.iter().find(|p| p.id == pid))
+                        .map(|p| p.name.clone())
+                })
+                .unwrap_or_else(|| "Param".into());
+            match comp {
+                None => format!("Param · {pname}"),
+                Some("0") => format!("Param · {pname} · 0/X/R"),
+                Some("1") => format!("Param · {pname} · 1/Y/G"),
+                Some("2") => format!("Param · {pname} · B"),
+                Some("3") => format!("Param · {pname} · A"),
+                Some(c) => format!("Param · {pname} · {c}"),
+            }
+        }
         _ => track_lbl.clone(),
     };
     
@@ -8663,6 +9221,31 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                 "stroke_a" => sc[3] as f64,
                 _ => 0.0,
             }
+        } else if track_lbl.starts_with("param:") {
+            let rest = &track_lbl["param:".len()..];
+            let (id_str, comp) = rest
+                .split_once(':')
+                .map(|(a, b)| (a, Some(b)))
+                .unwrap_or((rest, None));
+            uuid::Uuid::parse_str(id_str)
+                .ok()
+                .and_then(|pid| {
+                    app.project
+                        .document
+                        .layers
+                        .iter()
+                        .find(|l| l.id == node_id)
+                        .and_then(|l| l.node_graph.as_ref())
+                        .and_then(|g| g.parameters.iter().find(|p| p.id == pid))
+                        .map(|p| match comp {
+                            None | Some("0") => p.v0,
+                            Some("1") => p.v1,
+                            Some("2") => p.v2,
+                            Some("3") => p.v3,
+                            _ => p.v0,
+                        })
+                })
+                .unwrap_or(0.0)
         } else {
             0.0
         };
@@ -8719,6 +9302,15 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                     anim.stroke_b.clone(),
                     sc[2] as f64,
                 ));
+            } else if track_lbl.starts_with("param:") {
+                if let Some(t) = anim.get_track(&track_lbl) {
+                    tracks_to_draw.push((
+                        track_lbl.clone(),
+                        egui::Color32::from_rgb(200, 160, 60),
+                        t.clone(),
+                        default_val,
+                    ));
+                }
             } else if track_lbl.starts_with("geom_") {
                 if let Ok(idx) = track_lbl["geom_".len()..].parse::<usize>() {
                     let mut grouped = false;
@@ -10180,7 +10772,177 @@ fn graph_stack_formula_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
     }
 }
 
+/// Animation tab for Node Editor graph parameters (keyed on the layer id).
+fn animation_node_editor_params(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_id: uuid::Uuid) {
+    let layer_name = app
+        .project
+        .document
+        .layers
+        .iter()
+        .find(|l| l.id == layer_id)
+        .map(|l| l.name.clone())
+        .unwrap_or_else(|| "Node Editor".into());
+    ui.label(
+        RichText::new(format!("Animation · Node Editor · {layer_name}"))
+            .strong()
+            .color(colors::ACCENT),
+    );
+    ui.label(
+        RichText::new(format!("Current Frame: {}", app.anim_current_frame))
+            .strong(),
+    );
+    ui.separator();
+
+    let params: Vec<(uuid::Uuid, String, crate::document::GraphParamKind, f64, f64, f64, f64)> = {
+        let Some(layer) = app
+            .project
+            .document
+            .layers
+            .iter()
+            .find(|l| l.id == layer_id)
+        else {
+            return;
+        };
+        let Some(g) = layer.node_graph.as_ref() else {
+            ui.label(
+                RichText::new("No graph on this layer.")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            return;
+        };
+        if g.parameters.is_empty() {
+            ui.label(
+                RichText::new("Add parameters on the Parameter tab, then keyframe them here.")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            return;
+        }
+        g.parameters
+            .iter()
+            .map(|p| (p.id, p.name.clone(), p.kind, p.v0, p.v1, p.v2, p.v3))
+            .collect()
+    };
+
+    let frame = app.anim_current_frame;
+    let before_timeline = app.project.anim_timeline.clone();
+    let mut entry = app
+        .project
+        .anim_timeline
+        .nodes
+        .entry(layer_id)
+        .or_default()
+        .clone();
+    let mut entry_changed = false;
+    let mut open_graph: Option<String> = None;
+
+    for (pid, name, kind, v0, v1, v2, v3) in params {
+        ui.group(|ui| {
+            ui.label(RichText::new(&name).strong());
+            let rows: Vec<(String, &str, f64)> = match kind {
+                crate::document::GraphParamKind::Real => {
+                    vec![(format!("param:{pid}"), "value", v0)]
+                }
+                crate::document::GraphParamKind::Color => vec![
+                    (format!("param:{pid}:0"), "R", v0),
+                    (format!("param:{pid}:1"), "G", v1),
+                    (format!("param:{pid}:2"), "B", v2),
+                    (format!("param:{pid}:3"), "A", v3),
+                ],
+                crate::document::GraphParamKind::Position => vec![
+                    (format!("param:{pid}:0"), "X", v0),
+                    (format!("param:{pid}:1"), "Y", v1),
+                ],
+            };
+            for (lbl, comp_name, def) in rows {
+                entry.ensure_track(&lbl);
+                let track = entry
+                    .param_tracks
+                    .entry(lbl.clone())
+                    .or_default();
+                let has_kf = track.keyframes.iter().any(|kf| kf.frame == frame);
+                let val = track.interpolate(frame).unwrap_or(def);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(comp_name).small());
+                    if has_kf {
+                        let mut v = val;
+                        if ui
+                            .add(egui::DragValue::new(&mut v).speed(0.05))
+                            .changed()
+                        {
+                            track.insert(frame, v);
+                            entry_changed = true;
+                        }
+                        if ui.button("🗑").on_hover_text("Delete keyframe").clicked() {
+                            track.keyframes.retain(|kf| kf.frame != frame);
+                            entry_changed = true;
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new(format!("{val:.3} (interp)"))
+                                .small()
+                                .color(colors::TEXT_MUTED),
+                        );
+                        if ui.button("+").on_hover_text("Add keyframe").clicked() {
+                            track.insert(frame, val);
+                            entry_changed = true;
+                        }
+                    }
+                    if ui
+                        .small_button("Graph")
+                        .on_hover_text("Open graph editor for this track")
+                        .clicked()
+                    {
+                        open_graph = Some(lbl.clone());
+                    }
+                });
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    if entry_changed {
+        app.project.anim_timeline.nodes.insert(layer_id, entry);
+        let after_timeline = app.project.anim_timeline.clone();
+        app.history.push(
+            &mut app.project,
+            crate::history::ProjectEdit::PatchTimeline {
+                before: before_timeline,
+                after: after_timeline,
+            },
+        );
+        app.apply_animation_for_frame(app.anim_current_frame);
+    } else if open_graph.is_some() {
+        // Ensure timeline slot exists so the graph editor can sample the track.
+        app.project.anim_timeline.nodes.insert(layer_id, entry);
+    }
+    if let Some(lbl) = open_graph {
+        app.anim_graph_editor_track = Some((layer_id, lbl));
+        app.anim_graph_editor_target_track = None;
+    }
+}
+
 fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+    // Node Editor layer parameters (P3): animate when layer is active, with or without selection.
+    let ne_layer_id = app
+        .project
+        .document
+        .active_layer()
+        .filter(|l| l.kind == crate::document::LayerKind::NodeEditor)
+        .map(|l| l.id);
+    if let Some(layer_id) = ne_layer_id {
+        let sel_is_layer = app.selection.first().copied() == Some(layer_id);
+        let sel_is_doc_node = app
+            .selection
+            .first()
+            .is_some_and(|id| app.project.nodes.get(*id).is_some());
+        if app.selection.is_empty() || sel_is_layer || !sel_is_doc_node {
+            animation_node_editor_params(app, ui, layer_id);
+            return;
+        }
+    }
+
     if app.selection.is_empty() {
         ui.label(RichText::new("Select one object to edit animation properties").color(colors::TEXT_MUTED));
         return;

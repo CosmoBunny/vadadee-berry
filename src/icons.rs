@@ -59,6 +59,14 @@ pub const SHADING: &str = "󰌾";
 /// Live collaboration chat (Nerd Font).
 pub const CHAT: &str = "󰭹";
 pub const COLLAB: &str = "󰒗";
+/// Node Editor layer (nf-md-graph-outline style).
+pub const NODE_EDITOR: &str = "󱁉";
+/// Open node editor dialog.
+pub const NODE_EDITOR_OPEN: &str = "";
+/// Hide node editor dialog.
+pub const NODE_EDITOR_HIDE: &str = "";
+/// Parameters tab.
+pub const PARAMETER: &str = "󰀻";
 
 pub fn nerd_font_id(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name(FONT_NAME.into()))

@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -318,6 +319,9 @@ pub struct NodeAnimation {
     pub stroke_a: KeyframeTrack,
     #[serde(default)]
     pub geom_tracks: Vec<KeyframeTrack>,
+    /// Node Editor graph parameter tracks (`param:{uuid}` / `param:{uuid}:N`).
+    #[serde(default)]
+    pub param_tracks: IndexMap<String, KeyframeTrack>,
     #[serde(default)]
     pub base_fill: Option<Fill>,
     /// Base stroke paint (for solid / gradient tint while color tracks play).
@@ -353,6 +357,13 @@ impl NodeAnimation {
                 }
                 self.geom_tracks.get_mut(idx)
             }
+            _ if label.starts_with("param:") => {
+                Some(
+                    self.param_tracks
+                        .entry(label.to_string())
+                        .or_insert_with(KeyframeTrack::default),
+                )
+            }
             _ => None,
         }
     }
@@ -381,6 +392,7 @@ impl NodeAnimation {
                 let idx: usize = label["geom_".len()..].parse().ok()?;
                 self.geom_tracks.get(idx)
             }
+            _ if label.starts_with("param:") => self.param_tracks.get(label),
             _ => None,
         }
     }
@@ -553,4 +565,21 @@ impl NodeAnimation {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AnimationTimeline {
     pub nodes: std::collections::HashMap<NodeId, NodeAnimation>,
+}
+
+#[cfg(test)]
+mod param_track_tests {
+    use super::*;
+
+    #[test]
+    fn param_track_insert_and_sample() {
+        let mut anim = NodeAnimation::default();
+        let lbl = "param:00000000-0000-0000-0000-000000000001";
+        anim.ensure_track(lbl);
+        anim.get_track_mut(lbl).unwrap().insert(0, 1.0);
+        anim.get_track_mut(lbl).unwrap().insert(10, 11.0);
+        assert!((anim.sample(lbl, 0).unwrap() - 1.0).abs() < 1e-9);
+        assert!((anim.sample(lbl, 5).unwrap() - 6.0).abs() < 1e-9);
+        assert!((anim.sample(lbl, 10).unwrap() - 11.0).abs() < 1e-9);
+    }
 }

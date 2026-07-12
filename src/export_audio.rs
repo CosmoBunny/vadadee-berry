@@ -354,6 +354,7 @@ mod export_audio_tests {
             video_timeline_start: 0.0,
             media_source_duration: Some(180.0),
             track_row: 0,
+            source_node_ids: Vec::new(),
         });
         layer.video_start_offset = 40.0;
         layer.video_play_length = 60.0;
@@ -390,6 +391,7 @@ mod export_audio_tests {
                 video_timeline_start: 0.0,
                 media_source_duration: Some(200.0),
                 track_row: 0,
+                source_node_ids: Vec::new(),
             },
             AvClip {
                 id: Uuid::new_v4(),
@@ -400,6 +402,7 @@ mod export_audio_tests {
                 video_timeline_start: 20.0,
                 media_source_duration: Some(50.0),
                 track_row: 1,
+                source_node_ids: Vec::new(),
             },
         ];
         let mut doc = crate::document::Document::new_empty_project().document;

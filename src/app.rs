@@ -43,6 +43,19 @@ enum GradientFlowTarget {
     Stroke,
 }
 
+/// GPU-resident graph FX texture (egui native TextureId, no CPU pixels).
+#[derive(Debug, Clone)]
+struct GraphGpuFxEntry {
+    id: egui::TextureId,
+    size: [usize; 2],
+    /// Last baked blur (skip re-GPU when unchanged).
+    blur_px: f32,
+    /// Color-only cache key (brightness/contrast/sat/hue).
+    color_key: String,
+    /// Keep wgpu texture alive (egui bind group holds the view; we retain the Texture).
+    _tex: std::sync::Arc<egui_wgpu::wgpu::Texture>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct GradientFlowDrag {
     target: GradientFlowTarget,
@@ -127,6 +140,11 @@ pub struct VadadeeBerryApp {
     pub pixel_cell_size: f32,
     pub anim_current_frame: usize,
     pub anim_is_playing: bool,
+    /// Wall-clock last playback tick so timeline keeps advancing when the window is unfocused.
+    pub anim_playback_wall: Option<std::time::Instant>,
+    /// Absolute wall-clock play origin: (instant when play started, frame at that instant).
+    /// Playhead = start_frame + elapsed * fps — skips frames under load (no lag catch-up).
+    pub anim_play_origin: Option<(std::time::Instant, usize)>,
     pub anim_keyframing_mode: bool,
     pub anim_show_timeline_window: bool,
     pub show_video_editor_window: Option<uuid::Uuid>,
@@ -137,6 +155,10 @@ pub struct VadadeeBerryApp {
     pub piano_zoom: f32,
     pub piano_scroll_offset: f32,
     pub piano_pitch_scroll: f32,
+    /// Sticky AV timeline clip/trim drag (survives clip moving under the cursor).
+    pub av_timeline_drag: Option<crate::av_ui::AvTimelineDrag>,
+    /// Node Editor dialog UI (open layer, tools, selection).
+    pub node_editor_ui: crate::node_editor_ui::NodeEditorUiState,
     pub ui_shading_pass_sel: usize,
     pub anim_time_accumulator: f32,
     pub anim_last_seen_frame: usize,
@@ -326,6 +348,16 @@ pub struct VadadeeBerryApp {
     image_textures: std::collections::HashMap<NodeId, egui::TextureHandle>,
     /// Cached decoded RGBA images for Eyedropper sampling to avoid massive decode frame drops.
     image_pixel_cache: std::collections::HashMap<NodeId, egui::ColorImage>,
+    /// Node Editor file-path image textures (ObjectImage / ObjectVideo stills).
+    graph_path_textures: std::collections::HashMap<String, egui::TextureHandle>,
+    /// GPU-baked FX textures (no CPU readback). Key = fx_cache_key; live path keys use `path|live`.
+    graph_gpu_fx: std::collections::HashMap<String, GraphGpuFxEntry>,
+    /// Decoded base RGBA for graph paths (avoid re-opening files every FX cache miss).
+    graph_base_rgba: std::collections::HashMap<String, image::RgbaImage>,
+    /// Downscaled base (path|side) — avoid re-downscaling full images every frame.
+    graph_preview_rgba: std::collections::HashMap<String, image::RgbaImage>,
+    /// Color-only (no blur) preview cache: path|color|side → rgba.
+    graph_color_rgba: std::collections::HashMap<String, image::RgbaImage>,
     gradient_flow_drag: Option<GradientFlowDrag>,
     canvas_screen_rect: Option<egui::Rect>,
     canvas_origin: Pos2,
@@ -458,6 +490,8 @@ pub struct VideoLayerState {
     pub stream_active: bool,
     /// Last request timestamp in seconds (from egui time) to throttle scrubbing requests.
     pub last_req_time: Option<f64>,
+    /// For object-linked stills: document revision last baked into this texture.
+    pub object_link_rev: Option<u64>,
 }
 
 
@@ -722,6 +756,8 @@ impl VadadeeBerryApp {
             pixel_cell_size: 1.0,
             anim_current_frame: 0,
             anim_is_playing: false,
+            anim_playback_wall: None,
+            anim_play_origin: None,
             anim_keyframing_mode: false,
             anim_show_timeline_window: false,
             show_video_editor_window: None,
@@ -732,6 +768,8 @@ impl VadadeeBerryApp {
             piano_zoom: 1.0,
             piano_scroll_offset: 0.0,
             piano_pitch_scroll: 36.0,
+            av_timeline_drag: None,
+            node_editor_ui: crate::node_editor_ui::NodeEditorUiState::default(),
             ui_shading_pass_sel: 0,
             anim_time_accumulator: 0.0,
             anim_last_seen_frame: 0,
@@ -870,6 +908,11 @@ impl VadadeeBerryApp {
             on_page_text_newly_created: false,
             image_textures: std::collections::HashMap::new(),
             image_pixel_cache: std::collections::HashMap::new(),
+            graph_path_textures: std::collections::HashMap::new(),
+            graph_gpu_fx: std::collections::HashMap::new(),
+            graph_base_rgba: std::collections::HashMap::new(),
+            graph_preview_rgba: std::collections::HashMap::new(),
+            graph_color_rgba: std::collections::HashMap::new(),
             cursor_doc: None,
             action_bar_open: true,
             action_bar_width: 300.0,
@@ -2231,7 +2274,9 @@ impl VadadeeBerryApp {
         );
     }
 
-    pub fn get_max_animation_frame(&self) -> usize {
+    /// Highest content frame (keyframes / AV) — does **not** grow with the playhead.
+    /// Used for loop length so scrubbing/play doesn't expand the span mid-play.
+    pub fn get_content_max_animation_frame(&self) -> usize {
         let mut max_f = 0usize;
         // Only living nodes/layers — deleted objects leave orphan tracks otherwise.
         for (id, anim) in &self.project.anim_timeline.nodes {
@@ -2250,6 +2295,11 @@ impl VadadeeBerryApp {
             }
             for gt in &anim.geom_tracks {
                 if let Some(last) = gt.keyframes.last() {
+                    max_f = max_f.max(last.frame);
+                }
+            }
+            for pt in anim.param_tracks.values() {
+                if let Some(last) = pt.keyframes.last() {
                     max_f = max_f.max(last.frame);
                 }
             }
@@ -2280,12 +2330,16 @@ impl VadadeeBerryApp {
             }
         }
 
-        // Allow extending beyond current content (so user can set keyframes / current frame > prior max)
-        max_f = max_f.max(self.anim_current_frame);
         if max_f == 0 {
             max_f = 300; // default room (~5s @60fps) when project is empty
         }
         max_f
+    }
+
+    pub fn get_max_animation_frame(&self) -> usize {
+        // Scrub room: allow playhead past last keyframe without stretching loop mid-play.
+        self.get_content_max_animation_frame()
+            .max(self.anim_current_frame)
     }
 
     /// Drop animation tracks for nodes/layers that no longer exist.
@@ -2555,6 +2609,98 @@ impl VadadeeBerryApp {
                 }
             }
         }
+
+        // Node Editor graph parameters (layer id → param_* tracks).
+        self.apply_node_editor_param_animation(frame);
+    }
+
+    /// Sample `param:{uuid}` tracks into GraphParam values for Node Editor layers.
+    fn apply_node_editor_param_animation(&mut self, frame: usize) {
+        let layer_ids: Vec<uuid::Uuid> = self
+            .project
+            .document
+            .layers
+            .iter()
+            .filter(|l| l.kind == crate::document::LayerKind::NodeEditor)
+            .map(|l| l.id)
+            .collect();
+        for layer_id in layer_ids {
+            let Some(anim) = self.project.anim_timeline.nodes.get(&layer_id) else {
+                continue;
+            };
+            // Collect (param_id, component, value) samples without holding graph mut.
+            let mut samples: Vec<(uuid::Uuid, Option<usize>, f64)> = Vec::new();
+            let param_meta: Vec<(uuid::Uuid, crate::document::GraphParamKind, f64, f64, f64, f64)> = {
+                let Some(layer) = self
+                    .project
+                    .document
+                    .layers
+                    .iter()
+                    .find(|l| l.id == layer_id)
+                else {
+                    continue;
+                };
+                let Some(g) = layer.node_graph.as_ref() else {
+                    continue;
+                };
+                g.parameters
+                    .iter()
+                    .map(|p| (p.id, p.kind, p.v0, p.v1, p.v2, p.v3))
+                    .collect()
+            };
+            for (pid, kind, v0, v1, v2, v3) in param_meta {
+                let labels = match kind {
+                    crate::document::GraphParamKind::Real => {
+                        vec![(format!("param:{pid}"), None, v0)]
+                    }
+                    crate::document::GraphParamKind::Color => vec![
+                        (format!("param:{pid}:0"), Some(0usize), v0),
+                        (format!("param:{pid}:1"), Some(1), v1),
+                        (format!("param:{pid}:2"), Some(2), v2),
+                        (format!("param:{pid}:3"), Some(3), v3),
+                    ],
+                    crate::document::GraphParamKind::Position => vec![
+                        (format!("param:{pid}:0"), Some(0usize), v0),
+                        (format!("param:{pid}:1"), Some(1), v1),
+                    ],
+                };
+                for (lbl, comp, def) in labels {
+                    if let Some(v) = anim.sample(&lbl, frame) {
+                        samples.push((pid, comp, v));
+                    } else if anim.get_track(&lbl).is_some_and(|t| !t.keyframes.is_empty()) {
+                        // sample returned None only if empty; keep default
+                        let _ = def;
+                    }
+                }
+            }
+            if samples.is_empty() {
+                continue;
+            }
+            let Some(layer) = self
+                .project
+                .document
+                .layers
+                .iter_mut()
+                .find(|l| l.id == layer_id)
+            else {
+                continue;
+            };
+            let Some(g) = layer.node_graph.as_mut() else {
+                continue;
+            };
+            for (pid, comp, v) in samples {
+                if let Some(p) = g.parameters.iter_mut().find(|p| p.id == pid) {
+                    match comp {
+                        None => p.v0 = v,
+                        Some(0) => p.v0 = v,
+                        Some(1) => p.v1 = v,
+                        Some(2) => p.v2 = v,
+                        Some(3) => p.v3 = v,
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     pub fn get_node_geom_floats(&self, id: NodeId) -> Vec<f64> {
@@ -2802,6 +2948,44 @@ impl VadadeeBerryApp {
         );
     }
 
+    pub fn add_node_editor_layer(&mut self, name: &str) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let idx = after.add_node_editor_layer(name);
+        after.active_layer_index = idx;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+        if let Some(layer) = self.project.document.layers.get(idx) {
+            let lid = layer.id;
+            self.selection = vec![lid];
+            self.node_editor_ui.open(lid);
+            crate::ui::promote_action_tab(self, crate::ui::ActionTab::Parameter);
+            self.action_tab = crate::ui::ActionTab::Parameter;
+        }
+        self.status_message = "Node Editor layer created".into();
+    }
+
+    pub fn add_graph_node_to_active(&mut self, kind: crate::document::GraphNodeKind) {
+        let idx = self.project.document.active_layer_index;
+        let Some(layer) = self.project.document.layers.get_mut(idx) else {
+            return;
+        };
+        if layer.kind != crate::document::LayerKind::NodeEditor {
+            self.status_message = "Select a Node Editor layer".into();
+            return;
+        }
+        layer.ensure_node_graph();
+        let Some(g) = layer.node_graph.as_mut() else {
+            return;
+        };
+        let n = g.nodes.len() as f32;
+        let id = g.add_node(kind, 40.0 + n * 12.0, 40.0 + n * 18.0);
+        self.node_editor_ui.selected = Some(id);
+        self.status_message = "Node added".into();
+    }
+
     fn rebalance_active_flowchart_layer_if_any(&mut self) {
         let doc = &self.project.document;
         if let Some(layer) = doc.layers.get(doc.active_layer_index) {
@@ -2906,54 +3090,127 @@ impl VadadeeBerryApp {
         );
     }
 
+    /// Infer AV role from media path. Images → Video. Audio → Audio. Video → Video.
+    fn av_role_for_media_path(path: &str) -> Option<crate::document::AvRole> {
+        use crate::document::AvClip;
+        if AvClip::path_is_audio_only(path) {
+            Some(crate::document::AvRole::Audio)
+        } else if AvClip::path_is_visual_media(path) {
+            Some(crate::document::AvRole::Video)
+        } else {
+            None
+        }
+    }
+
+    /// Push media onto the active AV layer when role matches; otherwise refuse (no cross-type).
+    /// If active is not a matching AV layer, find/create the correct role layer.
     pub fn add_av_layer(&mut self, name: &str, media_path: String) {
         let clean_name = std::path::Path::new(name)
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or(name);
-        let is_audio = crate::document::AvClip::path_is_audio_only(&media_path);
-        let role = if is_audio {
-            crate::document::AvRole::Audio
-        } else {
-            crate::document::AvRole::Video
+            .unwrap_or(name)
+            .to_string();
+        match self.push_media_clip(&clean_name, media_path, false) {
+            Ok(msg) => self.status_message = msg,
+            Err(e) => self.status_message = e,
+        }
+    }
+
+    /// Queue a media file onto the correct Video/Audio layer (role-enforced).
+    /// `require_active_role` — if true, active layer must already match (Layer tab "Add track").
+    pub fn push_media_clip(
+        &mut self,
+        name: &str,
+        media_path: String,
+        require_active_role: bool,
+    ) -> Result<String, String> {
+        use crate::document::{AvClip, AvRole, LayerKind};
+        let Some(role) = Self::av_role_for_media_path(&media_path) else {
+            return Err("Unsupported media type (use video/image for Video layer, audio for Audio)"
+                .into());
+        };
+        let default_name = match role {
+            AvRole::Audio => "Audio",
+            AvRole::Video => "Video",
+            AvRole::Daw => "DAW",
         };
         let before = snapshot_document(&self.project.document);
         let mut after = before.clone();
+
+        if require_active_role {
+            let active = after
+                .active_layer()
+                .ok_or_else(|| "No active layer".to_string())?;
+            if active.kind != LayerKind::AV {
+                return Err("Select a Video or Audio layer first".into());
+            }
+            if active.av_role != role {
+                return Err(match active.av_role {
+                    AvRole::Video => {
+                        "This is a Video layer — add audio on an Audio layer".into()
+                    }
+                    AvRole::Audio => {
+                        "This is an Audio layer — add video/image on a Video layer".into()
+                    }
+                    AvRole::Daw => "This is a DAW layer — use Video/Audio layers for media".into()
+                });
+            }
+        }
+
+        let idx = if require_active_role {
+            after.active_layer_index
+        } else {
+            // Prefer active when matching; else correct role layer; else create.
+            if let Some(l) = after.active_layer() {
+                if l.kind == LayerKind::AV && l.av_role == role {
+                    after.active_layer_index
+                } else {
+                    after.ensure_av_role_layer(role, default_name)
+                }
+            } else {
+                after.ensure_av_role_layer(role, default_name)
+            }
+        };
+
         let path_for_extract = media_path.clone();
-        // Queue onto existing role layer when present; otherwise create a dedicated layer.
-        let default_name = if is_audio { "Audio" } else { "Video" };
-        // Prefer active layer when it matches role (queue onto the selected Video/Audio layer).
-        let idx = after.ensure_av_role_layer(role, default_name);
+        let is_image = AvClip::path_is_still_image(&media_path);
         if let Some(layer) = after.layers.get_mut(idx) {
             layer.av_role = role;
-            // Empty target: set primary path. Non-empty: append to end of queue (after last clip).
+            layer.ensure_av_clips();
             let empty = layer.av_clips.is_empty() && layer.video_path.is_empty();
             let timeline_start = if empty {
                 0.0
             } else {
                 crate::av_ui::queue_append_start_sec(layer)
             };
-            if empty {
-                layer.video_path = media_path.clone();
-                layer.name = if clean_name.is_empty() {
-                    default_name.to_string()
-                } else {
-                    clean_name.to_string()
-                };
-            }
-            let clip_name = if clean_name.is_empty() {
+            let clip_name = if name.is_empty() {
                 default_name.to_string()
             } else {
-                clean_name.to_string()
+                name.to_string()
             };
+            if empty {
+                layer.video_path = media_path.clone();
+                if !name.is_empty() {
+                    layer.name = clip_name.clone();
+                }
+            }
             let mut clip =
-                crate::document::AvClip::new_from_media(clip_name, media_path.clone(), timeline_start);
-            // Unique id per queue item (do not reuse layer.id for later clips).
+                AvClip::new_from_media(clip_name, media_path.clone(), timeline_start);
             if empty {
                 clip.id = layer.id;
             }
-            clip.track_row = 0; // single row per layer — queue is time-ordered, not stacked rows
-            if let Some(dur) = crate::video_decode::probe_media_duration_secs(&media_path) {
+            clip.track_row = 0;
+            if is_image {
+                // Still image: default 5s hold unless probe later overrides.
+                clip.media_source_duration = Some(5.0);
+                clip.video_play_length = 5.0;
+                if empty {
+                    layer.media_source_duration = Some(5.0);
+                    layer.video_play_length = 5.0;
+                }
+            } else if let Some(dur) =
+                crate::video_decode::probe_media_duration_secs(&media_path)
+            {
                 clip.media_source_duration = Some(dur);
                 clip.video_play_length = dur;
                 if empty {
@@ -2969,11 +3226,366 @@ impl VadadeeBerryApp {
             &mut self.project,
             ProjectEdit::PatchDocument { before, after },
         );
-        spawn_video_audio_extract(
-            &path_for_extract,
-            &self.audio_extract_status,
-            &self.audio_pcm_cache,
+        if !is_image {
+            spawn_video_audio_extract(
+                &path_for_extract,
+                &self.audio_extract_status,
+                &self.audio_pcm_cache,
+            );
+        }
+        Ok(format!(
+            "Added {} track to {} layer",
+            if is_image {
+                "image"
+            } else if role == AvRole::Audio {
+                "audio"
+            } else {
+                "video"
+            },
+            default_name
+        ))
+    }
+
+    /// Rasterize selection / image object into a PNG and queue on the active Video layer.
+    pub fn push_selection_as_av_image_clip(&mut self) -> Result<String, String> {
+        use crate::document::{AvRole, LayerKind};
+        let active = self
+            .project
+            .document
+            .active_layer()
+            .ok_or("No active layer")?;
+        if active.kind != LayerKind::AV || active.av_role != AvRole::Video {
+            return Err("Select a Video layer to add an image track from object".into());
+        }
+        if self.selection.is_empty() {
+            return Err("Select an Image object (or any drawable) first".into());
+        }
+
+        let source_ids: Vec<uuid::Uuid> = self.selection.clone();
+        let tmp_dir = std::env::temp_dir().join("vadadee-berry-av");
+        std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+        let staging = tmp_dir.join(format!("obj_stage_{}.png", uuid::Uuid::new_v4().as_simple()));
+
+        self.rasterize_nodes_to_png(&source_ids, &staging)?;
+
+        let name = self
+            .selection
+            .first()
+            .and_then(|id| self.project.nodes.get(*id))
+            .map(|n| n.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "Object".into());
+        let path_str = staging.to_string_lossy().into_owned();
+        self.push_media_clip(&name, path_str, true)?;
+        // Attach live object link; stabilize path to clip id for overwrite refresh.
+        if let Some(layer) = self.project.document.active_layer_mut() {
+            if let Some(clip) = layer.av_clips.last_mut() {
+                let stable = tmp_dir.join(format!("obj_{}.png", clip.id.as_simple()));
+                let _ = std::fs::rename(&staging, &stable)
+                    .or_else(|_| std::fs::copy(&staging, &stable).map(|_| ()));
+                clip.media_path = stable.to_string_lossy().into_owned();
+                clip.source_node_ids = source_ids;
+                clip.name = name;
+            }
+            layer.sync_legacy_from_primary_clip();
+        }
+        Ok("Added live object track (updates when object changes)".into())
+    }
+
+    /// Rasterize one or more document nodes into a PNG path (for object-linked AV tracks).
+    fn rasterize_nodes_to_png(
+        &self,
+        node_ids: &[uuid::Uuid],
+        out_path: &std::path::Path,
+    ) -> Result<(), String> {
+        use crate::document::NodeKind;
+        if node_ids.is_empty() {
+            return Err("No objects to rasterize".into());
+        }
+        // Single Image node → write raw bytes (fast path).
+        if node_ids.len() == 1 {
+            if let Some(node) = self.project.nodes.get(node_ids[0]) {
+                if let NodeKind::Image { bytes, .. } = &node.kind {
+                    std::fs::write(out_path, bytes).map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+            }
+        }
+        let mut bounds: Option<kurbo::Rect> = None;
+        for id in node_ids {
+            let Some(node) = self.project.nodes.get(*id) else {
+                continue;
+            };
+            let b = node.bounds();
+            bounds = Some(match bounds {
+                Some(acc) => acc.union(b),
+                None => b,
+            });
+        }
+        let Some(bounds) = bounds else {
+            return Err("Could not compute object bounds".into());
+        };
+        crate::io::export_selection_raster(
+            &self.project,
+            node_ids,
+            bounds,
+            crate::io::ExportImageFormat::Png,
+            1.0,
+            out_path,
+        )
+        .map_err(|e| format!("Rasterize object failed: {e}"))
+    }
+
+    /// Content fingerprint for live object→track updates (geometry, name, image, anim frame).
+    /// Not limited to history revision so drag / playback update frame-by-frame.
+    fn object_link_content_sig(&self, node_ids: &[uuid::Uuid]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.anim_current_frame.hash(&mut h);
+        self.history.revision().hash(&mut h);
+        for id in node_ids {
+            id.hash(&mut h);
+            let Some(node) = self.project.nodes.get(*id) else {
+                0u8.hash(&mut h);
+                continue;
+            };
+            node.name.hash(&mut h);
+            let b = node.bounds();
+            b.x0.to_bits().hash(&mut h);
+            b.y0.to_bits().hash(&mut h);
+            b.x1.to_bits().hash(&mut h);
+            b.y1.to_bits().hash(&mut h);
+            let (px, py) = node.get_pos();
+            px.to_bits().hash(&mut h);
+            py.to_bits().hash(&mut h);
+            node.get_rotation().to_bits().hash(&mut h);
+            node.get_opacity().to_bits().hash(&mut h);
+            if let crate::document::NodeKind::Image { bytes, width, height, .. } = &node.kind {
+                width.to_bits().hash(&mut h);
+                height.to_bits().hash(&mut h);
+                bytes.len().hash(&mut h);
+                // Sample ends so paint changes invalidate without hashing whole blob every frame.
+                if let Some(b) = bytes.first() {
+                    b.hash(&mut h);
+                }
+                if let Some(b) = bytes.last() {
+                    b.hash(&mut h);
+                }
+                if bytes.len() > 64 {
+                    bytes[bytes.len() / 2].hash(&mut h);
+                }
+            }
+        }
+        h.finish()
+    }
+
+    /// Delete object-linked tracks whose sources are gone; re-bake remaining every content change.
+    fn refresh_object_linked_av_clips(&mut self, ctx: &Context) {
+        // --- 1) Orphan tracks: source object(s) deleted → remove the track ---
+        let mut orphan_clips: Vec<(usize, uuid::Uuid)> = Vec::new();
+        for (li, layer) in self.project.document.layers.iter().enumerate() {
+            if layer.kind != crate::document::LayerKind::AV {
+                continue;
+            }
+            for clip in &layer.av_clips {
+                if clip.source_node_ids.is_empty() {
+                    continue;
+                }
+                let any_alive = clip
+                    .source_node_ids
+                    .iter()
+                    .any(|id| self.project.nodes.get(*id).is_some());
+                if !any_alive {
+                    orphan_clips.push((li, clip.id));
+                }
+            }
+        }
+        if !orphan_clips.is_empty() {
+            let before = snapshot_document(&self.project.document);
+            let mut after = before.clone();
+            let mut removed = 0usize;
+            // Process high indices first so layer indices stay valid if we ever delete layers.
+            orphan_clips.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            for (li, clip_id) in &orphan_clips {
+                if let Some(layer) = after.layers.get_mut(*li) {
+                    let n0 = layer.av_clips.len();
+                    layer.av_clips.retain(|c| c.id != *clip_id);
+                    if layer.av_clips.len() != n0 {
+                        removed += 1;
+                        if layer.av_clips.is_empty() {
+                            layer.video_path.clear();
+                            layer.media_source_duration = None;
+                        } else {
+                            layer.sync_legacy_from_primary_clip();
+                        }
+                    }
+                    self.video_layers.remove(clip_id);
+                }
+                self.selection.retain(|id| id != clip_id);
+                if self.piano_roll_clip == Some(*clip_id) {
+                    self.piano_roll_clip = None;
+                }
+            }
+            if removed > 0 {
+                self.history.push(
+                    &mut self.project,
+                    ProjectEdit::PatchDocument { before, after },
+                );
+                self.status_message = if removed == 1 {
+                    "Deleted track (source object removed)".into()
+                } else {
+                    format!("Deleted {removed} tracks (source objects removed)")
+                };
+                ctx.request_repaint();
+            }
+        }
+
+        // --- 2) Prune dead ids from multi-source links; refresh living ones frame-by-frame ---
+        let mut jobs: Vec<(usize, uuid::Uuid, Vec<uuid::Uuid>, String, u64)> = Vec::new();
+        for (li, layer) in self.project.document.layers.iter().enumerate() {
+            if layer.kind != crate::document::LayerKind::AV {
+                continue;
+            }
+            for clip in &layer.av_clips {
+                if clip.source_node_ids.is_empty() {
+                    continue;
+                }
+                let living: Vec<uuid::Uuid> = clip
+                    .source_node_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| self.project.nodes.get(*id).is_some())
+                    .collect();
+                if living.is_empty() {
+                    continue; // will be removed next frame if race
+                }
+                let sig = self.object_link_content_sig(&living);
+                let stale = self
+                    .video_layers
+                    .get(&clip.id)
+                    .and_then(|s| s.object_link_rev)
+                    .map(|r| r != sig)
+                    .unwrap_or(true);
+                if stale {
+                    jobs.push((
+                        li,
+                        clip.id,
+                        living,
+                        clip.media_path.clone(),
+                        sig,
+                    ));
+                }
+            }
+        }
+
+        // Drop dead source ids on multi-links (keep track).
+        for layer in &mut self.project.document.layers {
+            if layer.kind != crate::document::LayerKind::AV {
+                continue;
+            }
+            for clip in &mut layer.av_clips {
+                if clip.source_node_ids.is_empty() {
+                    continue;
+                }
+                clip.source_node_ids
+                    .retain(|id| self.project.nodes.get(*id).is_some());
+            }
+        }
+
+        if jobs.is_empty() {
+            // Still repaint while any live-linked clip exists and user is dragging / playing,
+            // so content sig can catch mid-drag geometry without waiting for pointer release.
+            let any_linked = self.project.document.layers.iter().any(|l| {
+                l.kind == crate::document::LayerKind::AV
+                    && l.av_clips.iter().any(|c| !c.source_node_ids.is_empty())
+            });
+            if any_linked
+                && (self.anim_is_playing
+                    || self.tools.select.drag_mode.is_some()
+                    || self.tools.select.drag_snapshot.is_empty() == false)
+            {
+                ctx.request_repaint();
+            }
+            return;
+        }
+
+        for (li, clip_id, source_ids, path, sig) in jobs {
+            let out = if path.is_empty() {
+                let tmp = std::env::temp_dir()
+                    .join("vadadee-berry-av")
+                    .join(format!("obj_{}.png", clip_id.as_simple()));
+                let _ = std::fs::create_dir_all(tmp.parent().unwrap_or(std::path::Path::new(".")));
+                tmp
+            } else {
+                std::path::PathBuf::from(&path)
+            };
+            if let Err(e) = self.rasterize_nodes_to_png(&source_ids, &out) {
+                log::warn!("object-linked AV refresh failed for {clip_id}: {e}");
+                continue;
+            }
+            let new_name = source_ids
+                .iter()
+                .find_map(|id| self.project.nodes.get(*id))
+                .map(|n| n.name.clone())
+                .filter(|n| !n.is_empty());
+            let out_str = out.to_string_lossy().into_owned();
+            if let Some(layer) = self.project.document.layers.get_mut(li) {
+                if let Some(clip) = layer.av_clips.iter_mut().find(|c| c.id == clip_id) {
+                    if let Some(n) = new_name {
+                        clip.name = n;
+                    }
+                    clip.media_path = out_str;
+                    clip.source_node_ids = source_ids;
+                }
+            }
+            if let Some(state) = self.video_layers.get_mut(&clip_id) {
+                state.texture = None;
+                state.cached_frame = None;
+                state.cached_source_frame = None;
+                state.object_link_rev = Some(sig);
+            }
+            if self
+                .video_frame_cache
+                .as_ref()
+                .is_some_and(|c| c.layer_id == clip_id)
+            {
+                self.video_frame_cache = None;
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    pub fn delete_av_clip(&mut self, layer_idx: usize, clip_id: uuid::Uuid) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let Some(layer) = after.layers.get_mut(layer_idx) else {
+            return;
+        };
+        if layer.kind != crate::document::LayerKind::AV {
+            return;
+        }
+        layer.ensure_av_clips();
+        let n0 = layer.av_clips.len() + layer.music_clips.len();
+        layer.av_clips.retain(|c| c.id != clip_id);
+        layer.music_clips.retain(|c| c.id != clip_id);
+        if layer.av_clips.len() + layer.music_clips.len() == n0 {
+            return;
+        }
+        if layer.av_clips.is_empty() {
+            layer.video_path.clear();
+            layer.media_source_duration = None;
+        } else {
+            layer.sync_legacy_from_primary_clip();
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
         );
+        self.selection.retain(|id| *id != clip_id);
+        if self.piano_roll_clip == Some(clip_id) {
+            self.piano_roll_clip = None;
+        }
+        self.status_message = "Deleted track".into();
     }
 
     // Back-compat
@@ -4545,6 +5157,9 @@ impl VadadeeBerryApp {
                     }
                 } else if self.on_page_text_edit.is_some() {
                     self.finish_on_page_text_edit();
+                } else if self.node_editor_ui.open_layer_id.is_some() {
+                    // Node Editor owns Esc (unfocus text field, then close dialog).
+                    // Do not cancel tools / deselect canvas objects underneath.
                 } else {
                     self.cancel_tool_to_select();
                 }
@@ -4564,7 +5179,10 @@ impl VadadeeBerryApp {
                 };
             } else if (i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) && !text_focused
             {
-                if let Some((node_id, track_lbl, frame)) = self.anim_selected_keyframe.clone() {
+                // Node Editor dialog handles Delete/Backspace for graph nodes itself.
+                if self.node_editor_ui.open_layer_id.is_some() {
+                    // leave key for node_editor_ui
+                } else if let Some((node_id, track_lbl, frame)) = self.anim_selected_keyframe.clone() {
                     self.delete_keyframe(node_id, &track_lbl, frame);
                 } else if self.tools.active == ToolKind::Node
                     && !self.tools.select.selected_path_points.is_empty()
@@ -4580,7 +5198,14 @@ impl VadadeeBerryApp {
                 // Play/pause on Space
                 if i.key_pressed(Key::Space) {
                     self.anim_is_playing = !self.anim_is_playing;
-                    if !self.anim_is_playing {
+                    if self.anim_is_playing {
+                        let now = std::time::Instant::now();
+                        self.anim_playback_wall = Some(now);
+                        self.anim_play_origin = Some((now, self.anim_current_frame));
+                        self.anim_time_accumulator = 0.0;
+                    } else {
+                        self.anim_playback_wall = None;
+                        self.anim_play_origin = None;
                         self.stop_all_video_streams();
                     }
                     let _ = i.consume_key(egui::Modifiers::NONE, Key::Space);
@@ -4590,6 +5215,8 @@ impl VadadeeBerryApp {
                 if cmd && i.key_pressed(Key::ArrowLeft) {
                     self.anim_current_frame = 0;
                     self.anim_is_playing = false;
+                    self.anim_playback_wall = None;
+                    self.anim_play_origin = None;
                     self.stop_all_video_streams();
                     let _ = i.consume_key(egui::Modifiers::CTRL, Key::ArrowLeft);
                     let _ = i.consume_key(egui::Modifiers::COMMAND, Key::ArrowLeft);
@@ -5373,6 +6000,238 @@ impl VadadeeBerryApp {
         }
     }
 
+    /// Load a filesystem image for Node Editor ObjectImage/ObjectVideo paths.
+    pub fn ensure_graph_path_texture(&mut self, path: &str, ctx: &Context) -> Option<egui::TextureHandle> {
+        if let Some(t) = self.graph_path_textures.get(path) {
+            return Some(t.clone());
+        }
+        let dyn_img = image::open(path).ok()?;
+        let rgba = dyn_img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let pixels = rgba.into_raw();
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+        let handle = ctx.load_texture(
+            format!("vadadee-berry-graph-path-{}", path),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.graph_path_textures.insert(path.to_string(), handle.clone());
+        Some(handle)
+    }
+
+    /// Public wrapper for Node Editor preview popup.
+    pub fn ensure_graph_fx_texture_public(
+        &mut self,
+        path: &str,
+        eval: &crate::document::GraphOutputEval,
+        ctx: &Context,
+    ) -> Option<egui::TextureHandle> {
+        self.ensure_graph_fx_texture(path, eval, ctx)
+    }
+
+    pub fn graph_path_texture_id(&self, key: &str) -> Option<egui::TextureId> {
+        self.graph_path_textures.get(key).map(|t| t.id())
+    }
+
+    pub fn image_texture_id(&self, id: NodeId) -> Option<egui::TextureId> {
+        self.image_textures.get(&id).map(|t| t.id())
+    }
+
+    /// Load path texture with FX. **Blur is GPU-baked** (native texture, no CPU readback).
+    /// While playing, reuses one live TextureId per path; skips re-bake when blur/color unchanged.
+    fn ensure_graph_fx_texture(
+        &mut self,
+        path: &str,
+        eval: &crate::document::GraphOutputEval,
+        ctx: &Context,
+    ) -> Option<egui::TextureHandle> {
+        let animating = self.anim_is_playing;
+        let q = eval.quantized_for_cache(animating);
+
+        let needs_bake = q.needs_pixel_fx() || (q.brightness - 1.0).abs() > 1e-3;
+        if !needs_bake {
+            return self.ensure_graph_path_texture(path, ctx);
+        }
+
+        let key = if animating {
+            // One live GPU slot per path while playing — reblur in place (smooth, no thrash).
+            format!("{path}|live")
+        } else {
+            q.fx_cache_key(path)
+        };
+
+        let br = q.blur_px.clamp(0.0, 64.0) as f32;
+        let color_key = format!(
+            "b{:.3}|c{:.3}|s{:.3}|h{:.2}",
+            q.brightness, q.contrast, q.saturation, q.hue_shift
+        );
+
+        // Exact CPU-handle hit (color-only / fallback path).
+        if br < 0.05 {
+            if let Some(t) = self.graph_path_textures.get(&key) {
+                return Some(t.clone());
+            }
+        } else if let Some(e) = self.graph_gpu_fx.get(&key) {
+            // Hit when blur+color match (critical while playing: don't re-GPU every UI tick).
+            if e.color_key == color_key && (e.blur_px - br).abs() < 0.015 {
+                return None;
+            }
+            if !animating {
+                // Idle scrub: exact key already in map but values differ → fall through to rebake.
+            }
+        }
+
+        if !self.graph_base_rgba.contains_key(path) {
+            let dyn_img = image::open(path).ok()?;
+            self.graph_base_rgba
+                .insert(path.to_string(), dyn_img.to_rgba8());
+        }
+
+        // Tiny while playing so UI can stay near real-time; larger when scrubbing.
+        let max_side = if animating { 128u32 } else { 256u32 };
+        let preview_key = format!("{path}|{max_side}");
+        if !self.graph_preview_rgba.contains_key(&preview_key) {
+            let base = self.graph_base_rgba.get(path)?;
+            let small = crate::document::downscale_rgba_max_side(base, max_side);
+            self.graph_preview_rgba.insert(preview_key.clone(), small);
+        }
+        let preview = self.graph_preview_rgba.get(&preview_key)?.clone();
+
+        if br >= 0.05 {
+            let color_cache_key = format!("{path}|{color_key}|{max_side}");
+            let rgba = if let Some(c) = self.graph_color_rgba.get(&color_cache_key) {
+                c.clone()
+            } else {
+                let mut color_only = q.clone();
+                color_only.blur_px = 0.0;
+                let mut rgba = preview;
+                crate::document::apply_graph_image_fx(&mut rgba, &color_only);
+                self.graph_color_rgba
+                    .insert(color_cache_key, rgba.clone());
+                // Cap color cache.
+                if self.graph_color_rgba.len() > 32 {
+                    self.graph_color_rgba.clear();
+                }
+                rgba
+            };
+
+            // --- GPU blur (preferred) ---
+            if let Some(rs) = self.wgpu_render.clone() {
+                if let Some((tex, view, w, h)) =
+                    crate::shading::graph_blur::GraphBlurEngine::blur_to_texture(
+                        &rs.device,
+                        &rs.queue,
+                        &rgba,
+                        br,
+                    )
+                {
+                    let existing = self.graph_gpu_fx.get(&key).map(|e| e.id);
+                    if let Some(id) =
+                        crate::shading::graph_blur::register_or_update_native(&rs, &view, existing)
+                    {
+                        // Evict old non-live GPU slots for this path.
+                        if !animating {
+                            let prefix = format!("{path}|");
+                            let mut drop_keys: Vec<String> = self
+                                .graph_gpu_fx
+                                .keys()
+                                .filter(|k| {
+                                    k.starts_with(&prefix) && *k != &key && !k.ends_with("|live")
+                                })
+                                .cloned()
+                                .collect();
+                            if drop_keys.len() > 48 {
+                                drop_keys.sort();
+                                let n = drop_keys.len() - 48;
+                                for old in drop_keys.into_iter().take(n) {
+                                    if let Some(e) = self.graph_gpu_fx.remove(&old) {
+                                        crate::shading::graph_blur::free_native_texture(&rs, e.id);
+                                    }
+                                }
+                            }
+                        }
+                        self.graph_gpu_fx.insert(
+                            key,
+                            GraphGpuFxEntry {
+                                id,
+                                size: [w as usize, h as usize],
+                                blur_px: br,
+                                color_key,
+                                _tex: std::sync::Arc::new(tex),
+                            },
+                        );
+                        return None; // draw uses graph_gpu_fx
+                    }
+                }
+            }
+
+            // CPU fallback if GPU unavailable (keep cheap).
+            let mut rgba = rgba;
+            crate::document::continuous_preview_blur_rgba(&mut rgba, br);
+            let (w, h) = rgba.dimensions();
+            let pixels = rgba.into_raw();
+            let color_image =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+            let handle = ctx.load_texture(
+                format!(
+                    "vadadee-berry-gfx-{}",
+                    key.len().wrapping_mul(2654435761) ^ (br.to_bits() as usize)
+                ),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.graph_path_textures.insert(key, handle.clone());
+            return Some(handle);
+        }
+
+        let mut rgba = preview;
+        crate::document::apply_graph_image_fx(&mut rgba, &q);
+        let (w, h) = rgba.dimensions();
+        let pixels = rgba.into_raw();
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+        let handle = ctx.load_texture(
+            format!(
+                "vadadee-berry-gfx-{}",
+                key.len().wrapping_mul(2654435761) ^ (q.blur_px.to_bits() as usize)
+            ),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.graph_path_textures.insert(key, handle.clone());
+        Some(handle)
+    }
+
+    /// Resolve a graph file (+FX) texture for canvas paint: GPU native or egui handle.
+    fn graph_fx_paint_tex(
+        &self,
+        path: &str,
+        eval: &crate::document::GraphOutputEval,
+    ) -> Option<(egui::TextureId, [usize; 2])> {
+        let animating = self.anim_is_playing;
+        let q = eval.quantized_for_cache(animating);
+        let needs_bake = q.needs_pixel_fx() || (q.brightness - 1.0).abs() > 1e-3;
+        if !needs_bake {
+            let t = self.graph_path_textures.get(path)?;
+            return Some((t.id(), t.size()));
+        }
+        let key = if animating {
+            format!("{path}|live")
+        } else {
+            q.fx_cache_key(path)
+        };
+        if let Some(e) = self.graph_gpu_fx.get(&key) {
+            return Some((e.id, e.size));
+        }
+        if let Some(t) = self.graph_path_textures.get(&key) {
+            return Some((t.id(), t.size()));
+        }
+        self.graph_path_textures
+            .get(path)
+            .map(|t| (t.id(), t.size()))
+    }
+
 fn run_video_decode_thread(
     rx_cmd: std::sync::mpsc::Receiver<VideoCommand>,
     tx_frame: std::sync::mpsc::Sender<(usize, usize, u32, u32, Vec<u8>)>,
@@ -5514,17 +6373,19 @@ fn run_video_decode_thread(
                     requested_frame: None,
                     stream_active: false,
                     last_req_time: None,
+                    object_link_rev: None,
                 }
             });
 
             // Outside clip window: drop texture so canvas stays blank (no freeze first/last frame).
+            // Still images keep the last texture while active only.
             if !*active {
                 if state.stream_active {
                     let _ = state.tx_cmd.send(VideoCommand::StopStream);
                     state.stream_active = false;
                 }
-                // Drain any late frames without uploading.
                 while state.rx_frame.try_recv().is_ok() {}
+                // Drop video frames when inactive; still images also clear so they don't linger.
                 state.texture = None;
                 state.cached_frame = None;
                 state.cached_source_frame = None;
@@ -5535,6 +6396,50 @@ fn run_video_decode_thread(
                     .is_some_and(|c| c.layer_id == *layer_id)
                 {
                     self.video_frame_cache = None;
+                }
+                continue;
+            }
+
+            // Static / animated-image files: load into texture (no FFmpeg).
+            // Object-linked tracks clear texture when sources change (see refresh_object_linked_av_clips).
+            if crate::document::AvClip::path_is_still_image(video_path) {
+                if state.texture.is_none() {
+                    if let Ok(dyn_img) = image::open(video_path) {
+                        let rgba = dyn_img.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        let mut pixels = rgba.into_raw();
+                        if *hue != 0.0 || *sat != 1.0 || *bright != 1.0 || *contrast != 1.0 {
+                            let mut img =
+                                image::RgbaImage::from_raw(w, h, pixels).unwrap_or_default();
+                            apply_color_controls(&mut img, *hue, *sat, *bright, *contrast);
+                            pixels = img.into_raw();
+                        }
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            &pixels,
+                        );
+                        // Unique texture name so egui doesn't keep a stale GPU handle.
+                        let handle = ctx.load_texture(
+                            format!(
+                                "vadadee-img-{}-{}",
+                                layer_id.as_simple(),
+                                self.history.revision()
+                            ),
+                            color_image,
+                            egui::TextureOptions::default(),
+                        );
+                        state.texture = Some(handle.clone());
+                        state.cached_frame = Some(current_frame);
+                        // Keep object_link_rev from refresh_object_linked_av_clips (content sig).
+                        // Do not overwrite with history revision — that would re-bake every frame.
+                        self.video_frame_cache = Some(VideoFrameCache {
+                            layer_id: *layer_id,
+                            frame: current_frame,
+                            texture: handle,
+                        });
+                    }
+                } else {
+                    state.cached_frame = Some(current_frame);
                 }
                 continue;
             }
@@ -5866,7 +6771,30 @@ fn run_video_decode_thread(
             }
 
             // Async video decode: non-blocking poll + kick off background decode if needed
+            self.refresh_object_linked_av_clips(&ctx);
             self.tick_video_layers(&ctx);
+
+            // Warm Node Editor Output Object textures (include blur bake when not playing).
+            let graph_evals: Vec<(String, crate::document::GraphOutputEval)> = self
+                .project
+                .document
+                .layers
+                .iter()
+                .filter(|l| l.kind == crate::document::LayerKind::NodeEditor && l.visible)
+                .filter_map(|l| l.node_graph.as_ref())
+                .filter_map(|g| {
+                    let eval = g.resolve_output_image();
+                    match &eval.image {
+                        crate::document::GraphImageSource::FilePath(p) => {
+                            Some((p.clone(), eval))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            for (path, eval) in &graph_evals {
+                let _ = self.ensure_graph_fx_texture(path, eval, &ctx);
+            }
 
             let mut hidden_sources = self.hidden_canvas_sources();
             hidden_sources.extend(path_effect_form_node_ids(
@@ -6108,6 +7036,175 @@ fn run_video_decode_thread(
                         // with heavy raymarch WGSL was melting the UI (~7 FPS).
                         if layer.shading_passes.iter().any(|p| p.enabled) {
                             ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                        }
+                    }
+                    crate::document::LayerKind::NodeEditor => {
+                        // P2/P4: composite Output Object + effect chain onto the canvas.
+                        if let Some(g) = &layer.node_graph {
+                            let eval = g.resolve_output_image();
+                            match &eval.image {
+                                crate::document::GraphImageSource::AppObjects(ids) => {
+                                    if !ids.is_empty() {
+                                        let order: Vec<NodeId> = draw_order
+                                            .iter()
+                                            .copied()
+                                            .filter(|id| ids.contains(id))
+                                            .chain(
+                                                ids.iter()
+                                                    .copied()
+                                                    .filter(|id| !draw_order.contains(id)),
+                                            )
+                                            .collect();
+                                        if !order.is_empty() {
+                                            let mut hide = hidden_sources.clone();
+                                            for id in &order {
+                                                hide.remove(id);
+                                            }
+                                            // Soft multi-pass blur for app objects (continuous radius).
+                                            let blur = eval.blur_px.clamp(0.0, 12.0) as f32;
+                                            if blur > 0.05 {
+                                                let step = blur; // frame-continuous, not max(1.0) steps
+                                                let offsets = [
+                                                    (0.0, 0.0),
+                                                    (step, 0.0),
+                                                    (-step, 0.0),
+                                                    (0.0, step),
+                                                    (0.0, -step),
+                                                    (step * 0.7, step * 0.7),
+                                                    (-step * 0.7, step * 0.7),
+                                                    (step * 0.7, -step * 0.7),
+                                                    (-step * 0.7, -step * 0.7),
+                                                ];
+                                                // Primary draw once; offset hints only as faint overlay.
+                                                render::draw_nodes(
+                                                    &painter,
+                                                    &self.project.nodes,
+                                                    &order,
+                                                    &self.viewport,
+                                                    origin,
+                                                    self.project.document.width as f32,
+                                                    self.project.document.height as f32,
+                                                    &self.selection,
+                                                    &hide,
+                                                    &loft_paths,
+                                                    &self.fonts,
+                                                    &self.image_textures,
+                                                );
+                                                let _ = offsets; // full re-draw offset not available without node translate
+                                            } else {
+                                                render::draw_nodes(
+                                                    &painter,
+                                                    &self.project.nodes,
+                                                    &order,
+                                                    &self.viewport,
+                                                    origin,
+                                                    self.project.document.width as f32,
+                                                    self.project.document.height as f32,
+                                                    &self.selection,
+                                                    &hide,
+                                                    &loft_paths,
+                                                    &self.fonts,
+                                                    &self.image_textures,
+                                                );
+                                            }
+                                            // Effect chip for live algebra-driven params.
+                                            if eval.effects_on_path {
+                                                let chip = format!(
+                                                    "FX b={:.2} sat={:.2} hue={:.0} blur={:.1}",
+                                                    eval.brightness,
+                                                    eval.saturation,
+                                                    eval.hue_shift,
+                                                    eval.blur_px
+                                                );
+                                                let pos =
+                                                    self.viewport.doc_to_screen((12.0, 28.0), origin);
+                                                painter.text(
+                                                    pos,
+                                                    egui::Align2::LEFT_TOP,
+                                                    chip,
+                                                    egui::FontId::proportional(11.0),
+                                                    egui::Color32::from_rgb(200, 180, 90),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                crate::document::GraphImageSource::FilePath(path) => {
+                                    if let Some((tex_id, tex_size)) =
+                                        self.graph_fx_paint_tex(path, &eval)
+                                    {
+                                        let mut dx = layer.x as f64 + eval.geo_off_x;
+                                        let mut dy = layer.y as f64 + eval.geo_off_y;
+                                        let mut rot_deg =
+                                            layer.rotation as f64 + eval.geo_rot_deg;
+                                        let mut layer_opacity = 1.0_f32;
+                                        if let Some(track) =
+                                            self.project.anim_timeline.nodes.get(&layer.id)
+                                        {
+                                            if let Some(o) =
+                                                track.opacity.interpolate(self.anim_current_frame)
+                                            {
+                                                layer_opacity = o as f32;
+                                            }
+                                            if let Some(x) =
+                                                track.pos_x.interpolate(self.anim_current_frame)
+                                            {
+                                                dx = x + eval.geo_off_x;
+                                            }
+                                            if let Some(y) =
+                                                track.pos_y.interpolate(self.anim_current_frame)
+                                            {
+                                                dy = y + eval.geo_off_y;
+                                            }
+                                            if let Some(r) =
+                                                track.rotation.interpolate(self.anim_current_frame)
+                                            {
+                                                rot_deg = r + eval.geo_rot_deg;
+                                            }
+                                        }
+                                        let tex_w = tex_size[0] as f32;
+                                        let tex_h = tex_size[1] as f32;
+                                        let aspect = if tex_h > 0.0 { tex_w / tex_h } else { 1.0 };
+                                        let mut w = layer.width * eval.geo_scale_w as f32;
+                                        let mut h = layer.height * eval.geo_scale_h as f32;
+                                        if layer.aspect_ratio_locked {
+                                            if w / h > aspect {
+                                                w = h * aspect;
+                                            } else {
+                                                h = w / aspect;
+                                            }
+                                        }
+                                        let tl = self.viewport.doc_to_screen((dx, dy), origin);
+                                        let br = self.viewport.doc_to_screen(
+                                            (dx + w as f64, dy + h as f64),
+                                            origin,
+                                        );
+                                        let rect = egui::Rect::from_min_max(tl, br);
+                                        let rot_rad = (rot_deg as f32).to_radians();
+                                        let mirror = eval.geo_mirror.round() as i32;
+                                        paint_rotated_image_mirrored(
+                                            &painter,
+                                            tex_id,
+                                            rect,
+                                            rot_rad,
+                                            layer_opacity.clamp(0.0, 1.0),
+                                            mirror & 1 != 0,
+                                            mirror & 2 != 0,
+                                        );
+                                    }
+                                }
+                                crate::document::GraphImageSource::Empty => {}
+                            }
+                            if let Some(err) = &g.root_error {
+                                let pos = self.viewport.doc_to_screen((12.0, 12.0), origin);
+                                painter.text(
+                                    pos,
+                                    egui::Align2::LEFT_TOP,
+                                    format!("Node Editor: {err}"),
+                                    egui::FontId::proportional(12.0),
+                                    egui::Color32::from_rgb(255, 120, 120),
+                                );
+                            }
                         }
                     }
                     crate::document::LayerKind::Flowchart => {
@@ -7196,19 +8293,29 @@ fn run_video_decode_thread(
             let mut l = layer.clone();
             l.ensure_av_clips();
             for clip in &l.av_clips {
-                if clip.media_path.is_empty() {
+                if clip.media_path.is_empty() || clip.is_still_image() {
+                    continue;
+                }
+                // Audio layer: pure audio. Video layer: demux audio from video containers only.
+                let path = &clip.media_path;
+                let playable = crate::document::AvClip::path_is_audio_only(path)
+                    || is_video_container_ext(path);
+                if !playable {
                     continue;
                 }
                 let start = clip.video_timeline_start;
-                let duration = clip.video_play_length;
+                let duration = clip.timeline_play_secs();
                 if playhead_time >= start && playhead_time < start + duration {
                     active_clip_ids.insert(clip.id);
-                    clip_info_map.insert(clip.id, (
-                        clip.media_path.clone(),
-                        start,
-                        clip.video_start_offset,
-                        layer.volume,
-                    ));
+                    clip_info_map.insert(
+                        clip.id,
+                        (
+                            clip.media_path.clone(),
+                            start,
+                            clip.video_start_offset,
+                            layer.volume,
+                        ),
+                    );
                 }
             }
         }
@@ -9726,6 +10833,35 @@ fn run_video_decode_thread(
         out
     }
 
+    /// Drop broken ObjectFromApp links after document object deletes.
+    fn prune_node_editor_object_links(&mut self) {
+        let living: std::collections::HashSet<uuid::Uuid> =
+            self.project.nodes.map.keys().copied().collect();
+        for layer in &mut self.project.document.layers {
+            if layer.kind != crate::document::LayerKind::NodeEditor {
+                continue;
+            }
+            if let Some(g) = layer.node_graph.as_mut() {
+                g.prune_dead_object_links(&living);
+            }
+        }
+    }
+
+    /// Evaluate Real algebra for every Node Editor layer (frame / time / value / expr / param).
+    fn eval_node_editor_graphs(&mut self) {
+        let frame = self.anim_current_frame;
+        let fps = self.anim_fps.max(1) as f32;
+        for layer in &mut self.project.document.layers {
+            if layer.kind != crate::document::LayerKind::NodeEditor {
+                continue;
+            }
+            layer.ensure_node_graph();
+            if let Some(g) = layer.node_graph.as_mut() {
+                g.eval_reals(frame, fps);
+            }
+        }
+    }
+
     pub fn delete_nodes(&mut self, ids: &[NodeId]) {
         if ids.is_empty() {
             return;
@@ -9774,6 +10910,7 @@ fn run_video_decode_thread(
             },
         );
         self.selection.retain(|id| !expanded.contains(id));
+        self.prune_node_editor_object_links();
     }
 
     pub fn delete_on_page_text_node(&mut self, id: NodeId) {
@@ -12882,9 +14019,407 @@ fn run_video_decode_thread(
         let _ = id;
     }
 
+    /// Resolve Node Editor layer index from optional layer_id / layer_index.
+    fn mcp_resolve_ne_layer_idx(&self, args: &serde_json::Value) -> Result<usize, String> {
+        if let Some(id_str) = args.get("layer_id").and_then(|v| v.as_str()) {
+            let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
+            return self
+                .project
+                .document
+                .layers
+                .iter()
+                .position(|l| l.id == id)
+                .ok_or_else(|| format!("Layer {id_str} not found"));
+        }
+        if let Some(i) = args.get("layer_index").and_then(|v| v.as_u64()) {
+            let i = i as usize;
+            if i >= self.project.document.layers.len() {
+                return Err(format!("layer_index {i} out of range"));
+            }
+            return Ok(i);
+        }
+        let active = self.project.document.active_layer_index;
+        if self
+            .project
+            .document
+            .layers
+            .get(active)
+            .is_some_and(|l| l.kind == crate::document::LayerKind::NodeEditor)
+        {
+            return Ok(active);
+        }
+        self.project
+            .document
+            .layers
+            .iter()
+            .position(|l| l.kind == crate::document::LayerKind::NodeEditor)
+            .ok_or_else(|| {
+                "No Node Editor layer — use add_node_editor_layer first".into()
+            })
+    }
+
+    fn mcp_with_node_graph_mut<R>(
+        &mut self,
+        args: &serde_json::Value,
+        f: impl FnOnce(&mut crate::document::NodeGraph, usize, uuid::Uuid) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let idx = self.mcp_resolve_ne_layer_idx(args)?;
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let layer = after
+            .layers
+            .get_mut(idx)
+            .ok_or("Layer missing")?;
+        if layer.kind != crate::document::LayerKind::NodeEditor {
+            return Err("Layer is not a Node Editor layer".into());
+        }
+        layer.ensure_node_graph();
+        let layer_id = layer.id;
+        let g = layer
+            .node_graph
+            .as_mut()
+            .ok_or("Node graph missing")?;
+        let result = f(g, idx, layer_id)?;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+        Ok(result)
+    }
+
+    fn mcp_node_editor_tool(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Result<String, String> {
+        use crate::mcp::node_editor as ne;
+        match name {
+            "list_graph_node_kinds" => Ok(ne::list_kinds_json()),
+            "add_node_editor_layer" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Node Editor");
+                self.add_node_editor_layer(name);
+                let idx = self.project.document.active_layer_index;
+                let id = self
+                    .project
+                    .document
+                    .layers
+                    .get(idx)
+                    .map(|l| l.id.to_string())
+                    .unwrap_or_default();
+                Ok(format!(
+                    "Added Node Editor layer \"{name}\" id={id} index={idx}"
+                ))
+            }
+            "open_node_editor" => {
+                let idx = self.mcp_resolve_ne_layer_idx(args)?;
+                let layer = self
+                    .project
+                    .document
+                    .layers
+                    .get(idx)
+                    .ok_or("Layer missing")?;
+                if layer.kind != crate::document::LayerKind::NodeEditor {
+                    return Err("Not a Node Editor layer".into());
+                }
+                let lid = layer.id;
+                self.project.document.active_layer_index = idx;
+                self.selection = vec![lid];
+                self.node_editor_ui.open(lid);
+                Ok(format!("Opened Node Editor for layer {lid}"))
+            }
+            "list_graph_nodes" => {
+                let idx = self.mcp_resolve_ne_layer_idx(args)?;
+                let layer = self
+                    .project
+                    .document
+                    .layers
+                    .get(idx)
+                    .ok_or("Layer missing")?;
+                let g = layer
+                    .node_graph
+                    .as_ref()
+                    .ok_or("No node graph on layer")?;
+                let nodes: Vec<_> = g
+                    .nodes
+                    .values()
+                    .map(|n| {
+                        serde_json::json!({
+                            "id": n.id.to_string(),
+                            "name": n.name,
+                            "kind": ne::kind_label(&n.kind),
+                            "title": n.kind.default_title(),
+                            "x": n.x,
+                            "y": n.y,
+                            "ports": ne::ports_json(&n.kind),
+                            "fields": ne::node_fields_json(&n.kind),
+                            "error": n.error,
+                        })
+                    })
+                    .collect();
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "layer_id": layer.id.to_string(),
+                    "layer_index": idx,
+                    "layer_name": layer.name,
+                    "output_node_id": g.output_node_id.map(|id| id.to_string()),
+                    "node_count": nodes.len(),
+                    "nodes": nodes,
+                }))
+                .map_err(|e| e.to_string())
+            }
+            "list_graph_links" => {
+                let idx = self.mcp_resolve_ne_layer_idx(args)?;
+                let layer = self
+                    .project
+                    .document
+                    .layers
+                    .get(idx)
+                    .ok_or("Layer missing")?;
+                let g = layer
+                    .node_graph
+                    .as_ref()
+                    .ok_or("No node graph on layer")?;
+                let links: Vec<_> = g
+                    .links
+                    .iter()
+                    .map(|l| {
+                        serde_json::json!({
+                            "id": l.id.to_string(),
+                            "from_node": l.from_node.to_string(),
+                            "from_port": l.from_port,
+                            "to_node": l.to_node.to_string(),
+                            "to_port": l.to_port,
+                        })
+                    })
+                    .collect();
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "layer_id": layer.id.to_string(),
+                    "link_count": links.len(),
+                    "links": links,
+                }))
+                .map_err(|e| e.to_string())
+            }
+            "get_graph_output" => {
+                let idx = self.mcp_resolve_ne_layer_idx(args)?;
+                let layer = self
+                    .project
+                    .document
+                    .layers
+                    .get(idx)
+                    .ok_or("Layer missing")?;
+                let g = layer
+                    .node_graph
+                    .as_ref()
+                    .ok_or("No node graph on layer")?;
+                let eval = g.resolve_output_image();
+                let image = match &eval.image {
+                    crate::document::GraphImageSource::Empty => {
+                        serde_json::json!({ "type": "empty" })
+                    }
+                    crate::document::GraphImageSource::FilePath(p) => {
+                        serde_json::json!({ "type": "file", "path": p })
+                    }
+                    crate::document::GraphImageSource::AppObjects(ids) => {
+                        serde_json::json!({
+                            "type": "app_objects",
+                            "ids": ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                        })
+                    }
+                };
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "layer_id": layer.id.to_string(),
+                    "image": image,
+                    "blur_px": eval.blur_px,
+                    "brightness": eval.brightness,
+                    "contrast": eval.contrast,
+                    "saturation": eval.saturation,
+                    "hue_shift": eval.hue_shift,
+                    "geo_off_x": eval.geo_off_x,
+                    "geo_off_y": eval.geo_off_y,
+                    "geo_rot_deg": eval.geo_rot_deg,
+                    "geo_scale_w": eval.geo_scale_w,
+                    "geo_scale_h": eval.geo_scale_h,
+                    "effects_on_path": eval.effects_on_path,
+                    "root_error": g.root_error,
+                }))
+                .map_err(|e| e.to_string())
+            }
+            "add_graph_node" => {
+                let kind_str = args
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .ok_or("kind required")?;
+                let mut kind = ne::kind_from_args(kind_str, args)?;
+                let (kind2, param) = ne::attach_param(kind, args)?;
+                kind = kind2;
+                let x = args.get("x").and_then(|v| v.as_f64()).map(|v| v as f32);
+                let y = args.get("y").and_then(|v| v.as_f64()).map(|v| v as f32);
+                let name_opt = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let id = self.mcp_with_node_graph_mut(args, |g, _idx, _lid| {
+                    let nx = x.unwrap_or_else(|| {
+                        40.0 + (g.nodes.len() as f32 % 5.0) * 180.0
+                    });
+                    let ny = y.unwrap_or_else(|| {
+                        40.0 + (g.nodes.len() as f32 / 5.0).floor() * 100.0
+                    });
+                    if let Some(p) = param {
+                        g.parameters.push(p);
+                    }
+                    let nid = g.add_node(kind, nx, ny);
+                    if let Some(n) = name_opt {
+                        if let Some(node) = g.nodes.get_mut(&nid) {
+                            node.name = n;
+                        }
+                    }
+                    Ok(nid)
+                })?;
+                Ok(format!(
+                    "Added graph node {id} kind={kind_str}"
+                ))
+            }
+            "edit_graph_node" => {
+                let node_id = args
+                    .get("node_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("node_id required")?;
+                let nid = uuid::Uuid::parse_str(node_id).map_err(|e| e.to_string())?;
+                self.mcp_with_node_graph_mut(args, |g, _, _| {
+                    let node = g
+                        .nodes
+                        .get_mut(&nid)
+                        .ok_or_else(|| format!("Graph node {node_id} not found"))?;
+                    if let Some(x) = args.get("x").and_then(|v| v.as_f64()) {
+                        node.x = x as f32;
+                    }
+                    if let Some(y) = args.get("y").and_then(|v| v.as_f64()) {
+                        node.y = y as f32;
+                    }
+                    if let Some(n) = args.get("name").and_then(|v| v.as_str()) {
+                        node.name = n.to_string();
+                    }
+                    match &mut node.kind {
+                        crate::document::GraphNodeKind::Value { value } => {
+                            if let Some(v) = args.get("value").and_then(|x| x.as_f64()) {
+                                *value = v;
+                            }
+                        }
+                        crate::document::GraphNodeKind::Expr { expr } => {
+                            if let Some(e) = args.get("expr").and_then(|x| x.as_str()) {
+                                *expr = e.to_string();
+                            }
+                        }
+                        crate::document::GraphNodeKind::ObjectImage { path }
+                        | crate::document::GraphNodeKind::ObjectVideo { path }
+                        | crate::document::GraphNodeKind::ObjectAudio { path } => {
+                            if let Some(p) = args.get("path").and_then(|x| x.as_str()) {
+                                *path = p.to_string();
+                            }
+                        }
+                        crate::document::GraphNodeKind::ObjectFromApp { node_ids } => {
+                            if args.get("app_object_ids").is_some() {
+                                *node_ids = ne::parse_uuid_list(args.get("app_object_ids"));
+                            }
+                        }
+                        _ => {}
+                    }
+                    // Sync param real default value when editing ParamReal via value + parameters list
+                    if let crate::document::GraphNodeKind::ParamReal { param_id } = node.kind {
+                        if let Some(v) = args.get("value").and_then(|x| x.as_f64()) {
+                            if let Some(p) = g.parameters.iter_mut().find(|p| p.id == param_id) {
+                                p.v0 = v;
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
+                Ok(format!("Updated graph node {node_id}"))
+            }
+            "remove_graph_node" => {
+                let node_id = args
+                    .get("node_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("node_id required")?;
+                let nid = uuid::Uuid::parse_str(node_id).map_err(|e| e.to_string())?;
+                self.mcp_with_node_graph_mut(args, |g, _, _| {
+                    if !g.nodes.contains_key(&nid) {
+                        return Err(format!("Graph node {node_id} not found"));
+                    }
+                    g.remove_node(nid);
+                    Ok(())
+                })?;
+                Ok(format!("Removed graph node {node_id}"))
+            }
+            "connect_graph_nodes" => {
+                let from = args
+                    .get("from_node")
+                    .and_then(|v| v.as_str())
+                    .ok_or("from_node required")?;
+                let to = args
+                    .get("to_node")
+                    .and_then(|v| v.as_str())
+                    .ok_or("to_node required")?;
+                let from_id = uuid::Uuid::parse_str(from).map_err(|e| e.to_string())?;
+                let to_id = uuid::Uuid::parse_str(to).map_err(|e| e.to_string())?;
+                let from_port = args
+                    .get("from_port")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("out");
+                let to_port = args
+                    .get("to_port")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("image");
+                self.mcp_with_node_graph_mut(args, |g, _, _| {
+                    g.try_add_link(from_id, from_port, to_id, to_port)?;
+                    Ok(())
+                })?;
+                Ok(format!(
+                    "Connected {from}:{from_port} → {to}:{to_port}"
+                ))
+            }
+            "disconnect_graph_link" => {
+                let link_id = args
+                    .get("link_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                let to_node = args
+                    .get("to_node")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                let to_port = args.get("to_port").and_then(|v| v.as_str());
+                if link_id.is_none() && to_node.is_none() {
+                    return Err("Provide link_id or to_node (+ optional to_port)".into());
+                }
+                let removed = self.mcp_with_node_graph_mut(args, |g, _, _| {
+                    let before = g.links.len();
+                    if let Some(lid) = link_id {
+                        g.links.retain(|l| l.id != lid);
+                    } else if let Some(tn) = to_node {
+                        if let Some(tp) = to_port {
+                            g.links
+                                .retain(|l| !(l.to_node == tn && l.to_port == tp));
+                        } else {
+                            g.links.retain(|l| l.to_node != tn);
+                        }
+                    }
+                    Ok(before.saturating_sub(g.links.len()))
+                })?;
+                Ok(format!("Removed {removed} connector(s)"))
+            }
+            _ => Err(format!("unknown node editor tool: {name}")),
+        }
+    }
+
     fn mcp_drawing_tool(&mut self, name: &str, args: serde_json::Value) -> Result<String, String> {
         use crate::document::{ArcJoin, Fill, Node, NodeKind, TextStyle};
         use crate::mcp::drawing::{fill_from_style, parse_arc_join, style_from_args, stroke_from_style};
+        if crate::mcp::node_editor::is_node_editor_tool(name) {
+            return self.mcp_node_editor_tool(name, &args);
+        }
         if !matches!(name, "add_layer" | "add_shading_layer") {
             self.mcp_ensure_editable()?;
         }
@@ -13229,7 +14764,14 @@ fn run_video_decode_thread(
                     .unwrap_or(true);
                 self.anim_is_playing = playing;
                 if playing {
+                    let now = std::time::Instant::now();
+                    self.anim_playback_wall = Some(now);
+                    self.anim_play_origin = Some((now, self.anim_current_frame));
+                    self.anim_time_accumulator = 0.0;
                     self.apply_animation_for_frame(self.anim_current_frame);
+                } else {
+                    self.anim_playback_wall = None;
+                    self.anim_play_origin = None;
                 }
                 Ok(if playing {
                     format!("Playing from frame {}", self.anim_current_frame)
@@ -14733,19 +16275,61 @@ impl eframe::App for VadadeeBerryApp {
         }
 
         // --- ANIMATION TIMELINE PLAYBACK & RECORDING ---
+        // Wall-clock advance so play continues when the window is unfocused / another workspace.
+        // Unfocused: request 1 FPS UI refresh only (idle render); clock still advances each tick.
         let mut frame_changed = false;
+        let window_focused = ctx.input(|i| i.focused);
         if self.anim_is_playing {
-            let dt = ctx.input(|i| i.stable_dt);
-            self.anim_time_accumulator += dt;
-            let frame_time = 1.0 / (self.anim_fps as f32).max(1.0);
-            if self.anim_time_accumulator >= frame_time {
-                let steps = (self.anim_time_accumulator / frame_time) as usize;
-                self.anim_time_accumulator -= steps as f32 * frame_time;
-                let max_frame = self.get_max_animation_frame();
-                self.anim_current_frame = (self.anim_current_frame + steps) % (max_frame + 1);
-                frame_changed = true;
+            let now = std::time::Instant::now();
+            // Hybrid playhead:
+            // - Track wall-clock "ideal" frame for real-time intent
+            // - Advance at most 1–2 frames per UI tick so a 2 FPS hitch never jumps 4→34
+            // - Rebase origin after steps so backlog is dropped without visual teleport
+            if self.anim_play_origin.is_none() {
+                self.anim_play_origin = Some((now, self.anim_current_frame));
             }
-            ctx.request_repaint(); // Keep ticking
+            let (origin_t, origin_f) = self.anim_play_origin.unwrap();
+            let wall_dt = match self.anim_playback_wall {
+                Some(prev) => now.duration_since(prev).as_secs_f32(),
+                None => ctx.input(|i| i.stable_dt),
+            };
+            self.anim_playback_wall = Some(now);
+
+            let fps = (self.anim_fps as f32).max(1.0);
+            // Content loop only — do not use playhead-inflated max mid-play.
+            let max_frame = self.get_content_max_animation_frame();
+            let span = max_frame.saturating_add(1).max(1);
+            let elapsed = now.duration_since(origin_t).as_secs_f32().clamp(0.0, 3600.0);
+            let ideal = (origin_f.saturating_add((elapsed * fps).floor() as usize)) % span;
+            let cur = self.anim_current_frame % span;
+            let behind = if ideal >= cur {
+                ideal - cur
+            } else {
+                (span - cur) + ideal
+            };
+
+            if behind > 0 {
+                // Cap steps so low UI FPS never skips the whole timeline in one paint.
+                // At 30 UI fps → up to 60 anim fps; at 2 UI fps → 4 anim fps (slow but smooth).
+                let steps = behind.min(2);
+                self.anim_current_frame = (cur + steps) % span;
+                frame_changed = true;
+                // Drop time debt: pretend we are on-time at the displayed frame.
+                self.anim_play_origin = Some((now, self.anim_current_frame));
+            }
+
+            // Quiet unused warning if wall_dt needed later for diagnostics.
+            let _ = wall_dt;
+
+            if window_focused {
+                ctx.request_repaint();
+            } else {
+                // Idle: ~1 UI frame/sec; origin rebase still keeps playhead moving slowly.
+                ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+            }
+        } else {
+            self.anim_playback_wall = None;
+            self.anim_play_origin = None;
         }
 
         let frame_scrubbed = self.anim_current_frame != self.anim_last_seen_frame;
@@ -14770,7 +16354,12 @@ impl eframe::App for VadadeeBerryApp {
                     });
                 }
             }
-        } else if self.anim_keyframing_mode && !self.anim_is_playing && self.tools.select.drag_mode.is_some() {
+        }
+
+        // Node Editor algebra (Value / Frame / Time / Expr / ParamReal) every frame.
+        self.eval_node_editor_graphs();
+
+        if self.anim_keyframing_mode && !self.anim_is_playing && self.tools.select.drag_mode.is_some() {
             // Ensure reference state is populated
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
@@ -15339,6 +16928,8 @@ mod tests {
             pixel_cell_size: 1.0,
                 anim_current_frame: 0,
                 anim_is_playing: false,
+                anim_playback_wall: None,
+                anim_play_origin: None,
                 anim_keyframing_mode: false,
                 anim_show_timeline_window: false,
                 show_video_editor_window: None,
@@ -15349,6 +16940,8 @@ mod tests {
                 piano_zoom: 1.0,
                 piano_scroll_offset: 0.0,
                 piano_pitch_scroll: 36.0,
+                av_timeline_drag: None,
+                node_editor_ui: crate::node_editor_ui::NodeEditorUiState::default(),
                 ui_shading_pass_sel: 0,
                 anim_time_accumulator: 0.0,
                 anim_last_seen_frame: 0,
@@ -15469,6 +17062,11 @@ mod tests {
                 on_page_text_newly_created: false,
                 image_textures: std::collections::HashMap::new(),
                 image_pixel_cache: std::collections::HashMap::new(),
+                graph_path_textures: std::collections::HashMap::new(),
+                graph_gpu_fx: std::collections::HashMap::new(),
+                graph_base_rgba: std::collections::HashMap::new(),
+                graph_preview_rgba: std::collections::HashMap::new(),
+                graph_color_rgba: std::collections::HashMap::new(),
                 cursor_doc: None,
                 action_bar_open: true,
                 action_bar_width: 300.0,
@@ -15725,8 +17323,23 @@ fn resolve_audio_path_for_rodio(
     status_map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
     pcm_cache: &crate::audio_extract::AudioPcmCache,
 ) -> Option<std::path::PathBuf> {
+    use crate::document::AvClip;
+    // Still images / non-audio paths must never hit symphonia (EOF spam every frame).
+    if AvClip::path_is_still_image(video_path) || video_path.is_empty() {
+        return None;
+    }
     if !is_video_container_ext(video_path) {
+        // Pure audio files only (mp3/wav/…). Skip unknown extensions.
+        if !AvClip::path_is_audio_only(video_path) {
+            return None;
+        }
         let pb = std::path::PathBuf::from(video_path);
+        if !pb.is_file() {
+            return None;
+        }
+        if pb.metadata().map(|m| m.len()).unwrap_or(0) < 2048 {
+            return None;
+        }
         crate::audio_extract::spawn_preload_pcm(
             pcm_cache.clone(),
             video_path.to_string(),
@@ -15822,18 +17435,28 @@ fn paint_rotated_image(
     rotation_rad: f32,
     opacity: f32,
 ) {
+    paint_rotated_image_mirrored(painter, texture_id, rect, rotation_rad, opacity, false, false);
+}
+
+fn paint_rotated_image_mirrored(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    rect: egui::Rect,
+    rotation_rad: f32,
+    opacity: f32,
+    flip_h: bool,
+    flip_v: bool,
+) {
     let mut mesh = egui::Mesh::with_texture(texture_id);
     let color = egui::Color32::WHITE.gamma_multiply(opacity);
-    
-    // 4 corners of the rect
+
     let mut points = [
         rect.left_top(),
         rect.right_top(),
         rect.right_bottom(),
         rect.left_bottom(),
     ];
-    
-    // Rotated around center
+
     if rotation_rad != 0.0 {
         let center = rect.center();
         let cos = rotation_rad.cos();
@@ -15845,17 +17468,36 @@ fn paint_rotated_image(
             *pt = center + egui::vec2(rx, ry);
         }
     }
-    
-    // Add 4 vertices
-    mesh.vertices.push(egui::epaint::Vertex { pos: points[0], uv: egui::pos2(0.0, 0.0), color });
-    mesh.vertices.push(egui::epaint::Vertex { pos: points[1], uv: egui::pos2(1.0, 0.0), color });
-    mesh.vertices.push(egui::epaint::Vertex { pos: points[2], uv: egui::pos2(1.0, 1.0), color });
-    mesh.vertices.push(egui::epaint::Vertex { pos: points[3], uv: egui::pos2(0.0, 1.0), color });
-    
-    // Add 2 triangles
+
+    let u0 = if flip_h { 1.0 } else { 0.0 };
+    let u1 = if flip_h { 0.0 } else { 1.0 };
+    let v0 = if flip_v { 1.0 } else { 0.0 };
+    let v1 = if flip_v { 0.0 } else { 1.0 };
+
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[0],
+        uv: egui::pos2(u0, v0),
+        color,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[1],
+        uv: egui::pos2(u1, v0),
+        color,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[2],
+        uv: egui::pos2(u1, v1),
+        color,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[3],
+        uv: egui::pos2(u0, v1),
+        color,
+    });
+
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
-    
+
     painter.add(mesh);
 }
 

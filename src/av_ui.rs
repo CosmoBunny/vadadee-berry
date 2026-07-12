@@ -8,7 +8,8 @@ use crate::document::{AvClip, Layer, LayerKind, MusicClip};
 use crate::icons;
 
 
-const TRIM_HANDLE_W: f32 = 8.0;
+/// Wider handles so trim start/end are easy to grab.
+const TRIM_HANDLE_W: f32 = 14.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AvClipHit {
@@ -20,6 +21,34 @@ pub enum AvClipHit {
     MusicBody(Uuid),
     MusicTrimStart(Uuid),
     MusicTrimEnd(Uuid),
+}
+
+/// Sticky gesture so clip/trim drag does not "slip" into timeline scroll mid-drag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AvDragMode {
+    Move,
+    TrimStart,
+    TrimEnd,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AvTimelineDrag {
+    pub layer_idx: usize,
+    pub clip_id: Uuid,
+    pub is_music: bool,
+    pub mode: AvDragMode,
+    /// Clip timeline start (or DAW start) when the gesture began.
+    pub origin_start_sec: f32,
+    /// Play length / duration when the gesture began.
+    pub origin_len_sec: f32,
+    /// Source in-point when the gesture began (media only).
+    pub origin_offset_sec: f32,
+    /// Pointer X at press (screen).
+    pub origin_pointer_x: f32,
+    /// Track width at press (for sec-per-pixel).
+    pub origin_track_w: f32,
+    /// Visible time span in seconds at press.
+    pub origin_visible_sec: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -151,17 +180,22 @@ pub fn paint_trim_caps(
 }
 
 pub fn hit_test_clip(clip_rect: Rect, pos: egui::Pos2, music_id: Option<Uuid>) -> AvClipHit {
-    if !clip_rect.contains(pos) {
+    // Inflate slightly so short clips / edges are still hittable.
+    let hit_rect = clip_rect.expand2(egui::vec2(2.0, 2.0));
+    if !hit_rect.contains(pos) {
         return AvClipHit::None;
     }
-    let left = Rect::from_min_size(clip_rect.min, egui::vec2(TRIM_HANDLE_W, clip_rect.height()));
+    let handle = TRIM_HANDLE_W.min(clip_rect.width() * 0.35).max(10.0);
+    let left = Rect::from_min_size(clip_rect.min, egui::vec2(handle, clip_rect.height())).expand2(egui::vec2(2.0, 2.0));
     let right = Rect::from_min_size(
-        egui::pos2(clip_rect.max.x - TRIM_HANDLE_W, clip_rect.min.y),
-        egui::vec2(TRIM_HANDLE_W, clip_rect.height()),
-    );
+        egui::pos2(clip_rect.max.x - handle, clip_rect.min.y),
+        egui::vec2(handle, clip_rect.height()),
+    )
+    .expand2(egui::vec2(2.0, 2.0));
     let m_start = |id: Uuid| AvClipHit::MusicTrimStart(id);
     let m_end = |id: Uuid| AvClipHit::MusicTrimEnd(id);
     let m_body = |id: Uuid| AvClipHit::MusicBody(id);
+    // Prefer trim handles when near edges (even if body also covers them).
     if left.contains(pos) {
         return if let Some(id) = music_id {
             m_start(id)
@@ -176,10 +210,50 @@ pub fn hit_test_clip(clip_rect: Rect, pos: egui::Pos2, music_id: Option<Uuid>) -
             AvClipHit::TrimEnd
         };
     }
+    if !clip_rect.contains(pos) {
+        return AvClipHit::None;
+    }
     if let Some(id) = music_id {
         m_body(id)
     } else {
         AvClipHit::Body
+    }
+}
+
+/// Map sticky drag to a new start / length / offset.
+pub fn apply_sticky_drag(
+    drag: &AvTimelineDrag,
+    pointer_x: f32,
+) -> (f32, f32, f32) {
+    let track_w = drag.origin_track_w.max(1.0);
+    let dx_sec = (pointer_x - drag.origin_pointer_x) / track_w * drag.origin_visible_sec;
+    match drag.mode {
+        AvDragMode::Move => {
+            let start = (drag.origin_start_sec + dx_sec).max(0.0);
+            (start, drag.origin_len_sec, drag.origin_offset_sec)
+        }
+        AvDragMode::TrimStart => {
+            // Positive dx → later start (shorter from left); negative → earlier.
+            let mut start = drag.origin_start_sec + dx_sec;
+            let mut len = drag.origin_len_sec - dx_sec;
+            let mut offset = drag.origin_offset_sec + dx_sec;
+            if start < 0.0 {
+                len += start; // start is negative
+                offset -= start; // undo offset for clamped region
+                start = 0.0;
+            }
+            if offset < 0.0 {
+                start -= offset;
+                len += offset;
+                offset = 0.0;
+            }
+            len = len.max(0.1);
+            (start.max(0.0), len, offset.max(0.0))
+        }
+        AvDragMode::TrimEnd => {
+            let len = (drag.origin_len_sec + dx_sec).max(0.1);
+            (drag.origin_start_sec, len, drag.origin_offset_sec)
+        }
     }
 }
 

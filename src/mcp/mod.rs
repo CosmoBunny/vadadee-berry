@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub mod drawing;
+pub mod node_editor;
 pub mod path_parse;
 
 /// Port for the in-app MCP bridge (override with `VADADEE_MCP_PORT`).
@@ -295,6 +296,7 @@ pub fn mcp_tools_list_result() -> Value {
         ),
     ];
     tools.extend(drawing::drawing_tools());
+    tools.extend(node_editor::node_editor_tools());
     json!({ "tools": tools })
 }
 
@@ -391,7 +393,7 @@ fn handle_jsonrpc(shared: &McpShared, req: JsonRpcRequest) -> Option<Value> {
                         .to_string();
                     host_call(shared, McpHostRequest::GetObject { id })
                 }
-                name if is_drawing_tool(name) => {
+                name if is_drawing_tool(name) || node_editor::is_node_editor_tool(name) => {
                     host_call(
                         shared,
                         McpHostRequest::DrawingTool {

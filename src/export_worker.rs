@@ -1147,6 +1147,9 @@ impl<'a> ExportSession<'a> {
                             Some(render_state),
                         );
                     }
+                    crate::document::LayerKind::NodeEditor => {
+                        // Continuous graph output not yet evaluated in export (P2+).
+                    }
                 }
             }
 

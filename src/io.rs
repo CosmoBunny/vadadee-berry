@@ -295,7 +295,10 @@ pub fn document_svg_string(
             }
             crate::document::LayerKind::Shading => {}
             crate::document::LayerKind::Flowchart => {}
-            crate::document::LayerKind::Flowchart => {}
+            crate::document::LayerKind::NodeEditor => {
+                // Node Editor Output Object: app-object sources are drawn as normal
+                // document nodes; file-path sources are not yet inlined into SVG.
+            }
         }
     }
     svg.push_str("</svg>\n");
@@ -1076,6 +1079,9 @@ pub fn composite_export_frame(
                 apply_shading_passes_skia(&mut pixmap, &layer.shading_passes, time_secs);
             }
             crate::document::LayerKind::Flowchart => {}
+            crate::document::LayerKind::NodeEditor => {
+                // Graph output compositing lands in a later phase.
+            }
         }
     }
 

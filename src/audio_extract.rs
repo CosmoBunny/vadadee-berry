@@ -54,6 +54,18 @@ pub fn load_pcm_from_wav(path: &Path) -> Option<CachedPcm> {
 }
 
 pub fn load_pcm_from_file(path: &Path) -> Option<CachedPcm> {
+    let path_str = path.to_string_lossy();
+    // Images / tiny files: never hand to symphonia (probe EOF spam).
+    if crate::document::AvClip::path_is_still_image(path_str.as_ref()) {
+        return None;
+    }
+    if path
+        .metadata()
+        .map(|m| m.len() < 2048)
+        .unwrap_or(true)
+    {
+        return None;
+    }
     if path
         .extension()
         .and_then(|e| e.to_str())
@@ -393,7 +405,16 @@ fn extract_audio_symphonia(input: &Path, output: &Path) -> Result<(), String> {
 
 /// Media duration via symphonia (audio files and many containers).
 pub fn probe_media_duration_symphonia(path: &str) -> Option<f32> {
+    // Never probe still images / non-media — causes ERROR spam ("probe reach EOF").
+    if crate::document::AvClip::path_is_still_image(path) {
+        return None;
+    }
     let path = Path::new(path);
+    let meta = std::fs::metadata(path).ok()?;
+    // Tiny files are never useful media (broken extracts, icons, etc.).
+    if meta.len() < 2048 {
+        return None;
+    }
     let file = File::open(path).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();

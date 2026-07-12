@@ -1,6 +1,7 @@
 //! WGSL shading passes composited over the canvas.
 
 pub mod cpu_effects;
+pub mod graph_blur;
 pub mod procedural_blackhole;
 pub mod wgpu_pass;
 

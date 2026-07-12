@@ -6,6 +6,7 @@ mod av_clip;
 mod music;
 mod shading;
 pub mod flowchart;
+mod node_graph;
 
 pub use av_clip::*;
 pub use node::*;
@@ -14,6 +15,7 @@ pub use style::*;
 pub use animation::*;
 pub use music::*;
 pub use shading::*;
+pub use node_graph::*;
 pub mod expr;
 pub use expr::{eval_expr, eval_expr_vars, ExprError, ExprVars};
 
@@ -88,6 +90,8 @@ pub enum LayerKind {
     Shading,
     /// Dynamic flowchart with nodes and orthogonal paths.
     Flowchart,
+    /// Node-based processing graph (typed ports, Output Object as continuous video sink).
+    NodeEditor,
 }
 
 /// Role of an AV layer in the media queue (video / audio / DAW tracks stay separate).
@@ -172,6 +176,9 @@ pub struct Layer {
     /// WGSL shading passes when `kind == Shading`.
     #[serde(default)]
     pub shading_passes: Vec<ShadingPass>,
+    /// Node graph when `kind == NodeEditor` (one graph per layer).
+    #[serde(default)]
+    pub node_graph: Option<NodeGraph>,
 }
 
 fn default_max_duration() -> f32 {
@@ -231,6 +238,7 @@ impl Layer {
             music_clips: Vec::new(),
             av_role: AvRole::Video,
             shading_passes: Vec::new(),
+            node_graph: None,
         }
     }
 
@@ -271,6 +279,7 @@ impl Layer {
             music_clips: Vec::new(),
             av_role: role,
             shading_passes: Vec::new(),
+            node_graph: None,
         }
     }
 
@@ -318,6 +327,7 @@ impl Layer {
             // Empty by default — callers attach the desired pass (preset / custom / MCP).
             // UI fills vignette only if still empty when the layer is inspected.
             shading_passes: Vec::new(),
+            node_graph: None,
         }
     }
 
@@ -353,6 +363,50 @@ impl Layer {
             music_clips: Vec::new(),
             av_role: AvRole::Video,
             shading_passes: Vec::new(),
+            node_graph: None,
+        }
+    }
+
+    pub fn new_node_editor_layer(id: Uuid, name: String) -> Self {
+        Self {
+            id,
+            name,
+            visible: true,
+            locked: false,
+            nodes: vec![],
+            kind: LayerKind::NodeEditor,
+            video_path: String::new(),
+            volume: 1.0,
+            is_renderer: true,
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            width: A4_WIDTH_PX as f32,
+            height: A4_HEIGHT_PX as f32,
+            aspect_ratio_locked: true,
+            hue: 0.0,
+            saturation: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            eq_bass: 0.0,
+            eq_mid: 0.0,
+            eq_treble: 0.0,
+            video_start_offset: 0.0,
+            video_play_length: 3600.0,
+            video_timeline_start: 0.0,
+            media_source_duration: None,
+            av_clips: Vec::new(),
+            music_clips: Vec::new(),
+            av_role: AvRole::Video,
+            shading_passes: Vec::new(),
+            node_graph: Some(NodeGraph::new_empty()),
+        }
+    }
+
+    /// Ensure node_graph exists for NodeEditor layers.
+    pub fn ensure_node_graph(&mut self) {
+        if self.kind == LayerKind::NodeEditor && self.node_graph.is_none() {
+            self.node_graph = Some(NodeGraph::new_empty());
         }
     }
 
@@ -379,27 +433,32 @@ impl Layer {
     }
 
     pub fn has_canvas_video(&self) -> bool {
-        if self.kind != LayerKind::AV || self.av_role == AvRole::Daw {
-            return false;
-        }
-        if !self.av_clips.is_empty() {
-            return self.av_clips.iter().any(|c| !c.is_audio_only());
-        }
-        !self.video_path.is_empty() && !AvClip::path_is_audio_only(&self.video_path)
-    }
-
-    /// Whether a video frame should be painted on the canvas at timeline time `t` (seconds).
-    pub fn shows_video_at(&self, t: f32) -> bool {
-        if self.kind != LayerKind::AV || !self.visible {
+        if self.kind != LayerKind::AV || matches!(self.av_role, AvRole::Daw | AvRole::Audio) {
             return false;
         }
         if !self.av_clips.is_empty() {
             return self
                 .av_clips
                 .iter()
-                .any(|c| !c.is_audio_only() && !c.media_path.is_empty() && c.contains_timeline_sec(t));
+                .any(|c| !c.is_audio_only() && !c.media_path.is_empty());
         }
-        if self.video_path.is_empty() || AvClip::path_is_audio_only(&self.video_path) {
+        !self.video_path.is_empty() && AvClip::path_is_visual_media(&self.video_path)
+    }
+
+    /// Whether a video/image frame should be painted on the canvas at timeline time `t` (seconds).
+    pub fn shows_video_at(&self, t: f32) -> bool {
+        if self.kind != LayerKind::AV || !self.visible {
+            return false;
+        }
+        if matches!(self.av_role, AvRole::Daw | AvRole::Audio) {
+            return false;
+        }
+        if !self.av_clips.is_empty() {
+            return self.av_clips.iter().any(|c| {
+                !c.is_audio_only() && !c.media_path.is_empty() && c.contains_timeline_sec(t)
+            });
+        }
+        if self.video_path.is_empty() || !AvClip::path_is_visual_media(&self.video_path) {
             return false;
         }
         let start = self.video_timeline_start;
@@ -439,50 +498,49 @@ impl Layer {
         ))
     }
 
-    /// Copy the clip active at `t` (or first clip) into legacy layer fields for details UI.
-    pub fn sync_legacy_from_primary_clip(&mut self) {
-        // Prefer the currently timed clip if any; else first.
-        let pick = self
-            .av_clips
-            .iter()
-            .find(|c| !c.is_audio_only())
-            .or_else(|| self.av_clips.first())
-            .cloned();
-        if let Some(clip) = pick {
+    /// Copy a specific clip into legacy layer fields (details UI).
+    pub fn sync_legacy_from_clip_id(&mut self, clip_id: Uuid) {
+        if let Some(clip) = self.av_clips.iter().find(|c| c.id == clip_id).cloned() {
             self.video_path = clip.media_path;
             self.video_start_offset = clip.video_start_offset;
             self.video_play_length = clip.video_play_length;
             self.video_timeline_start = clip.video_timeline_start;
             self.media_source_duration = clip.media_source_duration;
+        }
+    }
+
+    /// Copy the first visual clip into legacy layer fields for details UI.
+    pub fn sync_legacy_from_primary_clip(&mut self) {
+        let pick = self
+            .av_clips
+            .first()
+            .map(|c| c.id)
+            .or_else(|| self.av_clips.first().map(|c| c.id));
+        if let Some(id) = pick {
+            self.sync_legacy_from_clip_id(id);
         }
     }
 
     /// Sync legacy fields from the video clip covering timeline time `t`.
     pub fn sync_legacy_from_clip_at(&mut self, t: f32) {
-        if let Some(clip) = self
+        if let Some(id) = self
             .av_clips
             .iter()
             .find(|c| !c.is_audio_only() && c.contains_timeline_sec(t))
-            .cloned()
-            .or_else(|| self.av_clips.first().cloned())
+            .map(|c| c.id)
+            .or_else(|| self.av_clips.first().map(|c| c.id))
         {
-            self.video_path = clip.media_path;
-            self.video_start_offset = clip.video_start_offset;
-            self.video_play_length = clip.video_play_length;
-            self.video_timeline_start = clip.video_timeline_start;
-            self.media_source_duration = clip.media_source_duration;
+            self.sync_legacy_from_clip_id(id);
         }
     }
 
-    /// Push Active Track Details trim/duration onto the primary clip.
-    /// Timeline placement stays clip-authoritative (strip drag); only in-point and
-    /// play length are written from the layer fields used by the details bar.
-    pub fn sync_primary_clip_from_legacy(&mut self) {
+    /// Push Active Track Details trim/duration onto **one** clip (never all clips).
+    pub fn sync_clip_from_legacy(&mut self, clip_id: Uuid) {
         if self.kind != LayerKind::AV {
             return;
         }
         self.ensure_av_clips();
-        if let Some(clip) = self.av_clips.first_mut() {
+        if let Some(clip) = self.av_clips.iter_mut().find(|c| c.id == clip_id) {
             if clip.media_path.is_empty() && !self.video_path.is_empty() {
                 clip.media_path = self.video_path.clone();
             }
@@ -490,13 +548,20 @@ impl Layer {
             clip.video_play_length = self.video_play_length.max(0.1);
             if self.media_source_duration.is_some() {
                 clip.media_source_duration = self.media_source_duration;
-            } else if clip.media_source_duration.is_none() {
-                clip.media_source_duration = self.media_source_duration;
             }
         }
     }
 
-    /// Ensure clips exist and primary clip carries layer Trim Start / Play Duration.
+    /// Push Active Track Details onto the first clip only (legacy name kept).
+    pub fn sync_primary_clip_from_legacy(&mut self) {
+        let id = self.av_clips.first().map(|c| c.id);
+        if let Some(id) = id {
+            self.sync_clip_from_legacy(id);
+        }
+    }
+
+    /// Ensure clips exist; push Active Track Details onto the **first** clip only.
+    /// Other queue items keep their own trim/duration (never bulk-overwritten).
     pub fn prepare_av_for_export(&mut self) {
         if self.kind != LayerKind::AV {
             return;
@@ -681,6 +746,12 @@ impl Document {
 
     pub fn add_flowchart_layer(&mut self, name: impl Into<String>) -> usize {
         let layer = Layer::new_flowchart_layer(Uuid::new_v4(), name.into());
+        self.layers.push(layer);
+        self.layers.len() - 1
+    }
+
+    pub fn add_node_editor_layer(&mut self, name: impl Into<String>) -> usize {
+        let layer = Layer::new_node_editor_layer(Uuid::new_v4(), name.into());
         self.layers.push(layer);
         self.layers.len() - 1
     }
