@@ -5529,7 +5529,170 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     }
 }
 
+/// P7e: Color/Stroke panel content when the Output Object proxy Image is selected.
+fn ne_output_proxy_inspector(
+    app: &mut VadadeeBerryApp,
+    ui: &mut Ui,
+    layer_idx: usize,
+    proxy_id: uuid::Uuid,
+) {
+    let (layer_name, layer_id, img_line, snd_line, output_graph_id, (px, py, pw, ph, rot_deg)) = {
+        let Some(layer) = app.project.document.layers.get(layer_idx) else {
+            return;
+        };
+        let g = layer.node_graph.as_ref();
+        let eval = g.map(|g| g.resolve_output_image());
+        let img_line = match eval.as_ref().map(|e| &e.image) {
+            Some(crate::document::GraphImageSource::FilePath(p)) => {
+                let name = std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file");
+                format!("Image: {name}")
+            }
+            Some(crate::document::GraphImageSource::AppObjects(ids)) => {
+                format!("Image: {} app object(s)", ids.len())
+            }
+            Some(crate::document::GraphImageSource::Empty) | None => "Image: —".into(),
+        };
+        let snd = g.map(|g| g.resolve_output_sound());
+        let snd_line = match snd.as_ref().and_then(|s| s.path()) {
+            Some(p) => {
+                let name = std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("audio");
+                format!("Sound: {name}")
+            }
+            None => "Sound: —".into(),
+        };
+        let output_graph_id = g.and_then(|g| {
+            g.nodes
+                .values()
+                .find(|n| matches!(n.kind, crate::document::GraphNodeKind::OutputObject))
+                .map(|n| n.id)
+        });
+        let geom = if let Some(n) = app.project.nodes.get(proxy_id) {
+            if let NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } = &n.kind
+            {
+                (
+                    *x,
+                    *y,
+                    *width,
+                    *height,
+                    n.get_rotation().to_degrees(),
+                )
+            } else {
+                (0.0, 0.0, 0.0, 0.0, 0.0)
+            }
+        } else {
+            (0.0, 0.0, 0.0, 0.0, 0.0)
+        };
+        (
+            layer.name.clone(),
+            layer.id,
+            img_line,
+            snd_line,
+            output_graph_id,
+            geom,
+        )
+    };
+
+    ui.label(
+        RichText::new(format!("{} Output Object", icons::NODE_EDITOR))
+            .strong()
+            .color(colors::ACCENT)
+            .font(nerd_font_id(14.0)),
+    );
+    ui.label(
+        RichText::new(format!("Layer: {layer_name}"))
+            .small()
+            .color(colors::TEXT_MUTED),
+    );
+    ui.add_space(6.0);
+    ui.label(RichText::new(&img_line).color(colors::TEXT));
+    ui.label(RichText::new(&snd_line).color(colors::TEXT));
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.label(RichText::new("Canvas transform").strong());
+    ui.label(
+        RichText::new(format!(
+            "x {:.0}  y {:.0}  ·  {:.0}×{:.0}  ·  rot {:.1}°",
+            px, py, pw, ph, rot_deg
+        ))
+        .small()
+        .color(colors::TEXT_MUTED),
+    );
+    ui.label(
+        RichText::new("Move / scale / rotate with Select on the canvas.")
+            .small()
+            .color(colors::TEXT_MUTED),
+    );
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        if ui
+            .button("Open Node Editor")
+            .on_hover_text("Edit the graph that drives this Output")
+            .clicked()
+        {
+            if let Some(idx) = app
+                .project
+                .document
+                .layers
+                .iter()
+                .position(|l| l.id == layer_id)
+            {
+                app.set_active_layer(idx);
+            }
+            app.node_editor_ui.open(layer_id);
+            if let Some(oid) = output_graph_id {
+                app.node_editor_ui.selected = Some(oid);
+                app.node_editor_ui.selected_link = None;
+            }
+            promote_action_tab(app, ActionTab::Parameter);
+        }
+        if ui
+            .small_button("Select layer")
+            .on_hover_text("Select the Node Editor layer")
+            .clicked()
+        {
+            app.selection = vec![layer_id];
+            if let Some(idx) = app
+                .project
+                .document
+                .layers
+                .iter()
+                .position(|l| l.id == layer_id)
+            {
+                app.set_active_layer(idx);
+            }
+        }
+    });
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new("Graph parameters: Parameter tab · Keyframes: Animation tab")
+            .small()
+            .color(colors::TEXT_MUTED),
+    );
+}
+
 fn appearance_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+    // P7e: NE Output proxy — dedicated inspector (not fill/stroke of empty Image).
+    if app.selection.len() == 1 {
+        let id = app.selection[0];
+        if let Some(layer_idx) = app.project.document.ne_output_proxy_layer_index(id) {
+            ne_output_proxy_inspector(app, ui, layer_idx, id);
+            return;
+        }
+    }
     if app.selection.len() == 1 {
         let id = app.selection[0];
         if let Some(pos) = app.project.document.layers.iter().position(|l| l.id == id) {
@@ -8738,6 +8901,22 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 6.0;
                         
+                        let is_output_proxy = app
+                            .project
+                            .document
+                            .ne_output_proxy_layer_index(node_id)
+                            .is_some();
+                        let pos_label = if is_output_proxy {
+                            "Output Position"
+                        } else {
+                            "Position"
+                        };
+                        let rot_label = if is_output_proxy {
+                            "Output Rotation"
+                        } else {
+                            "Rotation"
+                        };
+
                         if has_pos {
                             let mut plots = vec![
                                 TrackPlotInfo {
@@ -8755,7 +8934,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             ];
                             draw_timeline_track(
                                 ui,
-                                "Position",
+                                pos_label,
                                 Some(node_id),
                                 &mut plots,
                                 &mut curr_frame,
@@ -8782,7 +8961,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             ];
                             draw_timeline_track(
                                 ui,
-                                "Rotation",
+                                rot_label,
                                 Some(node_id),
                                 &mut plots,
                                 &mut curr_frame,
@@ -9090,6 +9269,11 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                             }
                                             let label = if i < GEOM_LABELS.len() { GEOM_LABELS[i] } else { "geom_unknown" };
                                             let default_val = if i < geom_floats.len() { geom_floats[i] } else { 0.0 };
+                                            let is_out = app
+                                                .project
+                                                .document
+                                                .ne_output_proxy_layer_index(node_id)
+                                                .is_some();
                                             let track_name = match &node.kind {
                                                 NodeKind::Rect { .. } => match i {
                                                     0 => "Width".to_string(),
@@ -9097,6 +9281,20 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                                     2 => "Corner Rad".to_string(),
                                                     _ => format!("Geom {}", i),
                                                 },
+                                                NodeKind::Image { .. } => {
+                                                    let base = match i {
+                                                        0 => "Width",
+                                                        1 => "Height",
+                                                        _ => "Geom",
+                                                    };
+                                                    if is_out {
+                                                        format!("Output {base}")
+                                                    } else if i <= 1 {
+                                                        base.to_string()
+                                                    } else {
+                                                        format!("Geom {}", i)
+                                                    }
+                                                }
                                                 NodeKind::Ellipse { .. } => match i {
                                                     0 => "Radius X".to_string(),
                                                     1 => "Radius Y".to_string(),
@@ -11247,7 +11445,17 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         )
     };
     
-    ui.label(RichText::new(format!("Animation for {}", name)).strong().color(colors::ACCENT));
+    let is_output_proxy = app
+        .project
+        .document
+        .ne_output_proxy_layer_index(id)
+        .is_some();
+    let title = if is_output_proxy {
+        format!("Animation · Output Object ({name})")
+    } else {
+        format!("Animation for {name}")
+    };
+    ui.label(RichText::new(title).strong().color(colors::ACCENT));
     ui.add_space(4.0);
     ui.label(RichText::new(format!("Current Frame: {}", app.anim_current_frame)).strong());
     ui.separator();

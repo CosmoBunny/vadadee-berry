@@ -252,28 +252,10 @@ impl<'a> ExportSession<'a> {
         })
     }
 
-    /// Prefer CPU whenever possible (NE FilePath + optional empty vectors + AV).
+    /// Prefer CPU whenever possible (NE FilePath / AppObjects + vectors + AV).
     fn can_fast_cpu_export(&self) -> bool {
-        if self.needs_gpu_export() {
-            return false;
-        }
-        // AppObjects still need vector compositing → fall back to GPU/egui for now.
-        for l in &self.project.document.layers {
-            if !l.visible || !l.is_renderer {
-                continue;
-            }
-            if l.kind == crate::document::LayerKind::NodeEditor {
-                if let Some(g) = &l.node_graph {
-                    if matches!(
-                        g.resolve_output_image().image,
-                        crate::document::GraphImageSource::AppObjects(_)
-                    ) {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
+        // Only WGSL shading requires the GPU/egui path.
+        !self.needs_gpu_export()
     }
 
     /// Fast CPU composite: page + AV frames + NE FilePath (cached bake). No egui/GPU.
@@ -371,6 +353,31 @@ impl<'a> ExportSession<'a> {
                 crate::document::LayerKind::NodeEditor => {}
                 _ => {}
             }
+        }
+
+        // P7c: NE AppObjects — vector SVG of source ids, composited onto the page.
+        for layer in &self.project.document.layers {
+            if !layer.visible
+                || !layer.is_renderer
+                || layer.kind != crate::document::LayerKind::NodeEditor
+            {
+                continue;
+            }
+            let Some(g) = &layer.node_graph else {
+                continue;
+            };
+            let eval = g.resolve_output_image();
+            let crate::document::GraphImageSource::AppObjects(ids) = &eval.image else {
+                continue;
+            };
+            if ids.is_empty() {
+                continue;
+            }
+            let svg = io::document_svg_nodes_only(self.project, ids);
+            if let Ok(tree) = usvg::Tree::from_str(&svg, &usvg_opt) {
+                resvg::render(&tree, svg_scale, &mut pixmap.as_mut());
+            }
+            let _ = time_secs;
         }
 
         // NE FilePath: bake with session caches + sticky last-key reuse.

@@ -184,6 +184,15 @@ pub struct Layer {
     pub ne_output_proxy: Option<Uuid>,
 }
 
+impl Document {
+    /// P7d/e: if `node_id` is a NE Output proxy Image, return owning layer index.
+    pub fn ne_output_proxy_layer_index(&self, node_id: Uuid) -> Option<usize> {
+        self.layers.iter().position(|l| {
+            l.kind == LayerKind::NodeEditor && l.ne_output_proxy == Some(node_id)
+        })
+    }
+}
+
 fn default_max_duration() -> f32 {
     3600.0
 }

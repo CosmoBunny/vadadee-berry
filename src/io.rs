@@ -1004,6 +1004,53 @@ pub fn document_svg_single_image_layer(
     svg
 }
 
+/// SVG containing only the given node ids (P7c: NE AppObjects export).
+/// Transparent background — intended to composite onto an existing pixmap.
+pub fn document_svg_nodes_only(
+    project: &ProjectFile,
+    node_ids: &[crate::document::NodeId],
+) -> String {
+    let (defs_str, clip_map, mask_set) = clip_defs_and_maps(project);
+    let w = project.document.width;
+    let h = project.document.height;
+    let allow: std::collections::HashSet<_> = node_ids.iter().copied().collect();
+    let mut svg = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
+{defs_str}"#,
+    );
+    for layer in &project.document.layers {
+        if !layer.visible {
+            continue;
+        }
+        if layer.kind != crate::document::LayerKind::Image
+            && layer.kind != crate::document::LayerKind::Flowchart
+        {
+            continue;
+        }
+        for id in &layer.nodes {
+            if !allow.contains(id) || mask_set.contains(id) {
+                continue;
+            }
+            let Some(node) = project.nodes.get(*id) else {
+                continue;
+            };
+            let node_svg = node_to_svg_fragment(node, &project.nodes);
+            if let Some(cm) = clip_map.get(id) {
+                svg.push_str(&format!(
+                    r#"<g clip-path="url(#clip-{})">{}</g>"#,
+                    cm.id.as_simple(),
+                    node_svg
+                ));
+            } else {
+                svg.push_str(&node_svg);
+            }
+        }
+    }
+    svg.push_str("</svg>\n");
+    svg
+}
+
 /// Rasterize one image layer to RGBA at `scale` document-pixels per doc unit.
 pub fn rasterize_image_layer(
     project: &ProjectFile,
