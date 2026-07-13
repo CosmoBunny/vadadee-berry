@@ -19,6 +19,10 @@ pub enum ProjectEdit {
         removed_anims: Vec<(NodeId, NodeAnimation)>,
         layer_index: usize,
         layer_nodes_before: Vec<NodeId>,
+        /// P7g: NE `ne_output_proxy` values before clear (restored on undo).
+        /// `(layer_index, previous Option proxy id)`.
+        #[allow(clippy::type_complexity)]
+        ne_proxy_before: Vec<(usize, Option<uuid::Uuid>)>,
     },
     PatchNode {
         id: NodeId,
@@ -154,6 +158,7 @@ fn apply_forward(cmd: &ProjectEdit, project: &mut ProjectFile) {
             removed_anims,
             layer_index,
             layer_nodes_before,
+            ne_proxy_before,
         } => {
             let gone: std::collections::HashSet<_> = removed.iter().map(|(id, _)| *id).collect();
             for (id, _) in removed {
@@ -172,6 +177,12 @@ fn apply_forward(cmd: &ProjectEdit, project: &mut ProjectFile) {
                     .filter(|id| !gone.contains(id))
                     .copied()
                     .collect();
+            }
+            // P7g: clear Output proxy fields that pointed at deleted nodes.
+            for (li, _) in ne_proxy_before {
+                if let Some(layer) = project.document.layers.get_mut(*li) {
+                    layer.ne_output_proxy = None;
+                }
             }
         }
         ProjectEdit::PatchNode { id, after, .. } => {
@@ -231,9 +242,16 @@ fn apply_inverse(cmd: &ProjectEdit, project: &mut ProjectFile) {
             removed_anims,
             layer_index,
             layer_nodes_before,
+            ne_proxy_before,
         } => {
             if let Some(layer) = project.document.layers.get_mut(*layer_index) {
                 layer.nodes = layer_nodes_before.clone();
+            }
+            // Restore Output proxy pointers before re-inserting nodes.
+            for (li, prev) in ne_proxy_before {
+                if let Some(layer) = project.document.layers.get_mut(*li) {
+                    layer.ne_output_proxy = *prev;
+                }
             }
             for (id, node) in removed {
                 project.nodes.map.insert(*id, node.clone());

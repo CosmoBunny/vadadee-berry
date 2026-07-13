@@ -427,8 +427,9 @@ impl Layer {
         }
     }
 
-    /// P6b: ensure a selectable canvas Image proxy for the Output Object.
+    /// P6b/P7g: ensure a selectable canvas Image proxy for the Output Object.
     /// Creates once (empty bytes; live FX texture is painted from the graph).
+    /// Clears stale proxy ids; reuses an existing empty "Output Object" Image if present.
     pub fn ensure_ne_output_proxy(&mut self, nodes: &mut NodeStore) -> Option<Uuid> {
         if self.kind != LayerKind::NodeEditor {
             return None;
@@ -439,6 +440,21 @@ impl Layer {
                     self.nodes.push(id);
                 }
                 return Some(id);
+            }
+            // Stale pointer (deleted without undo restore) — clear and recreate.
+            self.ne_output_proxy = None;
+        }
+        // Prefer an existing empty Output Object Image already on this layer (load/undo).
+        for &nid in &self.nodes {
+            if let Some(n) = nodes.get(nid) {
+                if n.name == "Output Object" {
+                    if let NodeKind::Image { bytes, .. } = &n.kind {
+                        if bytes.is_empty() {
+                            self.ne_output_proxy = Some(nid);
+                            return Some(nid);
+                        }
+                    }
+                }
             }
         }
         let mut node = Node::image(

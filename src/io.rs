@@ -1153,7 +1153,12 @@ pub fn composite_export_frame(
                     if let crate::document::GraphImageSource::FilePath(path) = &eval.image {
                         let max_side = pixel_w.max(pixel_h).clamp(256, 2048);
                         if let Some(rgba) = crate::document::bake_graph_output_rgba(
-                            path, &eval, max_side, None, None,
+                            path,
+                            &eval,
+                            max_side.min(512),
+                            1.0,
+                            None,
+                            None,
                         ) {
                             let (tw, th) = rgba.dimensions();
                             if let Some(mut src) = resvg::tiny_skia::Pixmap::new(tw, th) {

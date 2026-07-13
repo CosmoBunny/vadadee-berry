@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use rustc_hash::FxHashMap;
 
-use crate::app::{ExportPowerLevel, VideoFormat};
+use crate::app::{ExportFxQuality, ExportPowerLevel, VideoFormat};
 use crate::document::{Fill, NodeId, ProjectFile};
 use crate::io::{self, VideoFrameMap, VideoLayerBuffer};
 use crate::recorder::{Frame, RecorderConfig, SyncRecorder};
@@ -33,6 +33,8 @@ pub struct ExportJobConfig {
     pub bitrate_kbps: u32,
     pub format: VideoFormat,
     pub power: ExportPowerLevel,
+    /// P7f: NE Output bake quality (max side + blur step).
+    pub fx_quality: ExportFxQuality,
     pub total_frames: usize,
     pub anim_fps: u32,
     pub max_anim_frame: usize,
@@ -235,10 +237,15 @@ impl<'a> ExportSession<'a> {
         }
     }
 
-    /// Max side for NE FilePath bake — small bake, scaled onto page by transform.
+    /// Max side for NE FilePath bake — from P7f quality, capped by page size.
     fn ne_bake_max_side(&self, pixel_w: u32, pixel_h: u32) -> u32 {
-        let m = pixel_w.max(pixel_h).max(128);
-        m.min(256)
+        let cap = self.config.fx_quality.max_side();
+        let m = pixel_w.max(pixel_h).max(64);
+        m.min(cap)
+    }
+
+    fn ne_blur_step(&self) -> f32 {
+        self.config.fx_quality.blur_step()
     }
 
     /// GPU only when WGSL shading is active. Vector Image layers use resvg CPU (below).
@@ -399,16 +406,19 @@ impl<'a> ExportSession<'a> {
             })
             .collect();
 
+        let blur_step = self.ne_blur_step();
         for (layer_id, path, eval) in ne_layers {
             let mut q = eval.quantized_for_cache(true);
-            q.blur_px = q.blur_px.round().clamp(0.0, 64.0);
-            let fx_key = format!("{}|ms{max_side}", q.fx_cache_key(&path));
+            let step = blur_step.max(0.25) as f64;
+            q.blur_px = ((q.blur_px / step).round() * step).clamp(0.0, 64.0);
+            let fx_key = format!("{}|ms{max_side}|s{step}", q.fx_cache_key(&path));
 
             if self.last_ne_bake_key.as_ref() != Some(&fx_key) {
                 let baked = crate::document::bake_graph_output_rgba(
                     &path,
                     &eval,
                     max_side,
+                    blur_step,
                     Some(&mut self.base_image_cache),
                     Some(&mut self.fx_image_cache),
                 )?;
@@ -532,6 +542,7 @@ impl<'a> ExportSession<'a> {
             path,
             eval,
             max_side,
+            self.ne_blur_step(),
             Some(&mut self.base_image_cache),
             Some(&mut self.fx_image_cache),
         )?;
@@ -730,8 +741,10 @@ impl<'a> ExportSession<'a> {
             frame_done: 0,
             total: self.config.total_frames,
             message: format!(
-                "Export path={path_label} · {}% · {} frames",
-                self.config.resolution_pct, self.config.total_frames
+                "Export path={path_label} · {}% · FX {} · {} frames",
+                self.config.resolution_pct,
+                self.config.fx_quality.label(),
+                self.config.total_frames
             ),
             elapsed_secs: 0.0,
             sec_per_frame: 0.0,

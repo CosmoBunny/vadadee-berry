@@ -529,6 +529,46 @@ impl ExportPowerLevel {
     }
 }
 
+/// P7f: Node Editor / FX bake quality for export (max side + blur quantization).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ExportFxQuality {
+    /// Fast: 128px bake, 2px blur steps.
+    Draft,
+    /// Default: 256px bake, 1px blur steps.
+    #[default]
+    Normal,
+    /// Best: 512px bake, 0.5px blur steps.
+    High,
+}
+
+impl ExportFxQuality {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "Draft (fast)",
+            Self::Normal => "Normal",
+            Self::High => "High",
+        }
+    }
+
+    /// Longest side of NE FilePath bake (pixels).
+    pub fn max_side(self) -> u32 {
+        match self {
+            Self::Draft => 128,
+            Self::Normal => 256,
+            Self::High => 512,
+        }
+    }
+
+    /// Blur radius quantization step for export FX cache keys.
+    pub fn blur_step(self) -> f32 {
+        match self {
+            Self::Draft => 2.0,
+            Self::Normal => 1.0,
+            Self::High => 0.5,
+        }
+    }
+}
+
 /// Container format for video export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoFormat {
@@ -583,6 +623,8 @@ pub struct VideoExportState {
     pub frames_dir: Option<std::path::PathBuf>,
     pub output_path: Option<std::path::PathBuf>,
     pub power_level: ExportPowerLevel,
+    /// P7f: NE Output bake quality (Draft / Normal / High).
+    pub fx_quality: ExportFxQuality,
     pub export_start_time: Option<std::time::Instant>,
     export_rx: Option<std::sync::mpsc::Receiver<crate::export_worker::ExportWorkerEvent>>,
     export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -625,6 +667,7 @@ impl std::fmt::Debug for VideoExportState {
             .field("frames_dir", &self.frames_dir)
             .field("output_path", &self.output_path)
             .field("power_level", &self.power_level)
+            .field("fx_quality", &self.fx_quality)
             .field("export_start_time", &self.export_start_time)
             .finish()
     }
@@ -693,6 +736,7 @@ impl Default for VideoExportState {
             frames_dir: None,
             output_path: None,
             power_level: ExportPowerLevel::default(),
+            fx_quality: ExportFxQuality::default(),
             export_start_time: None,
             export_rx: None,
             export_cancel: None,
@@ -3899,6 +3943,7 @@ impl VadadeeBerryApp {
             bitrate_kbps: self.video_export.bitrate_kbps,
             format: self.video_export.format,
             power: self.video_export.power_level,
+            fx_quality: self.video_export.fx_quality,
             total_frames,
             anim_fps,
             max_anim_frame: max_frame,
@@ -5636,6 +5681,7 @@ impl VadadeeBerryApp {
                 removed_anims,
                 layer_index,
                 layer_nodes_before,
+                ne_proxy_before: Vec::new(),
             },
         );
         self.selection.clear();
@@ -9626,6 +9672,7 @@ fn run_video_decode_thread(
                         removed_anims,
                         layer_index,
                         layer_nodes_before,
+                        ne_proxy_before: Vec::new(),
                     },
                 );
                 self.selection.retain(|id| *id != fid);
@@ -11097,6 +11144,23 @@ fn run_video_decode_thread(
         if removed.is_empty() {
             return;
         }
+        // P7g: remember NE Output proxy fields cleared with these nodes (undo-safe).
+        let gone: std::collections::HashSet<_> = removed.iter().map(|(id, _)| *id).collect();
+        let ne_proxy_before: Vec<(usize, Option<uuid::Uuid>)> = self
+            .project
+            .document
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let pid = l.ne_output_proxy?;
+                if gone.contains(&pid) {
+                    Some((i, Some(pid)))
+                } else {
+                    None
+                }
+            })
+            .collect();
         self.history.push(
             &mut self.project,
             ProjectEdit::RemoveNodes {
@@ -11104,6 +11168,7 @@ fn run_video_decode_thread(
                 removed_anims,
                 layer_index,
                 layer_nodes_before,
+                ne_proxy_before,
             },
         );
         self.selection.retain(|id| !expanded.contains(id));
@@ -11153,6 +11218,7 @@ fn run_video_decode_thread(
                         removed_anims,
                         layer_index,
                         layer_nodes_before,
+                        ne_proxy_before: Vec::new(),
                     },
                 );
             }

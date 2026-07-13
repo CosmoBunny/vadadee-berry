@@ -966,19 +966,21 @@ pub fn export_fast_blur_rgba(img: &mut image::RgbaImage, blur_px: f32) {
 
 /// Decode + downscale + apply FX for Output Object FilePath (export / software path).
 ///
+/// `blur_step` quantizes blur for cache reuse (Draft=2, Normal=1, High=0.5).
 /// When `base_cache` / `fx_cache` are provided, reuse decoded base and baked FX across frames.
 pub fn bake_graph_output_rgba(
     path: &str,
     eval: &GraphOutputEval,
     max_side: u32,
+    blur_step: f32,
     mut base_cache: Option<&mut std::collections::HashMap<String, image::RgbaImage>>,
     mut fx_cache: Option<&mut std::collections::HashMap<String, image::RgbaImage>>,
 ) -> Option<image::RgbaImage> {
     let mut q = eval.quantized_for_cache(true);
-    // 1px blur buckets: animating blur reuses frames far more often.
-    q.blur_px = q.blur_px.round().clamp(0.0, 64.0);
-    // Cap bake size hard — image is scaled onto the page anyway.
-    let max_side = max_side.max(64).min(256);
+    let step = blur_step.max(0.25) as f64;
+    q.blur_px = ((q.blur_px / step).round() * step).clamp(0.0, 64.0);
+    // Cap bake size — image is scaled onto the page; High allows 512.
+    let max_side = max_side.max(64).min(1024);
     let base_key = format!("{path}|ms{max_side}");
     let fx_key = format!("{}|{}", q.fx_cache_key(path), max_side);
 
@@ -992,14 +994,28 @@ pub fn bake_graph_output_rgba(
         if let Some(img) = cache.get(&base_key) {
             img.clone()
         } else {
-            let dyn_img = image::open(path).ok()?;
+            let dyn_img = image::open(path).unwrap_or_else(|e| {
+                eprintln!("Warning: Failed to open image file {:?}: {}, using fallback placeholder.", path, e);
+                let mut fallback = image::RgbaImage::new(64, 64);
+                for px in fallback.pixels_mut() {
+                    *px = image::Rgba([128, 128, 128, 128]);
+                }
+                image::DynamicImage::ImageRgba8(fallback)
+            });
             let rgba = dyn_img.to_rgba8();
             let down = downscale_rgba_max_side(&rgba, max_side);
             cache.insert(base_key.clone(), down.clone());
             down
         }
     } else {
-        let dyn_img = image::open(path).ok()?;
+        let dyn_img = image::open(path).unwrap_or_else(|e| {
+            eprintln!("Warning: Failed to open image file {:?}: {}, using fallback placeholder.", path, e);
+            let mut fallback = image::RgbaImage::new(64, 64);
+            for px in fallback.pixels_mut() {
+                *px = image::Rgba([128, 128, 128, 128]);
+            }
+            image::DynamicImage::ImageRgba8(fallback)
+        });
         let rgba = dyn_img.to_rgba8();
         downscale_rgba_max_side(&rgba, max_side)
     };

@@ -2178,6 +2178,31 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 });
         });
 
+        // P7f: NE Output bake quality
+        ui.horizontal(|ui| {
+            ui.label("FX quality");
+            egui::ComboBox::from_id_salt("video_export_fx_quality")
+                .selected_text(app.video_export.fx_quality.label())
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for q in [
+                        crate::app::ExportFxQuality::Draft,
+                        crate::app::ExportFxQuality::Normal,
+                        crate::app::ExportFxQuality::High,
+                    ] {
+                        ui.selectable_value(
+                            &mut app.video_export.fx_quality,
+                            q,
+                            q.label(),
+                        );
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Node Editor image bake: Draft=128px fast · Normal=256 · High=512 sharper blur",
+                );
+        });
+
         // Resolution
         ui.horizontal(|ui| {
             ui.label("Resolution");
@@ -3316,7 +3341,7 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
         if pointer_primary_released {
             app.av_timeline_drag = None;
         }
-        let pointer_x_now = ui.input(|i| i.pointer.hover_pos().map(|p| p.x));
+        let pointer_x_now = ui.input(|i| i.pointer.interact_pos().map(|p| p.x));
 
         // Apply sticky drag with absolute pointer mapping (no mid-drag mode flip).
         if let (Some(drag), Some(px)) = (app.av_timeline_drag, pointer_x_now) {
@@ -8368,7 +8393,7 @@ fn draw_timeline_track(
             if let (Some(n_id), Some((drag_n_id, drag_lbl, drag_orig_frame))) = (node_id, dragged_keyframe.clone()) {
                 if n_id == drag_n_id {
                     if ui.input(|i| i.pointer.any_down()) {
-                        if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
+                        if let Some(mpos) = ui.input(|i| i.pointer.interact_pos()) {
                             let relative_x = mpos.x - rect.left();
                             let raw_frame = start_frame + (relative_x / rect.width() * visible_frames);
                             let target_frame = raw_frame.round().max(0.0) as usize;
