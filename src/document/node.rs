@@ -2566,20 +2566,9 @@ impl Node {
                 *x = nx;
                 *y = ny;
             }
-            NodeKind::Image { x, y, width, height, .. } => {
-                let corners = [
-                    (*x, *y),
-                    (*x + *width, *y),
-                    (*x + *width, *y + *height),
-                    (*x, *y + *height),
-                ];
-                let mapped: Vec<_> = corners.iter().map(|(px, py)| map(*px, *py)).collect();
-                let xs: Vec<_> = mapped.iter().map(|p| p.0).collect();
-                let ys: Vec<_> = mapped.iter().map(|p| p.1).collect();
-                *x = xs.iter().copied().fold(f64::INFINITY, f64::min);
-                *y = ys.iter().copied().fold(f64::INFINITY, f64::min);
-                *width = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max) - *x;
-                *height = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max) - *y;
+            NodeKind::Image { .. } => {
+                // Keep axis-aligned x/y/w/h for hit-test; visual rotation lives on
+                // `transform.rotation_rad` (see set_rotation / NE Output paint).
             }
             NodeKind::Arc { cx: acx, cy: acy, .. } => {
                 let (nx, ny) = map(*acx, *acy);
@@ -3262,6 +3251,7 @@ impl Node {
     pub fn get_geom_floats(&self) -> Vec<f64> {
         let mut v = match &self.kind {
             NodeKind::Rect { w, h, rx, .. } => vec![*w, *h, *rx],
+            NodeKind::Image { width, height, .. } => vec![*width, *height],
             NodeKind::Plotter {
                 w,
                 h,
@@ -3357,6 +3347,7 @@ impl Node {
         }
         let base_len = match &self.kind {
             NodeKind::Rect { .. } => 3,
+            NodeKind::Image { .. } => 2,
             NodeKind::Plotter { .. } => 8,
             NodeKind::Ellipse { .. } => 2,
             NodeKind::Polygon { .. } => 3,
@@ -3371,6 +3362,12 @@ impl Node {
                     *w = floats[0];
                     *h = floats[1];
                     *rx = floats[2];
+                }
+            }
+            NodeKind::Image { width, height, .. } => {
+                if floats.len() >= 2 {
+                    *width = floats[0].max(1.0);
+                    *height = floats[1].max(1.0);
                 }
             }
             NodeKind::Plotter {

@@ -2958,9 +2958,12 @@ impl VadadeeBerryApp {
             &mut self.project,
             ProjectEdit::PatchDocument { before, after },
         );
-        if let Some(layer) = self.project.document.layers.get(idx) {
+        // P6b: create Output proxy Image so the object is immediately selectable.
+        if let Some(layer) = self.project.document.layers.get_mut(idx) {
+            let _ = layer.ensure_ne_output_proxy(&mut self.project.nodes);
             let lid = layer.id;
-            self.selection = vec![lid];
+            let proxy = layer.ne_output_proxy;
+            self.selection = vec![proxy.unwrap_or(lid)];
             self.node_editor_ui.open(lid);
             crate::ui::promote_action_tab(self, crate::ui::ActionTab::Parameter);
             self.action_tab = crate::ui::ActionTab::Parameter;
@@ -6367,6 +6370,11 @@ fn run_video_decode_thread(
     /// - Kicks off a new background decode if the current frame differs from cached.
     /// - Never blocks the UI thread.
     fn tick_video_layers(&mut self, ctx: &Context) {
+        // Export holds LIBAV_LOCK on the worker — skip UI decode so we don't serialize
+        // and stall both threads (was a major export slowdown).
+        if self.video_export.rendering {
+            return;
+        }
         let fps = self.anim_fps as f32;
         let current_frame = self.anim_current_frame;
 
@@ -6834,6 +6842,25 @@ fn run_video_decode_thread(
             self.refresh_object_linked_av_clips(&ctx);
             self.tick_video_layers(&ctx);
 
+            // P6b: ensure Output Object canvas proxies exist (selectable Image nodes).
+            {
+                let layer_indices: Vec<usize> = self
+                    .project
+                    .document
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.kind == crate::document::LayerKind::NodeEditor)
+                    .map(|(i, _)| i)
+                    .collect();
+                for i in layer_indices {
+                    let Some(layer) = self.project.document.layers.get_mut(i) else {
+                        continue;
+                    };
+                    let _ = layer.ensure_ne_output_proxy(&mut self.project.nodes);
+                }
+            }
+
             // Warm Node Editor Output Object textures (include blur bake when not playing).
             let graph_evals: Vec<(String, crate::document::GraphOutputEval)> = self
                 .project
@@ -6854,6 +6881,47 @@ fn run_video_decode_thread(
                 .collect();
             for (path, eval) in &graph_evals {
                 let _ = self.ensure_graph_fx_texture(path, eval, &ctx);
+            }
+            // Fit still-default proxies to natural image size (once).
+            {
+                let page_w = self.project.document.width;
+                let page_h = self.project.document.height;
+                let fit_jobs: Vec<(usize, u32, u32)> = self
+                    .project
+                    .document
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.kind == crate::document::LayerKind::NodeEditor && l.visible)
+                    .filter_map(|(i, l)| {
+                        let g = l.node_graph.as_ref()?;
+                        let eval = g.resolve_output_image();
+                        let path = match &eval.image {
+                            crate::document::GraphImageSource::FilePath(p) => p.as_str(),
+                            _ => return None,
+                        };
+                        let size = self
+                            .graph_fx_paint_tex(path, &eval)
+                            .map(|(_, s)| s)
+                            .or_else(|| {
+                                self.graph_path_textures
+                                    .get(path)
+                                    .map(|t| t.size())
+                            })?;
+                        Some((i, size[0] as u32, size[1] as u32))
+                    })
+                    .collect();
+                for (i, iw, ih) in fit_jobs {
+                    if let Some(layer) = self.project.document.layers.get_mut(i) {
+                        layer.fit_ne_output_proxy_to_image(
+                            &mut self.project.nodes,
+                            iw,
+                            ih,
+                            page_w,
+                            page_h,
+                        );
+                    }
+                }
             }
 
             let mut hidden_sources = self.hidden_canvas_sources();
@@ -7190,57 +7258,39 @@ fn run_video_decode_thread(
                                     }
                                 }
                                 crate::document::GraphImageSource::FilePath(path) => {
-                                    if let Some((tex_id, tex_size)) =
+                                    if let Some((tex_id, _tex_size)) =
                                         self.graph_fx_paint_tex(path, &eval)
                                     {
-                                        let mut dx = layer.x as f64 + eval.geo_off_x;
-                                        let mut dy = layer.y as f64 + eval.geo_off_y;
-                                        let mut rot_deg =
-                                            layer.rotation as f64 + eval.geo_rot_deg;
-                                        let mut layer_opacity = 1.0_f32;
-                                        if let Some(track) =
-                                            self.project.anim_timeline.nodes.get(&layer.id)
-                                        {
-                                            if let Some(o) =
-                                                track.opacity.interpolate(self.anim_current_frame)
+                                        // P6b: placement from Output proxy (apply_animation already
+                                        // wrote pos/rot/size into the node for this frame).
+                                        let (dx, dy, w, h, rot_rad) = layer.ne_output_paint_geom(
+                                            &self.project.nodes,
+                                            &eval,
+                                        );
+                                        let mut layer_opacity = layer
+                                            .ne_output_proxy
+                                            .and_then(|pid| self.project.nodes.get(pid))
+                                            .map(|n| n.get_opacity())
+                                            .unwrap_or(1.0);
+                                        // Opacity track (if any) wins when present.
+                                        if let Some(pid) = layer.ne_output_proxy {
+                                            if let Some(track) =
+                                                self.project.anim_timeline.nodes.get(&pid)
                                             {
-                                                layer_opacity = o as f32;
-                                            }
-                                            if let Some(x) =
-                                                track.pos_x.interpolate(self.anim_current_frame)
-                                            {
-                                                dx = x + eval.geo_off_x;
-                                            }
-                                            if let Some(y) =
-                                                track.pos_y.interpolate(self.anim_current_frame)
-                                            {
-                                                dy = y + eval.geo_off_y;
-                                            }
-                                            if let Some(r) =
-                                                track.rotation.interpolate(self.anim_current_frame)
-                                            {
-                                                rot_deg = r + eval.geo_rot_deg;
-                                            }
-                                        }
-                                        let tex_w = tex_size[0] as f32;
-                                        let tex_h = tex_size[1] as f32;
-                                        let aspect = if tex_h > 0.0 { tex_w / tex_h } else { 1.0 };
-                                        let mut w = layer.width * eval.geo_scale_w as f32;
-                                        let mut h = layer.height * eval.geo_scale_h as f32;
-                                        if layer.aspect_ratio_locked {
-                                            if w / h > aspect {
-                                                w = h * aspect;
-                                            } else {
-                                                h = w / aspect;
+                                                if let Some(o) = track
+                                                    .opacity
+                                                    .interpolate(self.anim_current_frame)
+                                                {
+                                                    layer_opacity = o as f32;
+                                                }
                                             }
                                         }
                                         let tl = self.viewport.doc_to_screen((dx, dy), origin);
                                         let br = self.viewport.doc_to_screen(
-                                            (dx + w as f64, dy + h as f64),
+                                            (dx + w, dy + h),
                                             origin,
                                         );
                                         let rect = egui::Rect::from_min_max(tl, br);
-                                        let rot_rad = (rot_deg as f32).to_radians();
                                         let mirror = eval.geo_mirror.round() as i32;
                                         // Brightness-only: free vertex tint (Param anim does not rebake).
                                         let mul = layer_opacity.clamp(0.0, 1.0);
@@ -7253,12 +7303,44 @@ fn run_video_decode_thread(
                                             &painter,
                                             tex_id,
                                             rect,
-                                            rot_rad,
+                                            rot_rad as f32,
                                             mul,
                                             rgb_mul,
                                             mirror & 1 != 0,
                                             mirror & 2 != 0,
                                         );
+                                        // Selection stroke when proxy is selected (not drawn via draw_nodes).
+                                        if let Some(pid) = layer.ne_output_proxy {
+                                            if self.selection.contains(&pid) {
+                                                // Outline follows rotation (corners of rotated rect).
+                                                let c = rect.center();
+                                                let cos = (rot_rad as f32).cos();
+                                                let sin = (rot_rad as f32).sin();
+                                                let half = rect.size() * 0.5;
+                                                let corners = [
+                                                    egui::vec2(-half.x, -half.y),
+                                                    egui::vec2(half.x, -half.y),
+                                                    egui::vec2(half.x, half.y),
+                                                    egui::vec2(-half.x, half.y),
+                                                ]
+                                                .map(|d| {
+                                                    c + egui::vec2(
+                                                        d.x * cos - d.y * sin,
+                                                        d.x * sin + d.y * cos,
+                                                    )
+                                                });
+                                                let stroke = egui::Stroke::new(
+                                                    1.0,
+                                                    egui::Color32::from_rgb(0, 120, 215),
+                                                );
+                                                for i in 0..4 {
+                                                    painter.line_segment(
+                                                        [corners[i], corners[(i + 1) % 4]],
+                                                        stroke,
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 crate::document::GraphImageSource::Empty => {}
@@ -8253,6 +8335,22 @@ fn run_video_decode_thread(
             if e.hide_operands {
                 hidden.insert(e.a_id);
                 hidden.insert(e.b_id);
+            }
+        }
+        // P6c: App objects feeding a visible Node Editor Output are drawn by the NE
+        // composite only — hide originals so they don't double-draw on Image layers.
+        for layer in &self.project.document.layers {
+            if !layer.visible || layer.kind != crate::document::LayerKind::NodeEditor {
+                continue;
+            }
+            let Some(g) = layer.node_graph.as_ref() else {
+                continue;
+            };
+            let eval = g.resolve_output_image();
+            if let crate::document::GraphImageSource::AppObjects(ids) = &eval.image {
+                for id in ids {
+                    hidden.insert(*id);
+                }
             }
         }
         hidden

@@ -179,6 +179,9 @@ pub struct Layer {
     /// Node graph when `kind == NodeEditor` (one graph per layer).
     #[serde(default)]
     pub node_graph: Option<NodeGraph>,
+    /// P6b: selectable canvas proxy for Output Object (`NodeKind::Image` with live FX texture).
+    #[serde(default)]
+    pub ne_output_proxy: Option<Uuid>,
 }
 
 fn default_max_duration() -> f32 {
@@ -239,6 +242,7 @@ impl Layer {
             av_role: AvRole::Video,
             shading_passes: Vec::new(),
             node_graph: None,
+            ne_output_proxy: None,
         }
     }
 
@@ -280,6 +284,7 @@ impl Layer {
             av_role: role,
             shading_passes: Vec::new(),
             node_graph: None,
+            ne_output_proxy: None,
         }
     }
 
@@ -328,6 +333,7 @@ impl Layer {
             // UI fills vignette only if still empty when the layer is inspected.
             shading_passes: Vec::new(),
             node_graph: None,
+            ne_output_proxy: None,
         }
     }
 
@@ -364,6 +370,7 @@ impl Layer {
             av_role: AvRole::Video,
             shading_passes: Vec::new(),
             node_graph: None,
+            ne_output_proxy: None,
         }
     }
 
@@ -400,6 +407,7 @@ impl Layer {
             av_role: AvRole::Video,
             shading_passes: Vec::new(),
             node_graph: Some(NodeGraph::new_empty()),
+            ne_output_proxy: None,
         }
     }
 
@@ -408,6 +416,135 @@ impl Layer {
         if self.kind == LayerKind::NodeEditor && self.node_graph.is_none() {
             self.node_graph = Some(NodeGraph::new_empty());
         }
+    }
+
+    /// P6b: ensure a selectable canvas Image proxy for the Output Object.
+    /// Creates once (empty bytes; live FX texture is painted from the graph).
+    pub fn ensure_ne_output_proxy(&mut self, nodes: &mut NodeStore) -> Option<Uuid> {
+        if self.kind != LayerKind::NodeEditor {
+            return None;
+        }
+        if let Some(id) = self.ne_output_proxy {
+            if nodes.get(id).is_some() {
+                if !self.nodes.contains(&id) {
+                    self.nodes.push(id);
+                }
+                return Some(id);
+            }
+        }
+        let mut node = Node::image(
+            self.x as f64,
+            self.y as f64,
+            self.width.max(1.0) as f64,
+            self.height.max(1.0) as f64,
+            Vec::new(),
+        );
+        node.name = "Output Object".into();
+        let id = node.id;
+        nodes.insert(node);
+        self.nodes.push(id);
+        self.ne_output_proxy = Some(id);
+        Some(id)
+    }
+
+    /// Canvas/export placement for Output Object FilePath paint (proxy node + graph geo).
+    /// Returns `(dx, dy, w, h, rot_rad)` in document space. Rotation is **radians**.
+    pub fn ne_output_paint_geom(
+        &self,
+        nodes: &NodeStore,
+        eval: &GraphOutputEval,
+    ) -> (f64, f64, f64, f64, f64) {
+        let (base_x, base_y, base_w, base_h, base_rot_rad) =
+            if let Some(pid) = self.ne_output_proxy {
+                if let Some(n) = nodes.get(pid) {
+                    if let NodeKind::Image {
+                        x,
+                        y,
+                        width,
+                        height,
+                        ..
+                    } = &n.kind
+                    {
+                        (*x, *y, *width, *height, n.get_rotation())
+                    } else {
+                        (
+                            self.x as f64,
+                            self.y as f64,
+                            self.width as f64,
+                            self.height as f64,
+                            (self.rotation as f64).to_radians(),
+                        )
+                    }
+                } else {
+                    (
+                        self.x as f64,
+                        self.y as f64,
+                        self.width as f64,
+                        self.height as f64,
+                        (self.rotation as f64).to_radians(),
+                    )
+                }
+            } else {
+                (
+                    self.x as f64,
+                    self.y as f64,
+                    self.width as f64,
+                    self.height as f64,
+                    (self.rotation as f64).to_radians(),
+                )
+            };
+        let dx = base_x + eval.geo_off_x;
+        let dy = base_y + eval.geo_off_y;
+        let w = (base_w * eval.geo_scale_w).max(1.0);
+        let h = (base_h * eval.geo_scale_h).max(1.0);
+        let rot = base_rot_rad + eval.geo_rot_deg.to_radians();
+        (dx, dy, w, h, rot)
+    }
+
+    /// One-shot: if the Output proxy is still page-sized (default), fit it to the
+    /// image's natural pixel size (capped to the page).
+    pub fn fit_ne_output_proxy_to_image(
+        &mut self,
+        nodes: &mut NodeStore,
+        img_w: u32,
+        img_h: u32,
+        page_w: f64,
+        page_h: f64,
+    ) {
+        if img_w == 0 || img_h == 0 {
+            return;
+        }
+        let Some(pid) = self.ne_output_proxy else {
+            return;
+        };
+        let Some(node) = nodes.get_mut(pid) else {
+            return;
+        };
+        let NodeKind::Image {
+            width, height, ..
+        } = &mut node.kind
+        else {
+            return;
+        };
+        // Still the ensure-default box (layer page size or A4).
+        let def_w = self.width as f64;
+        let def_h = self.height as f64;
+        let near_default = (*width - def_w).abs() < 2.0 && (*height - def_h).abs() < 2.0;
+        let near_a4 = (*width - A4_WIDTH_PX).abs() < 2.0 && (*height - A4_HEIGHT_PX).abs() < 2.0;
+        if !near_default && !near_a4 {
+            return;
+        }
+        let mut w = img_w as f64;
+        let mut h = img_h as f64;
+        let max_w = page_w.max(1.0);
+        let max_h = page_h.max(1.0);
+        if w > max_w || h > max_h {
+            let s = (max_w / w).min(max_h / h);
+            w *= s;
+            h *= s;
+        }
+        *width = w.max(1.0);
+        *height = h.max(1.0);
     }
 
     /// Migrate legacy single-clip fields into `av_clips` (idempotent).

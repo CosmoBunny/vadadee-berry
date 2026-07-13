@@ -5181,7 +5181,8 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             crate::document::GraphImageSource::Empty
                         );
                         let snd_ok = snd.path().is_some();
-                        let detail = format!("{out_img}  ·  {out_snd}");
+                        // Keep detail short — long "image: …" paths overflow the Objects panel.
+                        let detail = String::new();
                         ne_nodes.push(NeGraphRow {
                             id: n.id,
                             name: safe_trunc_label(&n.name, 24),
@@ -5311,9 +5312,19 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     });
                 }
                 for row in ne_nodes {
-                    let g_sel = app.selection.contains(&layer_id)
-                        && (app.node_editor_ui.selected == Some(row.id)
-                            || app.node_editor_ui.open_layer_id == Some(layer_id));
+                    // P6b: canvas selection targets the Output proxy Image when present.
+                    let proxy_id = app
+                        .project
+                        .document
+                        .layers
+                        .iter()
+                        .find(|l| l.id == layer_id)
+                        .and_then(|l| l.ne_output_proxy);
+                    let g_sel = proxy_id
+                        .map(|pid| app.selection.contains(&pid))
+                        .unwrap_or_else(|| app.selection.contains(&layer_id))
+                        || (app.node_editor_ui.selected == Some(row.id)
+                            && app.node_editor_ui.open_layer_id == Some(layer_id));
                     let label_txt = format!("{} Output Object", row.icon);
                     ui.horizontal(|ui| {
                         ui.add_space(10.0);
@@ -5331,7 +5342,24 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             {
                                 app.set_active_layer(idx);
                             }
-                            app.selection = vec![layer_id];
+                            // Ensure proxy exists, then select it for canvas transform tools.
+                            if let Some(layer) = app
+                                .project
+                                .document
+                                .layers
+                                .iter_mut()
+                                .find(|l| l.id == layer_id)
+                            {
+                                let _ = layer.ensure_ne_output_proxy(&mut app.project.nodes);
+                            }
+                            let pid = app
+                                .project
+                                .document
+                                .layers
+                                .iter()
+                                .find(|l| l.id == layer_id)
+                                .and_then(|l| l.ne_output_proxy);
+                            app.selection = vec![pid.unwrap_or(layer_id)];
                             if app.node_editor_ui.open_layer_id != Some(layer_id) {
                                 app.node_editor_ui.open(layer_id);
                             }
@@ -5352,18 +5380,15 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             app.node_editor_ui.open(layer_id);
                             app.node_editor_ui.selected = Some(row.id);
                         }
-                        resp.on_hover_text(format!(
-                            "Output Object\n{}\nClick: select · Double-click: open Node Editor",
-                            row.detail
-                        ));
-                        if !row.detail.is_empty() {
-                            ui.label(
-                                RichText::new(&row.detail)
-                                    .small()
-                                    .weak()
-                                    .color(egui::Color32::from_rgb(180, 190, 120)),
-                            );
-                        }
+                        // Hover shows short image/sound summary (not inline — avoids panel overflow).
+                        let hover = {
+                            let img = safe_trunc_label(&out_img, 48);
+                            let snd = safe_trunc_label(&out_snd, 40);
+                            format!(
+                                "Output Object\n{img}\n{snd}\nClick: select · Double-click: open NE"
+                            )
+                        };
+                        resp.on_hover_text(hover);
                     });
                 }
             }

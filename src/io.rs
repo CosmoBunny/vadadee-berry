@@ -879,7 +879,7 @@ pub fn render_svg_to_rgba_even(svg_data: &str, scale: f32) -> Option<(u32, u32, 
     Some((pixel_w, pixel_h, pixmap.take()))
 }
 
-fn layer_anim_transform(
+pub(crate) fn layer_anim_transform(
     layer: &crate::document::Layer,
     project: &ProjectFile,
     current_frame: usize,
@@ -905,7 +905,7 @@ fn layer_anim_transform(
     (dx, dy, rot, opacity)
 }
 
-fn video_layer_dest_size(layer: &crate::document::Layer, frame_w: u32, frame_h: u32) -> (f32, f32) {
+pub(crate) fn video_layer_dest_size(layer: &crate::document::Layer, frame_w: u32, frame_h: u32) -> (f32, f32) {
     let aspect = if frame_h > 0 {
         frame_w as f32 / frame_h as f32
     } else {
@@ -1100,7 +1100,69 @@ pub fn composite_export_frame(
             }
             crate::document::LayerKind::Flowchart => {}
             crate::document::LayerKind::NodeEditor => {
-                // Graph output compositing lands in a later phase.
+                // P6c: software path for NE Output (GPU export uses export_worker caches).
+                if let Some(g) = &layer.node_graph {
+                    let eval = g.resolve_output_image();
+                    if let crate::document::GraphImageSource::FilePath(path) = &eval.image {
+                        let max_side = pixel_w.max(pixel_h).clamp(256, 2048);
+                        if let Some(rgba) = crate::document::bake_graph_output_rgba(
+                            path, &eval, max_side, None, None,
+                        ) {
+                            let (tw, th) = rgba.dimensions();
+                            if let Some(mut src) = resvg::tiny_skia::Pixmap::new(tw, th) {
+                                src.data_mut().copy_from_slice(&rgba);
+                                let (dx, dy, mut w, mut h, rot_rad) = layer
+                                    .ne_output_paint_geom(&project.nodes, &eval);
+                                let def_w = layer.width as f64;
+                                let def_h = layer.height as f64;
+                                let near_default = (w - def_w).abs() < 2.0
+                                    && (h - def_h).abs() < 2.0;
+                                let near_a4 = (w - crate::document::A4_WIDTH_PX).abs()
+                                    < 2.0
+                                    && (h - crate::document::A4_HEIGHT_PX).abs() < 2.0;
+                                if near_default || near_a4 {
+                                    let page_w = doc_w.max(1.0);
+                                    let page_h = doc_h.max(1.0);
+                                    let mut nw = tw as f64;
+                                    let mut nh = th as f64;
+                                    if nw > page_w || nh > page_h {
+                                        let s = (page_w / nw).min(page_h / nh);
+                                        nw *= s;
+                                        nh *= s;
+                                    }
+                                    w = nw.max(1.0);
+                                    h = nh.max(1.0);
+                                }
+                                let x = (dx as f32) * scale;
+                                let y = (dy as f32) * scale;
+                                let dw = (w as f32) * scale;
+                                let dh = (h as f32) * scale;
+                                let sx = dw / tw as f32;
+                                let sy = dh / th as f32;
+                                let rot_deg = rot_rad.to_degrees() as f32;
+                                let transform = if rot_deg.abs() > 1e-4 {
+                                    Transform::from_translate(x, y).pre_concat(
+                                        Transform::from_translate(dw / 2.0, dh / 2.0)
+                                            .pre_rotate(rot_deg)
+                                            .pre_translate(-dw / 2.0, -dh / 2.0)
+                                            .pre_scale(sx, sy),
+                                    )
+                                } else {
+                                    Transform::from_translate(x, y).pre_scale(sx, sy)
+                                };
+                                let paint = PixmapPaint::default();
+                                pixmap.draw_pixmap(
+                                    0,
+                                    0,
+                                    src.as_ref(),
+                                    &paint,
+                                    transform,
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
