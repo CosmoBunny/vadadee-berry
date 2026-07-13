@@ -942,10 +942,31 @@ pub fn downscale_rgba_max_side(img: &image::RgbaImage, max_side: u32) -> image::
     image::imageops::resize(img, nw, nh, image::imageops::FilterType::Triangle)
 }
 
+/// Export-only blur: single downscale→upscale, **no** residual box passes.
+/// Live preview keeps `continuous_preview_blur_rgba` (looks smoother, costs more).
+pub fn export_fast_blur_rgba(img: &mut image::RgbaImage, blur_px: f32) {
+    let blur = blur_px.clamp(0.0, 64.0);
+    if blur < 0.05 {
+        return;
+    }
+    let (w, h) = img.dimensions();
+    if w < 2 || h < 2 {
+        return;
+    }
+    // Stronger downscale than live preview so export stays cheap at video scale.
+    let factor = (1.0 + blur * 0.55).clamp(1.05, 24.0);
+    let nw = ((w as f32) / factor).max(1.0).round() as u32;
+    let nh = ((h as f32) / factor).max(1.0).round() as u32;
+    if nw >= w && nh >= h {
+        return;
+    }
+    let small = image::imageops::resize(img, nw, nh, image::imageops::FilterType::Triangle);
+    *img = image::imageops::resize(&small, w, h, image::imageops::FilterType::Triangle);
+}
+
 /// Decode + downscale + apply FX for Output Object FilePath (export / software path).
 ///
 /// When `base_cache` / `fx_cache` are provided, reuse decoded base and baked FX across frames.
-/// Brightness-only FX can skip blur/color bake and return the base (tint at paint).
 pub fn bake_graph_output_rgba(
     path: &str,
     eval: &GraphOutputEval,
@@ -954,10 +975,10 @@ pub fn bake_graph_output_rgba(
     mut fx_cache: Option<&mut std::collections::HashMap<String, image::RgbaImage>>,
 ) -> Option<image::RgbaImage> {
     let mut q = eval.quantized_for_cache(true);
-    // Coarser blur steps for export cache: 0.5 px buckets → far more frame reuse
-    // when blur is animated (still looks continuous at video scale).
-    q.blur_px = ((q.blur_px * 2.0).round() / 2.0).clamp(0.0, 64.0);
-    let max_side = max_side.max(64).min(512);
+    // 1px blur buckets: animating blur reuses frames far more often.
+    q.blur_px = q.blur_px.round().clamp(0.0, 64.0);
+    // Cap bake size hard — image is scaled onto the page anyway.
+    let max_side = max_side.max(64).min(256);
     let base_key = format!("{path}|ms{max_side}");
     let fx_key = format!("{}|{}", q.fx_cache_key(path), max_side);
 
@@ -996,9 +1017,7 @@ pub fn bake_graph_output_rgba(
     color_only.blur_px = 0.0;
     apply_graph_image_fx(&mut rgba, &color_only);
     if br >= 0.05 {
-        // Export/software path: downsample blur is ~50–100× faster than full
-        // separable Gaussian on multi-megapixel ChatGPT images (was ~15s/frame).
-        continuous_preview_blur_rgba(&mut rgba, br);
+        export_fast_blur_rgba(&mut rgba, br);
     }
     if let Some(cache) = fx_cache.as_mut() {
         cache.insert(fx_key, rgba.clone());

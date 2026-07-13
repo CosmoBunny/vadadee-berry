@@ -597,6 +597,12 @@ pub struct VideoExportState {
     pub joke_cycle: usize,
     pub sec_per_frame: f32,
     pub last_frame_time: Option<std::time::Instant>,
+    /// P7a: bar target from worker (`frame_done / total`).
+    pub progress_target: f32,
+    /// P7a: displayed bar value (lerps toward `progress_target` each UI frame).
+    pub progress_smooth: f32,
+    /// P7a: latest worker frame count (may jump ahead of displayed progress).
+    pub worker_frame_done: usize,
     pub renderer_reclaim: std::sync::Arc<std::sync::Mutex<Vec<egui_wgpu::Renderer>>>,
 }
 
@@ -699,6 +705,9 @@ impl Default for VideoExportState {
             joke_cycle: 0,
             sec_per_frame: 0.0,
             last_frame_time: None,
+            progress_target: 0.0,
+            progress_smooth: 0.0,
+            worker_frame_done: 0,
             renderer_reclaim: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -3908,10 +3917,13 @@ impl VadadeeBerryApp {
 
         self.video_export.restore_anim_frame = restore;
         self.video_export.frame_done = 0;
+        self.video_export.worker_frame_done = 0;
         self.video_export.total_frames = total_frames;
         self.video_export.frames_dir = Some(temp);
         self.video_export.rendering = true;
         self.video_export.progress = Some(0.0);
+        self.video_export.progress_target = 0.0;
+        self.video_export.progress_smooth = 0.0;
         self.video_export.progress_visible = true;
         self.video_export.export_start_time = Some(std::time::Instant::now());
         self.video_export.export_rx = Some(rx);
@@ -3976,6 +3988,7 @@ impl VadadeeBerryApp {
             return;
         };
         let mut done: Option<(bool, String)> = None;
+        // Drain all worker events; speed comes from worker EMA, not UI receive gaps.
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 crate::export_worker::ExportWorkerEvent::Phase(phase) => {
@@ -3998,22 +4011,35 @@ impl VadadeeBerryApp {
                     frame_done,
                     total,
                     message,
+                    sec_per_frame,
                     ..
                 } => {
-                    let now = std::time::Instant::now();
-                    if let Some(last) = self.video_export.last_frame_time {
-                        let diff_frames = frame_done.saturating_sub(self.video_export.frame_done);
-                        if diff_frames > 0 {
-                            self.video_export.sec_per_frame = now.duration_since(last).as_secs_f32() / diff_frames as f32;
-                        }
-                    }
-                    self.video_export.last_frame_time = Some(now);
-
+                    self.video_export.worker_frame_done = frame_done;
                     self.video_export.frame_done = frame_done;
                     self.video_export.total_frames = total;
-                    self.video_export.progress =
-                        Some(frame_done as f32 / total.max(1) as f32);
-                    self.video_export.status_msg = message;
+                    let target = frame_done as f32 / total.max(1) as f32;
+                    self.video_export.progress_target = target.clamp(0.0, 1.0);
+                    // Keep `progress` for anything that still reads it; UI uses smooth.
+                    self.video_export.progress = Some(self.video_export.progress_target);
+                    // Prefer worker-measured rate (immune to UI batching stalls).
+                    if sec_per_frame > 1e-6 {
+                        if self.video_export.sec_per_frame < 1e-6 {
+                            self.video_export.sec_per_frame = sec_per_frame;
+                        } else {
+                            // Light UI-side smooth so the label doesn't flicker.
+                            self.video_export.sec_per_frame =
+                                self.video_export.sec_per_frame * 0.7 + sec_per_frame * 0.3;
+                        }
+                    }
+                    // Don't thrash status with every frame once we have a stable line.
+                    if frame_done == 0
+                        || frame_done == total
+                        || message.starts_with("Export path=")
+                        || message.starts_with("Muxing")
+                        || frame_done % 15 == 0
+                    {
+                        self.video_export.status_msg = message;
+                    }
                 }
                 crate::export_worker::ExportWorkerEvent::Finished { success, message } => {
                     done = Some((success, message));
@@ -4021,12 +4047,23 @@ impl VadadeeBerryApp {
             }
         }
 
+        // P7a: ease progress bar toward worker target every UI tick (~smooth, no jumps).
+        let dt = ctx.input(|i| i.unstable_dt).clamp(1.0 / 120.0, 0.1);
+        let target = self.video_export.progress_target;
+        let cur = self.video_export.progress_smooth;
+        // Catch up in ~0.2s when behind; never overshoot.
+        let t = (dt / 0.2).min(1.0);
+        self.video_export.progress_smooth = cur + (target - cur) * t;
+        if (self.video_export.progress_smooth - target).abs() < 0.0005 {
+            self.video_export.progress_smooth = target;
+        }
+        self.video_export.progress = Some(self.video_export.progress_smooth);
+
         // Periodic updates:
         let now = std::time::Instant::now();
         if now.duration_since(self.video_export.last_stats_update) >= std::time::Duration::from_secs(1) {
             self.video_export.sys_stats.update();
             self.video_export.last_stats_update = now;
-            ctx.request_repaint();
         }
 
         if now.duration_since(self.video_export.last_joke_update) >= std::time::Duration::from_secs(10) {
@@ -4042,7 +4079,6 @@ impl VadadeeBerryApp {
                 self.video_export.joke_cycle,
             );
             self.video_export.last_joke_update = now;
-            ctx.request_repaint();
         }
 
         if let Some((success, message)) = done {
@@ -4053,6 +4089,8 @@ impl VadadeeBerryApp {
             let cancelled = !success && message.contains("Cancelled");
 
             if success {
+                self.video_export.progress_target = 1.0;
+                self.video_export.progress_smooth = 1.0;
                 self.video_export.progress = Some(1.0);
                 self.video_export.status_msg = message.clone();
                 self.status_message = message.clone();
@@ -4063,7 +4101,8 @@ impl VadadeeBerryApp {
             self.finish_video_export_ui(cancelled);
         }
         if self.video_export.rendering {
-            ctx.request_repaint();
+            // ~30 Hz UI updates keep the bar smooth without pegging the main thread.
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
     }
 

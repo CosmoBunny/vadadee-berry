@@ -1,6 +1,8 @@
 //! Background video export — keeps heavy libav + SVG raster work off the UI thread.
 //!
-//! Rasterizes frames on a worker thread and encodes with libav on the same thread.
+//! Rasterize + encode run **sequentially on the export worker** (not a second
+//! encode thread). Parallel x264 (all cores) + CPU blur thrash and can drop
+//! ~12fps → ~3fps; sequential keeps full cores for each stage.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,8 +20,8 @@ use crate::video_decode::VideoStream;
 
 use egui::Context;
 
-/// How often progress events are emitted (frames).
-const PROGRESS_EVERY_N_FRAMES: usize = 1;
+/// How often progress events are emitted (frames). Every frame floods the UI channel.
+const PROGRESS_EVERY_N_FRAMES: usize = 5;
 
 
 #[derive(Debug, Clone)]
@@ -56,6 +58,11 @@ pub enum ExportWorkerEvent {
         frame_done: usize,
         total: usize,
         message: String,
+        /// Seconds since encode loop started (worker wall clock — reliable).
+        #[allow(dead_code)]
+        elapsed_secs: f32,
+        /// Worker EMA of seconds per encoded frame (not UI receive timing).
+        sec_per_frame: f32,
     },
     Finished {
         success: bool,
@@ -140,6 +147,7 @@ struct ExportSession<'a> {
     video_layers: Vec<ExportVideoLayer>,
     video_streams: FxHashMap<String, VideoStream>,
     video_frames: VideoFrameMap,
+    /// Sequential libav encode on the export worker (see module docs).
     recorder: Option<SyncRecorder>,
     export_ctx: egui::Context,
     wgpu_render: Option<egui_wgpu::RenderState>,
@@ -154,6 +162,13 @@ struct ExportSession<'a> {
     /// Last FX key uploaded for NE layer id (skip re-upload when unchanged).
     ne_tex_fx_key: std::collections::HashMap<uuid::Uuid, String>,
     fonts: crate::fonts::FontRegistry,
+    /// P7a: EMA of wall time per frame on the worker (drives UI speed, not UI poll gaps).
+    sec_per_frame_ema: f32,
+    encode_loop_started: Option<Instant>,
+    last_frame_end: Option<Instant>,
+    /// Last NE bake key + pixels (skip re-bake/clone when FX key unchanged).
+    last_ne_bake_key: Option<String>,
+    last_ne_bake_rgba: Option<image::RgbaImage>,
 }
 
 impl<'a> ExportSession<'a> {
@@ -212,14 +227,18 @@ impl<'a> ExportSession<'a> {
             image_textures: std::collections::HashMap::new(),
             ne_tex_fx_key: std::collections::HashMap::new(),
             fonts: crate::fonts::FontRegistry::new(),
+            sec_per_frame_ema: 0.0,
+            encode_loop_started: None,
+            last_frame_end: None,
+            last_ne_bake_key: None,
+            last_ne_bake_rgba: None,
         }
     }
 
-    /// Max side for NE FilePath bake — keep small; scaled onto page by transform.
+    /// Max side for NE FilePath bake — small bake, scaled onto page by transform.
     fn ne_bake_max_side(&self, pixel_w: u32, pixel_h: u32) -> u32 {
-        let m = pixel_w.max(pixel_h).max(256);
-        // 512: export quality is fine when upscaled onto A4; big win vs 1024/2048 blurs.
-        m.min(512)
+        let m = pixel_w.max(pixel_h).max(128);
+        m.min(256)
     }
 
     /// GPU only when WGSL shading is active. Vector Image layers use resvg CPU (below).
@@ -297,6 +316,8 @@ impl<'a> ExportSession<'a> {
         let svg_scale = Transform::from_scale(scale_x, scale_y);
         let usvg_opt = crate::fonts::usvg_options();
 
+        // Collect NE jobs that need bake without holding pixmap mut + caches.
+        // (bake uses session caches; we do NE after other layers.)
         for layer in &self.project.document.layers {
             if !layer.visible || !layer.is_renderer {
                 continue;
@@ -306,7 +327,6 @@ impl<'a> ExportSession<'a> {
                     if layer.nodes.is_empty() {
                         continue;
                     }
-                    // CPU vector raster (avoids egui GPU path). Empty layers are free.
                     let svg = io::document_svg_single_image_layer(
                         self.project,
                         layer,
@@ -320,7 +340,9 @@ impl<'a> ExportSession<'a> {
                     let Some(buf) = self.video_frames.get(&layer.id) else {
                         continue;
                     };
-                    let mut src = Pixmap::new(buf.width, buf.height)?;
+                    let Some(mut src) = Pixmap::new(buf.width, buf.height) else {
+                        continue;
+                    };
                     src.data_mut().copy_from_slice(&buf.rgba);
                     let (dx, dy, rot, opacity) =
                         io::layer_anim_transform(layer, self.project, current_frame);
@@ -346,68 +368,99 @@ impl<'a> ExportSession<'a> {
                     paint.opacity = opacity;
                     pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
                 }
-                crate::document::LayerKind::NodeEditor => {
-                    let Some(g) = &layer.node_graph else {
-                        continue;
-                    };
-                    let eval = g.resolve_output_image();
-                    let crate::document::GraphImageSource::FilePath(path) = &eval.image else {
-                        continue;
-                    };
-                    let rgba = crate::document::bake_graph_output_rgba(
-                        path,
-                        &eval,
-                        max_side,
-                        Some(&mut self.base_image_cache),
-                        Some(&mut self.fx_image_cache),
-                    )?;
-                    let (tw, th) = rgba.dimensions();
-                    let mut src = Pixmap::new(tw, th)?;
-                    src.data_mut().copy_from_slice(&rgba);
-                    let (dx, dy, mut w, mut h, rot_rad) =
-                        layer.ne_output_paint_geom(&self.project.nodes, &eval);
-                    let def_w = layer.width as f64;
-                    let def_h = layer.height as f64;
-                    let near_default =
-                        (w - def_w).abs() < 2.0 && (h - def_h).abs() < 2.0;
-                    let near_a4 = (w - crate::document::A4_WIDTH_PX).abs() < 2.0
-                        && (h - crate::document::A4_HEIGHT_PX).abs() < 2.0;
-                    if near_default || near_a4 {
-                        let page_w = doc_w.max(1.0);
-                        let page_h = doc_h.max(1.0);
-                        let mut nw = tw as f64;
-                        let mut nh = th as f64;
-                        if nw > page_w || nh > page_h {
-                            let s = (page_w / nw).min(page_h / nh);
-                            nw *= s;
-                            nh *= s;
-                        }
-                        w = nw.max(1.0);
-                        h = nh.max(1.0);
-                    }
-                    let x = (dx as f32) * scale;
-                    let y = (dy as f32) * scale;
-                    let dw = (w as f32) * scale;
-                    let dh = (h as f32) * scale;
-                    let sx = dw / tw as f32;
-                    let sy = dh / th as f32;
-                    let rot_deg = rot_rad.to_degrees() as f32;
-                    let transform = if rot_deg.abs() > 1e-4 {
-                        Transform::from_translate(x, y).pre_concat(
-                            Transform::from_translate(dw / 2.0, dh / 2.0)
-                                .pre_rotate(rot_deg)
-                                .pre_translate(-dw / 2.0, -dh / 2.0)
-                                .pre_scale(sx, sy),
-                        )
-                    } else {
-                        Transform::from_translate(x, y).pre_scale(sx, sy)
-                    };
-                    let paint = PixmapPaint::default();
-                    pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
-                    let _ = time_secs;
-                }
+                crate::document::LayerKind::NodeEditor => {}
                 _ => {}
             }
+        }
+
+        // NE FilePath: bake with session caches + sticky last-key reuse.
+        let ne_layers: Vec<(uuid::Uuid, String, crate::document::GraphOutputEval)> = self
+            .project
+            .document
+            .layers
+            .iter()
+            .filter(|l| l.visible && l.is_renderer && l.kind == crate::document::LayerKind::NodeEditor)
+            .filter_map(|l| {
+                let g = l.node_graph.as_ref()?;
+                let eval = g.resolve_output_image();
+                match &eval.image {
+                    crate::document::GraphImageSource::FilePath(p) => {
+                        Some((l.id, p.clone(), eval))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+
+        for (layer_id, path, eval) in ne_layers {
+            let mut q = eval.quantized_for_cache(true);
+            q.blur_px = q.blur_px.round().clamp(0.0, 64.0);
+            let fx_key = format!("{}|ms{max_side}", q.fx_cache_key(&path));
+
+            if self.last_ne_bake_key.as_ref() != Some(&fx_key) {
+                let baked = crate::document::bake_graph_output_rgba(
+                    &path,
+                    &eval,
+                    max_side,
+                    Some(&mut self.base_image_cache),
+                    Some(&mut self.fx_image_cache),
+                )?;
+                self.last_ne_bake_key = Some(fx_key);
+                self.last_ne_bake_rgba = Some(baked);
+            }
+            let rgba = self.last_ne_bake_rgba.as_ref()?;
+
+            let layer = self
+                .project
+                .document
+                .layers
+                .iter()
+                .find(|l| l.id == layer_id)?;
+            let (tw, th) = rgba.dimensions();
+            let Some(mut src) = Pixmap::new(tw, th) else {
+                continue;
+            };
+            src.data_mut().copy_from_slice(rgba.as_raw());
+            let (dx, dy, mut w, mut h, rot_rad) =
+                layer.ne_output_paint_geom(&self.project.nodes, &eval);
+            let def_w = layer.width as f64;
+            let def_h = layer.height as f64;
+            let near_default = (w - def_w).abs() < 2.0 && (h - def_h).abs() < 2.0;
+            let near_a4 = (w - crate::document::A4_WIDTH_PX).abs() < 2.0
+                && (h - crate::document::A4_HEIGHT_PX).abs() < 2.0;
+            if near_default || near_a4 {
+                let page_w = doc_w.max(1.0);
+                let page_h = doc_h.max(1.0);
+                let mut nw = tw as f64;
+                let mut nh = th as f64;
+                if nw > page_w || nh > page_h {
+                    let s = (page_w / nw).min(page_h / nh);
+                    nw *= s;
+                    nh *= s;
+                }
+                w = nw.max(1.0);
+                h = nh.max(1.0);
+            }
+            let x = (dx as f32) * scale;
+            let y = (dy as f32) * scale;
+            let dw = (w as f32) * scale;
+            let dh = (h as f32) * scale;
+            let sx = dw / tw as f32;
+            let sy = dh / th as f32;
+            let rot_deg = rot_rad.to_degrees() as f32;
+            let transform = if rot_deg.abs() > 1e-4 {
+                Transform::from_translate(x, y).pre_concat(
+                    Transform::from_translate(dw / 2.0, dh / 2.0)
+                        .pre_rotate(rot_deg)
+                        .pre_translate(-dw / 2.0, -dh / 2.0)
+                        .pre_scale(sx, sy),
+                )
+            } else {
+                Transform::from_translate(x, y).pre_scale(sx, sy)
+            };
+            let paint = PixmapPaint::default();
+            pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
+            let _ = time_secs;
         }
 
         Some((pixel_w, pixel_h, pixmap.take()))
@@ -523,6 +576,8 @@ impl<'a> ExportSession<'a> {
             return Ok(());
         }
         self.check_cancel()?;
+        // Cap x264 threads: 0 = all cores was fine when encode was the only
+        // CPU consumer this frame; leave a sensible default for FullPower.
         let threads = match self.config.power {
             ExportPowerLevel::PowerSaving => 1,
             ExportPowerLevel::FullPower => 0,
@@ -599,14 +654,28 @@ impl<'a> ExportSession<'a> {
         recorder.write_frame(&Frame::new(width, height, rgba))
     }
 
+    fn finish_encoder(&mut self) -> Result<(), String> {
+        if let Some(recorder) = self.recorder.take() {
+            recorder.finish()?;
+        }
+        Ok(())
+    }
+
     fn emit_progress(&self, frame_done: usize) {
         if frame_done % PROGRESS_EVERY_N_FRAMES != 0 && frame_done != self.config.total_frames {
             return;
         }
-        let elapsed = self.started_at.elapsed().as_secs_f32();
-        let eta_str = if frame_done > 1 {
-            let avg = elapsed / (frame_done - 1) as f32;
-            let rem = (self.config.total_frames - frame_done) as f32 * avg;
+        let loop_start = self.encode_loop_started.unwrap_or(self.started_at);
+        let elapsed = loop_start.elapsed().as_secs_f32();
+        let spf = if self.sec_per_frame_ema > 1e-6 {
+            self.sec_per_frame_ema
+        } else if frame_done > 0 {
+            elapsed / frame_done as f32
+        } else {
+            0.0
+        };
+        let eta_str = if spf > 1e-6 && frame_done < self.config.total_frames {
+            let rem = (self.config.total_frames - frame_done) as f32 * spf;
             if rem < 60.0 {
                 format!("{:.0}s", rem)
             } else {
@@ -615,34 +684,54 @@ impl<'a> ExportSession<'a> {
         } else {
             "estimating…".to_string()
         };
+        let rate = if spf > 1e-6 { 1.0 / spf } else { 0.0 };
         let _ = self.tx.send(ExportWorkerEvent::Progress {
             phase: self.phase,
             frame_done,
             total: self.config.total_frames,
             message: format!(
-                "Encoding frame {}/{} ({} fps) | ETA: {}",
-                frame_done, self.config.total_frames, self.config.fps, eta_str
+                "Encoding frame {}/{} · {:.1} fps · ETA {}",
+                frame_done, self.config.total_frames, rate, eta_str
             ),
+            elapsed_secs: elapsed,
+            sec_per_frame: spf,
         });
+    }
+
+    fn note_frame_timing(&mut self) {
+        let now = Instant::now();
+        if let Some(prev) = self.last_frame_end {
+            let dt = now.duration_since(prev).as_secs_f32().max(1e-4);
+            // EMA: stable readout even if UI polls late and batches events.
+            if self.sec_per_frame_ema < 1e-6 {
+                self.sec_per_frame_ema = dt;
+            } else {
+                self.sec_per_frame_ema = self.sec_per_frame_ema * 0.85 + dt * 0.15;
+            }
+        }
+        self.last_frame_end = Some(now);
     }
 
     fn encode_all_frames(&mut self) -> Result<(), String> {
         let use_cpu = self.can_fast_cpu_export();
         let path_label = if use_cpu { "cpu" } else { "gpu" };
+        self.encode_loop_started = Some(Instant::now());
+        self.last_frame_end = None;
+        self.sec_per_frame_ema = 0.0;
         let _ = self.tx.send(ExportWorkerEvent::Progress {
             phase: ExportPhase::Encoding,
             frame_done: 0,
             total: self.config.total_frames,
             message: format!(
-                "Export path={path_label} scale={:.0}% frames={}",
-                self.scale * 100.0,
-                self.config.total_frames
+                "Export path={path_label} · {}% · {} frames",
+                self.config.resolution_pct, self.config.total_frames
             ),
+            elapsed_secs: 0.0,
+            sec_per_frame: 0.0,
         });
 
         for f in 0..self.config.total_frames {
             self.check_cancel()?;
-            let t_frame = Instant::now();
 
             // Map export frame into one animation cycle (supports multi-cycle loop exports).
             let cycle_len = self.config.cycle_frame_count.max(1);
@@ -651,10 +740,8 @@ impl<'a> ExportSession<'a> {
             let anim_frame = ((timeline_sec * self.anim_fps).round() as usize)
                 .min(self.config.max_anim_frame);
             apply_animation_for_frame_project(self.project, anim_frame);
-            let t_anim = t_frame.elapsed();
 
             self.decode_video_layers(timeline_sec)?;
-            let t_dec = t_frame.elapsed();
 
             // Prefer CPU path — GPU/egui was 8–15s/frame for NE FilePath.
             let (w, h, rgba) = if use_cpu {
@@ -703,33 +790,11 @@ impl<'a> ExportSession<'a> {
                 )
                 .ok_or_else(|| "Frame rasterize failed".to_string())?
             };
-            let t_rast = t_frame.elapsed();
 
             self.ensure_encoder(w, h)?;
             self.stream_frame(w, h, rgba)?;
-            let t_all = t_frame.elapsed();
-
-            // First frames: surface where time goes (ms).
-            if f < 3 || f % 30 == 0 {
-                let _ = self.tx.send(ExportWorkerEvent::Progress {
-                    phase: ExportPhase::Encoding,
-                    frame_done: f + 1,
-                    total: self.config.total_frames,
-                    message: format!(
-                        "f{} {path_label} {}x{} anim={:.0}ms dec={:.0}ms rast={:.0}ms enc={:.0}ms tot={:.0}ms",
-                        f + 1,
-                        w,
-                        h,
-                        t_anim.as_secs_f32() * 1000.0,
-                        (t_dec - t_anim).as_secs_f32() * 1000.0,
-                        (t_rast - t_dec).as_secs_f32() * 1000.0,
-                        (t_all - t_rast).as_secs_f32() * 1000.0,
-                        t_all.as_secs_f32() * 1000.0,
-                    ),
-                });
-            } else {
-                self.emit_progress(f + 1);
-            }
+            self.note_frame_timing();
+            self.emit_progress(f + 1);
         }
         Ok(())
     }
@@ -737,15 +802,20 @@ impl<'a> ExportSession<'a> {
     fn finalize(&mut self) -> Result<bool, String> {
         self.set_phase(ExportPhase::Finalizing)?;
         self.check_cancel()?;
+        let elapsed = self
+            .encode_loop_started
+            .unwrap_or(self.started_at)
+            .elapsed()
+            .as_secs_f32();
         let _ = self.tx.send(ExportWorkerEvent::Progress {
             phase: ExportPhase::Finalizing,
             frame_done: self.config.total_frames,
             total: self.config.total_frames,
             message: "Muxing audio…".into(),
+            elapsed_secs: elapsed,
+            sec_per_frame: self.sec_per_frame_ema,
         });
-        if let Some(recorder) = self.recorder.take() {
-            recorder.finish()?;
-        }
+        self.finish_encoder()?;
 
         let duration_secs =
             self.config.total_frames as f32 / self.config.fps.max(1) as f32;

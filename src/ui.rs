@@ -2596,9 +2596,27 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
                         .color(colors::TEXT_MUTED)
                         .italics(),
                 );
+                // Frame counter from worker (authoritative), not UI receive batches.
+                if app.video_export.rendering && app.video_export.total_frames > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "Frame {} / {}",
+                            app.video_export.worker_frame_done,
+                            app.video_export.total_frames
+                        ))
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                    );
+                }
                 ui.add_space(6.0);
-                
-                let pb = egui::ProgressBar::new(prog)
+
+                // P7a: smoothed bar (eases toward worker target; no multi-frame jumps).
+                let bar_prog = if app.video_export.rendering {
+                    app.video_export.progress_smooth.clamp(0.0, 1.0)
+                } else {
+                    prog
+                };
+                let pb = egui::ProgressBar::new(bar_prog)
                     .show_percentage()
                     .animate(app.video_export.rendering)
                     .desired_width(ui.available_width());
@@ -2687,12 +2705,34 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
                                 );
                                 ui.end_row();
 
-                                // Speed / Performance
+                                // Speed from worker EMA (stable; not UI poll gaps).
                                 ui.label(RichText::new("Export Speed:").color(colors::TEXT_MUTED));
-                                let speed_text = if app.video_export.sec_per_frame > 0.0 {
-                                    format!("{:.2} s/frame ({:.1} fps)", app.video_export.sec_per_frame, 1.0 / app.video_export.sec_per_frame)
+                                let speed_text = if app.video_export.sec_per_frame > 1e-6 {
+                                    let spf = app.video_export.sec_per_frame;
+                                    let fps = 1.0 / spf;
+                                    let eta = if app.video_export.worker_frame_done
+                                        < app.video_export.total_frames
+                                        && app.video_export.total_frames > 0
+                                    {
+                                        let rem = (app.video_export.total_frames
+                                            - app.video_export.worker_frame_done)
+                                            as f32
+                                            * spf;
+                                        if rem < 60.0 {
+                                            format!(" · ETA {:.0}s", rem)
+                                        } else {
+                                            format!(
+                                                " · ETA {}:{:02}",
+                                                (rem / 60.0) as i32,
+                                                (rem % 60.0) as i32
+                                            )
+                                        }
+                                    } else {
+                                        String::new()
+                                    };
+                                    format!("{:.2} s/frame ({:.1} fps){eta}", spf, fps)
                                 } else {
-                                    "Measuring...".to_string()
+                                    "Measuring…".to_string()
                                 };
                                 ui.label(RichText::new(speed_text).color(colors::TEXT).strong());
                                 ui.end_row();
