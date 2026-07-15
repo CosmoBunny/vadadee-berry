@@ -1012,3 +1012,119 @@ impl ProjectFile {
         self.anim_timeline.nodes.remove(&id);
     }
 }
+
+#[cfg(test)]
+mod p7_proxy_tests {
+    use super::*;
+
+    fn ne_project() -> ProjectFile {
+        let mut pf = Document::new_empty_project();
+        let idx = pf.document.add_node_editor_layer("NE");
+        pf.document.active_layer_index = idx;
+        pf
+    }
+
+    #[test]
+    fn ensure_ne_output_proxy_creates_and_reuses() {
+        let mut pf = ne_project();
+        let i = pf.document.active_layer_index;
+        let id1 = pf.document.layers[i]
+            .ensure_ne_output_proxy(&mut pf.nodes)
+            .expect("proxy");
+        let id2 = pf.document.layers[i]
+            .ensure_ne_output_proxy(&mut pf.nodes)
+            .expect("proxy again");
+        assert_eq!(id1, id2);
+        assert_eq!(pf.document.layers[i].ne_output_proxy, Some(id1));
+        assert!(pf.nodes.get(id1).is_some());
+        assert!(pf.document.layers[i].nodes.contains(&id1));
+        let n = pf.nodes.get(id1).unwrap();
+        assert_eq!(n.name, "Output Object");
+        assert!(matches!(n.kind, NodeKind::Image { ref bytes, .. } if bytes.is_empty()));
+    }
+
+    #[test]
+    fn ensure_ne_output_proxy_rebinds_stale_id() {
+        let mut pf = ne_project();
+        let i = pf.document.active_layer_index;
+        let id1 = pf.document.layers[i]
+            .ensure_ne_output_proxy(&mut pf.nodes)
+            .unwrap();
+        // Simulate orphaned pointer: remove node but leave field set.
+        pf.nodes.remove(id1);
+        pf.document.layers[i].nodes.retain(|n| *n != id1);
+        pf.document.layers[i].ne_output_proxy = Some(id1);
+        let id2 = pf.document.layers[i]
+            .ensure_ne_output_proxy(&mut pf.nodes)
+            .unwrap();
+        assert_ne!(id1, id2);
+        assert!(pf.nodes.get(id2).is_some());
+        assert_eq!(pf.document.layers[i].ne_output_proxy, Some(id2));
+    }
+
+    #[test]
+    fn ensure_ne_output_proxy_reuses_existing_named_image() {
+        let mut pf = ne_project();
+        let i = pf.document.active_layer_index;
+        let mut node = Node::image(10.0, 20.0, 100.0, 80.0, Vec::new());
+        node.name = "Output Object".into();
+        let nid = node.id;
+        pf.nodes.insert(node);
+        pf.document.layers[i].nodes.push(nid);
+        // Field unset — should adopt existing node.
+        assert!(pf.document.layers[i].ne_output_proxy.is_none());
+        let got = pf.document.layers[i]
+            .ensure_ne_output_proxy(&mut pf.nodes)
+            .unwrap();
+        assert_eq!(got, nid);
+        assert_eq!(pf.document.layers[i].ne_output_proxy, Some(nid));
+    }
+
+    #[test]
+    fn ne_output_proxy_layer_index_and_paint_geom() {
+        let mut pf = ne_project();
+        let i = pf.document.active_layer_index;
+        let id = pf.document.layers[i]
+            .ensure_ne_output_proxy(&mut pf.nodes)
+            .unwrap();
+        if let Some(n) = pf.nodes.get_mut(id) {
+            if let NodeKind::Image {
+                x, y, width, height, ..
+            } = &mut n.kind
+            {
+                *x = 50.0;
+                *y = 60.0;
+                *width = 200.0;
+                *height = 100.0;
+            }
+            n.set_rotation(std::f64::consts::FRAC_PI_2);
+        }
+        assert_eq!(
+            pf.document.ne_output_proxy_layer_index(id),
+            Some(i)
+        );
+        assert!(pf.document.ne_output_proxy_layer_index(Uuid::new_v4()).is_none());
+
+        let eval = GraphOutputEval {
+            geo_off_x: 5.0,
+            geo_off_y: 7.0,
+            geo_scale_w: 1.0,
+            geo_scale_h: 1.0,
+            geo_rot_deg: 0.0,
+            ..Default::default()
+        };
+        let (dx, dy, w, h, rot) = pf.document.layers[i].ne_output_paint_geom(&pf.nodes, &eval);
+        assert!((dx - 55.0).abs() < 1e-9);
+        assert!((dy - 67.0).abs() < 1e-9);
+        assert!((w - 200.0).abs() < 1e-9);
+        assert!((h - 100.0).abs() < 1e-9);
+        assert!((rot - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ensure_ne_output_proxy_noop_on_image_layer() {
+        let mut pf = Document::new_empty_project();
+        let id = pf.document.layers[0].ensure_ne_output_proxy(&mut pf.nodes);
+        assert!(id.is_none());
+    }
+}

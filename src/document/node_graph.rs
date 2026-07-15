@@ -2196,6 +2196,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn export_fast_blur_changes_pixels() {
+        let mut img = image::RgbaImage::from_fn(64, 64, |x, y| {
+            if x < 32 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let before = img.clone();
+        export_fast_blur_rgba(&mut img, 8.0);
+        assert_ne!(img.as_raw(), before.as_raw());
+        // Near-zero blur is a no-op.
+        let mid = img.clone();
+        export_fast_blur_rgba(&mut img, 0.0);
+        assert_eq!(img.as_raw(), mid.as_raw());
+    }
+
+    #[test]
+    fn bake_graph_output_fallback_missing_file() {
+        let eval = GraphOutputEval::default();
+        let img = bake_graph_output_rgba(
+            "/nonexistent/path/that/does/not/exist.png",
+            &eval,
+            128,
+            1.0,
+            None,
+            None,
+        )
+        .expect("fallback placeholder");
+        assert!(img.width() <= 128 && img.height() <= 128);
+        assert!(!img.as_raw().is_empty());
+    }
+
+    #[test]
+    fn bake_graph_output_fx_cache_hit() {
+        let path = "/nonexistent/bake_cache_test.png";
+        let mut eval = GraphOutputEval::default();
+        eval.blur_px = 4.0;
+        let mut base = std::collections::HashMap::new();
+        let mut fx = std::collections::HashMap::new();
+        let a = bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx))
+            .unwrap();
+        assert_eq!(base.len(), 1);
+        assert_eq!(fx.len(), 1);
+        let b = bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx))
+            .unwrap();
+        assert_eq!(a.as_raw(), b.as_raw());
+        // Same quantized blur step → same cache key (4.4 → 4 with step 1).
+        eval.blur_px = 4.4;
+        let c = bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx))
+            .unwrap();
+        assert_eq!(fx.len(), 1);
+        assert_eq!(a.as_raw(), c.as_raw());
+        // Different step bucket → new FX entry.
+        eval.blur_px = 6.0;
+        let _d = bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx))
+            .unwrap();
+        assert_eq!(fx.len(), 2);
+    }
+
+    #[test]
     fn eval_value_frame_time() {
         let mut g = NodeGraph {
             nodes: IndexMap::new(),

@@ -300,3 +300,60 @@ pub fn snapshot_project(project: &ProjectFile) -> ProjectFile {
 pub fn snapshot_document(doc: &Document) -> Document {
     doc.clone()
 }
+
+#[cfg(test)]
+mod p7_proxy_history_tests {
+    use super::*;
+    use crate::document::Document;
+
+    #[test]
+    fn remove_nodes_clears_and_restores_ne_output_proxy() {
+        let mut pf = Document::new_empty_project();
+        let idx = pf.document.add_node_editor_layer("NE");
+        pf.document.active_layer_index = idx;
+        let proxy = pf.document.layers[idx]
+            .ensure_ne_output_proxy(&mut pf.nodes)
+            .unwrap();
+        assert_eq!(pf.document.layers[idx].ne_output_proxy, Some(proxy));
+
+        let node = pf.nodes.get(proxy).cloned().unwrap();
+        let layer_nodes_before = pf.document.layers[idx].nodes.clone();
+        let ne_proxy_before = vec![(idx, Some(proxy))];
+
+        let mut hist = History::default();
+        hist.push(
+            &mut pf,
+            ProjectEdit::RemoveNodes {
+                removed: vec![(proxy, node)],
+                removed_anims: Vec::new(),
+                layer_index: idx,
+                layer_nodes_before,
+                ne_proxy_before,
+            },
+        );
+
+        assert!(pf.nodes.get(proxy).is_none());
+        assert!(pf.document.layers[idx].ne_output_proxy.is_none());
+        assert!(!pf.document.layers[idx].nodes.contains(&proxy));
+
+        assert!(hist.undo(&mut pf));
+        assert!(pf.nodes.get(proxy).is_some());
+        assert_eq!(pf.document.layers[idx].ne_output_proxy, Some(proxy));
+        assert!(pf.document.layers[idx].nodes.contains(&proxy));
+
+        assert!(hist.redo(&mut pf));
+        assert!(pf.nodes.get(proxy).is_none());
+        assert!(pf.document.layers[idx].ne_output_proxy.is_none());
+    }
+
+    #[test]
+    fn export_fx_quality_levels() {
+        use crate::app::ExportFxQuality;
+        assert_eq!(ExportFxQuality::Draft.max_side(), 128);
+        assert_eq!(ExportFxQuality::Normal.max_side(), 256);
+        assert_eq!(ExportFxQuality::High.max_side(), 512);
+        assert!((ExportFxQuality::Draft.blur_step() - 2.0).abs() < 1e-6);
+        assert!((ExportFxQuality::Normal.blur_step() - 1.0).abs() < 1e-6);
+        assert!((ExportFxQuality::High.blur_step() - 0.5).abs() < 1e-6);
+    }
+}
