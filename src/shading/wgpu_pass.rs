@@ -485,11 +485,26 @@ impl CallbackTrait for ShadingPaintCallback {
         let page = info.viewport; // full PaintCallback::rect (page), unclamped
         let left = ppp * page.min.x;
         let top = ppp * page.min.y;
-        let width = (ppp * page.width()).max(1.0);
-        let height = (ppp * page.height()).max(1.0);
+        let mut width = (ppp * page.width()).max(1.0);
+        let mut height = (ppp * page.height()).max(1.0);
         if width < 1.0 || height < 1.0 {
             return;
         }
+        // wgpu validates: origin >= -2*max_texture_dimension_2d and
+        // origin+size <= 2*max_texture_dimension_2d - 1 (often ±16384 around 8192).
+        // High zoom/pan can exceed either the size or the origin limit → panic.
+        const MAX_DIM: f32 = 8192.0;
+        const ORIGIN_MIN: f32 = -2.0 * MAX_DIM; // -16384
+        const EXTENT_MAX: f32 = 2.0 * MAX_DIM - 1.0; // 16383
+        if width > MAX_DIM || height > MAX_DIM {
+            let s = (MAX_DIM / width).min(MAX_DIM / height).min(1.0);
+            width = (width * s).max(1.0);
+            height = (height * s).max(1.0);
+        }
+        width = width.clamp(1.0, MAX_DIM);
+        height = height.clamp(1.0, MAX_DIM);
+        let left = left.clamp(ORIGIN_MIN, EXTENT_MAX - width);
+        let top = top.clamp(ORIGIN_MIN, EXTENT_MAX - height);
         render_pass.set_viewport(left, top, width, height, 0.0, 1.0);
 
         let clip = info.clip_rect_in_pixels();

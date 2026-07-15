@@ -1,11 +1,17 @@
-//! Extract audio from video containers to MP3 (for rodio) — symphonia, then libav + libmp3lame.
+//! Extract audio from video containers to WAV (for rodio) — symphonia, then libav.
+//! Playback uses streaming WAV reads so the UI never loads multi‑minute PCM.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use symphonia::core::audio::{AudioBufferRef, Signal};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_NULL, CODEC_TYPE_VORBIS};
+use symphonia::core::codecs::{
+    DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_NULL,
+    CODEC_TYPE_VORBIS,
+};
 use symphonia::core::errors::Error;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -35,6 +41,402 @@ pub struct AudioPrepareResult {
 
 pub type ExtractProgress = std::sync::Arc<dyn Fn(f32) + Send + Sync>;
 
+// ── Extract once per output path (process lifetime) ───────────────────────────
+
+fn extract_global_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// One demux per output WAV path for the whole process. Concurrent callers wait
+/// on the same `OnceLock` — never N parallel re-extracts of the same file.
+fn extract_once_map() -> &'static Mutex<HashMap<String, Arc<OnceLock<Result<PathBuf, String>>>>> {
+    static M: OnceLock<Mutex<HashMap<String, Arc<OnceLock<Result<PathBuf, String>>>>>> =
+        OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Ensure `output` WAV exists for `input` video/audio. Safe to call from many
+/// threads / every frame — demuxes **at most once** per output path.
+pub fn ensure_extracted_wav(
+    input: &Path,
+    output: &Path,
+    report: ExtractProgress,
+) -> Result<PathBuf, String> {
+    let wav_path = normalize_wav_path(output);
+    let key = wav_path.to_string_lossy().to_string();
+
+    // Hot path: already on disk and valid — no lock contention.
+    if wav_is_playable(&wav_path) {
+        return Ok(wav_path);
+    }
+
+    let cell = {
+        let mut map = extract_once_map().lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(key.clone())
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone()
+    };
+
+    // Exactly one thread runs the closure; others block until it finishes.
+    cell.get_or_init(|| {
+        // Re-check after waiting for another thread.
+        if wav_is_playable(&wav_path) {
+            return Ok(wav_path.clone());
+        }
+        extract_audio_to_wav_inner(input, &wav_path, report)
+    })
+    .clone()
+}
+
+fn normalize_wav_path(output: &Path) -> PathBuf {
+    if output
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+    {
+        output.to_path_buf()
+    } else {
+        output.with_extension("wav")
+    }
+}
+
+/// Decode video/container audio directly to a lossless WAV file.
+/// Prefer [`ensure_extracted_wav`] so the same path is never demuxed twice.
+pub fn extract_audio_to_wav(
+    input: &Path,
+    output: &Path,
+    report: ExtractProgress,
+) -> Result<PathBuf, String> {
+    ensure_extracted_wav(input, output, report)
+}
+
+fn extract_audio_to_wav_inner(
+    input: &Path,
+    wav_path: &Path,
+    report: ExtractProgress,
+) -> Result<PathBuf, String> {
+    let _serialize = extract_global_lock();
+    report(0.01);
+
+    if wav_is_playable(wav_path) {
+        report(1.0);
+        return Ok(wav_path.to_path_buf());
+    }
+    if !input.is_file() {
+        return Err(format!("input missing: {}", input.display()));
+    }
+
+    let stereo = match decode_audio_stereo_symphonia(input, report.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("[audio] symphonia decode failed ({e}), trying libav…");
+            report(0.12);
+            decode_audio_stereo_libav(input, report.clone())?
+        }
+    };
+    if stereo.samples.is_empty() {
+        return Err("decoded audio is empty".into());
+    }
+    let mut samples = stereo.samples;
+    let ch = OUT_CHANNELS as usize;
+    if ch > 1 && samples.len() % ch != 0 {
+        samples.resize(samples.len() + (ch - samples.len() % ch), 0);
+    }
+    report(0.86);
+    if let Some(parent) = wav_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+    }
+    let tmp = {
+        let mut t = wav_path.as_os_str().to_os_string();
+        t.push(format!(".tmp.{}", std::process::id()));
+        PathBuf::from(t)
+    };
+    write_wav_hound(&tmp, &samples, stereo.sample_rate, OUT_CHANNELS).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e
+    })?;
+    let tmp_sz = tmp.metadata().map(|m| m.len()).unwrap_or(0);
+    if tmp_sz < 1024 {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("wav write too small ({tmp_sz} bytes)"));
+    }
+    std::fs::rename(&tmp, wav_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename wav: {e}")
+    })?;
+    if !wav_is_playable(wav_path) {
+        let _ = std::fs::remove_file(wav_path);
+        return Err(format!("wav not playable after write: {}", wav_path.display()));
+    }
+    let sz = wav_path.metadata().map(|m| m.len()).unwrap_or(0);
+    report(1.0);
+    log::info!(
+        "[audio] extracted {} samples → {} ({sz} bytes)",
+        samples.len(),
+        wav_path.display()
+    );
+    Ok(wav_path.to_path_buf())
+}
+
+/// Cheap check: exists, large enough, RIFF/WAVE header.
+pub fn wav_is_playable(path: &Path) -> bool {
+    use std::io::Read;
+    let meta = match path.metadata() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if meta.len() < 1024 {
+        return false;
+    }
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut hdr = [0u8; 12];
+    if f.read_exact(&mut hdr).is_err() {
+        return false;
+    }
+    &hdr[0..4] == b"RIFF" && &hdr[8..12] == b"WAVE"
+}
+
+// ── Playback ──────────────────────────────────────────────────────────────────
+
+/// Stream a file into a rodio player (seek + append).
+pub fn stream_file_to_player(
+    player: &rodio::Player,
+    path: &Path,
+    offset_secs: f32,
+    volume: f32,
+) -> Result<(), String> {
+    stream_file_to_player_rate(player, path, offset_secs, volume, 1.0)
+}
+
+/// Stream WAV (or pure audio) at `playback_rate`×. **Never** loads multi‑minute PCM on the UI thread.
+pub fn stream_file_to_player_rate(
+    player: &rodio::Player,
+    path: &Path,
+    offset_secs: f32,
+    volume: f32,
+    playback_rate: f32,
+) -> Result<(), String> {
+    use std::num::{NonZeroU16, NonZeroU32};
+
+    player.set_volume(volume.clamp(0.0, 4.0));
+    let playback_rate = if playback_rate.is_finite() && playback_rate > 0.0 {
+        playback_rate.clamp(0.05, 16.0)
+    } else {
+        1.0
+    };
+
+    let path_str = path.to_string_lossy();
+    if crate::document::AvClip::path_is_video_container(path_str.as_ref()) {
+        return Err("video container cannot stream directly — wait for WAV extract".into());
+    }
+
+    let is_wav = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+
+    // Streaming first — O(1) open + seek, no multi‑MB UI stall on second Play.
+    if is_wav {
+        match StreamingWavSource::open(path, offset_secs, playback_rate) {
+            Ok(src) => {
+                player.append(src);
+                player.play();
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!("streaming wav failed {}: {e}", path.display());
+            }
+        }
+        // Tiny fallback (≤8s) only if streaming fails.
+        if let Some(buf) =
+            rodio_source_from_path_capped_rate(path, offset_secs, 8.0, playback_rate)
+        {
+            player.append(buf);
+            player.play();
+            return Ok(());
+        }
+        return Err(format!("decode audio: cannot read WAV {}", path.display()));
+    }
+
+    // Pure audio (mp3/aac/…): streaming rodio decoder at rate≈1.
+    if let Ok(file) = File::open(path) {
+        match rodio::Decoder::try_from(file) {
+            Ok(mut decoder) => {
+                use rodio::Source;
+                if offset_secs > 0.05 {
+                    let _ = decoder
+                        .try_seek(std::time::Duration::from_secs_f32(offset_secs.max(0.0)));
+                }
+                if (playback_rate - 1.0).abs() <= 0.02 {
+                    player.append(decoder);
+                    player.play();
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                log::debug!("rodio decode failed for {}: {e}", path.display());
+            }
+        }
+    }
+
+    if let Some(pcm) = load_pcm_from_file(path) {
+        let ch = NonZeroU16::new(pcm.channels.max(1))
+            .ok_or_else(|| "bad channel count".to_string())?;
+        let base_rate = pcm.sample_rate.max(1) as f32;
+        let out_rate = ((base_rate * playback_rate).round() as u32).max(1);
+        let rate = NonZeroU32::new(out_rate).ok_or_else(|| "bad sample rate".to_string())?;
+        let skip = (offset_secs.max(0.0) * pcm.sample_rate as f32 * pcm.channels as f32)
+            .round() as usize;
+        let samples: Vec<f32> = if skip >= pcm.samples.len() {
+            Vec::new()
+        } else {
+            pcm.samples[skip..].to_vec()
+        };
+        const MAX: usize = 44_100 * 2 * 30; // 30s max
+        let samples = if samples.len() > MAX {
+            samples[..MAX].to_vec()
+        } else {
+            samples
+        };
+        player.append(rodio::buffer::SamplesBuffer::new(ch, rate, samples));
+        player.play();
+        return Ok(());
+    }
+
+    Err(format!(
+        "decode audio: cannot play {} (unsupported or missing audio track)",
+        path.display()
+    ))
+}
+
+/// Streaming PCM WAV source for rodio.
+pub struct StreamingWavSource {
+    samples: hound::WavIntoSamples<std::io::BufReader<File>, i16>,
+    channels: std::num::NonZeroU16,
+    sample_rate: std::num::NonZeroU32,
+}
+
+impl StreamingWavSource {
+    pub fn open(path: &Path, offset_secs: f32, playback_rate: f32) -> Result<Self, String> {
+        let mut reader = hound::WavReader::open(path).map_err(|e| format!("open wav: {e}"))?;
+        let spec = reader.spec();
+        if spec.channels == 0 || spec.sample_rate == 0 {
+            return Err("invalid wav header".into());
+        }
+        let rate_f = playback_rate.clamp(0.05, 16.0);
+        let out_hz = ((spec.sample_rate as f32) * rate_f).round() as u32;
+        let channels = std::num::NonZeroU16::new(spec.channels.max(1))
+            .ok_or_else(|| "bad channels".to_string())?;
+        let sample_rate =
+            std::num::NonZeroU32::new(out_hz.max(1)).ok_or_else(|| "bad rate".to_string())?;
+        let total_frames = reader.duration();
+        if total_frames == 0 {
+            return Err("wav has zero frames".into());
+        }
+        let mut frame = (offset_secs.max(0.0) * spec.sample_rate as f32).floor() as u32;
+        if frame >= total_frames {
+            frame = total_frames.saturating_sub(spec.sample_rate.max(1));
+        }
+        if frame > 0 {
+            reader.seek(frame).map_err(|e| format!("seek wav: {e}"))?;
+        }
+        Ok(Self {
+            samples: reader.into_samples::<i16>(),
+            channels,
+            sample_rate,
+        })
+    }
+}
+
+impl Iterator for StreamingWavSource {
+    type Item = f32;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.samples.next() {
+                Some(Ok(s)) => return Some(s as f32 / i16::MAX as f32),
+                Some(Err(_)) => continue,
+                None => return None,
+            }
+        }
+    }
+}
+
+impl rodio::Source for StreamingWavSource {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> rodio::ChannelCount {
+        self.channels
+    }
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.sample_rate
+    }
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+pub fn rodio_source_from_path_capped(
+    path: &Path,
+    offset_secs: f32,
+    max_secs: f32,
+) -> Option<rodio::buffer::SamplesBuffer> {
+    rodio_source_from_path_capped_rate(path, offset_secs, max_secs, 1.0)
+}
+
+pub fn rodio_source_from_path_capped_rate(
+    path: &Path,
+    offset_secs: f32,
+    max_secs: f32,
+    playback_rate: f32,
+) -> Option<rodio::buffer::SamplesBuffer> {
+    use std::num::{NonZeroU16, NonZeroU32};
+
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+    {
+        return None;
+    }
+    let reader = hound::WavReader::open(path).ok()?;
+    let spec = reader.spec();
+    let channels = NonZeroU16::new(spec.channels.max(1))?;
+    let rate_f = playback_rate.clamp(0.05, 16.0);
+    let out_hz = ((spec.sample_rate as f32) * rate_f).round() as u32;
+    let rate = NonZeroU32::new(out_hz.max(1))?;
+    let ch = spec.channels as usize;
+    let skip = (offset_secs.max(0.0) * spec.sample_rate as f32 * ch as f32).round() as usize;
+    let take = ((max_secs.max(1.0) * spec.sample_rate as f32 * ch as f32).round() as usize)
+        .max(ch * spec.sample_rate as usize);
+    let samples: Vec<f32> = reader
+        .into_samples::<i16>()
+        .skip(skip)
+        .take(take)
+        .filter_map(|s| s.ok())
+        .map(|s| s as f32 / i16::MAX as f32)
+        .collect();
+    if samples.is_empty() {
+        return None;
+    }
+    Some(rodio::buffer::SamplesBuffer::new(channels, rate, samples))
+}
+
+pub fn rodio_source_from_path(
+    path: &Path,
+    offset_secs: f32,
+) -> Option<rodio::buffer::SamplesBuffer> {
+    rodio_source_from_path_capped(path, offset_secs, 30.0)
+}
+
+// ── PCM helpers (legacy / export paths) ───────────────────────────────────────
+
 pub fn load_pcm_from_wav(path: &Path) -> Option<CachedPcm> {
     let reader = hound::WavReader::open(path).ok()?;
     let spec = reader.spec();
@@ -55,7 +457,6 @@ pub fn load_pcm_from_wav(path: &Path) -> Option<CachedPcm> {
 
 pub fn load_pcm_from_file(path: &Path) -> Option<CachedPcm> {
     let path_str = path.to_string_lossy();
-    // Images / tiny files: never hand to symphonia (probe EOF spam).
     if crate::document::AvClip::path_is_still_image(path_str.as_ref()) {
         return None;
     }
@@ -81,7 +482,6 @@ pub fn load_pcm_from_file(path: &Path) -> Option<CachedPcm> {
     load_pcm_via_rodio(path)
 }
 
-/// Full-file decode via symphonia, then libav (covers MP4/MOV when rodio cannot stream).
 fn load_pcm_decoded(path: &Path) -> Option<CachedPcm> {
     let silent: ExtractProgress = std::sync::Arc::new(|_| {});
     if let Ok(stereo) = decode_audio_stereo_symphonia(path, silent.clone()) {
@@ -123,25 +523,16 @@ fn load_pcm_via_rodio(path: &Path) -> Option<CachedPcm> {
     })
 }
 
-/// In-flight preload keys — prevents spawning a decode thread every UI frame
-/// (that OOM'd laptops: N threads × full-song f32 PCM).
-fn preload_inflight() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+fn preload_inflight() -> &'static Mutex<std::collections::HashSet<String>> {
+    static S: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
-/// Max full-file PCM entries (each can be 50–200MB for long tracks).
 const PCM_CACHE_MAX_ENTRIES: usize = 2;
-/// Refuse to fully decode files larger than this many bytes on disk (~prevents RAM bomb).
-const PCM_MAX_FILE_BYTES: u64 = 12 * 1024 * 1024; // 12 MiB compressed ≈ still large decoded
-/// Cap decoded samples (~90s stereo @ 44.1k) if something still fully decodes.
+const PCM_MAX_FILE_BYTES: u64 = 12 * 1024 * 1024;
 const PCM_MAX_SAMPLES: usize = 44_100 * 2 * 90;
 
-/// Preload is **opt-in and rate-limited**. Prefer [`stream_file_to_player`] for playback
-/// so we never hold whole songs in RAM.
-pub fn spawn_preload_pcm(cache: AudioPcmCache, key: String, path: std::path::PathBuf) {
-    // Skip huge files — decoded f32 would be many× compressed size.
+pub fn spawn_preload_pcm(cache: AudioPcmCache, key: String, path: PathBuf) {
     if path
         .metadata()
         .map(|m| m.len() > PCM_MAX_FILE_BYTES)
@@ -157,14 +548,13 @@ pub fn spawn_preload_pcm(cache: AudioPcmCache, key: String, path: std::path::Pat
             return;
         };
         if !inflight.insert(key.clone()) {
-            return; // already decoding this path
+            return;
         }
     }
     std::thread::Builder::new()
         .name("vadadee-audio-pcm-cache".into())
         .spawn(move || {
             let pcm = load_pcm_from_file(&path).map(|mut p| {
-                // Hard cap decoded length.
                 if p.samples.len() > PCM_MAX_SAMPLES {
                     let mut v = (*p.samples).clone();
                     v.truncate(PCM_MAX_SAMPLES);
@@ -174,7 +564,6 @@ pub fn spawn_preload_pcm(cache: AudioPcmCache, key: String, path: std::path::Pat
             });
             if let Some(pcm) = pcm {
                 if let Ok(mut map) = cache.lock() {
-                    // LRU-ish: drop oldest if over cap.
                     while map.len() >= PCM_CACHE_MAX_ENTRIES {
                         if let Some(k) = map.keys().next().cloned() {
                             map.remove(&k);
@@ -192,27 +581,6 @@ pub fn spawn_preload_pcm(cache: AudioPcmCache, key: String, path: std::path::Pat
         .ok();
 }
 
-/// Stream a file into a rodio player (seek + append). **Does not load whole file into RAM.**
-pub fn stream_file_to_player(
-    player: &rodio::Player,
-    path: &Path,
-    offset_secs: f32,
-    volume: f32,
-) -> Result<(), String> {
-    use rodio::Source;
-    let file = File::open(path).map_err(|e| format!("open audio: {e}"))?;
-    let mut decoder =
-        rodio::Decoder::try_from(file).map_err(|e| format!("decode audio: {e}"))?;
-    if offset_secs > 0.05 {
-        let _ = decoder.try_seek(std::time::Duration::from_secs_f32(offset_secs.max(0.0)));
-    }
-    player.set_volume(volume.clamp(0.0, 4.0));
-    player.append(decoder);
-    player.play();
-    Ok(())
-}
-
-/// True when full-file PCM is already in the cache (instant slice, no decode).
 pub fn pcm_cache_has(cache: &AudioPcmCache, path: &str) -> bool {
     cache
         .lock()
@@ -220,8 +588,6 @@ pub fn pcm_cache_has(cache: &AudioPcmCache, path: &str) -> bool {
         .is_some_and(|m| m.contains_key(path))
 }
 
-/// Decode / slice audio (uses PCM cache when available). Prefer calling after
-/// [`spawn_preload_pcm`] so the first play is a cheap slice.
 pub fn prepare_samples_at_offset(
     path: &Path,
     offset_secs: f32,
@@ -240,39 +606,13 @@ pub fn prepare_samples_at_offset(
         }
         return Some(slice_cached(&arc, offset_secs));
     }
-
-    use rodio::Source;
-    use std::num::{NonZeroU16, NonZeroU32};
-    let file = File::open(path).ok()?;
-    let mut decoder = rodio::Decoder::try_from(file).ok()?;
-    let channels = NonZeroU16::new(decoder.channels().get())?;
-    let sample_rate = NonZeroU32::new(decoder.sample_rate().get())?;
-    if offset_secs > 0.0 {
-        let _ = decoder.try_seek(std::time::Duration::from_secs_f32(offset_secs));
-    }
-    let ch = channels.get() as f32;
-    let sr = sample_rate.get() as f32;
-    let mut samples: Vec<f32> = decoder.collect();
-    if offset_secs > 0.0 {
-        let skip = (offset_secs * sr * ch).round() as usize;
-        if skip < samples.len() {
-            samples.drain(0..skip);
-        } else {
-            samples.clear();
-        }
-    }
-    Some(AudioPrepareResult {
-        channels: channels.get(),
-        sample_rate: sample_rate.get(),
-        samples,
-    })
+    None
 }
 
 fn slice_cached(cached: &CachedPcm, offset_secs: f32) -> AudioPrepareResult {
     let ch = cached.channels.max(1) as f32;
     let skip = (offset_secs.max(0.0) * cached.sample_rate as f32 * ch).round() as usize;
     let skip = skip.min(cached.samples.len());
-    // Never clone multi-minute tails into a new Vec for SamplesBuffer — cap ahead window.
     let max_ahead = PCM_MAX_SAMPLES;
     let end = (skip + max_ahead).min(cached.samples.len());
     AudioPrepareResult {
@@ -282,8 +622,6 @@ fn slice_cached(cached: &CachedPcm, offset_secs: f32) -> AudioPrepareResult {
     }
 }
 
-/// Simple 3-band EQ (bass / mid / treble in “dB-ish” units, −12…+12).
-/// Audible bass shelf so LinearBlur-style Param → Equalizer.bass is felt.
 pub fn apply_eq_stereo_inplace(
     samples: &mut [f32],
     channels: u16,
@@ -298,11 +636,9 @@ pub fn apply_eq_stereo_inplace(
     let gb = 10f32.powf((bass.clamp(-18.0, 18.0)) / 20.0);
     let gm = 10f32.powf((mid.clamp(-18.0, 18.0)) / 20.0);
     let gt = 10f32.powf((treble.clamp(-18.0, 18.0)) / 20.0);
-    // Unity → no work.
     if (gb - 1.0).abs() < 0.02 && (gm - 1.0).abs() < 0.02 && (gt - 1.0).abs() < 0.02 {
         return;
     }
-    // One-pole low / high state per channel (≈200 Hz low, ≈3 kHz high at 44.1k).
     let a_low = 0.04_f32;
     let a_high = 0.25_f32;
     let mut low = vec![0.0_f32; ch];
@@ -317,28 +653,6 @@ pub fn apply_eq_stereo_inplace(
         let mid_b = x - low_b - high_b;
         *s = (low_b * gb + mid_b * gm + high_b * gt).clamp(-1.0, 1.0);
     }
-}
-
-/// Decode video/container audio directly to a lossless WAV file (perfect quality, zero compression artifacts).
-pub fn extract_audio_to_wav(
-    input: &Path,
-    output: &Path,
-    report: ExtractProgress,
-) -> Result<std::path::PathBuf, String> {
-    report(0.01);
-    let stereo = match decode_audio_stereo_symphonia(input, report.clone()) {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("[audio] symphonia decode failed ({}), trying libav…", e);
-            report(0.12);
-            decode_audio_stereo_libav(input, report.clone())?
-        }
-    };
-    report(0.86);
-    let wav_path = output.with_extension("wav");
-    write_wav(&wav_path, &stereo.samples, stereo.sample_rate, OUT_CHANNELS)?;
-    report(1.0);
-    Ok(wav_path)
 }
 
 pub struct StereoPcmI16 {
@@ -448,89 +762,12 @@ fn decode_audio_stereo_libav(input: &Path, report: ExtractProgress) -> Result<St
     })
 }
 
-fn extract_audio_symphonia(input: &Path, output: &Path) -> Result<(), String> {
-    let file = File::open(input).map_err(|e| e.to_string())?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-    let mut hint = Hint::new();
-    if let Some(ext) = input.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .map_err(|e| e.to_string())?;
-
-    let mut format = probed.format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| is_audio_track(t))
-        .ok_or_else(|| "No audio track".to_string())?;
-
-    let track_id = track.id;
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| e.to_string())?;
-
-    let mut pcm: Vec<i16> = Vec::new();
-    let mut src_rate = track.codec_params.sample_rate.unwrap_or(OUT_RATE);
-    let mut src_channels = track
-        .codec_params
-        .channels
-        .map(|c| c.count())
-        .unwrap_or(2)
-        .max(1) as u16;
-
-    loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(Error::ResetRequired) => break,
-            Err(Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.to_string()),
-        };
-
-        if packet.track_id() != track_id {
-            continue;
-        }
-
-        match decoder.decode(&packet) {
-            Ok(decoded) => append_interleaved_i16(&mut pcm, decoded),
-            Err(Error::IoError(_)) => break,
-            Err(Error::DecodeError(_)) => continue,
-            Err(e) => return Err(e.to_string()),
-        }
-        if let Some(rate) = decoder.codec_params().sample_rate {
-            src_rate = rate;
-        }
-        if let Some(ch) = decoder.codec_params().channels {
-            src_channels = ch.count().max(1) as u16;
-        }
-    }
-
-    if pcm.is_empty() {
-        return Err("No audio samples decoded".into());
-    }
-
-    let stereo = resample_interleaved_to_stereo(&pcm, src_rate, src_channels, OUT_RATE);
-    write_wav(output, &stereo, OUT_RATE, OUT_CHANNELS)?;
-    Ok(())
-}
-
-/// Media duration via symphonia (audio files and many containers).
 pub fn probe_media_duration_symphonia(path: &str) -> Option<f32> {
-    // Never probe still images / non-media — causes ERROR spam ("probe reach EOF").
     if crate::document::AvClip::path_is_still_image(path) {
         return None;
     }
     let path = Path::new(path);
     let meta = std::fs::metadata(path).ok()?;
-    // Tiny files are never useful media (broken extracts, icons, etc.).
     if meta.len() < 2048 {
         return None;
     }
@@ -558,20 +795,9 @@ pub fn probe_media_duration_symphonia(path: &str) -> Option<f32> {
         if n_frames == 0 {
             continue;
         }
-        let secs = if let Some(tb) = params.time_base {
-            let t = tb.calc_time(n_frames);
-            t.seconds as f64 + t.frac
-        } else if let Some(rate) = params.sample_rate {
-            if rate > 0 {
-                n_frames as f64 / rate as f64
-            } else {
-                continue;
-            }
-        } else {
-            continue;
-        };
-        if secs.is_finite() && secs > best_secs {
-            best_secs = secs;
+        let rate = params.sample_rate.unwrap_or(0);
+        if rate > 0 {
+            best_secs = best_secs.max(n_frames as f64 / rate as f64);
         }
     }
     if best_secs > 0.05 {
@@ -595,74 +821,66 @@ fn is_audio_track(t: &symphonia::core::formats::Track) -> bool {
     )
 }
 
-/// Build a rodio source starting at `offset_secs` (no tight `next()` skip loop).
-pub fn rodio_source_from_path(
-    path: &Path,
-    offset_secs: f32,
-) -> Option<rodio::buffer::SamplesBuffer> {
-    use rodio::Source;
-    use std::num::{NonZeroU16, NonZeroU32};
-
-    if path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
-    {
-        let reader = hound::WavReader::open(path).ok()?;
-        let spec = reader.spec();
-        let channels = NonZeroU16::new(spec.channels.max(1))?;
-        let rate = NonZeroU32::new(spec.sample_rate)?;
-        let ch = spec.channels as usize;
-        let skip = (offset_secs.max(0.0) * spec.sample_rate as f32 * ch as f32).round() as usize;
-        let samples: Vec<f32> = reader
-            .into_samples::<i16>()
-            .skip(skip)
-            .filter_map(|s| s.ok())
-            .map(|s| s as f32 / i16::MAX as f32)
-            .collect();
-        return Some(rodio::buffer::SamplesBuffer::new(channels, rate, samples));
-    }
-
-    let file = File::open(path).ok()?;
-    let mut decoder = rodio::Decoder::try_from(file).ok()?;
-    let channels = NonZeroU16::new(decoder.channels().get())?;
-    let sample_rate = NonZeroU32::new(decoder.sample_rate().get())?;
-    if offset_secs > 0.0 {
-        let seek = std::time::Duration::from_secs_f32(offset_secs);
-        if decoder.try_seek(seek).is_ok() {
-            let samples: Vec<f32> = decoder.collect();
-            return Some(rodio::buffer::SamplesBuffer::new(
-                channels,
-                sample_rate,
-                samples,
-            ));
-        }
-    }
-    let ch = channels.get() as f32;
-    let sr = sample_rate.get() as f32;
-    let mut samples: Vec<f32> = decoder.collect();
-    if offset_secs > 0.0 {
-        let skip = (offset_secs * sr * ch).round() as usize;
-        if skip < samples.len() {
-            samples.drain(0..skip);
-        } else {
-            samples.clear();
-        }
-    }
-    Some(rodio::buffer::SamplesBuffer::new(
-        channels,
-        sample_rate,
-        samples,
-    ))
+fn write_wav(path: &Path, samples: &[i16], rate: u32, channels: u16) -> Result<(), String> {
+    write_wav_hound(path, samples, rate, channels)
 }
 
-pub fn write_mono_f32_as_wav(mono: &[f32], src_rate: u32, output: &Path) -> Result<(), String> {
-    let pcm: Vec<i16> = mono
-        .iter()
-        .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-        .collect();
-    let stereo = resample_interleaved_to_stereo(&pcm, src_rate, 1, OUT_RATE);
-    write_wav(output, &stereo, OUT_RATE, OUT_CHANNELS)
+fn write_wav_hound(
+    path: &Path,
+    samples: &[i16],
+    rate: u32,
+    channels: u16,
+) -> Result<(), String> {
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate: rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    {
+        let mut writer =
+            hound::WavWriter::create(path, spec).map_err(|e| format!("wav create: {e}"))?;
+        for &s in samples {
+            writer.write_sample(s).map_err(|e| format!("wav sample: {e}"))?;
+        }
+        writer.finalize().map_err(|e| format!("wav finalize: {e}"))?;
+    }
+    if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(path) {
+        let _ = f.sync_all();
+    }
+    Ok(())
+}
+
+fn resample_interleaved_to_stereo(
+    pcm: &[i16],
+    src_rate: u32,
+    src_channels: u16,
+    out_rate: u32,
+) -> Vec<i16> {
+    let src_ch = src_channels.max(1) as usize;
+    let frames = pcm.len() / src_ch;
+    if frames == 0 {
+        return Vec::new();
+    }
+    let sample_at = |frame: usize, ch: usize| -> f32 {
+        let f = frame.min(frames - 1);
+        let c = ch.min(src_ch - 1);
+        pcm[f * src_ch + c] as f32 / i16::MAX as f32
+    };
+    let out_frames = ((frames as f64) * out_rate as f64 / src_rate.max(1) as f64).round() as usize;
+    let mut out = Vec::with_capacity(out_frames * 2);
+    for i in 0..out_frames {
+        let src_f = i as f64 * src_rate as f64 / out_rate.max(1) as f64;
+        let idx = src_f.floor() as usize;
+        let frac = (src_f - idx as f64) as f32;
+        for ch in 0..2 {
+            let s0 = sample_at(idx, ch.min(src_ch - 1));
+            let s1 = sample_at(idx + 1, ch.min(src_ch - 1));
+            let s = s0 + (s1 - s0) * frac;
+            out.push((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+        }
+    }
+    out
 }
 
 fn append_interleaved_i16(out: &mut Vec<i16>, buf: AudioBufferRef<'_>) {
@@ -700,68 +918,11 @@ fn append_interleaved_i16(out: &mut Vec<i16>, buf: AudioBufferRef<'_>) {
     }
 }
 
-/// Resample interleaved PCM to stereo at `out_rate` (keeps L/R; mono is duplicated).
-fn resample_interleaved_to_stereo(
-    interleaved: &[i16],
-    src_rate: u32,
-    src_channels: u16,
-    out_rate: u32,
-) -> Vec<i16> {
-    let ch = src_channels.max(1) as usize;
-    let frame_count = interleaved.len() / ch.max(1);
-    if frame_count == 0 {
-        return Vec::new();
-    }
-
-    let out_frames =
-        ((frame_count as f64) * (out_rate as f64) / (src_rate.max(1) as f64)).round() as usize;
-    let mut out = Vec::with_capacity(out_frames * 2);
-
-    let sample_at = |frame: usize, channel: usize| -> f32 {
-        let idx = frame * ch + channel.min(ch - 1);
-        interleaved
-            .get(idx)
-            .map(|s| *s as f32 / i16::MAX as f32)
-            .unwrap_or(0.0)
-    };
-
-    for i in 0..out_frames {
-        let src_pos = (i as f64) * (src_rate as f64) / (out_rate as f64);
-        let idx = src_pos.floor() as usize;
-        let frac = (src_pos - idx as f64) as f32;
-        for out_ch in 0..2usize {
-            let src_ch = if ch == 1 { 0 } else { out_ch.min(ch - 1) };
-            let s0 = sample_at(idx, src_ch);
-            let s1 = sample_at(idx + 1, src_ch);
-            let s = s0 + (s1 - s0) * frac;
-            let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-            out.push(v);
-        }
-    }
-    out
-}
-
-fn write_wav(path: &Path, samples: &[i16], rate: u32, channels: u16) -> Result<(), String> {
-    let data_len = (samples.len() * 2) as u32;
-    let mut f = File::create(path).map_err(|e| e.to_string())?;
-    let byte_rate = rate * channels as u32 * 2;
-    let block_align = channels * 2;
-    f.write_all(b"RIFF").map_err(|e| e.to_string())?;
-    f.write_all(&(36 + data_len).to_le_bytes())
-        .map_err(|e| e.to_string())?;
-    f.write_all(b"WAVE").map_err(|e| e.to_string())?;
-    f.write_all(b"fmt ").map_err(|e| e.to_string())?;
-    f.write_all(&16u32.to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&1u16.to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&channels.to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&rate.to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&byte_rate.to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&block_align.to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&16u16.to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(b"data").map_err(|e| e.to_string())?;
-    f.write_all(&data_len.to_le_bytes()).map_err(|e| e.to_string())?;
-    for s in samples {
-        f.write_all(&s.to_le_bytes()).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+pub fn write_mono_f32_as_wav(mono: &[f32], src_rate: u32, output: &Path) -> Result<(), String> {
+    let pcm: Vec<i16> = mono
+        .iter()
+        .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+        .collect();
+    let stereo = resample_interleaved_to_stereo(&pcm, src_rate, 1, OUT_RATE);
+    write_wav(output, &stereo, OUT_RATE, OUT_CHANNELS)
 }

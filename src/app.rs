@@ -30,6 +30,12 @@ pub enum AudioExtractStatus {
     Failed,
 }
 
+impl AudioExtractStatus {
+    fn is_extracting(&self) -> bool {
+        matches!(self, Self::Extracting { .. })
+    }
+}
+
 /// How two selected nodes relate for Path Magic boolean / clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BooleanPairMode {
@@ -232,6 +238,8 @@ pub struct VadadeeBerryApp {
     audio_player_buffer_offset: std::collections::HashMap<uuid::Uuid, f32>,
     /// Last timeline `file_pos` seen while a player is active (scrub/jump detection).
     audio_player_last_file_pos: std::collections::HashMap<uuid::Uuid, f32>,
+    /// Playback rate used when the player was created (VideoPlayer Expr x*2 → 2.0).
+    audio_player_playback_rate: std::collections::HashMap<uuid::Uuid, f32>,
     /// Do not retry rodio open/decode for these layers until playback stops.
     audio_layers_skip: std::collections::HashSet<uuid::Uuid>,
     /// MP4/MOV/… → one-shot symphonia PCM wav for rodio.
@@ -870,6 +878,7 @@ impl VadadeeBerryApp {
             audio_players: std::collections::HashMap::new(),
             audio_player_buffer_offset: std::collections::HashMap::new(),
             audio_player_last_file_pos: std::collections::HashMap::new(),
+            audio_player_playback_rate: std::collections::HashMap::new(),
             audio_layers_skip: std::collections::HashSet::new(),
             audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -4458,6 +4467,115 @@ impl VadadeeBerryApp {
         }
     }
 
+    /// Group selected nodes. Children keep absolute coords; group transform is
+    /// the parent origin (union center). Moving/rotating the group updates children.
+    pub fn group_selection(&mut self) {
+        if self.selection.len() < 2 {
+            self.status_message = "Select 2+ objects to group".into();
+            return;
+        }
+        if !self.layer_editable() {
+            return;
+        }
+        let mut child_ids: Vec<NodeId> = Vec::new();
+        let mut union: Option<kurbo::Rect> = None;
+        for &id in &self.selection {
+            if let Some(n) = self.project.nodes.get(id) {
+                if matches!(n.kind, NodeKind::Group { .. }) {
+                    continue; // skip nesting groups for now
+                }
+                child_ids.push(id);
+                let b = n.bounds();
+                union = Some(match union {
+                    Some(u) => u.union(b),
+                    None => b,
+                });
+            }
+        }
+        if child_ids.len() < 2 {
+            self.status_message = "Need 2+ non-group objects".into();
+            return;
+        }
+        let u = union.unwrap();
+        let ox = (u.x0 + u.x1) * 0.5;
+        let oy = (u.y0 + u.y1) * 0.5;
+        // Convert children to parent-relative positions (subtract group origin).
+        let mut patches = Vec::new();
+        for &cid in &child_ids {
+            let Some(before) = self.project.nodes.get(cid).cloned() else {
+                continue;
+            };
+            let mut after = before.clone();
+            after.translate(-ox, -oy);
+            patches.push((cid, before, after));
+        }
+        let mut group = Node::group(child_ids.clone(), "Group");
+        group.transform.translation = [ox, oy];
+        group.transform.rotation_rad = 0.0;
+        let gid = group.id;
+        if !patches.is_empty() {
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchNodes { patches },
+            );
+        }
+        self.history
+            .push(&mut self.project, ProjectEdit::InsertNode { node: group });
+        // Remove children from layer list order? Keep them but typically groups hold children
+        // that remain in the node store; layer.nodes may still list them — filter draw of
+        // nested children via hidden when parent is a group on the layer.
+        self.selection = vec![gid];
+        self.status_message = format!("Grouped {} objects (relative to parent)", child_ids.len());
+    }
+
+    pub fn ungroup_selection(&mut self) {
+        let sel = self.selection.clone();
+        let mut restored = Vec::new();
+        for &id in &sel {
+            let Some(group) = self.project.nodes.get(id).cloned() else {
+                continue;
+            };
+            let NodeKind::Group { children } = &group.kind else {
+                continue;
+            };
+            let (tx, ty) = (
+                group.transform.translation[0],
+                group.transform.translation[1],
+            );
+            let rot = group.transform.rotation_rad;
+            let cos = rot.cos();
+            let sin = rot.sin();
+            let mut patches = Vec::new();
+            for &cid in children {
+                let Some(before) = self.project.nodes.get(cid).cloned() else {
+                    continue;
+                };
+                let mut after = before.clone();
+                // Local → world: rotate about origin then translate by group origin.
+                let (lx, ly) = after.get_pos();
+                let wx = tx + lx * cos - ly * sin;
+                let wy = ty + lx * sin + ly * cos;
+                let (cx, cy) = after.get_pos();
+                after.translate(wx - cx, wy - cy);
+                after.set_rotation(before.get_rotation() + rot);
+                patches.push((cid, before, after));
+                restored.push(cid);
+            }
+            if !patches.is_empty() {
+                self.history
+                    .push(&mut self.project, ProjectEdit::PatchNodes { patches });
+            }
+            // Delete group node
+            self.delete_nodes(&[id]);
+        }
+        if !restored.is_empty() {
+            self.selection = restored;
+            self.status_message = "Ungrouped".into();
+        } else {
+            self.status_message = "No group in selection".into();
+        }
+    }
+
     pub fn duplicate_selection(&mut self) {
         let copies: Vec<Node> = self
             .selection
@@ -5989,12 +6107,20 @@ impl VadadeeBerryApp {
                 continue;
             };
             let bez = mask.bez_path();
-            let hit = if bez.elements().is_empty() {
+            let hit_mask = if bez.elements().is_empty() {
                 mask.bounds().inflate(slop, slop).contains(pt)
             } else {
                 bez.contains(pt) || mask.bounds().inflate(slop, slop).contains(pt)
             };
-            if hit {
+            // Also accept hits on the source image rect (before texture is warm the
+            // composite may be invisible, but the image footprint is still pickable).
+            let hit_src = self
+                .project
+                .nodes
+                .get(cm.source_id)
+                .map(|s| s.bounds().inflate(slop, slop).contains(pt))
+                .unwrap_or(false);
+            if hit_mask || hit_src {
                 return Some((cm.source_id, cm.mask_id));
             }
         }
@@ -6089,23 +6215,74 @@ impl VadadeeBerryApp {
         }
     }
 
-    /// Load a filesystem image for Node Editor ObjectImage/ObjectVideo paths.
+    /// Load a filesystem image (or video frame when `video_time_sec` is set) for NE paths.
     pub fn ensure_graph_path_texture(&mut self, path: &str, ctx: &Context) -> Option<egui::TextureHandle> {
-        if let Some(t) = self.graph_path_textures.get(path) {
+        self.ensure_graph_path_texture_at(path, None, ctx)
+    }
+
+    pub fn ensure_graph_path_texture_at(
+        &mut self,
+        path: &str,
+        video_time_sec: Option<f64>,
+        ctx: &Context,
+    ) -> Option<egui::TextureHandle> {
+        let key = match video_time_sec {
+            Some(t) => format!("{path}|t{t:.3}"),
+            None => path.to_string(),
+        };
+        if let Some(t) = self.graph_path_textures.get(&key) {
             return Some(t.clone());
         }
-        let dyn_img = image::open(path).ok()?;
-        let rgba = dyn_img.to_rgba8();
+        let last_key = format!("{path}|last");
+        // While WAV extract holds LIBAV_LOCK, skip UI video decode for this path —
+        // competing for the lock freezes the app until extract finishes (~frame 200+).
+        if self.ne_audio_extract_busy(path) {
+            if let Some(t) = self.graph_path_textures.get(&last_key) {
+                return Some(t.clone());
+            }
+            // One cheap frame-0 still so the canvas isn't empty before extract.
+            if video_time_sec.is_some() {
+                if let Some(t) = self.graph_path_textures.get(path) {
+                    return Some(t.clone());
+                }
+            }
+        }
+        let fps = self.anim_fps as f32;
+        let rgba = match crate::document::load_graph_media_rgba(path, video_time_sec, fps) {
+            Some(img) => img,
+            None => {
+                // Decode miss (libav busy / seek fail): keep last good frame — no white flash.
+                if let Some(t) = self.graph_path_textures.get(&last_key) {
+                    return Some(t.clone());
+                }
+                return None;
+            }
+        };
         let (w, h) = rgba.dimensions();
         let pixels = rgba.into_raw();
         let color_image =
             egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
         let handle = ctx.load_texture(
-            format!("vadadee-berry-graph-path-{}", path),
+            format!("vadadee-berry-graph-path-{}", key),
             color_image,
             egui::TextureOptions::LINEAR,
         );
-        self.graph_path_textures.insert(path.to_string(), handle.clone());
+        self.graph_path_textures.insert(key, handle.clone());
+        self.graph_path_textures
+            .insert(last_key, handle.clone());
+        // Cap timed-frame cache; never drop `|last` slots (prevents white flashes).
+        if self.graph_path_textures.len() > 64 {
+            let drop: Vec<String> = self
+                .graph_path_textures
+                .keys()
+                .filter(|k| k.contains("|t") && !k.ends_with("|last"))
+                .take(16)
+                .cloned()
+                .collect();
+            for k in drop {
+                self.graph_path_textures.remove(&k);
+            }
+        }
         Some(handle)
     }
 
@@ -6138,20 +6315,22 @@ impl VadadeeBerryApp {
         let animating = self.anim_is_playing;
         let q = eval.quantized_for_cache(animating);
 
+        let media_key = q.media_cache_key(path);
+
         // Identity **or brightness-only** → sharp base texture (tint applied when painting).
         if !q.needs_texture_bake() {
-            self.invalidate_graph_gpu_live(path);
+            self.invalidate_graph_gpu_live(&media_key);
             if q.brightness < 0.99 || q.brightness > 1.01 {
                 // Still drop soft GPU mips when leaving blur.
-                self.invalidate_graph_gpu_path_prefix(path);
+                self.invalidate_graph_gpu_path_prefix(&media_key);
             }
-            return self.ensure_graph_path_texture(path, ctx);
+            return self.ensure_graph_path_texture_at(path, q.video_time_sec, ctx);
         }
 
         // Always key by full FX state (incl. blur). Live-only key caused: blur→0 still
         // painting the previous blurred GPU texture when only brightness changed.
         let key = q.fx_cache_key(path);
-        let live_key = format!("{path}|live");
+        let live_key = format!("{media_key}|live");
 
         let br = q.blur_px.clamp(0.0, 64.0) as f32;
         let color_key = format!(
@@ -6161,19 +6340,19 @@ impl VadadeeBerryApp {
 
         // --- Sharp path with contrast/sat/hue (still no blur) ---
         if br < 0.05 {
-            self.invalidate_graph_gpu_live(path);
-            self.invalidate_graph_gpu_path_prefix(path);
+            self.invalidate_graph_gpu_live(&media_key);
+            self.invalidate_graph_gpu_path_prefix(&media_key);
             if let Some(t) = self.graph_path_textures.get(&key) {
                 return Some(t.clone());
             }
-            if !self.graph_base_rgba.contains_key(path) {
-                let dyn_img = image::open(path).ok()?;
-                self.graph_base_rgba
-                    .insert(path.to_string(), dyn_img.to_rgba8());
+            if !self.graph_base_rgba.contains_key(&media_key) {
+                let fps = self.anim_fps as f32;
+                let rgba = crate::document::load_graph_media_rgba(path, q.video_time_sec, fps)?;
+                self.graph_base_rgba.insert(media_key.clone(), rgba);
             }
             // Medium res for rare sat/hue/contrast bakes (not brightness-only).
             let max_side = if animating { 512u32 } else { 1024u32 };
-            let base = self.graph_base_rgba.get(path)?;
+            let base = self.graph_base_rgba.get(&media_key)?;
             let mut rgba = crate::document::downscale_rgba_max_side(base, max_side);
             let mut color_only = q.clone();
             color_only.blur_px = 0.0;
@@ -6206,22 +6385,22 @@ impl VadadeeBerryApp {
             }
         }
 
-        if !self.graph_base_rgba.contains_key(path) {
-            let dyn_img = image::open(path).ok()?;
-            self.graph_base_rgba
-                .insert(path.to_string(), dyn_img.to_rgba8());
+        if !self.graph_base_rgba.contains_key(&media_key) {
+            let fps = self.anim_fps as f32;
+            let rgba = crate::document::load_graph_media_rgba(path, q.video_time_sec, fps)?;
+            self.graph_base_rgba.insert(media_key.clone(), rgba);
         }
 
         let max_side = if animating { 128u32 } else { 256u32 };
-        let preview_key = format!("{path}|{max_side}");
+        let preview_key = format!("{media_key}|{max_side}");
         if !self.graph_preview_rgba.contains_key(&preview_key) {
-            let base = self.graph_base_rgba.get(path)?;
+            let base = self.graph_base_rgba.get(&media_key)?;
             let small = crate::document::downscale_rgba_max_side(base, max_side);
             self.graph_preview_rgba.insert(preview_key.clone(), small);
         }
         let preview = self.graph_preview_rgba.get(&preview_key)?.clone();
 
-        let color_cache_key = format!("{path}|{color_key}|{max_side}");
+        let color_cache_key = format!("{media_key}|{color_key}|{max_side}");
         let rgba = if let Some(c) = self.graph_color_rgba.get(&color_cache_key) {
             c.clone()
         } else {
@@ -6252,7 +6431,7 @@ impl VadadeeBerryApp {
                     crate::shading::graph_blur::register_or_update_native(&rs, &view, existing)
                 {
                     if !animating {
-                        let prefix = format!("{path}|");
+                        let prefix = format!("{media_key}|");
                         let mut drop_keys: Vec<String> = self
                             .graph_gpu_fx
                             .keys()
@@ -6342,13 +6521,19 @@ impl VadadeeBerryApp {
     ) -> Option<(egui::TextureId, [usize; 2])> {
         let animating = self.anim_is_playing;
         let q = eval.quantized_for_cache(animating);
+        let media_key = q.media_cache_key(path);
         if !q.needs_texture_bake() {
-            let t = self.graph_path_textures.get(path)?;
+            if let Some(t) = self.graph_path_textures.get(&media_key) {
+                return Some((t.id(), t.size()));
+            }
+            // Keep last good frame if this exact time key was evicted / not ready.
+            let last = format!("{}|last", path);
+            let t = self.graph_path_textures.get(&last)?;
             return Some((t.id(), t.size()));
         }
         let br = q.blur_px.clamp(0.0, 64.0) as f32;
         let key = q.fx_cache_key(path);
-        let live_key = format!("{path}|live");
+        let live_key = format!("{media_key}|live");
 
         // Sharp non-brightness FX (sat/hue/contrast): CPU cache; never stale GPU blur.
         if br < 0.05 {
@@ -6357,7 +6542,7 @@ impl VadadeeBerryApp {
             }
             return self
                 .graph_path_textures
-                .get(path)
+                .get(&media_key)
                 .map(|t| (t.id(), t.size()));
         }
 
@@ -6376,7 +6561,7 @@ impl VadadeeBerryApp {
             return Some((t.id(), t.size()));
         }
         self.graph_path_textures
-            .get(path)
+            .get(&media_key)
             .map(|t| (t.id(), t.size()))
     }
 
@@ -6674,7 +6859,8 @@ fn run_video_decode_thread(
             }
         }
 
-        if self.anim_current_frame % 300 == 0 {
+        // Rare memory prune only — never while playing (must not delete live WAV under rodio).
+        if !self.anim_is_playing && self.anim_current_frame % 300 == 0 {
             self.cleanup_unused_audio_caches();
         }
     }
@@ -6694,19 +6880,60 @@ fn run_video_decode_thread(
                     active_source_paths.insert(layer.video_path.clone());
                 }
             }
+            // Node Editor: graph media is what extract keys on — omitting this deleted
+            // Ready WAVs every ~300 frames and left speakers silent after a short play.
+            if layer.kind == crate::document::LayerKind::NodeEditor {
+                if let Some(g) = layer.node_graph.as_ref() {
+                    for node in g.nodes.values() {
+                        match &node.kind {
+                            crate::document::GraphNodeKind::ObjectImage { path }
+                            | crate::document::GraphNodeKind::ObjectVideo { path }
+                            | crate::document::GraphNodeKind::ObjectAudio { path } => {
+                                if !path.is_empty() {
+                                    active_source_paths.insert(path.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(p) = g.resolve_output_sound().path() {
+                        if !p.is_empty() {
+                            active_source_paths.insert(p.to_string());
+                        }
+                    }
+                    if let crate::document::GraphImageSource::FilePath(p) =
+                        g.resolve_output_image().image
+                    {
+                        if !p.is_empty() {
+                            active_source_paths.insert(p);
+                        }
+                    }
+                }
+            }
         }
 
+        let cache_dir = dirs_next_audio_cache_dir();
         let mut active_wav_paths = std::collections::HashSet::new();
         if let Ok(mut status_map) = self.audio_extract_status.lock() {
-            status_map.retain(|source_path, status| {
-                let keep = active_source_paths.contains(source_path);
-                if keep {
+            // First pass: remember WAVs still in use.
+            for (source_path, status) in status_map.iter() {
+                if active_source_paths.contains(source_path) {
                     if let AudioExtractStatus::Ready(wav_path) = status {
                         active_wav_paths.insert(wav_path.to_string_lossy().to_string());
                     }
-                } else {
+                }
+            }
+            status_map.retain(|source_path, status| {
+                let keep = active_source_paths.contains(source_path);
+                if !keep {
                     if let AudioExtractStatus::Ready(wav_path) = status {
-                        let _ = std::fs::remove_file(wav_path);
+                        // Only remove orphan XDG-cache files; never delete sidecars next to user media.
+                        let under_cache = wav_path.starts_with(&cache_dir);
+                        let still_ref = active_wav_paths
+                            .contains(wav_path.to_string_lossy().as_ref());
+                        if under_cache && !still_ref {
+                            let _ = std::fs::remove_file(wav_path);
+                        }
                     }
                 }
                 keep
@@ -6860,6 +7087,8 @@ fn run_video_decode_thread(
             }
         }
 
+        self.viewport.page_width = self.project.document.width as f32;
+        self.viewport.page_height = self.project.document.height as f32;
         let page = self.viewport.page_rect(
             origin,
             self.project.document.width as f32,
@@ -6946,6 +7175,10 @@ fn run_video_decode_thread(
                 }
             }
 
+            // Start video→WAV extract ASAP (not only when Play is pressed). Contending
+            // with per-frame UI video decode delayed audio until ~hundreds of frames.
+            self.warm_ne_video_audio_extract();
+
             // Warm Node Editor Output Object textures (include blur bake when not playing).
             let graph_evals: Vec<(String, crate::document::GraphOutputEval)> = self
                 .project
@@ -6964,7 +7197,17 @@ fn run_video_decode_thread(
                     }
                 })
                 .collect();
+            // While extract is busy, only show cached frames (no new libav seeks).
             for (path, eval) in &graph_evals {
+                if eval.video_time_sec.is_some() && self.ne_audio_extract_busy(path) {
+                    // Touch last texture only — skip FX rebake that would decode.
+                    let _ = self.ensure_graph_path_texture_at(
+                        path,
+                        eval.video_time_sec,
+                        &ctx,
+                    );
+                    continue;
+                }
                 let _ = self.ensure_graph_fx_texture(path, eval, &ctx);
             }
             // Fit still-default proxies to natural image size (once).
@@ -8422,6 +8665,14 @@ fn run_video_decode_thread(
                 hidden.insert(e.b_id);
             }
         }
+        // Group children are painted via the parent (relative transform).
+        for n in self.project.nodes.map.values() {
+            if let NodeKind::Group { children } = &n.kind {
+                for &cid in children {
+                    hidden.insert(cid);
+                }
+            }
+        }
         // P6c: App objects feeding a visible Node Editor Output are drawn by the NE
         // composite only — hide originals so they don't double-draw on Image layers.
         for layer in &self.project.document.layers {
@@ -8532,12 +8783,15 @@ fn run_video_decode_thread(
             return false;
         }
 
+        // Ensure algebra (Time / Expr) is current before resolving VideoPlayer windows.
+        self.eval_node_editor_graphs();
+
         let playhead_time = self.anim_current_frame as f32 / self.anim_fps as f32;
-        // (path, timeline_start, file_offset, volume, bass)
+        // (path, timeline_start, file_offset, volume, bass, playback_rate)
         let mut active_clip_ids = std::collections::HashSet::new();
         let mut clip_info_map: std::collections::HashMap<
             uuid::Uuid,
-            (String, f32, f32, f32, f32),
+            (String, f32, f32, f32, f32, f32),
         > = std::collections::HashMap::new();
 
         for layer in &self.project.document.layers {
@@ -8547,7 +8801,9 @@ fn run_video_decode_thread(
                     let snd = g.resolve_output_sound();
                     if let Some(path) = snd.path() {
                         let playable = crate::document::AvClip::path_is_audio_only(path)
-                            || is_video_container_ext(path);
+                            || crate::document::AvClip::path_is_video_container(path)
+                            || path.ends_with(".wav")
+                            || path.ends_with(".WAV");
                         if playable && std::path::Path::new(path).is_file() {
                             let id = layer.id;
                             // Bass as mild gain boost (streaming path has no full-buffer EQ).
@@ -8555,13 +8811,31 @@ fn run_video_decode_thread(
                                 (1.0 + (snd.eq_bass as f32).clamp(-6.0, 12.0) * 0.08).max(0.05);
                             let vol = ((layer.volume as f64 * snd.volume) as f32 * bass_boost)
                                 .clamp(0.0, 4.0);
+                            // Never sticky-skip NE layers — extract/stream must be retriable.
                             self.audio_layers_skip.remove(&id);
-                            // Do NOT spawn_preload here — that was called every frame and
-                            // forked N full-file decode threads until the machine OOM'd.
                             active_clip_ids.insert(id);
+                            // Timed VideoPlayer: seek media to media_time_sec.
+                            // Untimed ObjectAudio/Video.sound: follow playhead from 0.
+                            let (tl_start, file_off) = match snd.media_time_sec {
+                                Some(t) => (playhead_time, (t as f32).max(0.0)),
+                                None => (0.0_f32, 0.0_f32),
+                            };
+                            let rate = (snd.playback_rate as f32).clamp(0.05, 16.0);
                             clip_info_map.insert(
                                 id,
-                                (path.to_string(), 0.0_f32, 0.0_f32, vol, snd.eq_bass as f32),
+                                (
+                                    path.to_string(),
+                                    tl_start,
+                                    file_off,
+                                    vol.max(0.05), // never fully mute via float noise
+                                    snd.eq_bass as f32,
+                                    rate,
+                                ),
+                            );
+                        } else if !path.is_empty() {
+                            log::debug!(
+                                "NE sound path not playable yet: {path} (file={})",
+                                std::path::Path::new(path).is_file()
                             );
                         }
                     }
@@ -8595,6 +8869,7 @@ fn run_video_decode_thread(
                             clip.video_start_offset,
                             layer.volume,
                             0.0,
+                            1.0, // AV clips play 1× media rate
                         ),
                     );
                 }
@@ -8618,7 +8893,7 @@ fn run_video_decode_thread(
         });
 
         for &clip_id in &active_clip_ids {
-            let Some(&(ref media_path, start, start_offset, volume, _bass)) =
+            let Some(&(ref media_path, start, start_offset, volume, _bass, play_rate)) =
                 clip_info_map.get(&clip_id)
             else {
                 continue;
@@ -8628,9 +8903,20 @@ fn run_video_decode_thread(
             }
 
             let file_pos = ((playhead_time - start) + start_offset).max(0.0);
-            let frame_time = 1.0 / self.anim_fps.max(1) as f32;
-            let jump_threshold = (frame_time * 8.0).max(0.75);
+            // Scrub detection only — free-running rodio must NOT recreate every playhead skip.
+            let jump_threshold = 1.25_f32 * play_rate.max(1.0);
             let mut need_create = !self.audio_players.contains_key(&clip_id);
+
+            // Restart if rate changed (e.g. user edited Expr 1→2).
+            if let Some(&prev_rate) = self.audio_player_playback_rate.get(&clip_id) {
+                if (prev_rate - play_rate).abs() > 0.15 {
+                    self.audio_players.remove(&clip_id);
+                    self.audio_player_buffer_offset.remove(&clip_id);
+                    self.audio_player_last_file_pos.remove(&clip_id);
+                    self.audio_player_playback_rate.remove(&clip_id);
+                    need_create = true;
+                }
+            }
 
             if let Some(player) = self.audio_players.get(&clip_id) {
                 let last_pos = self
@@ -8639,41 +8925,80 @@ fn run_video_decode_thread(
                     .copied()
                     .unwrap_or(file_pos);
                 let delta = (file_pos - last_pos).abs();
-                let looped = file_pos + 0.5 < last_pos;
-                if delta > jump_threshold || looped {
+                let scrubbed_back = file_pos + 0.35 < last_pos;
+                let scrubbed_far = delta > jump_threshold;
+
+                // Still has samples queued → just keep playing (do not thrash recreate).
+                if !player.empty() && !scrubbed_back && !scrubbed_far {
+                    player.set_volume(volume);
+                    player.play();
+                    // Advance tracked pos with wall clock estimate so small skips don't seek.
+                    let est = last_pos
+                        + (1.0 / self.anim_fps.max(1) as f32) * play_rate.max(0.05);
+                    // Blend toward desired file_pos gently.
+                    let blended = est * 0.7 + file_pos * 0.3;
+                    self.audio_player_last_file_pos.insert(clip_id, blended);
+                } else if player.empty() || scrubbed_back || scrubbed_far {
+                    // Source finished or user scrubbed — rebuild from file_pos.
                     self.audio_players.remove(&clip_id);
                     self.audio_player_buffer_offset.remove(&clip_id);
                     self.audio_player_last_file_pos.remove(&clip_id);
+                    self.audio_player_playback_rate.remove(&clip_id);
                     need_create = true;
-                } else {
-                    player.set_volume(volume);
-                    player.play();
-                    self.audio_player_last_file_pos.insert(clip_id, file_pos);
                 }
             }
 
             if need_create {
-                if let Some(audio_path) = resolve_audio_path_for_rodio(
+                // Prefer cached WAV for video containers; pure audio / .wav stream as-is.
+                let resolved = resolve_audio_path_for_rodio(
                     media_path,
                     &self.audio_extract_status,
                     &self.audio_pcm_cache,
-                ) {
-                    // Stream from disk — never load whole song into RAM as f32.
-                    let player = rodio::Player::connect_new(mixer);
-                    match crate::audio_extract::stream_file_to_player(
-                        &player,
-                        &audio_path,
-                        file_pos,
-                        volume,
-                    ) {
-                        Ok(()) => {
-                            self.audio_player_last_file_pos.insert(clip_id, file_pos);
-                            self.audio_player_buffer_offset.insert(clip_id, file_pos);
-                            self.audio_players.insert(clip_id, player);
-                        }
-                        Err(e) => {
-                            log::warn!("audio stream failed {media_path}: {e}");
-                            self.audio_layers_skip.insert(clip_id);
+                );
+                if let Some(audio_path) = resolved {
+                    if !audio_path.is_file() {
+                        log::warn!("audio path missing: {}", audio_path.display());
+                        self.status_message =
+                            format!("Audio file missing: {}", audio_path.display());
+                    } else {
+                        let player = rodio::Player::connect_new(mixer);
+                        match crate::audio_extract::stream_file_to_player_rate(
+                            &player,
+                            &audio_path,
+                            file_pos,
+                            volume,
+                            play_rate,
+                        ) {
+                            Ok(()) => {
+                                self.audio_player_last_file_pos.insert(clip_id, file_pos);
+                                self.audio_player_buffer_offset.insert(clip_id, file_pos);
+                                self.audio_player_playback_rate.insert(clip_id, play_rate);
+                                self.audio_players.insert(clip_id, player);
+                                self.audio_layers_skip.remove(&clip_id);
+                                // Surface once so silent graphs (Visualizer Level is synthetic) are diagnosable.
+                                self.status_message = format!(
+                                    "Audio → speakers @ {:.1}s ×{:.2}",
+                                    file_pos, play_rate
+                                );
+                                log::info!(
+                                    "audio playing {} @ {:.2}s rate={:.2} vol={:.2}",
+                                    audio_path.display(),
+                                    file_pos,
+                                    play_rate,
+                                    volume
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!("audio stream failed {media_path}: {e}");
+                                self.status_message = format!("Audio: {e}");
+                                // Soft skip AV layers only; NE retries next frames.
+                                if !self.project.document.layers.iter().any(|l| {
+                                    l.id == clip_id
+                                        && l.kind == crate::document::LayerKind::NodeEditor
+                                }) {
+                                    self.audio_layers_skip.insert(clip_id);
+                                }
+                            }
                         }
                     }
                 } else {
@@ -8683,6 +9008,32 @@ fn run_video_decode_thread(
                         &self.audio_extract_status,
                         &self.audio_pcm_cache,
                     );
+                    if let Ok(map) = self.audio_extract_status.lock() {
+                        match map.get(media_path) {
+                            Some(AudioExtractStatus::Extracting { progress }) => {
+                                self.status_message = format!(
+                                    "Extracting video audio… {:.0}%",
+                                    progress * 100.0
+                                );
+                            }
+                            Some(AudioExtractStatus::Failed) => {
+                                self.status_message =
+                                    "Audio extract failed (no track or FFmpeg/libav issue)"
+                                        .into();
+                            }
+                            Some(AudioExtractStatus::Ready(p)) if !p.is_file() => {
+                                // Stale Ready — clear so extract can run again.
+                                drop(map);
+                                if let Ok(mut m) = self.audio_extract_status.lock() {
+                                    m.remove(media_path);
+                                }
+                            }
+                            _ => {
+                                self.status_message =
+                                    "Preparing audio…".into();
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -8692,6 +9043,8 @@ fn run_video_decode_thread(
         self.audio_player_buffer_offset
             .retain(|id, _| active_clip_ids.contains(id));
         self.audio_player_last_file_pos
+            .retain(|id, _| active_clip_ids.contains(id));
+        self.audio_player_playback_rate
             .retain(|id, _| active_clip_ids.contains(id));
         self.audio_prepare_rx
             .retain(|id, _| active_clip_ids.contains(id));
@@ -10313,8 +10666,9 @@ fn run_video_decode_thread(
         }
         let before_doc = snapshot_document(&self.project.document);
         let mut after_doc = before_doc.clone();
+        let effect_id = uuid::Uuid::new_v4();
         let effect = ClipMaskEffect {
-            id: uuid::Uuid::new_v4(),
+            id: effect_id,
             source_id: source,
             mask_id: mask,
             hide_mask: true,
@@ -10327,6 +10681,8 @@ fn run_video_decode_thread(
                 after: after_doc,
             },
         );
+        // Force texture rebuild next paint so live clip is visible/pickable immediately.
+        self.clip_mask_signatures.remove(&effect_id);
         self.status_message = "Clip Mask applied (image → solid face)".into();
     }
 
@@ -10447,9 +10803,12 @@ fn run_video_decode_thread(
         };
         let sx = pixel_w as f32 / w as f32;
         let sy = pixel_h as f32 / h as f32;
+        // SVG already has width/height in pixels matching the pixmap — do NOT scale
+        // again (from_scale made the result look zoomed vs the live clip).
+        let _ = (sx, sy);
         resvg::render(
             &tree,
-            resvg::tiny_skia::Transform::from_scale(sx, sy),
+            resvg::tiny_skia::Transform::identity(),
             &mut pixmap.as_mut(),
         );
         let rgba = pixmap.take();
@@ -10485,6 +10844,7 @@ fn run_video_decode_thread(
         } else {
             format!("{} clipped", source_node.name)
         };
+        // Place baked image at mask bounds in document units (matches clip region).
         let mut node = Node::image(mask_bounds.x0, mask_bounds.y0, w, h, png_bytes);
         node.name = name;
         let new_id = after.nodes.insert(node);
@@ -11685,7 +12045,7 @@ fn run_video_decode_thread(
                                         self.convert_rect_to_path(id);
                                         if let Some(node) = self.project.nodes.get(id) {
                                             self.tools.select.drag_mode = Some(SelectDrag::Rotate);
-                                            let b = node.bounds();
+                                            let b = node.bounds_with_store(&self.project.nodes);
                                             let cx = (b.x0 + b.x1) * 0.5;
                                             let cy = (b.y0 + b.y1) * 0.5;
                                             self.tools.select.rotate_center = Some((cx, cy));
@@ -11971,6 +12331,8 @@ fn run_video_decode_thread(
                         for &sid in &drag_ids {
                             if let Some(node) = self.project.nodes.get(sid) {
                                 if let NodeKind::Group { children } = &node.kind {
+                                    // Parent group (world origin/rotation) + local children.
+                                    nodes_to_snapshot.push((sid, node.clone()));
                                     for &cid in children {
                                         if let Some(child) = self.project.nodes.get(cid) {
                                             nodes_to_snapshot.push((cid, child.clone()));
@@ -12076,10 +12438,38 @@ fn run_video_decode_thread(
                             if self.tools.select.bulk_drag.is_some() {
                                 self.apply_bulk_move_preview(snapped_dx, snapped_dy);
                             } else {
+                                // Group children are local — only move the group origin.
+                                let group_child_ids: std::collections::HashSet<NodeId> = self
+                                    .tools
+                                    .select
+                                    .drag_snapshot
+                                    .iter()
+                                    .filter_map(|(id, n)| {
+                                        if matches!(n.kind, NodeKind::Group { .. }) {
+                                            None
+                                        } else if self.selection.iter().any(|sid| {
+                                            self.project.nodes.get(*sid).is_some_and(|g| {
+                                                matches!(&g.kind, NodeKind::Group { children } if children.contains(id))
+                                            })
+                                        }) {
+                                            Some(*id)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
                                 for &(id, ref orig_node) in &self.tools.select.drag_snapshot {
+                                    if group_child_ids.contains(&id) {
+                                        continue;
+                                    }
                                     if let Some(node) = self.project.nodes.get_mut(id) {
                                         *node = orig_node.clone();
-                                        node.translate(snapped_dx, snapped_dy);
+                                        if matches!(node.kind, NodeKind::Group { .. }) {
+                                            node.transform.translation[0] += snapped_dx;
+                                            node.transform.translation[1] += snapped_dy;
+                                        } else {
+                                            node.translate(snapped_dx, snapped_dy);
+                                        }
                                     }
                                 }
                                 // Circular ring rides with the source (rigid) so bbox size stays stable.
@@ -12216,12 +12606,44 @@ fn run_video_decode_thread(
                                     let layer = &mut self.project.document.layers[pos];
                                     let new_rot = self.tools.select.rotate_start_layer_rotation + delta_angle.to_degrees() as f32;
                                     layer.rotation = new_rot;
-                                } else if let Some(&(drag_id, ref original_node)) = self.tools.select.drag_snapshot.first() {
-                                    if drag_id == id {
-                                        let mut node = original_node.clone();
-                                        let original_rot = original_node.get_rotation();
-                                        node.set_rotation(original_rot + delta_angle);
-                                        if let Some(n) = self.project.nodes.get_mut(id) {
+                                } else if matches!(
+                                    self.project.nodes.get(id).map(|n| &n.kind),
+                                    Some(NodeKind::Group { .. })
+                                ) {
+                                    // Group: rotate parent only (children stay local).
+                                    let base = self
+                                        .tools
+                                        .select
+                                        .drag_snapshot
+                                        .iter()
+                                        .find(|(sid, _)| *sid == id)
+                                        .map(|(_, n)| n.transform.rotation_rad)
+                                        .or_else(|| {
+                                            self.project
+                                                .nodes
+                                                .get(id)
+                                                .map(|n| n.transform.rotation_rad)
+                                        })
+                                        .unwrap_or(0.0);
+                                    if let Some(n) = self.project.nodes.get_mut(id) {
+                                        n.transform.rotation_rad = base + delta_angle;
+                                    }
+                                } else if !self.tools.select.drag_snapshot.is_empty() {
+                                    // Multi-select / expanded children: rotate each about center.
+                                    let cos = delta_angle.cos();
+                                    let sin = delta_angle.sin();
+                                    let (cx, cy) = center;
+                                    for (sid, original) in self.tools.select.drag_snapshot.clone() {
+                                        let mut node = original.clone();
+                                        let (px, py) = original.get_pos();
+                                        let ox = px - cx;
+                                        let oy = py - cy;
+                                        let nx = cx + ox * cos - oy * sin;
+                                        let ny = cy + ox * sin + oy * cos;
+                                        let (cpx, cpy) = node.get_pos();
+                                        node.translate(nx - cpx, ny - cpy);
+                                        node.set_rotation(original.get_rotation() + delta_angle);
+                                        if let Some(n) = self.project.nodes.get_mut(sid) {
                                             *n = node;
                                         }
                                     }
@@ -14505,6 +14927,8 @@ fn run_video_decode_thread(
                     "image": image,
                     "sound": sound,
                     "sound_volume": snd.volume,
+                    "sound_media_time_sec": snd.media_time_sec,
+                    "sound_playback_rate": snd.playback_rate,
                     "sound_eq_bass": snd.eq_bass,
                     "sound_eq_mid": snd.eq_mid,
                     "sound_eq_treble": snd.eq_treble,
@@ -14585,7 +15009,7 @@ fn run_video_decode_thread(
                                 *value = v;
                             }
                         }
-                        crate::document::GraphNodeKind::Expr { expr } => {
+                        crate::document::GraphNodeKind::ExprX { expr } => {
                             if let Some(e) = args.get("expr").and_then(|x| x.as_str()) {
                                 *expr = e.to_string();
                             }
@@ -17283,8 +17707,9 @@ mod tests {
                 },
                 audio_device: rodio::DeviceSinkBuilder::open_default_sink().ok(),
                 audio_players: std::collections::HashMap::new(),
-            audio_player_buffer_offset: std::collections::HashMap::new(),
-            audio_player_last_file_pos: std::collections::HashMap::new(),
+                audio_player_buffer_offset: std::collections::HashMap::new(),
+                audio_player_last_file_pos: std::collections::HashMap::new(),
+                audio_player_playback_rate: std::collections::HashMap::new(),
                 audio_layers_skip: std::collections::HashSet::new(),
                 audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -17522,55 +17947,168 @@ mod tests {
 }
 
 fn is_video_container_ext(path: &str) -> bool {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(
-        ext.as_str(),
-        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mpeg" | "mpg" | "3gp"
-    )
+    crate::document::AvClip::path_is_video_container(path)
 }
 
-/// Start background stereo MP3 extract for video containers (idempotent).
+impl VadadeeBerryApp {
+    /// True while background video→WAV extract is running for this media path.
+    fn ne_audio_extract_busy(&self, path: &str) -> bool {
+        self.audio_extract_status
+            .lock()
+            .ok()
+            .and_then(|m| m.get(path).map(|s| s.is_extracting()))
+            .unwrap_or(false)
+    }
+
+    /// Kick extract for every NE video sound path as soon as the graph references it.
+    /// Rate-limited: at most once every 500ms (not every UI frame).
+    fn warm_ne_video_audio_extract(&mut self) {
+        use std::time::{Duration, Instant};
+        static LAST: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> =
+            std::sync::OnceLock::new();
+        let slot = LAST.get_or_init(|| std::sync::Mutex::new(None));
+        {
+            let mut last = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(t) = *last {
+                if t.elapsed() < Duration::from_millis(500) {
+                    return;
+                }
+            }
+            *last = Some(Instant::now());
+        }
+
+        let mut paths: Vec<String> = Vec::new();
+        for layer in &self.project.document.layers {
+            if layer.kind != crate::document::LayerKind::NodeEditor || !layer.visible {
+                continue;
+            }
+            let Some(g) = layer.node_graph.as_ref() else {
+                continue;
+            };
+            if let Some(p) = g.resolve_output_sound().path() {
+                paths.push(p.to_string());
+            }
+            for n in g.nodes.values() {
+                match &n.kind {
+                    crate::document::GraphNodeKind::ObjectVideo { path }
+                        if !path.trim().is_empty() =>
+                    {
+                        paths.push(path.clone());
+                    }
+                    crate::document::GraphNodeKind::VideoPlayer => {
+                        if let Some(src) = g.input_source_node(n.id, "video") {
+                            if let Some(sn) = g.nodes.get(&src) {
+                                if let crate::document::GraphNodeKind::ObjectVideo { path } =
+                                    &sn.kind
+                                {
+                                    if !path.trim().is_empty() {
+                                        paths.push(path.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        for p in paths {
+            if crate::document::AvClip::path_is_video_container(&p)
+                && std::path::Path::new(&p).is_file()
+            {
+                // resolve is cheap when Ready/cached; only spawns once per cache key.
+                let _ = resolve_audio_path_for_rodio(
+                    &p,
+                    &self.audio_extract_status,
+                    &self.audio_pcm_cache,
+                );
+            }
+        }
+    }
+}
+
+fn cached_wav_path_for_video(video_path: &str) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    // Prefer XDG cache (always writable). Sidecar next to video is a fallback.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    video_path.hash(&mut hasher);
+    dirs_next_audio_cache_dir().join(format!("vadadee_audio_{:016x}.wav", hasher.finish()))
+}
+
+/// Legacy / co-located extract: `movie.mp4` → `movie.vadadee.wav` next to the file.
+fn sidecar_wav_path_for_video(video_path: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(video_path);
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("audio");
+    p.with_file_name(format!("{stem}.vadadee.wav"))
+}
+
+/// First playable extracted WAV for a video (XDG cache, then sidecar).
+fn find_playable_extracted_wav(video_path: &str) -> Option<std::path::PathBuf> {
+    let cached = cached_wav_path_for_video(video_path);
+    if crate::audio_extract::wav_is_playable(&cached) {
+        return Some(cached);
+    }
+    let side = sidecar_wav_path_for_video(video_path);
+    if crate::audio_extract::wav_is_playable(&side) {
+        return Some(side);
+    }
+    None
+}
+
+/// Start background WAV extract (idempotent). Demuxes each video **at most once**
+/// per process via `ensure_extracted_wav` OnceLock.
 fn spawn_video_audio_extract(
     video_path: &str,
     status_map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
-    pcm_cache: &crate::audio_extract::AudioPcmCache,
+    _pcm_cache: &crate::audio_extract::AudioPcmCache,
 ) {
     if !is_video_container_ext(video_path) {
         return;
     }
 
-    let mut map = status_map.lock().unwrap();
-    match map.get(video_path) {
-        Some(AudioExtractStatus::Ready(pb)) if pb.exists() => return,
-        Some(AudioExtractStatus::Extracting { .. }) => return,
-        Some(AudioExtractStatus::Failed) => return,
-        _ => {}
+    // Already good on disk (cache or sidecar) → Ready, zero work.
+    if let Some(existing) = find_playable_extracted_wav(video_path) {
+        if let Ok(mut map) = status_map.lock() {
+            map.insert(
+                video_path.to_string(),
+                AudioExtractStatus::Ready(existing),
+            );
+        }
+        return;
     }
 
-    map.insert(
-        video_path.to_string(),
-        AudioExtractStatus::Extracting { progress: 0.0 },
-    );
+    let out_wav = cached_wav_path_for_video(video_path);
+
+    {
+        let mut map = status_map.lock().unwrap();
+        match map.get(video_path) {
+            Some(AudioExtractStatus::Failed) => return,
+            Some(AudioExtractStatus::Extracting { .. }) => return,
+            Some(AudioExtractStatus::Ready(p)) if crate::audio_extract::wav_is_playable(p) => {
+                return;
+            }
+            _ => {}
+        }
+        map.insert(
+            video_path.to_string(),
+            AudioExtractStatus::Extracting { progress: 0.0 },
+        );
+    }
+
     let path_clone = video_path.to_string();
     let map_for_report = status_map.clone();
     let map_for_done = status_map.clone();
-    let pcm_cache = pcm_cache.clone();
-    drop(map);
+    let out_wav_clone = out_wav.clone();
 
     std::thread::Builder::new()
         .name("vadadee-audio-extract".into())
         .spawn(move || {
-            use std::hash::{Hash, Hasher};
-
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            path_clone.hash(&mut hasher);
-            let out_wav =
-                std::env::temp_dir().join(format!("vadadee_audio_{:016x}.wav", hasher.finish()));
-
+            let _ = std::fs::create_dir_all(dirs_next_audio_cache_dir());
             let path_key = path_clone.clone();
             let report: crate::audio_extract::ExtractProgress = std::sync::Arc::new(move |p| {
                 if let Ok(mut m) = map_for_report.lock() {
@@ -17583,23 +18121,20 @@ fn spawn_video_audio_extract(
                 }
             });
 
-            let result = crate::audio_extract::extract_audio_to_wav(
+            // OnceLock inside ensure_extracted_wav: concurrent threads wait, demux once.
+            let result = crate::audio_extract::ensure_extracted_wav(
                 std::path::Path::new(&path_clone),
-                &out_wav,
+                &out_wav_clone,
                 report,
             );
 
             let mut m = map_for_done.lock().unwrap();
             match result {
-                Ok(out_path) if out_path.exists() => {
-                    m.insert(path_clone.clone(), AudioExtractStatus::Ready(out_path.clone()));
-                    crate::audio_extract::spawn_preload_pcm(
-                        pcm_cache,
-                        out_path.to_string_lossy().to_string(),
-                        out_path,
-                    );
+                Ok(out_path) => {
+                    m.insert(path_clone, AudioExtractStatus::Ready(out_path));
                 }
-                Ok(_) | Err(_) => {
+                Err(e) => {
+                    log::warn!("audio extract failed for {path_clone}: {e}");
                     m.insert(path_clone, AudioExtractStatus::Failed);
                 }
             }
@@ -17607,7 +18142,23 @@ fn spawn_video_audio_extract(
         .ok();
 }
 
-/// Rodio cannot reliably stream some MP4 layouts; use extracted stereo MP3 (or WAV fallback).
+fn dirs_next_audio_cache_dir() -> std::path::PathBuf {
+    // Prefer XDG cache, then home, then temp.
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if !xdg.is_empty() {
+            return std::path::PathBuf::from(xdg).join("vadadee-berry").join("audio");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home)
+            .join(".cache")
+            .join("vadadee-berry")
+            .join("audio");
+    }
+    std::env::temp_dir().join("vadadee-berry-audio")
+}
+
+/// Rodio cannot stream most video containers; use extracted stereo WAV.
 fn resolve_audio_path_for_rodio(
     video_path: &str,
     status_map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
@@ -17638,17 +18189,32 @@ fn resolve_audio_path_for_rodio(
         return Some(pb);
     }
 
+    // Ready in status map → use immediately if still playable.
+    if let Ok(map) = status_map.lock() {
+        if let Some(AudioExtractStatus::Ready(pb)) = map.get(video_path) {
+            if crate::audio_extract::wav_is_playable(pb) {
+                return Some(pb.clone());
+            }
+        }
+    }
+
+    // XDG cache or co-located `*.vadadee.wav` (older extracts wrote next to the video).
+    if let Some(existing) = find_playable_extracted_wav(video_path) {
+        if let Ok(mut map) = status_map.lock() {
+            map.insert(
+                video_path.to_string(),
+                AudioExtractStatus::Ready(existing.clone()),
+            );
+        }
+        return Some(existing);
+    }
+
+    // Never return the raw video path for rodio.
     spawn_video_audio_extract(video_path, status_map, pcm_cache);
 
     let map = status_map.lock().unwrap();
     match map.get(video_path) {
-        Some(AudioExtractStatus::Ready(pb)) if pb.exists() => {
-            let key = pb.to_string_lossy().to_string();
-            crate::audio_extract::spawn_preload_pcm(
-                pcm_cache.clone(),
-                key,
-                pb.clone(),
-            );
+        Some(AudioExtractStatus::Ready(pb)) if crate::audio_extract::wav_is_playable(pb) => {
             Some(pb.clone())
         }
         _ => None,

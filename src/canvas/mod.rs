@@ -7,6 +7,13 @@ pub struct Viewport {
     pub show_grid: bool,
     pub snap_grid: bool,
     pub grid_step: f32,
+    /// Static grid: divide page width into this many columns (0 = use `grid_step`).
+    pub grid_cols: u32,
+    /// Static grid: divide page height into this many rows (0 = use `grid_step`).
+    pub grid_rows: u32,
+    /// Page size for static grid division (document units).
+    pub page_width: f32,
+    pub page_height: f32,
 }
 
 impl Default for Viewport {
@@ -17,6 +24,10 @@ impl Default for Viewport {
             show_grid: true,
             snap_grid: true,
             grid_step: 20.0,
+            grid_cols: 0,
+            grid_rows: 0,
+            page_width: 794.0,
+            page_height: 1123.0,
         }
     }
 }
@@ -43,18 +54,34 @@ impl Viewport {
         )
     }
 
+    /// Step in X for snap/draw (static columns or fixed step).
+    pub fn step_x(&self) -> f64 {
+        if self.grid_cols > 0 && self.page_width > 1.0 {
+            (self.page_width as f64) / self.grid_cols as f64
+        } else {
+            self.grid_step.max(0.5) as f64
+        }
+    }
+
+    /// Step in Y for snap/draw (static rows or fixed step).
+    pub fn step_y(&self) -> f64 {
+        if self.grid_rows > 0 && self.page_height > 1.0 {
+            (self.page_height as f64) / self.grid_rows as f64
+        } else {
+            self.grid_step.max(0.5) as f64
+        }
+    }
+
     pub fn snap(&self, doc: (f64, f64)) -> (f64, f64) {
         if !self.snap_grid {
             return doc;
         }
-        let g = self.grid_step as f64;
-        if g <= 0.0 {
+        let gx = self.step_x();
+        let gy = self.step_y();
+        if gx <= 0.0 || gy <= 0.0 {
             return doc;
         }
-        (
-            (doc.0 / g).round() * g,
-            (doc.1 / g).round() * g,
-        )
+        ((doc.0 / gx).round() * gx, (doc.1 / gy).round() * gy)
     }
 
     pub fn page_rect(&self, origin: Pos2, width: f32, height: f32) -> Rect {

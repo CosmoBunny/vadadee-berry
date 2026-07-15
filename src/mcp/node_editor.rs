@@ -36,7 +36,7 @@ pub fn node_editor_tools() -> Vec<Value> {
         ),
         tool(
             "add_graph_node",
-            "Add a node to a Node Editor graph. kind: value|expr|frame|time|brightness|color_changer|linear_blur|speed|equalizer|geo_size|geo_placement|geo_rotate|geo_trapezoid|geo_mirror|geo_add|object_image|object_video|object_audio|object_from_app|param_real|param_color|param_position|output_object. Optional: x,y,value,expr,path,name,app_object_ids,param_name,param_value.",
+            "Add a node to a Node Editor graph. kind: value|expr|frame|time|brightness|color_changer|linear_blur|speed|equalizer|visualizer|geo_size|geo_placement|geo_rotate|geo_trapezoid|geo_mirror|geo_add|object_image|object_video|object_audio|object_from_app|param_real|param_color|param_position|output_object. Optional: x,y,value,expr,path,name,app_object_ids,param_name,param_value,gain.",
             json!({
                 "kind": { "type": "string" },
                 "x": { "type": "number", "description": "Graph X (default auto layout)" },
@@ -175,11 +175,25 @@ pub fn kind_from_args(kind: &str, args: &Value) -> Result<GraphNodeKind, String>
         "value" => Ok(GraphNodeKind::Value {
             value: args.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0),
         }),
-        "expr" | "expression" => Ok(GraphNodeKind::Expr {
+        "expr" | "expression" | "expr_x" | "exprx" => Ok(GraphNodeKind::ExprX {
             expr: args
                 .get("expr")
                 .and_then(|v| v.as_str())
                 .unwrap_or("x")
+                .to_string(),
+        }),
+        "expr_xy" | "exprxy" => Ok(GraphNodeKind::ExprXy {
+            expr: args
+                .get("expr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("x+y")
+                .to_string(),
+        }),
+        "expr_xyz" | "exprxyz" => Ok(GraphNodeKind::ExprXyz {
+            expr: args
+                .get("expr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("x+y+z")
                 .to_string(),
         }),
         "frame" => Ok(GraphNodeKind::Frame),
@@ -189,6 +203,9 @@ pub fn kind_from_args(kind: &str, args: &Value) -> Result<GraphNodeKind, String>
         "linear_blur" | "blur" => Ok(GraphNodeKind::LinearBlur),
         "speed" => Ok(GraphNodeKind::Speed),
         "equalizer" | "eq" => Ok(GraphNodeKind::Equalizer),
+        "visualizer" | "viz" => Ok(GraphNodeKind::Visualizer {
+            gain: args.get("gain").and_then(|v| v.as_f64()).unwrap_or(1.0),
+        }),
         "geo_size" | "size" => Ok(GraphNodeKind::GeoSize),
         "geo_placement" | "placement" => Ok(GraphNodeKind::GeoPlacement),
         "geo_rotate" | "rotate" => Ok(GraphNodeKind::GeoRotate),
@@ -233,6 +250,7 @@ pub fn kind_from_args(kind: &str, args: &Value) -> Result<GraphNodeKind, String>
             param_id: Uuid::nil(),
         }),
         "output_object" | "output" => Ok(GraphNodeKind::OutputObject),
+        "video_player" | "player" => Ok(GraphNodeKind::VideoPlayer),
         _ => Err(format!(
             "Unknown graph node kind \"{kind}\". Use list_graph_node_kinds for valid names."
         )),
@@ -252,7 +270,9 @@ pub fn parse_uuid_list(v: Option<&Value>) -> Vec<Uuid> {
 pub fn kind_label(kind: &GraphNodeKind) -> String {
     match kind {
         GraphNodeKind::Value { .. } => "value".into(),
-        GraphNodeKind::Expr { .. } => "expr".into(),
+        GraphNodeKind::ExprX { .. } => "expr_x".into(),
+        GraphNodeKind::ExprXy { .. } => "expr_xy".into(),
+        GraphNodeKind::ExprXyz { .. } => "expr_xyz".into(),
         GraphNodeKind::Frame => "frame".into(),
         GraphNodeKind::Time => "time".into(),
         GraphNodeKind::Brightness => "brightness".into(),
@@ -260,6 +280,7 @@ pub fn kind_label(kind: &GraphNodeKind) -> String {
         GraphNodeKind::LinearBlur => "linear_blur".into(),
         GraphNodeKind::Speed => "speed".into(),
         GraphNodeKind::Equalizer => "equalizer".into(),
+        GraphNodeKind::Visualizer { .. } => "visualizer".into(),
         GraphNodeKind::GeoSize => "geo_size".into(),
         GraphNodeKind::GeoPlacement => "geo_placement".into(),
         GraphNodeKind::GeoRotate => "geo_rotate".into(),
@@ -270,6 +291,7 @@ pub fn kind_label(kind: &GraphNodeKind) -> String {
         GraphNodeKind::ObjectVideo { .. } => "object_video".into(),
         GraphNodeKind::ObjectAudio { .. } => "object_audio".into(),
         GraphNodeKind::ObjectFromApp { .. } => "object_from_app".into(),
+        GraphNodeKind::VideoPlayer => "video_player".into(),
         GraphNodeKind::ParamReal { .. } => "param_real".into(),
         GraphNodeKind::ParamColor { .. } => "param_color".into(),
         GraphNodeKind::ParamPosition { .. } => "param_position".into(),
@@ -280,7 +302,9 @@ pub fn kind_label(kind: &GraphNodeKind) -> String {
 pub fn node_fields_json(kind: &GraphNodeKind) -> Value {
     match kind {
         GraphNodeKind::Value { value } => json!({ "value": value }),
-        GraphNodeKind::Expr { expr } => json!({ "expr": expr }),
+        GraphNodeKind::ExprX { expr }
+        | GraphNodeKind::ExprXy { expr }
+        | GraphNodeKind::ExprXyz { expr } => json!({ "expr": expr }),
         GraphNodeKind::ObjectImage { path }
         | GraphNodeKind::ObjectVideo { path }
         | GraphNodeKind::ObjectAudio { path } => json!({ "path": path }),
@@ -353,7 +377,9 @@ pub fn attach_param(
 pub fn list_kinds_json() -> String {
     let kinds = [
         ("value", "Algebra Real constant"),
-        ("expr", "Algebra expression (x,y,…)"),
+        ("expr_x", "Algebra Expr X (x)"),
+        ("expr_xy", "Algebra Expr XY (x,y)"),
+        ("expr_xyz", "Algebra Expr XYZ (x,y,z)"),
         ("frame", "Current animation frame"),
         ("time", "Time in seconds"),
         ("brightness", "Effect"),
@@ -371,6 +397,8 @@ pub fn list_kinds_json() -> String {
         ("object_video", "File video source"),
         ("object_audio", "File audio source"),
         ("object_from_app", "Document object reference"),
+        ("video_player", "Video + Time + Start/Duration → Image; Audio→Sound"),
+        ("visualizer", "Audio + Freq → Level 0..1"),
         ("param_real", "Animatable real parameter"),
         ("param_color", "Animatable color parameter"),
         ("param_position", "Animatable position parameter"),

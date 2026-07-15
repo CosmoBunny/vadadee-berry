@@ -16,6 +16,18 @@ const NODE_H_BASE: f32 = 56.0;
 const PORT_R: f32 = 6.0;
 const PORT_GAP: f32 = 18.0;
 
+/// Pin / wire colors by port type (shared so links match ports).
+fn port_type_color(ty: PortType) -> Color32 {
+    match ty {
+        PortType::RawImage => Color32::from_rgb(100, 160, 255), // blue
+        PortType::RawVideo => Color32::from_rgb(60, 220, 230),  // cyan
+        PortType::RawSound => Color32::from_rgb(200, 140, 255), // purple
+        PortType::Real => Color32::from_rgb(240, 200, 80),      // gold
+        PortType::Color => Color32::from_rgb(255, 120, 160),    // pink
+        PortType::Position => Color32::from_rgb(120, 220, 180), // mint
+    }
+}
+
 /// Card width grows with title length (no "…" in titles).
 fn node_width(n: &crate::document::GraphNode) -> f32 {
     let title = format!("{} · {}", n.kind.category_label(), n.name);
@@ -54,6 +66,10 @@ pub struct NodeEditorUiState {
     pub node_drag: Option<(Uuid, Vec2)>,
     /// Node whose image stream is shown in the floating preview popup.
     pub preview_node: Option<Uuid>,
+    /// ObjectFromApp picker open for this graph node id.
+    pub object_picker_for: Option<Uuid>,
+    /// Working selection inside the object picker (document NodeIds).
+    pub object_picker_ids: Vec<Uuid>,
     /// Last user-chosen window size (prevents content from “sticking” full height).
     pub window_size: Vec2,
 }
@@ -70,6 +86,8 @@ impl Default for NodeEditorUiState {
             add_menu_at: None,
             node_drag: None,
             preview_node: None,
+            object_picker_for: None,
+            object_picker_ids: Vec::new(),
             window_size: Vec2::new(920.0, 560.0),
         }
     }
@@ -96,6 +114,8 @@ impl NodeEditorUiState {
         self.selected_link = None;
         self.node_drag = None;
         self.preview_node = None;
+        self.object_picker_for = None;
+        self.object_picker_ids.clear();
         self.tool = NodeEditorToolMode::Idle;
     }
 
@@ -216,6 +236,124 @@ pub fn show_node_editor_dialog(app: &mut VadadeeBerryApp, ctx: &Context) {
     // Only the window [x] / hide control closes the editor — not Esc.
     if !open {
         app.node_editor_ui.close();
+    }
+
+    show_object_from_app_picker(app, ctx, layer_idx);
+}
+
+/// ObjectFromApp “Sel” dialog: multi-select document objects.
+fn show_object_from_app_picker(app: &mut VadadeeBerryApp, ctx: &Context, layer_idx: usize) {
+    let Some(graph_node_id) = app.node_editor_ui.object_picker_for else {
+        return;
+    };
+    let mut open = true;
+    let mut apply = false;
+    let mut cancel = false;
+    let mut draft = app.node_editor_ui.object_picker_ids.clone();
+
+    // Collect candidate objects (skip NE output proxies / empty groups optional).
+    let mut items: Vec<(Uuid, String, &'static str)> = Vec::new();
+    for layer in &app.project.document.layers {
+        if layer.kind != LayerKind::Image && layer.kind != LayerKind::AV {
+            // Still list nodes from Image layers primarily; also any node in store
+            // referenced by any layer.nodes.
+        }
+        for &nid in &layer.nodes {
+            if let Some(n) = app.project.nodes.get(nid) {
+                let kind = match &n.kind {
+                    crate::document::NodeKind::Group { .. } => "Group",
+                    crate::document::NodeKind::Image { .. } => "Image",
+                    crate::document::NodeKind::Text { .. } => "Text",
+                    crate::document::NodeKind::Path { .. } => "Path",
+                    crate::document::NodeKind::Rect { .. } => "Rect",
+                    crate::document::NodeKind::Ellipse { .. } => "Ellipse",
+                    crate::document::NodeKind::Polygon { .. } => "Polygon",
+                    crate::document::NodeKind::Plotter { .. } => "Plotter",
+                    crate::document::NodeKind::Arc { .. } => "Arc",
+                    crate::document::NodeKind::BrushStroke { .. } => "Brush",
+                    _ => "Object",
+                };
+                let name = if n.name.trim().is_empty() {
+                    format!("{kind}")
+                } else {
+                    n.name.clone()
+                };
+                items.push((nid, name, kind));
+            }
+        }
+    }
+    // De-dupe by id while preserving order.
+    {
+        let mut seen = std::collections::HashSet::new();
+        items.retain(|(id, _, _)| seen.insert(*id));
+    }
+
+    egui::Window::new("Select application objects")
+        .id(egui::Id::new(("ne_obj_picker", graph_node_id)))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size(Vec2::new(360.0, 420.0))
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new("Pick objects for Object from Application:")
+                    .color(Color32::from_rgb(180, 190, 210)),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Use canvas selection").clicked() {
+                    draft = app.selection.clone();
+                }
+                if ui.button("Clear").clicked() {
+                    draft.clear();
+                }
+                ui.label(format!("{} selected", draft.len()));
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    if items.is_empty() {
+                        ui.label("No document objects on layers.");
+                    }
+                    for (id, name, kind) in &items {
+                        let mut on = draft.contains(id);
+                        let label = format!("{name}  ·  {kind}");
+                        if ui.checkbox(&mut on, label).changed() {
+                            if on {
+                                if !draft.contains(id) {
+                                    draft.push(*id);
+                                }
+                            } else {
+                                draft.retain(|x| x != id);
+                            }
+                        }
+                    }
+                });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Apply").clicked() {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+    app.node_editor_ui.object_picker_ids = draft.clone();
+    if apply {
+        if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+            if let Some(node) = g.nodes.get_mut(&graph_node_id) {
+                if let GraphNodeKind::ObjectFromApp { node_ids } = &mut node.kind {
+                    *node_ids = draft;
+                }
+            }
+        }
+        app.node_editor_ui.object_picker_for = None;
+        app.node_editor_ui.object_picker_ids.clear();
+    } else if cancel || !open {
+        app.node_editor_ui.object_picker_for = None;
+        app.node_editor_ui.object_picker_ids.clear();
     }
 }
 
@@ -436,6 +574,16 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
                 spawn = Some(GraphNodeKind::ObjectFromApp { node_ids: ids });
                 ui.close();
             }
+            if ui
+                .button("Video Player")
+                .on_hover_text(
+                    "Video + Time [+ Start/Duration] → Image; optional Audio in → timed Sound",
+                )
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::VideoPlayer);
+                ui.close();
+            }
             if ui.button("Output Object").clicked() {
                 spawn = Some(GraphNodeKind::OutputObject);
                 ui.close();
@@ -446,9 +594,33 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
                 spawn = Some(GraphNodeKind::Value { value: 0.0 });
                 ui.close();
             }
-            if ui.button("Expr").clicked() {
-                spawn = Some(GraphNodeKind::Expr {
+            if ui
+                .button("Expr X")
+                .on_hover_text("Result from expression in x (and t, f)")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::ExprX {
                     expr: "x".into(),
+                });
+                ui.close();
+            }
+            if ui
+                .button("Expr XY")
+                .on_hover_text("Result from expression in x, y")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::ExprXy {
+                    expr: "x+y".into(),
+                });
+                ui.close();
+            }
+            if ui
+                .button("Expr XYZ")
+                .on_hover_text("Result from expression in x, y, z")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::ExprXyz {
+                    expr: "x+y+z".into(),
                 });
                 ui.close();
             }
@@ -480,6 +652,14 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
             }
             if ui.button("Speed").clicked() {
                 spawn = Some(GraphNodeKind::Speed);
+                ui.close();
+            }
+            if ui
+                .button("Visualizer")
+                .on_hover_text("Audio + Freq (Hz) + Gain → Level 0..1")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::Visualizer { gain: 1.0 });
                 ui.close();
             }
         });
@@ -824,12 +1004,28 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
             let link_selected = sel_link == Some(link.id);
             let endpoint_sel =
                 sel_node == Some(link.from_node) || sel_node == Some(link.to_node);
+            let ty_col = g
+                .nodes
+                .get(&link.from_node)
+                .and_then(|n| {
+                    n.ports()
+                        .into_iter()
+                        .find(|p| p.id == link.from_port)
+                        .map(|p| p.ty)
+                })
+                .map(port_type_color)
+                .unwrap_or(Color32::from_rgb(90, 100, 120));
             let col = if link_selected {
                 Color32::from_rgb(255, 200, 80)
             } else if endpoint_sel {
-                Color32::from_rgb(180, 160, 90)
+                // Warm blend of type color for emphasis.
+                Color32::from_rgb(
+                    ty_col.r().saturating_add(40).min(255),
+                    ty_col.g().saturating_add(30).min(255),
+                    ty_col.b().saturating_add(20).min(255),
+                )
             } else {
-                Color32::from_rgb(90, 100, 120)
+                ty_col
             };
             let thick = if link_selected {
                 3.4
@@ -963,13 +1159,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
         for (pi, port) in ports.iter().enumerate() {
             let pr = port_rect_for(&node_clone, port, pi, rect, &view, preview_open);
             let hot = pointer.map(|p| pr.expand(4.0).contains(p)).unwrap_or(false);
-            let col = match port.ty {
-                PortType::RawImage => Color32::from_rgb(100, 160, 255),
-                PortType::RawSound => Color32::from_rgb(200, 140, 255),
-                PortType::Real => Color32::from_rgb(240, 200, 80),
-                PortType::Color => Color32::from_rgb(255, 120, 160),
-                PortType::Position => Color32::from_rgb(120, 220, 180),
-            };
+            let col = port_type_color(port.ty);
             let pr_r = (PORT_R * view.zoom.max(0.7)).clamp(4.0, 10.0);
             painter.circle_filled(pr.center(), pr_r, col);
             painter.circle_stroke(
@@ -1217,20 +1407,21 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                     painter.text(
                         usesel_rect.left_center(),
                         egui::Align2::LEFT_CENTER,
-                        "Use sel",
+                        "Sel",
                         font.clone(),
                         link_col,
                     );
                     if click && usesel_rect.contains(ptr) {
-                        if let Some(g) =
-                            app.project.document.layers[layer_idx].node_graph.as_mut()
-                        {
-                            if let Some(node) = g.nodes.get_mut(&nid) {
-                                if let GraphNodeKind::ObjectFromApp { node_ids } = &mut node.kind {
-                                    *node_ids = app.selection.clone();
-                                }
-                            }
-                        }
+                        let current = match &node_clone.kind {
+                            GraphNodeKind::ObjectFromApp { node_ids } => node_ids.clone(),
+                            _ => Vec::new(),
+                        };
+                        app.node_editor_ui.object_picker_for = Some(nid);
+                        app.node_editor_ui.object_picker_ids = if current.is_empty() {
+                            app.selection.clone()
+                        } else {
+                            current
+                        };
                     }
                 }
             }
@@ -1252,7 +1443,12 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                             } else {
                                 let mut found = crate::document::GraphOutputEval::default();
                                 for p in node_clone.ports() {
-                                    if p.dir == PortDir::Input && p.ty == PortType::RawImage {
+                                    if p.dir == PortDir::Input
+                                        && matches!(
+                                            p.ty,
+                                            PortType::RawImage | PortType::RawVideo
+                                        )
+                                    {
                                         if let Some(src) = g.input_source_node(nid, &p.id) {
                                             found = g.resolve_node_image_out(src);
                                             if !matches!(
@@ -1270,8 +1466,13 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                     if let Some(eval) = preview_eval {
                         let tid = match &eval.image {
                             crate::document::GraphImageSource::FilePath(path) => {
-                                let _ = app.ensure_graph_path_texture(path, ui.ctx());
-                                app.graph_path_texture_id(path)
+                                let _ = app.ensure_graph_path_texture_at(
+                                    path,
+                                    eval.video_time_sec,
+                                    ui.ctx(),
+                                );
+                                let key = eval.media_cache_key(path);
+                                app.graph_path_texture_id(&key)
                             }
                             crate::document::GraphImageSource::AppObjects(ids) => {
                                 ids.iter().find_map(|id| app.image_texture_id(*id))
@@ -1339,7 +1540,12 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                     );
                 }
             }
-            if let GraphNodeKind::Expr { ref expr } = node_clone.kind {
+            if let Some(expr) = match &node_clone.kind {
+                GraphNodeKind::ExprX { expr }
+                | GraphNodeKind::ExprXy { expr }
+                | GraphNodeKind::ExprXyz { expr } => Some(expr.as_str()),
+                _ => None,
+            } {
                 if !edit {
                     if let Some(v) = live_real {
                         painter.text(
@@ -1403,7 +1609,18 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                     }
                 }
             }
-            if let GraphNodeKind::Expr { ref expr } = node_clone.kind {
+            if matches!(
+                node_clone.kind,
+                GraphNodeKind::ExprX { .. }
+                    | GraphNodeKind::ExprXy { .. }
+                    | GraphNodeKind::ExprXyz { .. }
+            ) {
+                let expr0 = match &node_clone.kind {
+                    GraphNodeKind::ExprX { expr }
+                    | GraphNodeKind::ExprXy { expr }
+                    | GraphNodeKind::ExprXyz { expr } => expr.clone(),
+                    _ => String::new(),
+                };
                 let edit_rect = Rect::from_min_size(
                     Pos2::new(r.min.x + 8.0 * view.zoom.max(0.7), r.min.y + 26.0 * view.zoom.max(0.7)),
                     Vec2::new((r.width() - 16.0).max(20.0), (18.0 * view.zoom).clamp(16.0, 28.0)),
@@ -1411,7 +1628,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 if canvas_clip.contains(edit_rect.min)
                     && canvas_clip.contains(edit_rect.max - Vec2::splat(0.5))
                 {
-                    let mut e = expr.clone();
+                    let mut e = expr0;
                     let resp = egui::Area::new(egui::Id::new(("ne_expr_area", nid)))
                         .order(egui::Order::Foreground)
                         .fixed_pos(edit_rect.min)
@@ -1578,8 +1795,11 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
     for (id, e) in expr_edits {
         if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
             if let Some(n) = g.nodes.get_mut(&id) {
-                if let GraphNodeKind::Expr { expr } = &mut n.kind {
-                    *expr = e;
+                match &mut n.kind {
+                    GraphNodeKind::ExprX { expr }
+                    | GraphNodeKind::ExprXy { expr }
+                    | GraphNodeKind::ExprXyz { expr } => *expr = e,
+                    _ => {}
                 }
             }
         }
@@ -1633,7 +1853,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
         } else {
             vec![
                 GraphNodeKind::Value { value: 0.0 },
-                GraphNodeKind::Expr {
+                GraphNodeKind::ExprX {
                     expr: "x".into(),
                 },
                 GraphNodeKind::Brightness,
@@ -1882,7 +2102,9 @@ fn paint_node_card(
         if matches!(
             node.kind,
             GraphNodeKind::Value { .. }
-                | GraphNodeKind::Expr { .. }
+                | GraphNodeKind::ExprX { .. }
+                | GraphNodeKind::ExprXy { .. }
+                | GraphNodeKind::ExprXyz { .. }
                 | GraphNodeKind::Frame
                 | GraphNodeKind::Time
                 | GraphNodeKind::ParamReal { .. }

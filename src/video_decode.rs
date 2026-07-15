@@ -690,12 +690,51 @@ unsafe fn fmt_duration_secs(fmt: *mut AVFormatContext, avformat_major: u32) -> f
     }
 }
 
-/// Duration in seconds (libav first, then symphonia).
+/// Duration in seconds (libav first, then symphonia). Cached per path — probe is heavy.
 pub fn probe_media_duration_secs(path: &str) -> Option<f32> {
-    if let Some(secs) = probe_media_duration_libav(path) {
-        return Some(secs);
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<f32>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(v) = map.get(path) {
+            return *v;
+        }
     }
-    crate::audio_extract::probe_media_duration_symphonia(path)
+    let secs = probe_media_duration_libav(path)
+        .or_else(|| crate::audio_extract::probe_media_duration_symphonia(path));
+    if let Ok(mut map) = cache.lock() {
+        if map.len() > 64 {
+            map.clear();
+        }
+        map.insert(path.to_string(), secs);
+    }
+    secs
+}
+
+/// Decode a video frame reusing a process-wide stream for the same path (avoids reopen every frame).
+pub fn decode_frame_cached(
+    video_path: &str,
+    source_frame: usize,
+    fps: f32,
+) -> Option<(u32, u32, Vec<u8>)> {
+    use std::sync::Mutex;
+    static STREAM: Mutex<Option<(String, VideoStream)>> = Mutex::new(None);
+    let mut guard = STREAM.lock().ok()?;
+    let need_open = guard
+        .as_ref()
+        .map(|(p, _)| p.as_str() != video_path)
+        .unwrap_or(true);
+    if need_open {
+        *guard = VideoStream::open(video_path).map(|s| (video_path.to_string(), s));
+    }
+    if let Some((_, stream)) = guard.as_mut() {
+        if let Some(rgba) = stream.get_frame(source_frame, fps) {
+            return Some(rgba);
+        }
+    }
+    // Fallback: one-shot open (stream may have failed seek).
+    decode_frame(video_path, source_frame, fps)
 }
 
 fn probe_media_duration_libav(path: &str) -> Option<f32> {
@@ -881,6 +920,8 @@ pub fn decode_audio_to_stereo_i16_libav(
     input: &str,
     mut on_progress: impl FnMut(f32),
 ) -> Result<(Vec<i16>, u32), String> {
+    // Serialize with video decode / VideoStream (same FFmpeg libs are not thread-safe here).
+    let _guard = libav_guard();
     let libs = FFMPEG_LIBS
         .get_or_init(|| try_load_ffmpeg())
         .as_ref()

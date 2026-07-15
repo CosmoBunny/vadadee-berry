@@ -183,6 +183,8 @@ struct TextCacheKey {
     stroke_cap: String,
     opacity_bits: u32,
     zoom_bits: u32,
+    /// Rotation in radians as bits — required so rotated text is not served unrotated.
+    rotation_bits: u64,
 }
 
 #[derive(Clone)]
@@ -315,6 +317,8 @@ pub fn draw_text_glyphs(
         stroke_cap: format!("{:?}", stroke_cap),
         opacity_bits: opacity.to_bits(),
         zoom_bits: viewport.zoom.to_bits(),
+        // Must include rotation — cached meshes bake orientation.
+        rotation_bits: rotation_rad.to_bits(),
     };
 
     let cached = TEXT_CACHE.with(|cache| {

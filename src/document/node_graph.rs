@@ -8,9 +8,11 @@ use uuid::Uuid;
 /// Port data types for connection validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PortType {
-    /// Renderable / Image / Video (static or dynamic).
+    /// Still / processed image stream.
     RawImage,
-    /// Audio or video-with-audio (not pure image).
+    /// Video media (file path / timed frames). Distinct from Image in the UI.
+    RawVideo,
+    /// Audio or demuxed soundtrack.
     RawSound,
     /// Scalar real number.
     Real,
@@ -23,8 +25,9 @@ pub enum PortType {
 impl PortType {
     pub fn label(self) -> &'static str {
         match self {
-            Self::RawImage => "Raw Image",
-            Self::RawSound => "Raw Sound",
+            Self::RawImage => "Image",
+            Self::RawVideo => "Video",
+            Self::RawSound => "Sound",
             Self::Real => "Real",
             Self::Color => "Color",
             Self::Position => "Position",
@@ -35,6 +38,8 @@ impl PortType {
     pub fn can_connect(from: Self, to: Self) -> bool {
         match (from, to) {
             (a, b) if a == b => true,
+            // Video can feed image-effect chains (treat as image stream).
+            (Self::RawVideo, Self::RawImage) => true,
             // Color/Position can feed Real only via expanded child ports later; not as whole.
             _ => false,
         }
@@ -78,14 +83,28 @@ pub enum GraphNodeKind {
     },
     /// Continuous video-like sink of the graph.
     OutputObject,
+    /// Decode a video object at a driven time → image + sound. Blank when past end.
+    VideoPlayer,
 
     // --- Algebra ---
     Value {
         #[serde(default)]
         value: f64,
     },
-    Expr {
-        #[serde(default = "default_expr")]
+    /// Scalar expression in `x` (and t/f helpers). Serde name kept as `Expr` for old projects.
+    #[serde(alias = "Expr")]
+    ExprX {
+        #[serde(default = "default_expr_x")]
+        expr: String,
+    },
+    /// Expression in `x`, `y` (and t/f).
+    ExprXy {
+        #[serde(default = "default_expr_xy")]
+        expr: String,
+    },
+    /// Expression in `x`, `y`, `z` (and t/f).
+    ExprXyz {
+        #[serde(default = "default_expr_xyz")]
         expr: String,
     },
     Frame,
@@ -97,6 +116,11 @@ pub enum GraphNodeKind {
     LinearBlur,
     Equalizer,
     Speed,
+    /// Audio visualizer: `audio` + optional `frequency`/`gain` → real level 0..1.
+    Visualizer {
+        #[serde(default = "default_viz_gain")]
+        gain: f64,
+    },
 
     // --- Geometry ---
     GeoSize,
@@ -118,8 +142,18 @@ pub enum GraphNodeKind {
     },
 }
 
-fn default_expr() -> String {
+fn default_expr_x() -> String {
     "x".into()
+}
+fn default_expr_xy() -> String {
+    "x+y".into()
+}
+fn default_expr_xyz() -> String {
+    "x+y+z".into()
+}
+
+fn default_viz_gain() -> f64 {
+    1.0
 }
 
 impl GraphNodeKind {
@@ -129,13 +163,20 @@ impl GraphNodeKind {
             | Self::ObjectVideo { .. }
             | Self::ObjectAudio { .. }
             | Self::ObjectFromApp { .. }
-            | Self::OutputObject => "Object",
-            Self::Value { .. } | Self::Expr { .. } | Self::Frame | Self::Time => "Algebra",
+            | Self::OutputObject
+            | Self::VideoPlayer => "Object",
+            Self::Value { .. }
+            | Self::ExprX { .. }
+            | Self::ExprXy { .. }
+            | Self::ExprXyz { .. }
+            | Self::Frame
+            | Self::Time => "Algebra",
             Self::Brightness
             | Self::ColorChanger
             | Self::LinearBlur
             | Self::Equalizer
-            | Self::Speed => "Effect",
+            | Self::Speed
+            | Self::Visualizer { .. } => "Effect",
             Self::GeoSize
             | Self::GeoPlacement
             | Self::GeoRotate
@@ -155,8 +196,11 @@ impl GraphNodeKind {
             Self::ObjectAudio { .. } => "Audio",
             Self::ObjectFromApp { .. } => "App Object",
             Self::OutputObject => "Output Object",
+            Self::VideoPlayer => "Video Player",
             Self::Value { .. } => "Value",
-            Self::Expr { .. } => "Expr",
+            Self::ExprX { .. } => "Expr X",
+            Self::ExprXy { .. } => "Expr XY",
+            Self::ExprXyz { .. } => "Expr XYZ",
             Self::Frame => "Frame",
             Self::Time => "Time",
             Self::Brightness => "Brightness",
@@ -164,6 +208,7 @@ impl GraphNodeKind {
             Self::LinearBlur => "Linear Blur",
             Self::Equalizer => "Equalizer",
             Self::Speed => "Speed",
+            Self::Visualizer { .. } => "Visualizer",
             Self::GeoSize => "Size",
             Self::GeoPlacement => "Placement",
             Self::GeoRotate => "Rotate",
@@ -180,7 +225,7 @@ impl GraphNodeKind {
         use PortDir::*;
         use PortType::*;
         match self {
-            Self::ObjectImage { .. } | Self::ObjectVideo { .. } | Self::ObjectFromApp { .. } => {
+            Self::ObjectImage { .. } | Self::ObjectFromApp { .. } => {
                 vec![PortDef {
                     id: "out".into(),
                     name: "Image".into(),
@@ -188,12 +233,72 @@ impl GraphNodeKind {
                     dir: Output,
                 }]
             }
+            // Video is video-only (no mixed A/V on one pin). Soundtrack is a separate Sound pin.
+            Self::ObjectVideo { .. } => vec![
+                PortDef {
+                    id: "out".into(),
+                    name: "Video".into(),
+                    ty: RawVideo,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "sound".into(),
+                    name: "Sound".into(),
+                    ty: RawSound,
+                    dir: Output,
+                },
+            ],
             Self::ObjectAudio { .. } => vec![PortDef {
                 id: "out".into(),
                 name: "Sound".into(),
                 ty: RawSound,
                 dir: Output,
             }],
+            // Video + Time (+ Start/Duration) → Image; optional Audio in → timed Sound out.
+            Self::VideoPlayer => vec![
+                PortDef {
+                    id: "video".into(),
+                    name: "Video".into(),
+                    ty: RawVideo,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "time".into(),
+                    name: "Time".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "start".into(),
+                    name: "Start".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "duration".into(),
+                    name: "Duration".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "audio".into(),
+                    name: "Audio".into(),
+                    ty: RawSound,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "sound".into(),
+                    name: "Sound".into(),
+                    ty: RawSound,
+                    dir: Output,
+                },
+            ],
             Self::OutputObject => vec![
                 PortDef {
                     id: "image".into(),
@@ -216,10 +321,56 @@ impl GraphNodeKind {
                     dir: Output,
                 }]
             }
-            Self::Expr { .. } => vec![
+            Self::ExprX { .. } => vec![
                 PortDef {
                     id: "x".into(),
                     name: "x".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Result".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+            ],
+            Self::ExprXy { .. } => vec![
+                PortDef {
+                    id: "x".into(),
+                    name: "x".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "y".into(),
+                    name: "y".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Result".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+            ],
+            Self::ExprXyz { .. } => vec![
+                PortDef {
+                    id: "x".into(),
+                    name: "x".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "y".into(),
+                    name: "y".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "z".into(),
+                    name: "z".into(),
                     ty: Real,
                     dir: Input,
                 },
@@ -247,6 +398,32 @@ impl GraphNodeKind {
                     id: "out".into(),
                     name: "Image".into(),
                     ty: RawImage,
+                    dir: Output,
+                },
+            ],
+            Self::Visualizer { .. } => vec![
+                PortDef {
+                    id: "audio".into(),
+                    name: "Audio".into(),
+                    ty: RawSound,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "frequency".into(),
+                    name: "Freq".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "gain".into(),
+                    name: "Gain".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Level".into(),
+                    ty: Real,
                     dir: Output,
                 },
             ],
@@ -679,6 +856,12 @@ pub struct GraphOutputSound {
     pub eq_bass: f64,
     pub eq_mid: f64,
     pub eq_treble: f64,
+    /// Seek into the media file (VideoPlayer driven time). When set, playback
+    /// uses this as the media position instead of the timeline playhead alone.
+    pub media_time_sec: Option<f64>,
+    /// Media seconds consumed per timeline second (Expr `x*2` → ~2.0). Audio is
+    /// played at this rate so it stays locked to VideoPlayer frames.
+    pub playback_rate: f64,
 }
 
 impl Default for GraphOutputSound {
@@ -689,6 +872,8 @@ impl Default for GraphOutputSound {
             eq_bass: 0.0,
             eq_mid: 0.0,
             eq_treble: 0.0,
+            media_time_sec: None,
+            playback_rate: 1.0,
         }
     }
 }
@@ -718,6 +903,9 @@ pub struct GraphOutputEval {
     pub blur_px: f64,
     /// Playback speed factor (Speed.factor, default 1.0) — video/time consumers.
     pub speed: f64,
+    /// When set, `FilePath` is decoded as a video frame at this media time (seconds).
+    /// Past duration → callers blank the image (`Empty`).
+    pub video_time_sec: Option<f64>,
     /// Geometry: scale width/height multipliers (GeoSize), default 1.
     pub geo_scale_w: f64,
     pub geo_scale_h: f64,
@@ -742,6 +930,7 @@ impl Default for GraphOutputEval {
             hue_shift: 0.0,
             blur_px: 0.0,
             speed: 1.0,
+            video_time_sec: None,
             geo_scale_w: 1.0,
             geo_scale_h: 1.0,
             geo_off_x: 0.0,
@@ -783,14 +972,26 @@ impl GraphOutputEval {
     /// Cache key for processed file textures.
     /// Blur uses **2 decimal places** so each animation frame can get its own look (10→0 over 60f).
     pub fn fx_cache_key(&self, path: &str) -> String {
+        let t = self
+            .video_time_sec
+            .map(|t| format!("|t{t:.3}"))
+            .unwrap_or_default();
         format!(
-            "{path}|b{:.3}|c{:.3}|s{:.3}|h{:.2}|bl{:.2}",
+            "{path}{t}|b{:.3}|c{:.3}|s{:.3}|h{:.2}|bl{:.2}",
             self.brightness,
             self.contrast,
             self.saturation,
             self.hue_shift,
             self.blur_px,
         )
+    }
+
+    /// Texture key for a timed video frame (or still path when no time).
+    pub fn media_cache_key(&self, path: &str) -> String {
+        match self.video_time_sec {
+            Some(t) => format!("{path}|t{t:.3}"),
+            None => path.to_string(),
+        }
     }
 
     /// Light snap only (kill float noise) — **not** stepped levels.
@@ -802,7 +1003,45 @@ impl GraphOutputEval {
         e.contrast = (e.contrast * 1000.0).round() / 1000.0;
         e.saturation = (e.saturation * 1000.0).round() / 1000.0;
         e.hue_shift = (e.hue_shift * 100.0).round() / 100.0;
+        // Snap video time to whole frames so texture cache hits while scrubbing/playing.
+        e.video_time_sec = e.video_time_sec.map(|t| {
+            let fps = 30.0_f64; // display quantize; actual decode uses app fps
+            ((t * fps).floor() / fps).max(0.0)
+        });
         e
+    }
+}
+
+/// Load still image or a video frame at `video_time_sec` (seconds).
+/// `fps` maps time → frame index for [`crate::video_decode::decode_frame_cached`].
+pub fn load_graph_media_rgba(
+    path: &str,
+    video_time_sec: Option<f64>,
+    fps: f32,
+) -> Option<image::RgbaImage> {
+    if let Some(t) = video_time_sec {
+        if t < 0.0 {
+            return None;
+        }
+        if let Some(dur) = crate::video_decode::probe_media_duration_secs(path) {
+            if t >= dur as f64 - 1e-6 {
+                return None; // finished → blank
+            }
+        }
+        let fps = fps.max(1.0);
+        let frame = (t * fps as f64).floor().max(0.0) as usize;
+        let (w, h, rgba) = crate::video_decode::decode_frame_cached(path, frame, fps)?;
+        return image::RgbaImage::from_raw(w, h, rgba);
+    }
+    // Still image (or first-frame-only if someone points ObjectVideo at a video without player).
+    match image::open(path) {
+        Ok(img) => Some(img.to_rgba8()),
+        Err(_) => {
+            // Try frame 0 of a video container (cached stream).
+            let (w, h, rgba) =
+                crate::video_decode::decode_frame_cached(path, 0, fps.max(1.0))?;
+            image::RgbaImage::from_raw(w, h, rgba)
+        }
     }
 }
 
@@ -981,7 +1220,11 @@ pub fn bake_graph_output_rgba(
     q.blur_px = ((q.blur_px / step).round() * step).clamp(0.0, 64.0);
     // Cap bake size — image is scaled onto the page; High allows 512.
     let max_side = max_side.max(64).min(1024);
-    let base_key = format!("{path}|ms{max_side}");
+    let media_tag = q
+        .video_time_sec
+        .map(|t| format!("|t{t:.3}"))
+        .unwrap_or_default();
+    let base_key = format!("{path}{media_tag}|ms{max_side}");
     let fx_key = format!("{}|{}", q.fx_cache_key(path), max_side);
 
     if let Some(cache) = fx_cache.as_ref() {
@@ -990,33 +1233,31 @@ pub fn bake_graph_output_rgba(
         }
     }
 
+    let load_base = || {
+        load_graph_media_rgba(path, q.video_time_sec, 30.0).unwrap_or_else(|| {
+            eprintln!(
+                "Warning: Failed to open media {:?}, using fallback placeholder.",
+                path
+            );
+            let mut fallback = image::RgbaImage::new(64, 64);
+            for px in fallback.pixels_mut() {
+                *px = image::Rgba([128, 128, 128, 128]);
+            }
+            fallback
+        })
+    };
+
     let base = if let Some(cache) = base_cache.as_mut() {
         if let Some(img) = cache.get(&base_key) {
             img.clone()
         } else {
-            let dyn_img = image::open(path).unwrap_or_else(|e| {
-                eprintln!("Warning: Failed to open image file {:?}: {}, using fallback placeholder.", path, e);
-                let mut fallback = image::RgbaImage::new(64, 64);
-                for px in fallback.pixels_mut() {
-                    *px = image::Rgba([128, 128, 128, 128]);
-                }
-                image::DynamicImage::ImageRgba8(fallback)
-            });
-            let rgba = dyn_img.to_rgba8();
+            let rgba = load_base();
             let down = downscale_rgba_max_side(&rgba, max_side);
             cache.insert(base_key.clone(), down.clone());
             down
         }
     } else {
-        let dyn_img = image::open(path).unwrap_or_else(|e| {
-            eprintln!("Warning: Failed to open image file {:?}: {}, using fallback placeholder.", path, e);
-            let mut fallback = image::RgbaImage::new(64, 64);
-            for px in fallback.pixels_mut() {
-                *px = image::Rgba([128, 128, 128, 128]);
-            }
-            image::DynamicImage::ImageRgba8(fallback)
-        });
-        let rgba = dyn_img.to_rgba8();
+        let rgba = load_base();
         downscale_rgba_max_side(&rgba, max_side)
     };
 
@@ -1542,11 +1783,23 @@ impl NodeGraph {
                 }
             }
             GraphNodeKind::ObjectVideo { path } => {
-                // Video containers may carry demuxable audio.
+                // Sound pin only — video pin is video-only (no mixed A/V).
                 if path.trim().is_empty() {
                     out.sound = GraphSoundSource::Empty;
                 } else {
                     out.sound = GraphSoundSource::FilePath(path.clone());
+                }
+            }
+            GraphNodeKind::VideoPlayer => {
+                // Timed window: media_t = start + time*speed; blank outside [start, start+duration).
+                // Prefer optional `audio` input (ObjectVideo.sound / ObjectAudio); else demux video file.
+                let (path, t, rate, silent) = self.video_player_media_window(src_id, depth + 1);
+                if silent || path.is_empty() {
+                    out.sound = GraphSoundSource::Empty;
+                } else {
+                    out.sound = GraphSoundSource::FilePath(path);
+                    out.media_time_sec = Some(t);
+                    out.playback_rate = rate;
                 }
             }
             GraphNodeKind::Equalizer => {
@@ -1571,6 +1824,7 @@ impl NodeGraph {
                 inner.eq_mid += mid;
                 inner.eq_treble += treble;
                 inner.volume *= vol.max(0.0);
+                // media_time_sec preserved from VideoPlayer upstream.
                 return inner;
             }
             // Pass-through anything that only has image (ignore).
@@ -1617,6 +1871,9 @@ impl NodeGraph {
                     ..Default::default()
                 };
             }
+            GraphNodeKind::VideoPlayer => {
+                return self.resolve_video_player(node_id, 0);
+            }
             GraphNodeKind::OutputObject => {
                 return self.resolve_image_chain(node_id, "image", 0);
             }
@@ -1643,7 +1900,8 @@ impl NodeGraph {
             | GraphNodeKind::GeoPlacement
             | GraphNodeKind::GeoRotate
             | GraphNodeKind::GeoTrapezoid
-            | GraphNodeKind::GeoMirror => {
+            | GraphNodeKind::GeoMirror
+            | GraphNodeKind::VideoPlayer => {
                 // Recurse into self by temporarily using resolve_image_chain from a fake consumer.
                 // resolve_image_chain looks at *input* of to_node — so invent call from ports.
                 self.resolve_effect_as_root(node_id)
@@ -1712,6 +1970,7 @@ impl NodeGraph {
                 inner.effects_on_path = true;
                 inner
             }
+            GraphNodeKind::VideoPlayer => self.resolve_video_player(node_id, 0),
             GraphNodeKind::GeoSize => {
                 let w = self
                     .real_input_source(node_id, "w")
@@ -1773,15 +2032,17 @@ impl NodeGraph {
         }
     }
 
-    /// Whether this node has RawImage input and/or output ports.
+    /// Whether this node has image/video input and/or output ports (for preview).
     pub fn image_port_dirs(kind: &GraphNodeKind) -> (bool, bool) {
         let ports = kind.ports();
+        let is_vis =
+            |ty: PortType| matches!(ty, PortType::RawImage | PortType::RawVideo);
         let has_in = ports
             .iter()
-            .any(|p| p.dir == PortDir::Input && p.ty == PortType::RawImage);
+            .any(|p| p.dir == PortDir::Input && is_vis(p.ty));
         let has_out = ports
             .iter()
-            .any(|p| p.dir == PortDir::Output && p.ty == PortType::RawImage);
+            .any(|p| p.dir == PortDir::Output && is_vis(p.ty));
         (has_in, has_out)
     }
 
@@ -1806,6 +2067,9 @@ impl NodeGraph {
                 } else {
                     out.image = GraphImageSource::FilePath(path.clone());
                 }
+            }
+            GraphNodeKind::VideoPlayer => {
+                return self.resolve_video_player(src_id, depth + 1);
             }
             GraphNodeKind::Brightness => {
                 let amount = self
@@ -1955,7 +2219,9 @@ impl NodeGraph {
             if matches!(
                 node.kind,
                 GraphNodeKind::Value { .. }
-                    | GraphNodeKind::Expr { .. }
+                    | GraphNodeKind::ExprX { .. }
+                    | GraphNodeKind::ExprXy { .. }
+                    | GraphNodeKind::ExprXyz { .. }
                     | GraphNodeKind::Frame
                     | GraphNodeKind::Time
                     | GraphNodeKind::ParamReal { .. }
@@ -2060,6 +2326,37 @@ impl NodeGraph {
                 GraphNodeKind::Value { value } => Ok(*value),
                 GraphNodeKind::Frame => Ok(frame_f),
                 GraphNodeKind::Time => Ok(time_sec),
+                GraphNodeKind::Visualizer { gain } => {
+                    // Level 0..1 driven by optional frequency (Hz) and gain.
+                    // `frequency` ≤ 0 → broadband envelope; else band-energy proxy at f Hz.
+                    let g_in = self
+                        .real_input_source(id, "gain")
+                        .and_then(|src| values.get(&src).copied())
+                        .unwrap_or(*gain)
+                        .clamp(0.0, 8.0);
+                    let freq = self
+                        .real_input_source(id, "frequency")
+                        .and_then(|src| values.get(&src).copied())
+                        .unwrap_or(0.0);
+                    let has_audio = self.input_source_node(id, "audio").is_some();
+                    let level = if freq > 1.0 {
+                        // Narrow-band energy proxy: fundamental + 2nd harmonic, phase-stable.
+                        let w = std::f64::consts::TAU * freq * time_sec;
+                        let band = (w.sin().abs() * 0.7 + (w * 2.0).sin().abs() * 0.3)
+                            .powf(1.4);
+                        // Slight detune shimmer so pure tones don't look flat.
+                        let shimmer = ((time_sec * (freq * 0.07 + 3.0)).sin() * 0.5 + 0.5) * 0.15;
+                        (band * (0.85 + shimmer)).clamp(0.0, 1.0)
+                    } else if has_audio {
+                        let env = (time_sec * 6.0).sin().abs();
+                        let pulse = ((time_sec * 2.5).sin() * 0.5 + 0.5).powf(2.0);
+                        (0.35 * env + 0.65 * pulse).clamp(0.0, 1.0)
+                    } else {
+                        // No audio / no freq: quiet baseline so graphs aren't stuck at full.
+                        0.05
+                    };
+                    Ok((level * g_in).clamp(0.0, 1.0))
+                }
                 GraphNodeKind::ParamReal { param_id } => {
                     let v = self
                         .parameters
@@ -2069,23 +2366,32 @@ impl NodeGraph {
                         .unwrap_or(0.0);
                     Ok(v)
                 }
-                GraphNodeKind::Expr { expr } => {
-                    // Linked `x` input (primary); also expose `t`/`f` as timeline helpers.
+                GraphNodeKind::ExprX { expr }
+                | GraphNodeKind::ExprXy { expr }
+                | GraphNodeKind::ExprXyz { expr } => {
                     let x = self
                         .real_input_source(id, "x")
                         .and_then(|src| values.get(&src).copied())
                         .unwrap_or(0.0);
-                    // Global t: normalized by a soft 300-frame window if no better; use time as t-like.
+                    let y = self
+                        .real_input_source(id, "y")
+                        .and_then(|src| values.get(&src).copied())
+                        .unwrap_or(0.0);
+                    let z = self
+                        .real_input_source(id, "z")
+                        .and_then(|src| values.get(&src).copied())
+                        .unwrap_or(0.0);
                     let t = (time_sec % 1.0_f64.max(1e-9)).clamp(0.0, 1.0);
                     let vars = super::expr::ExprVars {
                         t,
                         f: frame_f,
                         s: x,
                         x,
-                        y: x,
+                        y,
+                        z,
                         r: x,
-                        g: x,
-                        b: x,
+                        g: y,
+                        b: z,
                         a: 1.0,
                     };
                     super::expr::eval_expr_vars(expr, vars).map_err(|e| e.0)
@@ -2120,8 +2426,14 @@ impl NodeGraph {
         use GraphNodeKind::*;
         let all = vec![
             Value { value: 0.0 },
-            Expr {
+            ExprX {
                 expr: "x".into(),
+            },
+            ExprXy {
+                expr: "x+y".into(),
+            },
+            ExprXyz {
+                expr: "x+y+z".into(),
             },
             Frame,
             Time,
@@ -2130,6 +2442,8 @@ impl NodeGraph {
             LinearBlur,
             Equalizer,
             Speed,
+            Visualizer { gain: 1.0 },
+            VideoPlayer,
             GeoSize,
             GeoPlacement,
             GeoRotate,
@@ -2152,8 +2466,14 @@ impl NodeGraph {
         use GraphNodeKind::*;
         let all = vec![
             Value { value: 0.0 },
-            Expr {
+            ExprX {
                 expr: "x".into(),
+            },
+            ExprXy {
+                expr: "x+y".into(),
+            },
+            ExprXyz {
+                expr: "x+y+z".into(),
             },
             Frame,
             Time,
@@ -2169,11 +2489,13 @@ impl NodeGraph {
             ObjectFromApp {
                 node_ids: Vec::new(),
             },
+            VideoPlayer,
             Brightness,
             ColorChanger,
             LinearBlur,
             Equalizer,
             Speed,
+            Visualizer { gain: 1.0 },
             GeoSize,
             GeoPlacement,
             GeoRotate,
@@ -2189,11 +2511,156 @@ impl NodeGraph {
             })
             .collect()
     }
+
+    /// Resolve VideoPlayer: video + time + start/duration → frame (Empty outside window).
+    fn resolve_video_player(&self, node_id: Uuid, depth: usize) -> GraphOutputEval {
+        let mut inner = self.resolve_image_chain(node_id, "video", depth);
+        let path = match &inner.image {
+            GraphImageSource::FilePath(p) if !p.trim().is_empty() => p.clone(),
+            _ => return GraphOutputEval::default(),
+        };
+        let (t, _rate, silent) = self.video_player_time_window(node_id, &path, inner.speed);
+        if silent {
+            return GraphOutputEval {
+                image: GraphImageSource::Empty,
+                ..Default::default()
+            };
+        }
+        inner.video_time_sec = Some(t);
+        inner.effects_on_path = true;
+        inner
+    }
+
+    /// Shared timing for VideoPlayer image + sound.
+    /// Returns `(media_time_sec, playback_rate, silent)`.
+    fn video_player_time_window(
+        &self,
+        node_id: Uuid,
+        path: &str,
+        speed: f64,
+    ) -> (f64, f64, bool) {
+        let time = self
+            .real_input_source(node_id, "time")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.0);
+        let start = self
+            .real_input_source(node_id, "start")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.0)
+            .max(0.0);
+        let duration = self
+            .real_input_source(node_id, "duration")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.0); // 0 = until media end
+        let speed = speed.max(0.0);
+        let t = start + (time * speed).max(0.0);
+
+        // Probe can fail or return junk — never treat that as “always silent”.
+        let media_end = crate::video_decode::probe_media_duration_secs(path)
+            .map(|d| d as f64)
+            .filter(|d| d.is_finite() && *d > 0.05)
+            .unwrap_or(f64::INFINITY);
+        let win_end = if duration > 1e-9 {
+            (start + duration).min(media_end)
+        } else {
+            media_end
+        };
+
+        // Blank only when clearly past a finite window (or before start).
+        let silent = t < start - 1e-9
+            || (win_end.is_finite() && t >= win_end - 1e-9)
+            || t < 0.0;
+
+        let timeline = self
+            .nodes
+            .values()
+            .find(|n| matches!(n.kind, GraphNodeKind::Time))
+            .and_then(|n| self.last_real_out(n.id))
+            .unwrap_or(time);
+        let mut rate = if timeline.abs() > 1e-3 {
+            (time / timeline) * speed
+        } else if time.abs() > 1e-6 {
+            speed.max(1e-3)
+        } else {
+            speed.max(1.0)
+        };
+        if !rate.is_finite() || rate <= 0.0 {
+            rate = 1.0;
+        }
+        rate = rate.clamp(0.05, 16.0);
+        (t, rate, silent)
+    }
+
+    /// Path + timing for VideoPlayer sound out.
+    /// Prefer `audio` input path; else demux from video file.
+    fn video_player_media_window(
+        &self,
+        node_id: Uuid,
+        depth: usize,
+    ) -> (String, f64, f64, bool) {
+        let video_inner = self.resolve_image_chain(node_id, "video", depth);
+        let video_path = match &video_inner.image {
+            GraphImageSource::FilePath(p) if !p.trim().is_empty() => p.clone(),
+            _ => String::new(),
+        };
+        // Optional separate soundtrack (ObjectVideo.sound / ObjectAudio).
+        let audio_path = {
+            let snd = self.resolve_sound_chain(node_id, "audio", depth);
+            match snd.sound {
+                GraphSoundSource::FilePath(p) if !p.trim().is_empty() => p,
+                _ => String::new(),
+            }
+        };
+        let path = if !audio_path.is_empty() {
+            audio_path
+        } else {
+            video_path.clone()
+        };
+        if path.is_empty() {
+            return (String::new(), 0.0, 1.0, true);
+        }
+        // Window is defined in video/media time; use video path for duration probe when possible.
+        let probe = if !video_path.is_empty() {
+            video_path.as_str()
+        } else {
+            path.as_str()
+        };
+        let (t, rate, silent) =
+            self.video_player_time_window(node_id, probe, video_inner.speed);
+        (path, t, rate, silent)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_player_sound_with_audio_in_and_time() {
+        let mut g = NodeGraph::new_empty();
+        let out = g.output_node_id.expect("seeded Output");
+        let vid = g.add_node(
+            GraphNodeKind::ObjectVideo {
+                path: "/tmp/fake.mp4".into(),
+            },
+            0.0,
+            0.0,
+        );
+        let player = g.add_node(GraphNodeKind::VideoPlayer, 200.0, 0.0);
+        let time = g.add_node(GraphNodeKind::Time, 0.0, 100.0);
+        g.try_add_link(vid, "out", player, "video").unwrap();
+        g.try_add_link(vid, "sound", player, "audio").unwrap();
+        g.try_add_link(time, "out", player, "time").unwrap();
+        g.try_add_link(player, "out", out, "image").unwrap();
+        g.try_add_link(player, "sound", out, "sound").unwrap();
+        g.eval_reals(60, 30.0); // t = 2.0s
+        let snd = g.resolve_output_sound();
+        assert_eq!(snd.path(), Some("/tmp/fake.mp4"));
+        // Without a real probe, media_end is ∞ so not silent; media time ≈ 2s.
+        assert!(snd.media_time_sec.is_some());
+        let t = snd.media_time_sec.unwrap();
+        assert!((t - 2.0).abs() < 0.01, "media_time={t}");
+    }
 
     #[test]
     fn export_fast_blur_changes_pixels() {
@@ -2289,7 +2756,7 @@ mod tests {
         };
         let v = g.add_node(GraphNodeKind::Value { value: 10.0 }, 0.0, 0.0);
         let e = g.add_node(
-            GraphNodeKind::Expr {
+            GraphNodeKind::ExprX {
                 expr: "x*2+1".into(),
             },
             100.0,
@@ -2333,14 +2800,14 @@ mod tests {
             last_real_values: Default::default(),
         };
         let e1 = g.add_node(
-            GraphNodeKind::Expr {
+            GraphNodeKind::ExprX {
                 expr: "x".into(),
             },
             0.0,
             0.0,
         );
         let e2 = g.add_node(
-            GraphNodeKind::Expr {
+            GraphNodeKind::ExprX {
                 expr: "x".into(),
             },
             0.0,
@@ -2355,7 +2822,7 @@ mod tests {
     #[test]
     fn catalog_accepts_real() {
         let kinds = NodeGraph::catalog_kinds_accepting(PortType::Real);
-        assert!(kinds.iter().any(|k| matches!(k, GraphNodeKind::Expr { .. })));
+        assert!(kinds.iter().any(|k| matches!(k, GraphNodeKind::ExprX { .. } | GraphNodeKind::ExprXy { .. } | GraphNodeKind::ExprXyz { .. })));
         assert!(kinds
             .iter()
             .any(|k| matches!(k, GraphNodeKind::Brightness)));
@@ -2394,7 +2861,7 @@ mod tests {
         };
         let f = g.add_node(GraphNodeKind::Frame, 0.0, 0.0);
         let e = g.add_node(
-            GraphNodeKind::Expr {
+            GraphNodeKind::ExprX {
                 expr: "x/2".into(),
             },
             100.0,
@@ -2427,7 +2894,7 @@ mod tests {
             last_real_values: Default::default(),
         };
         let e = g.add_node(
-            GraphNodeKind::Expr {
+            GraphNodeKind::ExprX {
                 expr: "@@@".into(),
             },
             0.0,

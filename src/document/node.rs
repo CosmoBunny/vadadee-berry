@@ -1763,6 +1763,11 @@ impl Node {
     }
 
     pub fn set_rotation(&mut self, rad: f64) {
+        // Groups store orientation on the parent only (children stay local).
+        if matches!(self.kind, NodeKind::Group { .. }) {
+            self.transform.rotation_rad = rad;
+            return;
+        }
         let delta = rad - self.transform.rotation_rad;
         if delta.abs() > 1e-9 {
             self.rotate_about_center(delta);
@@ -1825,7 +1830,7 @@ impl Node {
                 }
             }
             NodeKind::Text { x, y, .. } => (*x, *y),
-            NodeKind::Group { .. } => (0.0, 0.0),
+            NodeKind::Group { .. } => (self.transform.translation[0], self.transform.translation[1]),
             NodeKind::Image { x, y, .. } => (*x, *y),
             NodeKind::Plotter { x, y, .. } => (*x, *y),
             NodeKind::Arc { cx, cy, .. } => (*cx, *cy),
@@ -1924,6 +1929,8 @@ impl Node {
     pub fn bounds_with_store(&self, store: &super::NodeStore) -> Rect {
         match &self.kind {
             NodeKind::Group { children } => {
+                // Children live in parent-local space; union their local AABBs then map
+                // the four corners through the group translation/rotation (world space).
                 let mut acc: Option<Rect> = None;
                 for id in children {
                     let Some(child) = store.get(*id) else {
@@ -1938,7 +1945,43 @@ impl Node {
                         None => b,
                     });
                 }
-                acc.unwrap_or(Rect::ZERO)
+                let Some(local) = acc else {
+                    return Rect::ZERO;
+                };
+                let (tx, ty) = (
+                    self.transform.translation[0],
+                    self.transform.translation[1],
+                );
+                let rot = self.transform.rotation_rad;
+                if rot.abs() < 1e-12 {
+                    return Rect::new(
+                        local.x0 + tx,
+                        local.y0 + ty,
+                        local.x1 + tx,
+                        local.y1 + ty,
+                    );
+                }
+                let cos = rot.cos();
+                let sin = rot.sin();
+                let corners = [
+                    (local.x0, local.y0),
+                    (local.x1, local.y0),
+                    (local.x1, local.y1),
+                    (local.x0, local.y1),
+                ];
+                let mut min_x = f64::MAX;
+                let mut min_y = f64::MAX;
+                let mut max_x = f64::MIN;
+                let mut max_y = f64::MIN;
+                for (lx, ly) in corners {
+                    let wx = tx + lx * cos - ly * sin;
+                    let wy = ty + lx * sin + ly * cos;
+                    min_x = min_x.min(wx);
+                    min_y = min_y.min(wy);
+                    max_x = max_x.max(wx);
+                    max_y = max_y.max(wy);
+                }
+                Rect::new(min_x, min_y, max_x, max_y)
             }
             _ => self.bounds(),
         }

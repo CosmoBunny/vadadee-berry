@@ -308,6 +308,23 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     }
                 });
                 ui.menu_button("Object", |ui| {
+                    if ui
+                        .button("Group")
+                        .on_hover_text("Group selection — children move/rotate with parent")
+                        .clicked()
+                    {
+                        app.group_selection();
+                        ui.close();
+                    }
+                    if ui
+                        .button("Ungroup")
+                        .on_hover_text("Dissolve selected group(s)")
+                        .clicked()
+                    {
+                        app.ungroup_selection();
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Duplicate   Ctrl+D").clicked() {
                         app.duplicate_selection();
                         ui.close();
@@ -352,6 +369,34 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ui.checkbox(&mut app.viewport.show_grid, "Show grid");
                     ui.checkbox(&mut app.viewport.snap_grid, "Snap to grid");
                     ui.checkbox(&mut app.snap_magnet, "Magnetic snap");
+                    ui.separator();
+                    ui.label(RichText::new("Static grid (page divisions)").small().weak());
+                    ui.horizontal(|ui| {
+                        ui.label("Cols");
+                        let mut c = app.viewport.grid_cols as i32;
+                        if ui
+                            .add(egui::DragValue::new(&mut c).range(0..=128).speed(1.0))
+                            .on_hover_text("0 = free step (px); >0 = divide page width")
+                            .changed()
+                        {
+                            app.viewport.grid_cols = c.clamp(0, 128) as u32;
+                        }
+                        ui.label("Rows");
+                        let mut r = app.viewport.grid_rows as i32;
+                        if ui
+                            .add(egui::DragValue::new(&mut r).range(0..=128).speed(1.0))
+                            .on_hover_text("0 = free step (px); >0 = divide page height")
+                            .changed()
+                        {
+                            app.viewport.grid_rows = r.clamp(0, 128) as u32;
+                        }
+                    });
+                    if app.viewport.grid_cols == 0 && app.viewport.grid_rows == 0 {
+                        ui.add(
+                            egui::Slider::new(&mut app.viewport.grid_step, 4.0..=200.0)
+                                .text("Grid step (px)"),
+                        );
+                    }
                     ui.checkbox(&mut app.pixel_art_mode, "Pixel art mode");
                     if app.pixel_art_mode {
                         ui.add(egui::Slider::new(&mut app.pixel_cell_size, 0.5..=10.0).text("Cell size"));

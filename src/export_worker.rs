@@ -1555,6 +1555,10 @@ impl<'a> ExportSession<'a> {
             show_grid: false,
             snap_grid: false,
             grid_step: 20.0,
+            grid_cols: 0,
+            grid_rows: 0,
+            page_width: self.project.document.width as f32,
+            page_height: self.project.document.height as f32,
         };
 
         let draw_order = self.project.document.ordered_node_ids();

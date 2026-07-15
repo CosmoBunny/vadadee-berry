@@ -34,40 +34,75 @@ fn fill_flatten_tolerance(viewport: &Viewport) -> f64 {
     (0.06 / (viewport.zoom as f64).max(0.25)).clamp(0.004, 0.06)
 }
 
-pub fn draw_grid(painter: &Painter, viewport: &Viewport, _origin: Pos2, page: Rect) {
+pub fn draw_grid(painter: &Painter, viewport: &Viewport, origin: Pos2, page: Rect) {
     if !viewport.show_grid {
         return;
     }
-    let step = viewport.grid_step * viewport.zoom;
-    if step < 4.0 {
+    let clip = page.intersect(painter.clip_rect());
+    let step_x = (viewport.step_x() as f32) * viewport.zoom;
+    let step_y = (viewport.step_y() as f32) * viewport.zoom;
+    if step_x < 2.0 && step_y < 2.0 {
         return;
     }
-    let clip = page.intersect(painter.clip_rect());
-    let mut x = (clip.left() / step).floor() * step;
-    while x < clip.right() {
-        let color = if (x / step).rem_euclid(5.0) < 0.5 {
-            Color32::from_gray(55)
-        } else {
-            Color32::from_gray(40)
-        };
-        painter.line_segment(
-            [Pos2::new(x, clip.top()), Pos2::new(x, clip.bottom())],
-            Stroke::new(1.0, color),
-        );
-        x += step;
+    // Align lines to document origin (page corner), not arbitrary screen cells.
+    let origin_scr = viewport.doc_to_screen((0.0, 0.0), origin);
+    if step_x >= 2.0 {
+        let mut i = ((clip.left() - origin_scr.x) / step_x).floor() as i32 - 1;
+        loop {
+            let x = origin_scr.x + i as f32 * step_x;
+            if x > clip.right() {
+                break;
+            }
+            if x >= clip.left() {
+                let major = if viewport.grid_cols > 0 {
+                    i.rem_euclid(viewport.grid_cols as i32) == 0
+                } else {
+                    i.rem_euclid(5) == 0
+                };
+                let color = if major {
+                    Color32::from_gray(60)
+                } else {
+                    Color32::from_gray(40)
+                };
+                painter.line_segment(
+                    [Pos2::new(x, clip.top()), Pos2::new(x, clip.bottom())],
+                    Stroke::new(1.0, color),
+                );
+            }
+            i += 1;
+            if i > 10_000 {
+                break;
+            }
+        }
     }
-    let mut y = (clip.top() / step).floor() * step;
-    while y < clip.bottom() {
-        let color = if (y / step).rem_euclid(5.0) < 0.5 {
-            Color32::from_gray(55)
-        } else {
-            Color32::from_gray(40)
-        };
-        painter.line_segment(
-            [Pos2::new(clip.left(), y), Pos2::new(clip.right(), y)],
-            Stroke::new(1.0, color),
-        );
-        y += step;
+    if step_y >= 2.0 {
+        let mut j = ((clip.top() - origin_scr.y) / step_y).floor() as i32 - 1;
+        loop {
+            let y = origin_scr.y + j as f32 * step_y;
+            if y > clip.bottom() {
+                break;
+            }
+            if y >= clip.top() {
+                let major = if viewport.grid_rows > 0 {
+                    j.rem_euclid(viewport.grid_rows as i32) == 0
+                } else {
+                    j.rem_euclid(5) == 0
+                };
+                let color = if major {
+                    Color32::from_gray(60)
+                } else {
+                    Color32::from_gray(40)
+                };
+                painter.line_segment(
+                    [Pos2::new(clip.left(), y), Pos2::new(clip.right(), y)],
+                    Stroke::new(1.0, color),
+                );
+            }
+            j += 1;
+            if j > 10_000 {
+                break;
+            }
+        }
     }
 }
 
@@ -2528,18 +2563,34 @@ pub fn draw_nodes(
         }
 
         if let NodeKind::Group { children } = &node.kind {
+            let (gx, gy) = (
+                node.transform.translation[0],
+                node.transform.translation[1],
+            );
+            let rot = node.transform.rotation_rad;
+            let cos = rot.cos();
+            let sin = rot.sin();
             for cid in children {
-                if let Some(child) = nodes.get(*cid) {
-                    draw_node(
-                        painter,
-                        child,
-                        viewport,
-                        origin,
-                        selection.contains(id),
-                        fonts,
-                        image_textures,
-                    );
-                }
+                let Some(child) = nodes.get(*cid) else {
+                    continue;
+                };
+                // Children are stored in parent-local space; map to world for paint.
+                let mut world = child.clone();
+                let (lx, ly) = child.get_pos();
+                let wx = gx + lx * cos - ly * sin;
+                let wy = gy + lx * sin + ly * cos;
+                let (cx, cy) = world.get_pos();
+                world.translate(wx - cx, wy - cy);
+                world.set_rotation(child.get_rotation() + rot);
+                draw_node(
+                    painter,
+                    &world,
+                    viewport,
+                    origin,
+                    selection.contains(id) || selection.contains(cid),
+                    fonts,
+                    image_textures,
+                );
             }
             continue;
         }

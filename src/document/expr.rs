@@ -22,6 +22,7 @@ pub struct ExprVars {
     pub s: f64,
     pub x: f64,
     pub y: f64,
+    pub z: f64,
     pub r: f64,
     pub g: f64,
     pub b: f64,
@@ -36,6 +37,7 @@ impl ExprVars {
             s: start,
             x: start,
             y: start,
+            z: start,
             r: start,
             g: start,
             b: start,
@@ -215,6 +217,7 @@ fn parse_primary(b: &[u8], i: &mut usize, vars: ExprVars) -> Result<f64, ExprErr
             "s" | "start" => Ok(vars.s),
             "x" => Ok(vars.x),
             "y" => Ok(vars.y),
+            "z" => Ok(vars.z),
             "r" => Ok(vars.r),
             "g" => Ok(vars.g),
             "b" => Ok(vars.b),
@@ -223,7 +226,7 @@ fn parse_primary(b: &[u8], i: &mut usize, vars: ExprVars) -> Result<f64, ExprErr
             "tau" => Ok(std::f64::consts::TAU),
             "e" => Ok(std::f64::consts::E),
             _ => Err(ExprError(format!(
-                "unknown variable '{name}' (t,f,s,x,y,r,g,b,a)"
+                "unknown variable '{name}' (t,f,s,x,y,z,r,g,b,a)"
             ))),
         };
     }

@@ -247,6 +247,7 @@ impl StackAnimationFunction {
             s: ch.start_value,
             x,
             y,
+            z: 0.0,
             r,
             g,
             b,
