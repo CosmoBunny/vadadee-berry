@@ -233,7 +233,14 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         .exact_size(32.0)
         .resizable(false)
         .show_inside(ui, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
+            // Keep menus open when clicking DragValue/Slider children (only close outside / Esc).
+            egui::MenuBar::new()
+                .config(
+                    egui::containers::menu::MenuConfig::new().close_behavior(
+                        egui::PopupCloseBehavior::CloseOnClickOutside,
+                    ),
+                )
+                .ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New A4 page   Ctrl+N").clicked() {
                         app.new_document();
@@ -366,36 +373,53 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     });
                 });
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut app.viewport.show_grid, "Show grid");
+                    ui.checkbox(&mut app.viewport.show_grid, "Show grid lines")
+                        .on_hover_text("Draw document grid on the page (View › grid step / cols×rows)");
                     ui.checkbox(&mut app.viewport.snap_grid, "Snap to grid");
                     ui.checkbox(&mut app.snap_magnet, "Magnetic snap");
                     ui.separator();
                     ui.label(RichText::new("Static grid (page divisions)").small().weak());
+                    // DragValue = label you drag + click to type (no slider track).
+                    // Menu stays open via MenuBar CloseOnClickOutside.
                     ui.horizontal(|ui| {
                         ui.label("Cols");
-                        let mut c = app.viewport.grid_cols as i32;
-                        if ui
-                            .add(egui::DragValue::new(&mut c).range(0..=128).speed(1.0))
-                            .on_hover_text("0 = free step (px); >0 = divide page width")
-                            .changed()
-                        {
-                            app.viewport.grid_cols = c.clamp(0, 128) as u32;
-                        }
+                        let mut c = app.viewport.grid_cols;
+                        ui.add(
+                            egui::DragValue::new(&mut c)
+                                .range(0..=128u32)
+                                .speed(0.15)
+                                .update_while_editing(true),
+                        )
+                        .on_hover_text(
+                            "Drag left/right to change. Click and type, then Enter. 0 = free step (px).",
+                        );
+                        app.viewport.grid_cols = c;
+                        ui.add_space(8.0);
                         ui.label("Rows");
-                        let mut r = app.viewport.grid_rows as i32;
-                        if ui
-                            .add(egui::DragValue::new(&mut r).range(0..=128).speed(1.0))
-                            .on_hover_text("0 = free step (px); >0 = divide page height")
-                            .changed()
-                        {
-                            app.viewport.grid_rows = r.clamp(0, 128) as u32;
-                        }
+                        let mut r = app.viewport.grid_rows;
+                        ui.add(
+                            egui::DragValue::new(&mut r)
+                                .range(0..=128u32)
+                                .speed(0.15)
+                                .update_while_editing(true),
+                        )
+                        .on_hover_text(
+                            "Drag left/right to change. Click and type, then Enter. 0 = free step (px).",
+                        );
+                        app.viewport.grid_rows = r;
                     });
                     if app.viewport.grid_cols == 0 && app.viewport.grid_rows == 0 {
-                        ui.add(
-                            egui::Slider::new(&mut app.viewport.grid_step, 4.0..=200.0)
-                                .text("Grid step (px)"),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Grid step");
+                            ui.add(
+                                egui::DragValue::new(&mut app.viewport.grid_step)
+                                    .range(4.0..=200.0)
+                                    .speed(0.4)
+                                    .suffix(" px")
+                                    .update_while_editing(true),
+                            )
+                            .on_hover_text("Drag or click to type (document units).");
+                        });
                     }
                     ui.checkbox(&mut app.pixel_art_mode, "Pixel art mode");
                     if app.pixel_art_mode {
@@ -4565,6 +4589,25 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             app.add_node_editor_layer(&format!("Node Editor {n}"));
             ui.close();
         }
+        if ui
+            .button(
+                RichText::new(format!("{} Screen Record/Stream", icons::SCREEN))
+                    .font(nerd_font_id(12.0)),
+            )
+            .on_hover_text("OS screen/window capture → .sepscrr (video + mouse)")
+            .clicked()
+        {
+            let n = app
+                .project
+                .document
+                .layers
+                .iter()
+                .filter(|l| l.kind == crate::document::LayerKind::ScreenRecord)
+                .count()
+                + 1;
+            app.add_screen_record_layer(&format!("Screen Record {n}"));
+            ui.close();
+        }
         #[cfg(not(target_os = "android"))]
         {
             if ui.button("Media from file… (auto Video/Audio layer)").clicked() {
@@ -4622,6 +4665,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 crate::document::LayerKind::Shading => icons::SHADING,
                 crate::document::LayerKind::Flowchart => icons::FLOWCHART,
                 crate::document::LayerKind::NodeEditor => icons::NODE_EDITOR,
+                crate::document::LayerKind::ScreenRecord => icons::SCREEN,
             };
             ui.label(RichText::new(icon).font(nerd_font_id(13.0)));
             let name_w = (ui.available_width() - 28.0).max(48.0);
@@ -4781,6 +4825,17 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
     // Active Layer settings (Renderer/Non-renderer and Video/Audio details)
     let active_idx = app.project.document.active_layer_index;
+    // Keep Screen Record REC flag in sync with live capture map.
+    if let Some(l) = app.project.document.layers.get(active_idx) {
+        if l.kind == crate::document::LayerKind::ScreenRecord {
+            let live = app.is_screen_recording(l.id);
+            if l.screen_recording != live {
+                if let Some(lm) = app.project.document.layers.get_mut(active_idx) {
+                    lm.screen_recording = live;
+                }
+            }
+        }
+    }
     let mut probe_media_at: Option<usize> = None;
     if let Some(l) = app.project.document.layers.get_mut(active_idx) {
         ui.add_space(8.0);
@@ -4802,6 +4857,9 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     crate::document::LayerKind::NodeEditor => {
                         format!("{} Node Editor", icons::NODE_EDITOR)
                     }
+                    crate::document::LayerKind::ScreenRecord => {
+                        format!("{} Screen Record", icons::SCREEN)
+                    }
                 };
                 egui::ComboBox::from_id_salt("layer_kind_combo")
                     .selected_text(RichText::new(current_label).font(nerd_font_id(12.0)))
@@ -4817,11 +4875,181 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             RichText::new(format!("{} Node Editor", icons::NODE_EDITOR))
                                 .font(nerd_font_id(12.0)),
                         );
+                        ui.selectable_value(
+                            &mut l.kind,
+                            crate::document::LayerKind::ScreenRecord,
+                            RichText::new(format!("{} Screen Record", icons::SCREEN))
+                                .font(nerd_font_id(12.0)),
+                        );
                     });
                 if l.kind == crate::document::LayerKind::NodeEditor {
                     l.ensure_node_graph();
                 }
             });
+
+            if l.kind == crate::document::LayerKind::ScreenRecord {
+                // Keep Layer tab narrow — no fixed wide TextEdit / long single-line labels.
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("{} Screen Record", icons::SCREEN))
+                        .font(nerd_font_id(12.0))
+                        .strong(),
+                );
+                let recording = l.screen_recording;
+
+                ui.checkbox(&mut l.capture_cursor, "Capture cursor")
+                    .on_hover_text(
+                        "Burn system cursor into pixels. Mouse track is always stored separately.",
+                    );
+                ui.checkbox(&mut l.capture_audio, "Capture audio")
+                    .on_hover_text(
+                        "System audio (default sink monitor via Pulse/PipeWire). Muxed as AAC.",
+                    );
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("FPS").small().weak());
+                    let mut fps = l.capture_fps as i32;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut fps)
+                                .range(1..=120)
+                                .speed(1.0)
+                                .suffix(" fps"),
+                        )
+                        .on_hover_text(
+                            "Container frame rate (default 60). Portal unique shots may be lower; timeline is padded to wall clock.",
+                        )
+                        .changed()
+                    {
+                        l.capture_fps = fps.clamp(1, 120) as u32;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Bitrate").small().weak());
+                    let mut br = l.capture_bitrate_kbps as i32;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut br)
+                                .range(0..=80_000)
+                                .speed(100.0)
+                                .suffix(" kbps")
+                                .custom_formatter(|n, _| {
+                                    if n <= 0.0 {
+                                        "auto".into()
+                                    } else {
+                                        format!("{n:.0}")
+                                    }
+                                })
+                                .custom_parser(|s| {
+                                    let t = s.trim().to_ascii_lowercase();
+                                    if t.is_empty() || t == "auto" {
+                                        Some(0.0)
+                                    } else {
+                                        s.parse().ok()
+                                    }
+                                }),
+                        )
+                        .on_hover_text(
+                            "Video bitrate (kbps). 0 / auto = scale from resolution × fps (~6–20 Mbps).",
+                        )
+                        .changed()
+                    {
+                        l.capture_bitrate_kbps = br.clamp(0, 80_000) as u32;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Folder").small().weak());
+                    let mut dir = l.capture_dir.clone();
+                    let edit_w = (ui.available_width() - 52.0).clamp(48.0, 140.0);
+                    let te = egui::TextEdit::singleline(&mut dir)
+                        .desired_width(edit_w)
+                        .hint_text("save folder")
+                        .clip_text(true)
+                        .interactive(!recording);
+                    if ui.add(te).changed() {
+                        l.capture_dir = dir;
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    if ui
+                        .add_enabled(!recording, egui::Button::new("…").small())
+                        .on_hover_text("Choose folder for new recordings (timestamped .sepscrr + .mp4)")
+                        .clicked()
+                    {
+                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                            l.capture_dir = p.to_string_lossy().into_owned();
+                        }
+                    }
+                });
+                if !l.septic_path.trim().is_empty() {
+                    let base = std::path::Path::new(l.septic_path.trim())
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("…");
+                    ui.label(
+                        RichText::new(format!("last: {base}"))
+                            .small()
+                            .weak(),
+                    )
+                    .on_hover_text(&l.septic_path);
+                }
+                // Buttons only set flags — start/stop run after this `get_mut` ends.
+                if recording {
+                    if ui
+                        .button(
+                            RichText::new("■ Stop")
+                                .color(egui::Color32::from_rgb(255, 120, 120)),
+                        )
+                        .on_hover_text("Stop capture and write .sepscrr + .mp4")
+                        .clicked()
+                    {
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(
+                                egui::Id::new("screen_rec_stop"),
+                                active_idx,
+                            );
+                        });
+                    }
+                    ui.label(
+                        RichText::new("● REC")
+                            .small()
+                            .color(egui::Color32::from_rgb(255, 80, 80)),
+                    );
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(200));
+                } else if ui
+                    .button(
+                        RichText::new("● Record")
+                            .color(egui::Color32::from_rgb(255, 90, 90)),
+                    )
+                    .on_hover_text("Capture full screen (ffmpeg x11grab) + mouse track")
+                    .clicked()
+                {
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new("screen_rec_start"), active_idx);
+                    });
+                }
+                if !recording {
+                    let tip = if crate::screen_capture::is_wayland_session() {
+                        "Wayland portal shots + optional system audio. FPS pads to wall clock. Mouse: input group or over Vadadee."
+                    } else {
+                        "X11 grab + optional Pulse audio. Empty path → cache."
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · {} fps{}",
+                            if crate::screen_capture::is_wayland_session() {
+                                "Portal"
+                            } else {
+                                "X11"
+                            },
+                            l.capture_fps,
+                            if l.capture_audio { " · audio" } else { "" }
+                        ))
+                        .small()
+                        .weak(),
+                    )
+                    .on_hover_text(tip);
+                }
+            }
 
             if l.kind == crate::document::LayerKind::Shading {
                 if l.shading_passes.is_empty() {
@@ -5087,6 +5315,16 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     }
 
+    // Screen Record start/stop (queued inside mut layer UI to avoid double-borrow).
+    if let Some(idx) = ui.ctx().data_mut(|d| d.remove_temp::<usize>(egui::Id::new("screen_rec_start")))
+    {
+        app.start_screen_record(idx);
+    }
+    if let Some(idx) = ui.ctx().data_mut(|d| d.remove_temp::<usize>(egui::Id::new("screen_rec_stop")))
+    {
+        app.stop_screen_record(idx);
+    }
+
     // Selected Clip Properties Panel
     let mut selected_clip_info = None;
     for (layer_idx, layer) in app.project.document.layers.iter().enumerate() {
@@ -5348,6 +5586,12 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             }
             crate::document::LayerKind::Flowchart => {
                 ui.label(RichText::new(format!("{} Flowchart", icons::FLOWCHART)).font(nerd_font_id(12.0)));
+            }
+            crate::document::LayerKind::ScreenRecord => {
+                ui.label(
+                    RichText::new(format!("{} Screen Record/Stream", icons::SCREEN))
+                        .font(nerd_font_id(12.0)),
+                );
             }
             crate::document::LayerKind::NodeEditor => {
                 // P6a: layer + Output Object only (not internal graph nodes).
@@ -6629,17 +6873,41 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     crate::tools::BrushType::Standard => "Standard",
                     crate::tools::BrushType::Pen => "Pen",
                     crate::tools::BrushType::Calligraphy => "Calligraphy",
+                    crate::tools::BrushType::Pixel => "Pixel",
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut app.tools.brush.brush_type, crate::tools::BrushType::Standard, "Standard");
                     ui.selectable_value(&mut app.tools.brush.brush_type, crate::tools::BrushType::Pen, "Pen");
                     ui.selectable_value(&mut app.tools.brush.brush_type, crate::tools::BrushType::Calligraphy, "Calligraphy");
+                    ui.selectable_value(&mut app.tools.brush.brush_type, crate::tools::BrushType::Pixel, "Pixel");
                 });
 
             ui.add_space(4.0);
-            brush_numeric_row(ui, "Size", &mut app.tools.brush.size, 1.0..=100.0, 0.4);
-            brush_numeric_row(ui, "Smoothness", &mut app.tools.brush.smoothness, 0.0..=1.0, 0.01);
-            brush_numeric_row(ui, "Heavybrush", &mut app.tools.brush.heavy, 0.0..=1.0, 0.01);
+            if app.tools.brush.brush_type == crate::tools::BrushType::Pixel {
+                ui.label(
+                    RichText::new("Pixel stamps snap to View grid step / cols×rows")
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
+                let mut cells = app.tools.brush.pixel_cells as f32;
+                if brush_numeric_row(ui, "Figure size (cells)", &mut cells, 1.0..=32.0, 1.0) {
+                    app.tools.brush.pixel_cells = cells.round().clamp(1.0, 32.0) as u32;
+                }
+                // Keep size in sync for any code that still reads brush.size
+                let gx = app.viewport.step_x() as f32;
+                app.tools.brush.size =
+                    (app.tools.brush.pixel_cells as f32 * gx).max(1.0);
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Ctrl+drag: straight line  ·  Shift+drag: erase pixels")
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
+            } else {
+                brush_numeric_row(ui, "Size", &mut app.tools.brush.size, 1.0..=100.0, 0.4);
+                brush_numeric_row(ui, "Smoothness", &mut app.tools.brush.smoothness, 0.0..=1.0, 0.01);
+                brush_numeric_row(ui, "Heavybrush", &mut app.tools.brush.heavy, 0.0..=1.0, 0.01);
+            }
         });
 
         ui.add_space(6.0);
@@ -6729,7 +6997,7 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
         // ── Brush-type Configure Container ──────────────────────────────
         match app.tools.brush.brush_type {
-            crate::tools::BrushType::Standard => {}  // No extra container for Standard
+            crate::tools::BrushType::Standard | crate::tools::BrushType::Pixel => {}
 
             crate::tools::BrushType::Pen => {
                 theme::constraint_block(ui, |ui| {

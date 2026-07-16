@@ -1,4 +1,4 @@
-//! MCP stdio ↔ Vadadee Berry TCP JSON-RPC bridge (replaces the Python script).
+//! MCP stdio ↔ Vadadee Berry TCP JSON-RPC bridge.
 //!
 //! Handshake and tool discovery are answered locally; tool calls forward to the
 //! editor TCP bridge on 127.0.0.1:17345 (override with `VADADEE_MCP_PORT`).
@@ -7,12 +7,17 @@
 //!   command: /path/to/vadadee-mcp-stdio
 //!   (no args)
 
-#![cfg(not(target_os = "android"))]
-
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
-
+#[cfg(target_os = "android")]
 fn main() {
+    eprintln!("vadadee-mcp-stdio is host-only");
+    std::process::exit(1);
+}
+
+#[cfg(not(target_os = "android"))]
+fn main() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
     let port = std::env::var("VADADEE_MCP_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -66,7 +71,11 @@ fn main() {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn forward_line(addr: &str, line: &str) -> Result<String, std::io::Error> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
     let mut stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;

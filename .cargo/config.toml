@@ -1,0 +1,7 @@
+# Local PipeWire headers (extracted from distro -dev debs) for pipewire-rs build.
+# Runtime still uses system libpipewire-0.3.so.
+[env]
+PKG_CONFIG_PATH = { value = ".deps/pipewire/usr/lib/x86_64-linux-gnu/pkgconfig", relative = true, force = true }
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-L", "native=.deps/pipewire/usr/lib/x86_64-linux-gnu"]

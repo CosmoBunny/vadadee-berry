@@ -504,8 +504,10 @@ mod export_audio_tests {
             let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("OZEN.mp3");
             if local.exists() {
                 local
+            } else if let Some(home) = std::env::var_os("HOME") {
+                Path::new(&home).join("Downloads").join("OZEN.mp3")
             } else {
-                Path::new("/home/angsudo/Downloads/OZEN.mp3").to_path_buf()
+                return;
             }
         };
         if !path.exists() {
@@ -547,11 +549,8 @@ mod export_audio_tests {
         }
         assert!(dec_peak > 500, "decoded aac peak {dec_peak}");
 
-        let anim_file = Path::new("/home/angsudo/project/vadadee-berry/animation.mp4");
         let manifest_anim = Path::new(env!("CARGO_MANIFEST_DIR")).join("animation.mp4");
-        let anim_path = if anim_file.exists() {
-            Some(anim_file)
-        } else if manifest_anim.exists() {
+        let anim_path = if manifest_anim.exists() {
             Some(manifest_anim.as_path())
         } else {
             None

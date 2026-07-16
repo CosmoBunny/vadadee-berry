@@ -295,6 +295,7 @@ pub fn document_svg_string(
             }
             crate::document::LayerKind::Shading => {}
             crate::document::LayerKind::Flowchart => {}
+            crate::document::LayerKind::ScreenRecord => {}
             crate::document::LayerKind::NodeEditor => {
                 // P5: note file-path Output as image reference when path is absolute PNG/JPG.
                 if let Some(g) = layer.node_graph.as_ref() {
@@ -1146,6 +1147,7 @@ pub fn composite_export_frame(
                 apply_shading_passes_skia(&mut pixmap, &layer.shading_passes, time_secs);
             }
             crate::document::LayerKind::Flowchart => {}
+            crate::document::LayerKind::ScreenRecord => {}
             crate::document::LayerKind::NodeEditor => {
                 // P6c: software path for NE Output (GPU export uses export_worker caches).
                 if let Some(g) = &layer.node_graph {

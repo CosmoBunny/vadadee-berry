@@ -39,13 +39,20 @@ pub fn draw_grid(painter: &Painter, viewport: &Viewport, origin: Pos2, page: Rec
         return;
     }
     let clip = page.intersect(painter.clip_rect());
+    if clip.width() < 1.0 || clip.height() < 1.0 {
+        return;
+    }
     let step_x = (viewport.step_x() as f32) * viewport.zoom;
     let step_y = (viewport.step_y() as f32) * viewport.zoom;
+    // Skip only when both axes would be unreadable noise.
     if step_x < 2.0 && step_y < 2.0 {
         return;
     }
     // Align lines to document origin (page corner), not arbitrary screen cells.
     let origin_scr = viewport.doc_to_screen((0.0, 0.0), origin);
+    // Visible over light/dark page fill (drawn after page background).
+    let minor = Color32::from_rgba_unmultiplied(120, 130, 150, 70);
+    let major_c = Color32::from_rgba_unmultiplied(100, 120, 160, 110);
     if step_x >= 2.0 {
         let mut i = ((clip.left() - origin_scr.x) / step_x).floor() as i32 - 1;
         loop {
@@ -59,14 +66,10 @@ pub fn draw_grid(painter: &Painter, viewport: &Viewport, origin: Pos2, page: Rec
                 } else {
                     i.rem_euclid(5) == 0
                 };
-                let color = if major {
-                    Color32::from_gray(60)
-                } else {
-                    Color32::from_gray(40)
-                };
+                let color = if major { major_c } else { minor };
                 painter.line_segment(
                     [Pos2::new(x, clip.top()), Pos2::new(x, clip.bottom())],
-                    Stroke::new(1.0, color),
+                    Stroke::new(if major { 1.0 } else { 0.8 }, color),
                 );
             }
             i += 1;
@@ -88,14 +91,10 @@ pub fn draw_grid(painter: &Painter, viewport: &Viewport, origin: Pos2, page: Rec
                 } else {
                     j.rem_euclid(5) == 0
                 };
-                let color = if major {
-                    Color32::from_gray(60)
-                } else {
-                    Color32::from_gray(40)
-                };
+                let color = if major { major_c } else { minor };
                 painter.line_segment(
                     [Pos2::new(clip.left(), y), Pos2::new(clip.right(), y)],
-                    Stroke::new(1.0, color),
+                    Stroke::new(if major { 1.0 } else { 0.8 }, color),
                 );
             }
             j += 1;
@@ -3600,6 +3599,66 @@ pub fn append_smoothed_points(path: &mut kurbo::BezPath, pts: &[[f64; 2]], smoot
     path.line_to(kurbo::Point::new(pts[n - 1][0], pts[n - 1][1]));
 }
 
+/// Live pixel-brush preview: axis-aligned filled cells (no smooth circles).
+fn draw_pixel_brush_preview(
+    painter: &Painter,
+    viewport: &Viewport,
+    origin: Pos2,
+    points: &[([f64; 2], f64, f32)],
+    stroke_color: Color32,
+    cursor_doc: Option<(f64, f64)>,
+) {
+    let gx = viewport.step_x().max(0.5);
+    let gy = viewport.step_y().max(0.5);
+    let aspect = gy / gx;
+    for &(pos, _, w) in points {
+        let w = w as f64;
+        if w <= 0.0 {
+            continue;
+        }
+        let h = w * aspect;
+        let tl = viewport.doc_to_screen((pos[0] - w * 0.5, pos[1] - h * 0.5), origin);
+        let br = viewport.doc_to_screen((pos[0] + w * 0.5, pos[1] + h * 0.5), origin);
+        let rect = Rect::from_min_max(
+            Pos2::new(tl.x.min(br.x), tl.y.min(br.y)),
+            Pos2::new(tl.x.max(br.x), tl.y.max(br.y)),
+        );
+        // Snap screen rect to whole pixels so preview looks crisp when zoomed.
+        let rect = Rect::from_min_max(
+            Pos2::new(rect.min.x.floor(), rect.min.y.floor()),
+            Pos2::new(rect.max.x.ceil(), rect.max.y.ceil()),
+        );
+        painter.rect_filled(rect, 0.0, stroke_color);
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 40)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    // Hover stamp under cursor (even before first point / between stamps).
+    if let Some(cur) = cursor_doc {
+        // Infer cell count from last stamp width if present.
+        let n = points
+            .last()
+            .map(|&(_, _, w)| ((w as f64) / gx).round().max(1.0) as u32)
+            .unwrap_or(1);
+        let (cx, cy, w, h) = crate::tools::pixel_stamp_at(cur, gx, gy, n);
+        let tl = viewport.doc_to_screen((cx - w * 0.5, cy - h * 0.5), origin);
+        let br = viewport.doc_to_screen((cx + w * 0.5, cy + h * 0.5), origin);
+        let rect = Rect::from_min_max(
+            Pos2::new(tl.x.min(br.x).floor(), tl.y.min(br.y).floor()),
+            Pos2::new(tl.x.max(br.x).ceil(), tl.y.max(br.y).ceil()),
+        );
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 200, 80, 200)),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
 pub fn draw_brush_preview(
     painter: &Painter,
     viewport: &Viewport,
@@ -3611,6 +3670,11 @@ pub fn draw_brush_preview(
     cursor_doc: Option<(f64, f64)>,
     brush_type: crate::tools::BrushType,
 ) {
+    if brush_type == crate::tools::BrushType::Pixel {
+        draw_pixel_brush_preview(painter, viewport, origin, points, stroke_color, cursor_doc);
+        return;
+    }
+
     if points.is_empty() {
         return;
     }

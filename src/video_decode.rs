@@ -690,6 +690,41 @@ unsafe fn fmt_duration_secs(fmt: *mut AVFormatContext, avformat_major: u32) -> f
     }
 }
 
+/// Video / still dimensions in pixels. Cached per path.
+pub fn probe_media_size(path: &str) -> Option<(u32, u32)> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<(u32, u32)>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(v) = map.get(path) {
+            return *v;
+        }
+    }
+    let size = probe_media_size_uncached(path);
+    if let Ok(mut map) = cache.lock() {
+        if map.len() > 64 {
+            map.clear();
+        }
+        map.insert(path.to_string(), size);
+    }
+    size
+}
+
+fn probe_media_size_uncached(path: &str) -> Option<(u32, u32)> {
+    // Still image
+    if let Ok(img) = image::image_dimensions(path) {
+        return Some(img);
+    }
+    // Video: first decodable frame
+    if let Some((w, h, _)) = decode_frame(path, 0, 30.0) {
+        if w > 0 && h > 0 {
+            return Some((w, h));
+        }
+    }
+    None
+}
+
 /// Duration in seconds (libav first, then symphonia). Cached per path — probe is heavy.
 pub fn probe_media_duration_secs(path: &str) -> Option<f32> {
     use std::collections::HashMap;

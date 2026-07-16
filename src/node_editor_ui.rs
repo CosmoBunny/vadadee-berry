@@ -22,6 +22,8 @@ fn port_type_color(ty: PortType) -> Color32 {
         PortType::RawImage => Color32::from_rgb(100, 160, 255), // blue
         PortType::RawVideo => Color32::from_rgb(60, 220, 230),  // cyan
         PortType::RawSound => Color32::from_rgb(200, 140, 255), // purple
+        PortType::Septic => Color32::from_rgb(255, 90, 90),     // red-orange
+        PortType::Mouse => Color32::from_rgb(255, 160, 60),     // amber
         PortType::Real => Color32::from_rgb(240, 200, 80),      // gold
         PortType::Color => Color32::from_rgb(255, 120, 160),    // pink
         PortType::Position => Color32::from_rgb(120, 220, 180), // mint
@@ -575,6 +577,36 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
                 ui.close();
             }
             if ui
+                .button(
+                    RichText::new(format!("{} Septic", icons::SEPTIC)).font(nerd_font_id(13.0)),
+                )
+                .on_hover_text("Septic session object (.sepscrr path)")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::ObjectSeptic {
+                    path: String::new(),
+                });
+                ui.close();
+            }
+            if ui
+                .button(
+                    RichText::new(format!("{} Mouse", icons::MOUSE)).font(nerd_font_id(13.0)),
+                )
+                .on_hover_text("Mouse object — wire to Mouse Player for pos / shake / event")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::ObjectMouse {
+                    path: String::new(),
+                });
+                ui.close();
+            }
+            if ui.button("Output Object").clicked() {
+                spawn = Some(GraphNodeKind::OutputObject);
+                ui.close();
+            }
+        });
+        ui.menu_button("Player ▾", |ui| {
+            if ui
                 .button("Video Player")
                 .on_hover_text(
                     "Video + Time [+ Start/Duration] → Image; optional Audio in → timed Sound",
@@ -584,8 +616,31 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
                 spawn = Some(GraphNodeKind::VideoPlayer);
                 ui.close();
             }
-            if ui.button("Output Object").clicked() {
-                spawn = Some(GraphNodeKind::OutputObject);
+            if ui
+                .button(
+                    RichText::new(format!("{} Septic Player", icons::SEPTIC))
+                        .font(nerd_font_id(13.0)),
+                )
+                .on_hover_text("Septic + Time → Video, Mouse, truth Time")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::SepticPlayer);
+                ui.close();
+            }
+            if ui
+                .button(
+                    RichText::new(format!("{} Mouse Player", icons::MOUSE))
+                        .font(nerd_font_id(13.0)),
+                )
+                .on_hover_text(
+                    "Mouse + Time → Pos / Shakiness (threshold+gain) / Event (0=none, 1=click)",
+                )
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::MouseEncoder {
+                    time_threshold: 0.20,
+                    gain: 6.0,
+                });
                 ui.close();
             }
         });
@@ -644,6 +699,14 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
             }
             if ui.button("Linear Blur").clicked() {
                 spawn = Some(GraphNodeKind::LinearBlur);
+                ui.close();
+            }
+            if ui
+                .button("Zoom")
+                .on_hover_text("Image + Pos (center) + Zoom factor (≥1, default 1) → cropped image")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::Zoom);
                 ui.close();
             }
             if ui.button("Equalizer").clicked() {
@@ -821,10 +884,15 @@ fn node_height(n: &crate::document::GraphNode, preview_open: bool) -> f32 {
     ) {
         h = h.max(92.0);
     }
+    let is_mouse_player = matches!(n.kind, GraphNodeKind::MouseEncoder { .. });
     let (has_in, has_out) = NodeGraph::image_port_dirs(&n.kind);
-    if preview_open && (has_in || has_out) && !matches!(n.kind, GraphNodeKind::ObjectAudio { .. }) {
-        h = h.max(148.0);
-    } else if has_in || has_out {
+    if preview_open
+        && (is_mouse_player
+            || ((has_in || has_out) && !matches!(n.kind, GraphNodeKind::ObjectAudio { .. })))
+    {
+        // Mouse XY plot needs a square-ish pad; image prev uses similar height.
+        h = h.max(if is_mouse_player { 168.0 } else { 148.0 });
+    } else if is_mouse_player || has_in || has_out {
         // Bottom strip for flat Prev control.
         if !matches!(
             n.kind,
@@ -1304,11 +1372,15 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 GraphNodeKind::ObjectImage { .. }
                     | GraphNodeKind::ObjectVideo { .. }
                     | GraphNodeKind::ObjectAudio { .. }
+                    | GraphNodeKind::ObjectSeptic { .. }
+                    | GraphNodeKind::ObjectMouse { .. }
             );
             let is_from_app = matches!(node_clone.kind, GraphNodeKind::ObjectFromApp { .. });
+            let is_mouse_player = matches!(node_clone.kind, GraphNodeKind::MouseEncoder { .. });
             let (has_in, has_out) = NodeGraph::image_port_dirs(&node_clone.kind);
-            let can_preview = (has_in || has_out)
-                && !matches!(node_clone.kind, GraphNodeKind::ObjectAudio { .. });
+            let can_preview = is_mouse_player
+                || ((has_in || has_out)
+                    && !matches!(node_clone.kind, GraphNodeKind::ObjectAudio { .. }));
 
             // Hit targets (clipped)
             let browse_rect = Rect::from_min_size(
@@ -1331,7 +1403,9 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 let path = match &node_clone.kind {
                     GraphNodeKind::ObjectImage { path }
                     | GraphNodeKind::ObjectVideo { path }
-                    | GraphNodeKind::ObjectAudio { path } => path.clone(),
+                    | GraphNodeKind::ObjectAudio { path }
+                    | GraphNodeKind::ObjectSeptic { path }
+                    | GraphNodeKind::ObjectMouse { path } => path.clone(),
                     _ => String::new(),
                 };
                 let display = truncate_middle(
@@ -1384,6 +1458,10 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                                     &["mp3", "wav", "ogg", "flac", "m4a", "aac"],
                                 )
                                 .add_filter("All", &["*"]),
+                            GraphNodeKind::ObjectSeptic { .. }
+                            | GraphNodeKind::ObjectMouse { .. } => dlg
+                                .add_filter("Septic", &["sepscrr", "json"])
+                                .add_filter("All", &["*"]),
                             _ => dlg,
                         };
                         if let Some(p) = dlg.pick_file() {
@@ -1426,7 +1504,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 }
             }
 
-            // In-node preview image (base texture only — never heavy bake here).
+            // In-node preview (image texture or Mouse Player XY pad).
             if preview_open && can_preview && body.height() > 20.0 {
                 let img_rect = Rect::from_min_max(
                     Pos2::new(body.min.x, body.min.y + fs * 2.2),
@@ -1434,65 +1512,89 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 )
                 .intersect(canvas_clip);
                 if img_rect.width() > 8.0 && img_rect.height() > 8.0 {
-                    let preview_eval = app.project.document.layers[layer_idx]
-                        .node_graph
-                        .as_ref()
-                        .map(|g| {
-                            if has_out {
-                                g.resolve_node_image_out(nid)
-                            } else {
-                                let mut found = crate::document::GraphOutputEval::default();
-                                for p in node_clone.ports() {
-                                    if p.dir == PortDir::Input
-                                        && matches!(
-                                            p.ty,
-                                            PortType::RawImage | PortType::RawVideo
-                                        )
-                                    {
-                                        if let Some(src) = g.input_source_node(nid, &p.id) {
-                                            found = g.resolve_node_image_out(src);
-                                            if !matches!(
-                                                found.image,
-                                                crate::document::GraphImageSource::Empty
-                                            ) {
-                                                break;
+                    if is_mouse_player {
+                        let (mx, my, mshake, mevt) = app.project.document.layers[layer_idx]
+                            .node_graph
+                            .as_ref()
+                            .map(|g| {
+                                (
+                                    g.last_real_port(nid, "x").unwrap_or(0.5),
+                                    g.last_real_port(nid, "y").unwrap_or(0.5),
+                                    g.last_real_port(nid, "shakiness").unwrap_or(0.0),
+                                    g.last_real_port(nid, "event").unwrap_or(0.0),
+                                )
+                            })
+                            .unwrap_or((0.5, 0.5, 0.0, 0.0));
+                        paint_mouse_xy_preview(
+                            &painter,
+                            img_rect,
+                            mx,
+                            my,
+                            mshake,
+                            mevt,
+                            z,
+                        );
+                    } else {
+                        let preview_eval = app.project.document.layers[layer_idx]
+                            .node_graph
+                            .as_ref()
+                            .map(|g| {
+                                if has_out {
+                                    g.resolve_node_image_out(nid)
+                                } else {
+                                    let mut found = crate::document::GraphOutputEval::default();
+                                    for p in node_clone.ports() {
+                                        if p.dir == PortDir::Input
+                                            && matches!(
+                                                p.ty,
+                                                PortType::RawImage | PortType::RawVideo
+                                            )
+                                        {
+                                            if let Some(src) = g.input_source_node(nid, &p.id) {
+                                                found = g.resolve_node_image_out(src);
+                                                if !matches!(
+                                                    found.image,
+                                                    crate::document::GraphImageSource::Empty
+                                                ) {
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
+                                    found
                                 }
-                                found
-                            }
-                        });
-                    if let Some(eval) = preview_eval {
-                        let tid = match &eval.image {
-                            crate::document::GraphImageSource::FilePath(path) => {
-                                let _ = app.ensure_graph_path_texture_at(
-                                    path,
-                                    eval.video_time_sec,
-                                    ui.ctx(),
+                            });
+                        if let Some(eval) = preview_eval {
+                            let tid = match &eval.image {
+                                crate::document::GraphImageSource::FilePath(path) => {
+                                    let _ = app.ensure_graph_path_texture_at(
+                                        path,
+                                        eval.video_time_sec,
+                                        ui.ctx(),
+                                    );
+                                    let key = eval.media_cache_key(path);
+                                    app.graph_path_texture_id(&key)
+                                }
+                                crate::document::GraphImageSource::AppObjects(ids) => {
+                                    ids.iter().find_map(|id| app.image_texture_id(*id))
+                                }
+                                crate::document::GraphImageSource::Empty => None,
+                            };
+                            if let Some(tid) = tid {
+                                let uv = egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
                                 );
-                                let key = eval.media_cache_key(path);
-                                app.graph_path_texture_id(&key)
+                                painter.image(tid, img_rect, uv, Color32::WHITE);
+                            } else {
+                                painter.text(
+                                    img_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "no image",
+                                    font.clone(),
+                                    Color32::from_rgb(120, 128, 140),
+                                );
                             }
-                            crate::document::GraphImageSource::AppObjects(ids) => {
-                                ids.iter().find_map(|id| app.image_texture_id(*id))
-                            }
-                            crate::document::GraphImageSource::Empty => None,
-                        };
-                        if let Some(tid) = tid {
-                            let uv = egui::Rect::from_min_max(
-                                egui::pos2(0.0, 0.0),
-                                egui::pos2(1.0, 1.0),
-                            );
-                            painter.image(tid, img_rect, uv, Color32::WHITE);
-                        } else {
-                            painter.text(
-                                img_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "no image",
-                                font.clone(),
-                                Color32::from_rgb(120, 128, 140),
-                            );
                         }
                     }
                 }
@@ -1810,13 +1912,22 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 match &mut n.kind {
                     GraphNodeKind::ObjectImage { path: p }
                     | GraphNodeKind::ObjectVideo { path: p }
-                    | GraphNodeKind::ObjectAudio { path: p } => {
+                    | GraphNodeKind::ObjectAudio { path: p }
+                    | GraphNodeKind::ObjectSeptic { path: p }
+                    | GraphNodeKind::ObjectMouse { path: p } => {
                         *p = path.clone();
                         app.status_message = "Media path set".into();
                         // Streaming playback — do not full-decode into RAM on Browse
                         // (that OOM'd machines for long MP3s / thread storms).
                         if matches!(n.kind, GraphNodeKind::ObjectAudio { .. }) && !path.is_empty() {
                             app.status_message = "Audio path set (streams on Play)".into();
+                        }
+                        if matches!(
+                            n.kind,
+                            GraphNodeKind::ObjectSeptic { .. } | GraphNodeKind::ObjectMouse { .. }
+                        ) && !path.is_empty()
+                        {
+                            app.status_message = "Septic/Mouse path set".into();
                         }
                     }
                     _ => {}
@@ -2049,6 +2160,147 @@ fn port_rect_for(
         PortDir::Output => body.max.x,
     };
     Rect::from_center_size(Pos2::new(x, y), Vec2::splat(PORT_R * 2.0 * view.zoom.max(0.7)))
+}
+
+/// One-quadrant mouse XY preview (origin bottom-left, X→ Y↑, domain 0..1).
+fn paint_mouse_xy_preview(
+    painter: &egui::Painter,
+    outer: Rect,
+    x: f64,
+    y: f64,
+    shakiness: f64,
+    event: f64,
+    zoom: f32,
+) {
+    let z = zoom.max(0.5);
+    let pad = (6.0 * z).clamp(4.0, 10.0);
+    // Leave a thin strip for axis labels outside the plot square.
+    let label_w = (14.0 * z).clamp(10.0, 18.0);
+    let label_h = (12.0 * z).clamp(9.0, 16.0);
+    let plot = Rect::from_min_max(
+        Pos2::new(outer.min.x + label_w, outer.min.y + 2.0),
+        Pos2::new(outer.max.x - 2.0, outer.max.y - label_h),
+    );
+    if plot.width() < 12.0 || plot.height() < 12.0 {
+        return;
+    }
+
+    // Square plot region (one quadrant pad) centered in available space.
+    let side = plot.width().min(plot.height());
+    let plot = Rect::from_center_size(plot.center(), Vec2::splat(side));
+
+    let bg = Color32::from_rgb(22, 26, 34);
+    let axis = Color32::from_rgb(90, 100, 120);
+    let grid = Color32::from_rgb(48, 54, 68);
+    let accent = Color32::from_rgb(255, 160, 60);
+    let click_col = Color32::from_rgb(255, 90, 110);
+
+    painter.rect_filled(plot, egui::CornerRadius::same(4), bg);
+    painter.rect_stroke(
+        plot,
+        egui::CornerRadius::same(4),
+        egui::Stroke::new(1.0, axis),
+        egui::StrokeKind::Inside,
+    );
+
+    // Light grid at 0.25 / 0.5 / 0.75 (still one quadrant — no negative axes).
+    for i in 1..4 {
+        let t = i as f32 / 4.0;
+        let gx = plot.min.x + plot.width() * t;
+        let gy = plot.max.y - plot.height() * t;
+        painter.line_segment(
+            [Pos2::new(gx, plot.min.y), Pos2::new(gx, plot.max.y)],
+            egui::Stroke::new(0.7, grid),
+        );
+        painter.line_segment(
+            [Pos2::new(plot.min.x, gy), Pos2::new(plot.max.x, gy)],
+            egui::Stroke::new(0.7, grid),
+        );
+    }
+
+    // Screen-style first quadrant: origin top-left, X→ right, Y↓ down
+    // (matches septic mouse track: y=0 top of display).
+    let origin = Pos2::new(plot.min.x, plot.min.y);
+    painter.line_segment(
+        [origin, Pos2::new(plot.max.x, plot.min.y)],
+        egui::Stroke::new(1.4, axis),
+    );
+    painter.line_segment(
+        [origin, Pos2::new(plot.min.x, plot.max.y)],
+        egui::Stroke::new(1.4, axis),
+    );
+
+    let mono = egui::FontId::monospace((9.0 * z).clamp(7.0, 12.0));
+    painter.text(
+        Pos2::new(plot.max.x - 2.0, plot.min.y + 1.0),
+        egui::Align2::RIGHT_TOP,
+        "x",
+        mono.clone(),
+        accent,
+    );
+    painter.text(
+        Pos2::new(plot.min.x - 2.0, plot.max.y - 1.0),
+        egui::Align2::RIGHT_BOTTOM,
+        "y",
+        mono.clone(),
+        accent,
+    );
+    painter.text(
+        Pos2::new(plot.min.x - 2.0, plot.min.y),
+        egui::Align2::RIGHT_CENTER,
+        "0",
+        mono.clone(),
+        muted_axis_label(),
+    );
+
+    // Point: same orientation as the screen (y increases downward).
+    let nx = x.clamp(0.0, 1.0) as f32;
+    let ny = y.clamp(0.0, 1.0) as f32;
+    let pt = Pos2::new(
+        plot.min.x + plot.width() * nx,
+        plot.min.y + plot.height() * ny,
+    );
+
+    // Soft glow from shakiness.
+    let shake = shakiness.clamp(0.0, 1.0) as f32;
+    if shake > 0.02 {
+        let glow_r = (4.0 + shake * 10.0) * z.clamp(0.7, 1.4);
+        painter.circle_filled(
+            pt,
+            glow_r,
+            Color32::from_rgba_unmultiplied(255, 160, 60, (40.0 + shake * 90.0) as u8),
+        );
+    }
+
+    let clicked = event >= 0.5;
+    let r_pt = (3.5 * z).clamp(2.5, 6.0);
+    painter.circle_filled(pt, r_pt + if clicked { 1.5 } else { 0.0 }, if clicked {
+        click_col
+    } else {
+        accent
+    });
+    painter.circle_stroke(
+        pt,
+        r_pt + 1.0,
+        egui::Stroke::new(1.0, Color32::from_rgb(255, 230, 200)),
+    );
+
+    // Compact readout under plot when there's room.
+    if outer.height() > side + label_h + 4.0 {
+        painter.text(
+            Pos2::new(outer.center().x, outer.max.y - 1.0),
+            egui::Align2::CENTER_BOTTOM,
+            format!("({nx:.2}, {ny:.2})"),
+            mono,
+            Color32::from_rgb(180, 190, 200),
+        );
+    }
+
+    let _ = pad;
+}
+
+fn muted_axis_label() -> Color32 {
+    Color32::from_rgb(110, 118, 132)
 }
 
 fn paint_node_card(

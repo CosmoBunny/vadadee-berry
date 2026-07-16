@@ -699,11 +699,16 @@ impl UiAnimation {
 
     pub fn status_message_seg_width(&self) -> f32 {
         if self.engine.is_animating("status_sign", ID) {
-            self.range_inclusive(
+            // Keep chip at least as wide as both labels so the outgoing text
+            // is not crushed under the incoming one during the slide.
+            let lerped = self.range_inclusive(
                 "status_sign",
                 self.status_msg_width_out,
                 self.status_msg_width_in,
-            )
+            );
+            lerped
+                .max(self.status_msg_width_out)
+                .max(self.status_msg_width_in)
         } else {
             self.status_msg_width_settled
         }

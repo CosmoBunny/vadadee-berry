@@ -21,7 +21,7 @@ impl Default for Viewport {
         Self {
             pan: Vec2::new(40.0, 40.0),
             zoom: 1.0,
-            show_grid: true,
+            show_grid: false,
             snap_grid: true,
             grid_step: 20.0,
             grid_cols: 0,

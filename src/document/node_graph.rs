@@ -14,6 +14,10 @@ pub enum PortType {
     RawVideo,
     /// Audio or demuxed soundtrack.
     RawSound,
+    /// Canonical septic session (`.sepscrr` / Screen Record layer).
+    Septic,
+    /// Mouse track / sample (needs Mouse Encoder for pos / shake / event).
+    Mouse,
     /// Scalar real number.
     Real,
     /// Compound color (3 reals in UI / expand).
@@ -28,6 +32,8 @@ impl PortType {
             Self::RawImage => "Image",
             Self::RawVideo => "Video",
             Self::RawSound => "Sound",
+            Self::Septic => "Septic",
+            Self::Mouse => "Mouse",
             Self::Real => "Real",
             Self::Color => "Color",
             Self::Position => "Position",
@@ -85,6 +91,25 @@ pub enum GraphNodeKind {
     OutputObject,
     /// Decode a video object at a driven time → image + sound. Blank when past end.
     VideoPlayer,
+    /// Septic session object (browse `.sepscrr` or path from Screen Record layer).
+    ObjectSeptic {
+        #[serde(default)]
+        path: String,
+    },
+    /// Mouse object — septic path / track reference. Use Mouse Encoder to extract signals.
+    ObjectMouse {
+        #[serde(default)]
+        path: String,
+    },
+    /// Septic + Time → video, mouse, truth time.
+    SepticPlayer,
+    /// Mouse → pos, shakiness (time threshold + gain), event (0/1).
+    MouseEncoder {
+        #[serde(default = "default_mouse_time_threshold")]
+        time_threshold: f64,
+        #[serde(default = "default_mouse_gain")]
+        gain: f64,
+    },
 
     // --- Algebra ---
     Value {
@@ -114,6 +139,8 @@ pub enum GraphNodeKind {
     Brightness,
     ColorChanger,
     LinearBlur,
+    /// Crop/zoom: image + position (center 0..1) + zoom factor (≥1; 1 = full frame).
+    Zoom,
     Equalizer,
     Speed,
     /// Audio visualizer: `audio` + optional `frequency`/`gain` → real level 0..1.
@@ -155,6 +182,14 @@ fn default_expr_xyz() -> String {
 fn default_viz_gain() -> f64 {
     1.0
 }
+fn default_mouse_time_threshold() -> f64 {
+    // Wider window = smoother shakiness envelope while still tracking tremor.
+    0.20
+}
+fn default_mouse_gain() -> f64 {
+    // Soft-exp residual metric; 6 sits in a comfortable mid-range.
+    6.0
+}
 
 impl GraphNodeKind {
     pub fn category_label(&self) -> &'static str {
@@ -163,8 +198,10 @@ impl GraphNodeKind {
             | Self::ObjectVideo { .. }
             | Self::ObjectAudio { .. }
             | Self::ObjectFromApp { .. }
-            | Self::OutputObject
-            | Self::VideoPlayer => "Object",
+            | Self::ObjectSeptic { .. }
+            | Self::ObjectMouse { .. }
+            | Self::OutputObject => "Object",
+            Self::VideoPlayer | Self::SepticPlayer | Self::MouseEncoder { .. } => "Player",
             Self::Value { .. }
             | Self::ExprX { .. }
             | Self::ExprXy { .. }
@@ -174,6 +211,7 @@ impl GraphNodeKind {
             Self::Brightness
             | Self::ColorChanger
             | Self::LinearBlur
+            | Self::Zoom
             | Self::Equalizer
             | Self::Speed
             | Self::Visualizer { .. } => "Effect",
@@ -197,6 +235,10 @@ impl GraphNodeKind {
             Self::ObjectFromApp { .. } => "App Object",
             Self::OutputObject => "Output Object",
             Self::VideoPlayer => "Video Player",
+            Self::ObjectSeptic { .. } => "Septic",
+            Self::ObjectMouse { .. } => "Mouse",
+            Self::SepticPlayer => "Septic Player",
+            Self::MouseEncoder { .. } => "Mouse Player",
             Self::Value { .. } => "Value",
             Self::ExprX { .. } => "Expr X",
             Self::ExprXy { .. } => "Expr XY",
@@ -206,6 +248,7 @@ impl GraphNodeKind {
             Self::Brightness => "Brightness",
             Self::ColorChanger => "Color Changer",
             Self::LinearBlur => "Linear Blur",
+            Self::Zoom => "Zoom",
             Self::Equalizer => "Equalizer",
             Self::Speed => "Speed",
             Self::Visualizer { .. } => "Visualizer",
@@ -255,6 +298,7 @@ impl GraphNodeKind {
                 dir: Output,
             }],
             // Video + Time (+ Start/Duration) → Image; optional Audio in → timed Sound out.
+            // Real outs: total media duration (s) + pixel size (W/H).
             Self::VideoPlayer => vec![
                 PortDef {
                     id: "video".into(),
@@ -276,7 +320,7 @@ impl GraphNodeKind {
                 },
                 PortDef {
                     id: "duration".into(),
-                    name: "Duration".into(),
+                    name: "Clip".into(),
                     ty: Real,
                     dir: Input,
                 },
@@ -298,6 +342,132 @@ impl GraphNodeKind {
                     ty: RawSound,
                     dir: Output,
                 },
+                PortDef {
+                    id: "total_duration".into(),
+                    name: "Duration".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "width".into(),
+                    name: "Width".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "height".into(),
+                    name: "Height".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+            ],
+            Self::ObjectSeptic { .. } => vec![PortDef {
+                id: "out".into(),
+                name: "Septic".into(),
+                ty: Septic,
+                dir: Output,
+            }],
+            Self::ObjectMouse { .. } => vec![PortDef {
+                id: "out".into(),
+                name: "Mouse".into(),
+                ty: Mouse,
+                dir: Output,
+            }],
+            // Septic + Time → video, mouse, sound (from session mp4), truth time
+            Self::SepticPlayer => vec![
+                PortDef {
+                    id: "septic".into(),
+                    name: "Septic".into(),
+                    ty: Septic,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "time".into(),
+                    name: "Time".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "video".into(),
+                    name: "Video".into(),
+                    ty: RawVideo,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "mouse".into(),
+                    name: "Mouse".into(),
+                    ty: Mouse,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "sound".into(),
+                    name: "Sound".into(),
+                    ty: RawSound,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "time_out".into(),
+                    name: "Time".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+            ],
+            // Mouse → pos, shakiness, event (requires Encoder — not raw object alone)
+            Self::MouseEncoder { .. } => vec![
+                PortDef {
+                    id: "mouse".into(),
+                    name: "Mouse".into(),
+                    ty: Mouse,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "time".into(),
+                    name: "Time".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "threshold".into(),
+                    name: "Threshold".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "gain".into(),
+                    name: "Gain".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "pos".into(),
+                    name: "Pos".into(),
+                    ty: Position,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "x".into(),
+                    name: "X".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "y".into(),
+                    name: "Y".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "shakiness".into(),
+                    name: "Shake".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "event".into(),
+                    name: "Event".into(),
+                    ty: Real,
+                    dir: Output,
+                },
             ],
             Self::OutputObject => vec![
                 PortDef {
@@ -310,6 +480,12 @@ impl GraphNodeKind {
                     id: "sound".into(),
                     name: "Sound".into(),
                     ty: RawSound,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "run_till".into(),
+                    name: "Run Till".into(),
+                    ty: Real,
                     dir: Input,
                 },
             ],
@@ -463,6 +639,32 @@ impl GraphNodeKind {
                 PortDef {
                     id: "amount".into(),
                     name: "Radius".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+            ],
+            Self::Zoom => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "pos".into(),
+                    name: "Pos".into(),
+                    ty: Position,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "zoom".into(),
+                    name: "Zoom".into(),
                     ty: Real,
                     dir: Input,
                 },
@@ -916,6 +1118,11 @@ pub struct GraphOutputEval {
     pub geo_rot_deg: f64,
     /// Geometry: mirror axis (0=none, 1=horizontal, 2=vertical, 3=both).
     pub geo_mirror: f64,
+    /// Zoom factor (≥1). `1.0` = identity (full frame).
+    pub zoom: f64,
+    /// Zoom center in normalized image coords (0..1), screen-style Y down.
+    pub zoom_cx: f64,
+    pub zoom_cy: f64,
     /// Whether any effect nodes were traversed.
     pub effects_on_path: bool,
 }
@@ -937,13 +1144,17 @@ impl Default for GraphOutputEval {
             geo_off_y: 0.0,
             geo_rot_deg: 0.0,
             geo_mirror: 0.0,
+            zoom: 1.0,
+            zoom_cx: 0.5,
+            zoom_cy: 0.5,
             effects_on_path: false,
         }
     }
 }
 
 impl GraphOutputEval {
-    /// True when any effect parameter differs from identity (needs pixel processing).
+    /// True when any **CPU** effect differs from identity (color / blur).
+    /// Zoom is paint-time UV only — not pixel FX.
     pub fn needs_pixel_fx(&self) -> bool {
         (self.brightness - 1.0).abs() > 1e-6
             || (self.contrast - 1.0).abs() > 1e-6
@@ -953,7 +1164,7 @@ impl GraphOutputEval {
     }
 
     /// Brightness alone can be applied as a vertex tint (free every frame).
-    /// Contrast / sat / hue / blur still need a texture bake.
+    /// Contrast / sat / hue / blur still need a texture bake. Zoom is free UV.
     pub fn only_brightness_fx(&self) -> bool {
         self.blur_px <= 0.01
             && (self.contrast - 1.0).abs() < 1e-3
@@ -961,7 +1172,7 @@ impl GraphOutputEval {
             && self.hue_shift.abs() < 1e-3
     }
 
-    /// Needs a new baked texture (not free paint-time multiply).
+    /// Needs a new baked texture (not free paint-time multiply / UV zoom).
     pub fn needs_texture_bake(&self) -> bool {
         self.blur_px > 0.01
             || (self.contrast - 1.0).abs() > 1e-3
@@ -969,7 +1180,7 @@ impl GraphOutputEval {
             || self.hue_shift.abs() > 1e-3
     }
 
-    /// Cache key for processed file textures.
+    /// Cache key for processed file textures (zoom is UV at paint — not in key).
     /// Blur uses **2 decimal places** so each animation frame can get its own look (10→0 over 60f).
     pub fn fx_cache_key(&self, path: &str) -> String {
         let t = self
@@ -984,6 +1195,48 @@ impl GraphOutputEval {
             self.hue_shift,
             self.blur_px,
         )
+    }
+
+    /// UV rect for paint-time zoom (0..1). Identity when zoom ≤ 1.
+    /// Center `(zoom_cx, zoom_cy)` screen-style (Y down); factor ≥ 1.
+    pub fn zoom_uv_rect(&self) -> (f32, f32, f32, f32) {
+        let z = self.zoom.max(1.0) as f32;
+        if z <= 1.001 {
+            return (0.0, 0.0, 1.0, 1.0);
+        }
+        let half = 0.5 / z;
+        let cx = (self.zoom_cx as f32).clamp(0.0, 1.0);
+        let cy = (self.zoom_cy as f32).clamp(0.0, 1.0);
+        let mut u0 = cx - half;
+        let mut v0 = cy - half;
+        let mut u1 = cx + half;
+        let mut v1 = cy + half;
+        if u0 < 0.0 {
+            u1 -= u0;
+            u0 = 0.0;
+        }
+        if v0 < 0.0 {
+            v1 -= v0;
+            v0 = 0.0;
+        }
+        if u1 > 1.0 {
+            u0 -= u1 - 1.0;
+            u1 = 1.0;
+        }
+        if v1 > 1.0 {
+            v0 -= v1 - 1.0;
+            v1 = 1.0;
+        }
+        (
+            u0.clamp(0.0, 1.0),
+            v0.clamp(0.0, 1.0),
+            u1.clamp(0.0, 1.0),
+            v1.clamp(0.0, 1.0),
+        )
+    }
+
+    pub fn has_zoom(&self) -> bool {
+        self.zoom > 1.001
     }
 
     /// Texture key for a timed video frame (or still path when no time).
@@ -1003,6 +1256,9 @@ impl GraphOutputEval {
         e.contrast = (e.contrast * 1000.0).round() / 1000.0;
         e.saturation = (e.saturation * 1000.0).round() / 1000.0;
         e.hue_shift = (e.hue_shift * 100.0).round() / 100.0;
+        e.zoom = ((e.zoom * 1000.0).round() / 1000.0).clamp(1.0, 64.0);
+        e.zoom_cx = ((e.zoom_cx * 1000.0).round() / 1000.0).clamp(0.0, 1.0);
+        e.zoom_cy = ((e.zoom_cy * 1000.0).round() / 1000.0).clamp(0.0, 1.0);
         // Snap video time to whole frames so texture cache hits while scrubbing/playing.
         e.video_time_sec = e.video_time_sec.map(|t| {
             let fps = 30.0_f64; // display quantize; actual decode uses app fps
@@ -1225,7 +1481,15 @@ pub fn bake_graph_output_rgba(
         .map(|t| format!("|t{t:.3}"))
         .unwrap_or_default();
     let base_key = format!("{path}{media_tag}|ms{max_side}");
-    let fx_key = format!("{}|{}", q.fx_cache_key(path), max_side);
+    // Export must bake zoom into pixels — include in cache key.
+    let fx_key = format!(
+        "{}|ms{}|z{:.3}@{:.3},{:.3}",
+        q.fx_cache_key(path),
+        max_side,
+        q.zoom,
+        q.zoom_cx,
+        q.zoom_cy
+    );
 
     if let Some(cache) = fx_cache.as_ref() {
         if let Some(img) = cache.get(&fx_key) {
@@ -1261,14 +1525,19 @@ pub fn bake_graph_output_rgba(
         downscale_rgba_max_side(&rgba, max_side)
     };
 
-    if !q.needs_pixel_fx() {
-        if let Some(cache) = fx_cache.as_mut() {
-            cache.insert(fx_key, base.clone());
-        }
-        return Some(base);
+    let mut rgba = base;
+    // Zoom first (export bake); live preview does this as UV at paint time.
+    if q.has_zoom() {
+        apply_zoom_crop_export(&mut rgba, &q);
     }
 
-    let mut rgba = base;
+    if !q.needs_pixel_fx() {
+        if let Some(cache) = fx_cache.as_mut() {
+            cache.insert(fx_key, rgba.clone());
+        }
+        return Some(rgba);
+    }
+
     let mut color_only = q.clone();
     let br = q.blur_px.clamp(0.0, 64.0) as f32;
     color_only.blur_px = 0.0;
@@ -1282,7 +1551,10 @@ pub fn bake_graph_output_rgba(
     Some(rgba)
 }
 
-/// Apply P4 color / blur effects to an RGBA buffer (in place).
+/// Apply color / blur effects (in place).
+///
+/// **Zoom is not applied here for live preview** — that is free UV sampling at paint time.
+/// Export bake paths that need baked zoom should call [`apply_zoom_crop_export`] first.
 pub fn apply_graph_image_fx(img: &mut image::RgbaImage, eval: &GraphOutputEval) {
     if !eval.needs_pixel_fx() {
         return;
@@ -1331,6 +1603,35 @@ pub fn apply_graph_image_fx(img: &mut image::RgbaImage, eval: &GraphOutputEval) 
         // Continuous Gaussian — radius maps to σ every frame (not stepped levels).
         gaussian_blur_rgba(img, radius as f32);
     }
+}
+
+/// CPU zoom crop for **export** only (live path uses UV — no lag).
+/// Uses Nearest when zooming heavily on already-downscaled previews for speed.
+pub fn apply_zoom_crop_export(img: &mut image::RgbaImage, eval: &GraphOutputEval) {
+    let z = eval.zoom.max(1.0);
+    if z <= 1.001 {
+        return;
+    }
+    let (w, h) = img.dimensions();
+    if w < 2 || h < 2 {
+        return;
+    }
+    let crop_w = ((w as f64) / z).floor().max(1.0) as u32;
+    let crop_h = ((h as f64) / z).floor().max(1.0) as u32;
+    let cx = eval.zoom_cx.clamp(0.0, 1.0);
+    let cy = eval.zoom_cy.clamp(0.0, 1.0);
+    let mut x0 = (cx * w as f64 - crop_w as f64 * 0.5).round() as i64;
+    let mut y0 = (cy * h as f64 - crop_h as f64 * 0.5).round() as i64;
+    x0 = x0.clamp(0, (w.saturating_sub(crop_w)) as i64);
+    y0 = y0.clamp(0, (h.saturating_sub(crop_h)) as i64);
+    let cropped = image::imageops::crop_imm(img, x0 as u32, y0 as u32, crop_w, crop_h).to_image();
+    // Triangle is expensive; Nearest is fine for large zooms / export intermediates.
+    let filter = if z >= 2.0 || w.max(h) <= 512 {
+        image::imageops::FilterType::Nearest
+    } else {
+        image::imageops::FilterType::Triangle
+    };
+    *img = image::imageops::resize(&cropped, w, h, filter);
 }
 
 fn fx_rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
@@ -1530,6 +1831,9 @@ pub struct NodeGraph {
     /// Cached Real outputs from last [`Self::eval_reals`] (not persisted).
     #[serde(skip)]
     pub last_real_values: std::collections::HashMap<Uuid, f64>,
+    /// Port-scoped Real outputs (Mouse Encoder x/y/shakiness/event, etc.).
+    #[serde(skip)]
+    pub last_real_port_values: std::collections::HashMap<(Uuid, String), f64>,
 }
 
 impl Default for NodeGraph {
@@ -1548,6 +1852,7 @@ impl NodeGraph {
             output_node_id: None,
             root_error: None,
             last_real_values: std::collections::HashMap::new(),
+            last_real_port_values: std::collections::HashMap::new(),
         };
         // Seed with an Output Object so the layer has a clear sink.
         let out = GraphNode::new(GraphNodeKind::OutputObject, 280.0, 120.0);
@@ -1720,7 +2025,12 @@ impl NodeGraph {
 
     /// Resolve Output Object image input for canvas compositing (P2).
     /// Walks pass-through effect/geometry nodes; applies Brightness.amount from last Real eval.
+    /// Blank when past Output Object `run_till` (seconds, if wired > 0).
     pub fn resolve_output_image(&self) -> GraphOutputEval {
+        let run_till = self.output_run_till_secs();
+        if run_till > 1e-9 && self.last_time_secs() >= run_till - 1e-9 {
+            return GraphOutputEval::default();
+        }
         // Prefer primary Output; if its image is empty, try other Output Objects
         // (legacy graphs may have image on one sink and sound on another).
         let mut tried = std::collections::HashSet::new();
@@ -1743,7 +2053,12 @@ impl NodeGraph {
     }
 
     /// Resolve Output Object sound input for playback / export (P5).
+    /// Silent when past Output Object `run_till` (seconds, if wired > 0).
     pub fn resolve_output_sound(&self) -> GraphOutputSound {
+        let run_till = self.output_run_till_secs();
+        if run_till > 1e-9 && self.last_time_secs() >= run_till - 1e-9 {
+            return GraphOutputSound::default();
+        }
         let mut tried = std::collections::HashSet::new();
         if let Some(out_id) = self.primary_output_id() {
             tried.insert(out_id);
@@ -1800,6 +2115,35 @@ impl NodeGraph {
                     out.sound = GraphSoundSource::FilePath(path);
                     out.media_time_sec = Some(t);
                     out.playback_rate = rate;
+                }
+            }
+            GraphNodeKind::SepticPlayer => {
+                // Sound from sibling/session video (muxed system audio when capture_audio was on).
+                let septic = self.resolve_septic_path(src_id, "septic", depth + 1);
+                let t_req = self
+                    .real_input_source(src_id, "time")
+                    .and_then(|id| self.last_real_out(id))
+                    .unwrap_or(0.0);
+                if let Some(sp) = septic {
+                    if let Ok(session) =
+                        super::septic::SepticSession::load_path_cached_arc(std::path::Path::new(&sp))
+                    {
+                        let t = session.truth_time(t_req);
+                        if let Some(vp) = super::septic::resolve_video_path(
+                            std::path::Path::new(&sp),
+                            &session.meta,
+                        ) {
+                            out.sound =
+                                GraphSoundSource::FilePath(vp.to_string_lossy().into_owned());
+                            out.media_time_sec = Some(t);
+                            out.playback_rate = 1.0;
+                        } else if !session.meta.video_path.is_empty() {
+                            out.sound =
+                                GraphSoundSource::FilePath(session.meta.video_path.clone());
+                            out.media_time_sec = Some(t);
+                            out.playback_rate = 1.0;
+                        }
+                    }
                 }
             }
             GraphNodeKind::Equalizer => {
@@ -1874,6 +2218,9 @@ impl NodeGraph {
             GraphNodeKind::VideoPlayer => {
                 return self.resolve_video_player(node_id, 0);
             }
+            GraphNodeKind::SepticPlayer => {
+                return self.resolve_septic_player_video(node_id, 0);
+            }
             GraphNodeKind::OutputObject => {
                 return self.resolve_image_chain(node_id, "image", 0);
             }
@@ -1895,6 +2242,7 @@ impl NodeGraph {
             GraphNodeKind::Brightness
             | GraphNodeKind::ColorChanger
             | GraphNodeKind::LinearBlur
+            | GraphNodeKind::Zoom
             | GraphNodeKind::Speed
             | GraphNodeKind::GeoSize
             | GraphNodeKind::GeoPlacement
@@ -1957,6 +2305,26 @@ impl NodeGraph {
                     .unwrap_or(0.0);
                 let mut inner = self.resolve_image_chain(node_id, "in", 0);
                 inner.blur_px += amount.max(0.0).min(128.0);
+                inner.effects_on_path = true;
+                inner
+            }
+            GraphNodeKind::Zoom => {
+                let (cx, cy) = self.resolve_position_input(node_id, "pos", 0.5, 0.5);
+                let z = self
+                    .real_input_value(node_id, "zoom")
+                    .or_else(|| {
+                        self.real_input_source(node_id, "zoom")
+                            .and_then(|id| self.last_real_out(id))
+                    })
+                    .unwrap_or(1.0)
+                    .clamp(1.0, 64.0);
+                let mut inner = self.resolve_image_chain(node_id, "in", 0);
+                let prev = inner.zoom.max(1.0);
+                inner.zoom = (prev * z).clamp(1.0, 64.0);
+                if z > 1.001 {
+                    inner.zoom_cx = cx.clamp(0.0, 1.0);
+                    inner.zoom_cy = cy.clamp(0.0, 1.0);
+                }
                 inner.effects_on_path = true;
                 inner
             }
@@ -2071,6 +2439,9 @@ impl NodeGraph {
             GraphNodeKind::VideoPlayer => {
                 return self.resolve_video_player(src_id, depth + 1);
             }
+            GraphNodeKind::SepticPlayer => {
+                return self.resolve_septic_player_video(src_id, depth + 1);
+            }
             GraphNodeKind::Brightness => {
                 let amount = self
                     .real_input_source(src_id, "amount")
@@ -2078,6 +2449,26 @@ impl NodeGraph {
                     .unwrap_or(1.0);
                 let mut inner = self.resolve_image_chain(src_id, "in", depth + 1);
                 inner.brightness *= amount;
+                inner.effects_on_path = true;
+                return inner;
+            }
+            GraphNodeKind::Zoom => {
+                let (cx, cy) = self.resolve_position_input(src_id, "pos", 0.5, 0.5);
+                let z = self
+                    .real_input_value(src_id, "zoom")
+                    .or_else(|| {
+                        self.real_input_source(src_id, "zoom")
+                            .and_then(|id| self.last_real_out(id))
+                    })
+                    .unwrap_or(1.0)
+                    .clamp(1.0, 64.0);
+                let mut inner = self.resolve_image_chain(src_id, "in", depth + 1);
+                let prev = inner.zoom.max(1.0);
+                inner.zoom = (prev * z).clamp(1.0, 64.0);
+                if z > 1.001 {
+                    inner.zoom_cx = cx.clamp(0.0, 1.0);
+                    inner.zoom_cy = cy.clamp(0.0, 1.0);
+                }
                 inner.effects_on_path = true;
                 return inner;
             }
@@ -2203,6 +2594,123 @@ impl NodeGraph {
         self.last_real_values.get(&node_id).copied()
     }
 
+    /// Real value on a specific output port (falls back to primary).
+    pub fn last_real_port(&self, node_id: Uuid, port: &str) -> Option<f64> {
+        self.last_real_port_values
+            .get(&(node_id, port.to_string()))
+            .copied()
+            .or_else(|| self.last_real_out(node_id))
+    }
+
+    /// Real input on `to_port`, using the source's **from_port** when multi-out.
+    pub fn real_input_value(&self, to_node: Uuid, to_port: &str) -> Option<f64> {
+        let link = self.links.iter().find(|l| {
+            l.to_node == to_node && l.to_port == to_port
+        })?;
+        let ty = self.port_type(link.from_node, &link.from_port)?;
+        if ty != PortType::Real {
+            return None;
+        }
+        self.last_real_port(link.from_node, &link.from_port)
+    }
+
+    /// Resolve a Position input (ParamPosition / Mouse Player x+y / defaults).
+    pub fn resolve_position_input(
+        &self,
+        to_node: Uuid,
+        to_port: &str,
+        default_x: f64,
+        default_y: f64,
+    ) -> (f64, f64) {
+        let Some(link) = self.links.iter().find(|l| {
+            l.to_node == to_node && l.to_port == to_port
+        }) else {
+            return (default_x, default_y);
+        };
+        let Some(src) = self.nodes.get(&link.from_node) else {
+            return (default_x, default_y);
+        };
+        match &src.kind {
+            GraphNodeKind::ParamPosition { param_id } => {
+                let p = self.parameters.iter().find(|p| p.id == *param_id);
+                (
+                    p.map(|p| p.v0).unwrap_or(default_x),
+                    p.map(|p| p.v1).unwrap_or(default_y),
+                )
+            }
+            GraphNodeKind::MouseEncoder { .. } => (
+                self.last_real_port(link.from_node, "x")
+                    .unwrap_or(default_x),
+                self.last_real_port(link.from_node, "y")
+                    .unwrap_or(default_y),
+            ),
+            _ => {
+                // Prefer explicit x/y port values when the source emits them.
+                let x = self
+                    .last_real_port(link.from_node, "x")
+                    .or_else(|| self.last_real_out(link.from_node))
+                    .unwrap_or(default_x);
+                let y = self
+                    .last_real_port(link.from_node, "y")
+                    .unwrap_or(default_y);
+                (x, y)
+            }
+        }
+    }
+
+    /// Output Object `run_till` (seconds). `0` / unconnected = no limit.
+    pub fn output_run_till_secs(&self) -> f64 {
+        let Some(out_id) = self.primary_output_id() else {
+            return 0.0;
+        };
+        self.real_input_value(out_id, "run_till")
+            .or_else(|| {
+                self.real_input_source(out_id, "run_till")
+                    .and_then(|id| self.last_real_out(id))
+            })
+            .unwrap_or(0.0)
+            .max(0.0)
+    }
+
+    /// Current algebra time (seconds) from the Time node, else 0.
+    pub fn last_time_secs(&self) -> f64 {
+        self.nodes
+            .values()
+            .find(|n| matches!(n.kind, GraphNodeKind::Time))
+            .and_then(|n| self.last_real_out(n.id))
+            .unwrap_or(0.0)
+            .max(0.0)
+    }
+
+    /// Resolve path to a `.sepscrr` from ObjectSeptic / ObjectMouse / SepticPlayer chain.
+    pub fn resolve_septic_path(&self, node_id: Uuid, port: &str, depth: usize) -> Option<String> {
+        if depth > 32 {
+            return None;
+        }
+        let Some(src) = self.input_source_node(node_id, port) else {
+            // Node itself may be the septic object.
+            let n = self.nodes.get(&node_id)?;
+            return match &n.kind {
+                GraphNodeKind::ObjectSeptic { path } | GraphNodeKind::ObjectMouse { path }
+                    if !path.trim().is_empty() =>
+                {
+                    Some(path.clone())
+                }
+                _ => None,
+            };
+        };
+        let n = self.nodes.get(&src)?;
+        match &n.kind {
+            GraphNodeKind::ObjectSeptic { path } | GraphNodeKind::ObjectMouse { path }
+                if !path.trim().is_empty() =>
+            {
+                Some(path.clone())
+            }
+            GraphNodeKind::SepticPlayer => self.resolve_septic_path(src, "septic", depth + 1),
+            _ => None,
+        }
+    }
+
     /// Evaluate all Real-producing algebra nodes for the current frame.
     /// Results stored in `last_real_values` (node_id → primary `out` value).
     /// Clears Real-related node errors and rewrites them on failure / cycles.
@@ -2210,6 +2718,7 @@ impl NodeGraph {
         use std::collections::{HashMap, HashSet, VecDeque};
 
         self.last_real_values.clear();
+        self.last_real_port_values.clear();
         let fps = fps.max(1.0) as f64;
         let frame_f = frame as f64;
         let time_sec = frame_f / fps;
@@ -2318,11 +2827,13 @@ impl NodeGraph {
 
         // Evaluate in order.
         let mut values: HashMap<Uuid, f64> = HashMap::new();
+        let mut port_buf: HashMap<(Uuid, String), f64> = HashMap::new();
         for id in order {
             let Some(node) = self.nodes.get(&id) else {
                 continue;
             };
-            let result = match &node.kind {
+            let kind = node.kind.clone();
+            let result = match &kind {
                 GraphNodeKind::Value { value } => Ok(*value),
                 GraphNodeKind::Frame => Ok(frame_f),
                 GraphNodeKind::Time => Ok(time_sec),
@@ -2356,6 +2867,124 @@ impl NodeGraph {
                         0.05
                     };
                     Ok((level * g_in).clamp(0.0, 1.0))
+                }
+                GraphNodeKind::SepticPlayer => {
+                    // Truth time out = clamped request time from session (or raw time).
+                    let t_req = self
+                        .real_input_source(id, "time")
+                        .and_then(|src| values.get(&src).copied())
+                        .unwrap_or(time_sec);
+                    let path = self.resolve_septic_path(id, "septic", 0);
+                    let t_out = if let Some(p) = path {
+                        if let Ok(session) = super::septic::SepticSession::load_path_cached_arc(
+                            std::path::Path::new(&p),
+                        ) {
+                            session.truth_time(t_req)
+                        } else {
+                            t_req.max(0.0)
+                        }
+                    } else {
+                        t_req.max(0.0)
+                    };
+                    port_buf.insert((id, "time_out".into()), t_out);
+                    Ok(t_out)
+                }
+                GraphNodeKind::VideoPlayer => {
+                    // Media metadata outs: total duration (s) + pixel size.
+                    let video_inner = self.resolve_image_chain(id, "video", 0);
+                    let path = match &video_inner.image {
+                        GraphImageSource::FilePath(p) if !p.trim().is_empty() => p.as_str(),
+                        _ => "",
+                    };
+                    let dur = if path.is_empty() {
+                        0.0
+                    } else {
+                        crate::video_decode::probe_media_duration_secs(path)
+                            .map(|d| d as f64)
+                            .unwrap_or(0.0)
+                    };
+                    let (w, h) = if path.is_empty() {
+                        (0.0, 0.0)
+                    } else {
+                        crate::video_decode::probe_media_size(path)
+                            .map(|(a, b)| (a as f64, b as f64))
+                            .unwrap_or((0.0, 0.0))
+                    };
+                    port_buf.insert((id, "total_duration".into()), dur);
+                    port_buf.insert((id, "width".into()), w);
+                    port_buf.insert((id, "height".into()), h);
+                    Ok(dur)
+                }
+                GraphNodeKind::MouseEncoder {
+                    time_threshold,
+                    gain,
+                } => {
+                    let t_req = self
+                        .real_input_source(id, "time")
+                        .and_then(|src| values.get(&src).copied())
+                        .unwrap_or(time_sec);
+                    let thr = self
+                        .real_input_source(id, "threshold")
+                        .and_then(|src| values.get(&src).copied())
+                        .unwrap_or(*time_threshold)
+                        .clamp(0.001, 5.0);
+                    let g = self
+                        .real_input_source(id, "gain")
+                        .and_then(|src| values.get(&src).copied())
+                        .unwrap_or(*gain)
+                        .clamp(0.0, 64.0);
+                    // Mouse object path: from mouse pin (ObjectMouse or SepticPlayer chain).
+                    let path = self
+                        .input_source_node(id, "mouse")
+                        .and_then(|src| {
+                            let n = self.nodes.get(&src)?;
+                            match &n.kind {
+                                GraphNodeKind::ObjectMouse { path }
+                                | GraphNodeKind::ObjectSeptic { path }
+                                    if !path.trim().is_empty() =>
+                                {
+                                    Some(path.clone())
+                                }
+                                GraphNodeKind::SepticPlayer => {
+                                    self.resolve_septic_path(src, "septic", 0)
+                                }
+                                _ => self.resolve_septic_path(src, "out", 0),
+                            }
+                        })
+                        .or_else(|| self.resolve_septic_path(id, "mouse", 0));
+                    let enc = if let Some(p) = path {
+                        match super::septic::SepticSession::load_path_cached_arc(std::path::Path::new(&p)) {
+                            Ok(session) => super::septic::encode_mouse(
+                                &session,
+                                t_req,
+                                super::septic::MouseEncoderParams {
+                                    time_threshold: thr,
+                                    gain: g,
+                                },
+                            ),
+                            Err(_) => super::septic::MouseEncoderOut {
+                                x: 0.5,
+                                y: 0.5,
+                                shakiness: 0.0,
+                                event: 0.0,
+                                time: t_req.max(0.0),
+                            },
+                        }
+                    } else {
+                        super::septic::MouseEncoderOut {
+                            x: 0.5,
+                            y: 0.5,
+                            shakiness: 0.0,
+                            event: 0.0,
+                            time: t_req.max(0.0),
+                        }
+                    };
+                    port_buf.insert((id, "x".into()), enc.x);
+                    port_buf.insert((id, "y".into()), enc.y);
+                    port_buf.insert((id, "shakiness".into()), enc.shakiness);
+                    port_buf.insert((id, "event".into()), enc.event);
+                    // Primary = shakiness (useful default for single-wire demos).
+                    Ok(enc.shakiness)
                 }
                 GraphNodeKind::ParamReal { param_id } => {
                     let v = self
@@ -2419,6 +3048,7 @@ impl NodeGraph {
         }
 
         self.last_real_values = values;
+        self.last_real_port_values = port_buf;
     }
 
     /// Kinds that can accept an input of `ty` (for wire-drop add menu).
@@ -2440,10 +3070,16 @@ impl NodeGraph {
             Brightness,
             ColorChanger,
             LinearBlur,
+            Zoom,
             Equalizer,
             Speed,
             Visualizer { gain: 1.0 },
             VideoPlayer,
+            SepticPlayer,
+            MouseEncoder {
+                time_threshold: 0.12,
+                gain: 8.0,
+            },
             GeoSize,
             GeoPlacement,
             GeoRotate,
@@ -2489,10 +3125,22 @@ impl NodeGraph {
             ObjectFromApp {
                 node_ids: Vec::new(),
             },
+            ObjectSeptic {
+                path: String::new(),
+            },
+            ObjectMouse {
+                path: String::new(),
+            },
             VideoPlayer,
+            SepticPlayer,
+            MouseEncoder {
+                time_threshold: 0.12,
+                gain: 8.0,
+            },
             Brightness,
             ColorChanger,
             LinearBlur,
+            Zoom,
             Equalizer,
             Speed,
             Visualizer { gain: 1.0 },
@@ -2510,6 +3158,34 @@ impl NodeGraph {
                     .any(|p| p.dir == PortDir::Output && p.ty == ty)
             })
             .collect()
+    }
+
+    /// Septic Player → video file path + media time from session.
+    fn resolve_septic_player_video(&self, node_id: Uuid, _depth: usize) -> GraphOutputEval {
+        let mut out = GraphOutputEval::default();
+        let path = self.resolve_septic_path(node_id, "septic", 0);
+        let t_req = self
+            .real_input_source(node_id, "time")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.0);
+        let Some(septic_path) = path else {
+            return out;
+        };
+        let Ok(session) =
+            super::septic::SepticSession::load_path_cached_arc(std::path::Path::new(&septic_path))
+        else {
+            return out;
+        };
+        let t = session.truth_time(t_req);
+        out.video_time_sec = Some(t);
+        if let Some(vp) =
+            super::septic::resolve_video_path(std::path::Path::new(&septic_path), &session.meta)
+        {
+            out.image = GraphImageSource::FilePath(vp.to_string_lossy().into_owned());
+        } else if !session.meta.video_path.is_empty() {
+            out.image = GraphImageSource::FilePath(session.meta.video_path.clone());
+        }
+        out
     }
 
     /// Resolve VideoPlayer: video + time + start/duration → frame (Empty outside window).
@@ -2733,6 +3409,7 @@ mod tests {
             output_node_id: None,
             root_error: None,
             last_real_values: Default::default(),
+            last_real_port_values: Default::default(),
         };
         let v = g.add_node(GraphNodeKind::Value { value: 3.5 }, 0.0, 0.0);
         let f = g.add_node(GraphNodeKind::Frame, 0.0, 0.0);
@@ -2753,6 +3430,7 @@ mod tests {
             output_node_id: None,
             root_error: None,
             last_real_values: Default::default(),
+            last_real_port_values: Default::default(),
         };
         let v = g.add_node(GraphNodeKind::Value { value: 10.0 }, 0.0, 0.0);
         let e = g.add_node(
@@ -2798,6 +3476,7 @@ mod tests {
             output_node_id: None,
             root_error: None,
             last_real_values: Default::default(),
+            last_real_port_values: Default::default(),
         };
         let e1 = g.add_node(
             GraphNodeKind::ExprX {
@@ -2841,6 +3520,7 @@ mod tests {
             output_node_id: None,
             root_error: None,
             last_real_values: Default::default(),
+            last_real_port_values: Default::default(),
         };
         let pid = g.parameters[0].id;
         let n = g.add_node(GraphNodeKind::ParamReal { param_id: pid }, 0.0, 0.0);
@@ -2858,6 +3538,7 @@ mod tests {
             output_node_id: None,
             root_error: None,
             last_real_values: Default::default(),
+            last_real_port_values: Default::default(),
         };
         let f = g.add_node(GraphNodeKind::Frame, 0.0, 0.0);
         let e = g.add_node(
@@ -2892,6 +3573,7 @@ mod tests {
             output_node_id: None,
             root_error: None,
             last_real_values: Default::default(),
+            last_real_port_values: Default::default(),
         };
         let e = g.add_node(
             GraphNodeKind::ExprX {
@@ -2978,6 +3660,7 @@ mod tests {
             output_node_id: None,
             root_error: None,
             last_real_values: Default::default(),
+            last_real_port_values: Default::default(),
         };
         let audio = g.add_node(
             GraphNodeKind::ObjectAudio {

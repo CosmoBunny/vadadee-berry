@@ -67,6 +67,12 @@ pub const NODE_EDITOR_OPEN: &str = "";
 pub const NODE_EDITOR_HIDE: &str = "";
 /// Parameters tab.
 pub const PARAMETER: &str = "󰀻";
+/// Screen Record / Stream layer (nf-cod-screen-full).
+pub const SCREEN: &str = "";
+/// Mouse object / encoder (nf-md-mouse).
+pub const MOUSE: &str = "󰍽";
+/// Septic session / player.
+pub const SEPTIC: &str = "󰑋";
 
 pub fn nerd_font_id(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name(FONT_NAME.into()))

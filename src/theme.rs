@@ -514,11 +514,24 @@ fn paint_status_separator(painter: &Painter, center: Pos2, alpha: f32) {
     );
 }
 
+/// First visual line only (newlines in status_message were painting stacked / overlapping).
+fn status_label_first_line(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 pub fn measure_status_label(ui: &egui::Ui, text: &str) -> f32 {
     let font = FontId::new(11.0, FontFamily::Proportional);
+    let one = status_label_first_line(text);
     let text_w = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), font, colors::TEXT)
+        .layout_no_wrap(one, font, colors::TEXT)
         .size()
         .x;
     (text_w + STATUS_PAD * 2.0).max(48.0)
@@ -533,19 +546,45 @@ fn paint_sliding_label(
     in_offset: f32,
     color: Color32,
 ) {
-    let clip = rect.shrink2(egui::vec2(4.0, 1.0));
-    let clipped = painter.with_clip_rect(clip);
+    let clip = rect.shrink2(egui::vec2(STATUS_PAD.min(6.0), 1.0));
+    let clipped = painter.with_clip_rect(clip.intersect(painter.clip_rect()));
     let font = FontId::new(11.0, FontFamily::Proportional);
-    let out_pos = Pos2::new(clip.left() + out_offset, clip.center().y);
-    let in_pos = Pos2::new(clip.left() + in_offset, clip.center().y);
-    clipped.text(
-        out_pos,
-        egui::Align2::LEFT_CENTER,
-        outgoing,
-        font.clone(),
-        color,
-    );
-    clipped.text(in_pos, egui::Align2::LEFT_CENTER, incoming, font, color);
+    let out = status_label_first_line(outgoing);
+    let inn = status_label_first_line(incoming);
+    // Same text or fully settled: single label — avoids double-draw overlap.
+    if out == inn || (out_offset.abs() < 0.5 && in_offset.abs() < 0.5) {
+        let t = if !inn.is_empty() { inn } else { out };
+        if !t.is_empty() {
+            clipped.text(
+                Pos2::new(clip.left(), clip.center().y),
+                egui::Align2::LEFT_CENTER,
+                t,
+                font,
+                color,
+            );
+        }
+        return;
+    }
+    // Hide a label once it has mostly left the chip (prevents mid-slide pile-up).
+    let chip_w = clip.width().max(1.0);
+    if !out.is_empty() && out_offset > -chip_w {
+        clipped.text(
+            Pos2::new(clip.left() + out_offset, clip.center().y),
+            egui::Align2::LEFT_CENTER,
+            out,
+            font.clone(),
+            color,
+        );
+    }
+    if !inn.is_empty() && in_offset < chip_w {
+        clipped.text(
+            Pos2::new(clip.left() + in_offset, clip.center().y),
+            egui::Align2::LEFT_CENTER,
+            inn,
+            font,
+            color,
+        );
+    }
 }
 
 /// Status order: mode › action › cursor › zoom (powerline chips).
@@ -576,28 +615,50 @@ pub fn paint_powerline_status(
     let row = ui.available_rect_before_wrap();
     let h = row.height().max(18.0);
     let y = row.top();
-    let painter = ui.painter();
+    // Hard clip so chips never paint into the right-side status controls.
+    let painter = ui.painter().with_clip_rect(row);
     let font = FontId::new(11.0, FontFamily::Proportional);
     const SEP_W: f32 = 14.0;
+    const EDGE: f32 = 6.0;
 
-    let w_tool = tool_width.max(48.0);
-    let w_msg = msg_width.max(48.0);
     let zoom_text = format!("Zoom {:.0}%", zoom * 100.0);
     let w_zoom = measure_status_label(ui, &zoom_text);
-    // coords_width is precomputed and animated from caller
-    let w_coords = coords_width.max(48.0);
+    let show_coords = coords_width > 4.0;
+    let w_coords = if show_coords {
+        coords_width.max(48.0)
+    } else {
+        0.0
+    };
+    let w_tool = tool_width.max(48.0);
+
+    // Budget: tool + seps + coords + zoom fixed; message chip absorbs leftover.
+    let fixed = EDGE
+        + w_tool
+        + SEP_W
+        + SEP_W // after msg
+        + if show_coords { w_coords + SEP_W } else { 0.0 }
+        + w_zoom
+        + EDGE;
+    let budget = (row.width() - fixed).max(48.0);
+    // Prefer the wider of animated width and both label measures so long text
+    // doesn't stick out of a too-narrow chip during slide.
+    let need_msg = msg_width
+        .max(measure_status_label(ui, msg_out))
+        .max(measure_status_label(ui, msg_in))
+        .max(48.0);
+    let w_msg = need_msg.min(budget);
 
     let tool_bg = colors::POWERLINE_A;
     let msg_bg = colors::BG_ELEVATED;
     let coords_bg = colors::ACCENT_DIM;
     let zoom_bg = colors::POWERLINE_B;
 
-    let mut x = row.left() + 6.0;
+    let mut x = row.left() + EDGE;
 
     let seg_tool = Rect::from_min_size(Pos2::new(x, y), egui::vec2(w_tool, h));
-    paint_status_chip(painter, seg_tool, tool_bg, alpha);
+    paint_status_chip(&painter, seg_tool, tool_bg, alpha);
     paint_sliding_label(
-        painter,
+        &painter,
         seg_tool,
         tool_out,
         tool_in,
@@ -607,15 +668,15 @@ pub fn paint_powerline_status(
     );
     x = seg_tool.right() + SEP_W;
     paint_status_separator(
-        painter,
+        &painter,
         Pos2::new(seg_tool.right() + SEP_W * 0.5, seg_tool.center().y),
         alpha,
     );
 
     let seg_msg = Rect::from_min_size(Pos2::new(x, y), egui::vec2(w_msg, h));
-    paint_status_chip(painter, seg_msg, msg_bg, alpha);
+    paint_status_chip(&painter, seg_msg, msg_bg, alpha);
     paint_sliding_label(
-        painter,
+        &painter,
         seg_msg,
         msg_out,
         msg_in,
@@ -625,16 +686,16 @@ pub fn paint_powerline_status(
     );
     x = seg_msg.right() + SEP_W;
     paint_status_separator(
-        painter,
+        &painter,
         Pos2::new(seg_msg.right() + SEP_W * 0.5, seg_msg.center().y),
         alpha,
     );
 
-    let seg_coords = Rect::from_min_size(Pos2::new(x, y), egui::vec2(w_coords, h));
-    if w_coords > 4.0 {
-        paint_status_chip(painter, seg_coords, coords_bg, alpha);
+    if show_coords {
+        let seg_coords = Rect::from_min_size(Pos2::new(x, y), egui::vec2(w_coords, h));
+        paint_status_chip(&painter, seg_coords, coords_bg, alpha);
         paint_sliding_label(
-            painter,
+            &painter,
             seg_coords,
             coords_out,
             coords_in,
@@ -644,14 +705,14 @@ pub fn paint_powerline_status(
         );
         x = seg_coords.right() + SEP_W;
         paint_status_separator(
-            painter,
+            &painter,
             Pos2::new(seg_coords.right() + SEP_W * 0.5, seg_coords.center().y),
             alpha,
         );
     }
 
     let seg_zoom = Rect::from_min_size(Pos2::new(x, y), egui::vec2(w_zoom, h));
-    paint_status_chip(painter, seg_zoom, zoom_bg, alpha);
+    paint_status_chip(&painter, seg_zoom, zoom_bg, alpha);
     painter.text(
         Pos2::new(seg_zoom.left() + STATUS_PAD, seg_zoom.center().y),
         egui::Align2::LEFT_CENTER,

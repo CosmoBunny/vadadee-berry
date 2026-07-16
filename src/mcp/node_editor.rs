@@ -36,14 +36,14 @@ pub fn node_editor_tools() -> Vec<Value> {
         ),
         tool(
             "add_graph_node",
-            "Add a node to a Node Editor graph. kind: value|expr|frame|time|brightness|color_changer|linear_blur|speed|equalizer|visualizer|geo_size|geo_placement|geo_rotate|geo_trapezoid|geo_mirror|geo_add|object_image|object_video|object_audio|object_from_app|param_real|param_color|param_position|output_object. Optional: x,y,value,expr,path,name,app_object_ids,param_name,param_value,gain.",
+            "Add a node to a Node Editor graph. Kinds (aliases ok): value, expr|expr_x|expr_xy|expr_xyz, frame, time, brightness, color_changer, linear_blur|blur, zoom, speed, equalizer|eq, visualizer|viz, geo_*, object_image|image, object_video|video, object_audio|audio, object_from_app, object_septic|septic, object_mouse|mouse, video_player|player, septic_player, mouse_encoder|mouse_player|mouse_enc, param_real|param_color|param_position, output_object. Optional: x,y,value,expr,path,name,app_object_ids,param_name,param_value,gain,time_threshold|threshold.",
             json!({
                 "kind": { "type": "string" },
                 "x": { "type": "number", "description": "Graph X (default auto layout)" },
                 "y": { "type": "number", "description": "Graph Y" },
                 "value": { "type": "number", "description": "For Value / ParamReal default" },
-                "expr": { "type": "string", "description": "For Expr node" },
-                "path": { "type": "string", "description": "File path for ObjectImage/Video/Audio" },
+                "expr": { "type": "string", "description": "For ExprX/XY/XYZ nodes" },
+                "path": { "type": "string", "description": "File path for ObjectImage/Video/Audio/Septic/Mouse" },
                 "name": { "type": "string", "description": "Node display name" },
                 "app_object_ids": {
                     "type": "array",
@@ -52,6 +52,9 @@ pub fn node_editor_tools() -> Vec<Value> {
                 },
                 "param_name": { "type": "string", "description": "Parameter tab name (param_* kinds)" },
                 "param_value": { "type": "number", "description": "Initial param real value" },
+                "gain": { "type": "number", "description": "MouseEncoder / Visualizer gain" },
+                "time_threshold": { "type": "number", "description": "MouseEncoder shake window (seconds)" },
+                "threshold": { "type": "number", "description": "Alias for time_threshold" },
                 "layer_id": { "type": "string" },
                 "layer_index": { "type": "integer" }
             }),
@@ -59,7 +62,7 @@ pub fn node_editor_tools() -> Vec<Value> {
         ),
         tool(
             "edit_graph_node",
-            "Edit a graph node: position (x,y), name, value, expr, path, app_object_ids. node_id required.",
+            "Edit a graph node: x,y,name,value,expr,path,app_object_ids,gain,time_threshold|threshold. Works for Value, ExprX/XY/XYZ, ObjectImage/Video/Audio/Septic/Mouse, MouseEncoder, Visualizer, ParamReal. node_id required.",
             json!({
                 "node_id": { "type": "string" },
                 "x": { "type": "number" },
@@ -68,6 +71,9 @@ pub fn node_editor_tools() -> Vec<Value> {
                 "value": { "type": "number" },
                 "expr": { "type": "string" },
                 "path": { "type": "string" },
+                "gain": { "type": "number" },
+                "time_threshold": { "type": "number" },
+                "threshold": { "type": "number" },
                 "app_object_ids": {
                     "type": "array",
                     "items": { "type": "string" }
@@ -89,12 +95,12 @@ pub fn node_editor_tools() -> Vec<Value> {
         ),
         tool(
             "connect_graph_nodes",
-            "Wire an output port to an input port (typed; one link per input). Ports e.g. out, image, amount, x, y.",
+            "Wire an output port to an input port (typed; one link per input). Port ids resolve case-insensitively; aliases: result→out, shake|shakiness→shakiness, position→pos, image|in→in/image/out, zoom_amount→zoom, amount→amount/zoom.",
             json!({
                 "from_node": { "type": "string" },
-                "from_port": { "type": "string", "description": "default out" },
+                "from_port": { "type": "string", "description": "default out (aliases resolved per node)" },
                 "to_node": { "type": "string" },
-                "to_port": { "type": "string", "description": "default image" },
+                "to_port": { "type": "string", "description": "default image (aliases resolved per node)" },
                 "layer_id": { "type": "string" },
                 "layer_index": { "type": "integer" }
             }),
@@ -201,60 +207,172 @@ pub fn kind_from_args(kind: &str, args: &Value) -> Result<GraphNodeKind, String>
         "brightness" => Ok(GraphNodeKind::Brightness),
         "color_changer" | "color" => Ok(GraphNodeKind::ColorChanger),
         "linear_blur" | "blur" => Ok(GraphNodeKind::LinearBlur),
-        "speed" => Ok(GraphNodeKind::Speed),
-        "equalizer" | "eq" => Ok(GraphNodeKind::Equalizer),
-        "visualizer" | "viz" => Ok(GraphNodeKind::Visualizer {
+        "zoom" | "zoom_fx" | "crop_zoom" => Ok(GraphNodeKind::Zoom),
+        "speed" | "playback_speed" => Ok(GraphNodeKind::Speed),
+        "equalizer" | "eq" | "eq_fx" => Ok(GraphNodeKind::Equalizer),
+        "visualizer" | "viz" | "audio_viz" => Ok(GraphNodeKind::Visualizer {
             gain: args.get("gain").and_then(|v| v.as_f64()).unwrap_or(1.0),
         }),
-        "geo_size" | "size" => Ok(GraphNodeKind::GeoSize),
-        "geo_placement" | "placement" => Ok(GraphNodeKind::GeoPlacement),
-        "geo_rotate" | "rotate" => Ok(GraphNodeKind::GeoRotate),
+        "geo_size" | "size" | "geometry_size" => Ok(GraphNodeKind::GeoSize),
+        "geo_placement" | "placement" | "geometry_placement" => Ok(GraphNodeKind::GeoPlacement),
+        "geo_rotate" | "rotate" | "geometry_rotate" => Ok(GraphNodeKind::GeoRotate),
         "geo_trapezoid" | "trapezoid" => Ok(GraphNodeKind::GeoTrapezoid),
         "geo_mirror" | "mirror" => Ok(GraphNodeKind::GeoMirror),
-        "geo_add" | "add" => Ok(GraphNodeKind::GeoAdd),
-        "object_image" | "image" => Ok(GraphNodeKind::ObjectImage {
+        "geo_add" | "add" | "geometry_add" => Ok(GraphNodeKind::GeoAdd),
+        "object_image" | "image" | "img" => Ok(GraphNodeKind::ObjectImage {
             path: args
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
         }),
-        "object_video" | "video" => Ok(GraphNodeKind::ObjectVideo {
+        "object_video" | "video" | "vid" => Ok(GraphNodeKind::ObjectVideo {
             path: args
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
         }),
-        "object_audio" | "audio" => Ok(GraphNodeKind::ObjectAudio {
+        "object_audio" | "audio" | "sound" => Ok(GraphNodeKind::ObjectAudio {
             path: args
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
         }),
-        "object_from_app" | "app_object" | "from_app" => {
+        "object_from_app" | "app_object" | "from_app" | "document_object" => {
             let ids = parse_uuid_list(args.get("app_object_ids"));
             Ok(GraphNodeKind::ObjectFromApp { node_ids: ids })
         }
-        "param_real" | "param" => {
+        "param_real" | "param" | "parameter" => {
             // Placeholder param_id; replaced when GraphParam is created.
             Ok(GraphNodeKind::ParamReal {
                 param_id: Uuid::nil(),
             })
         }
-        "param_color" => Ok(GraphNodeKind::ParamColor {
+        "param_color" | "parameter_color" => Ok(GraphNodeKind::ParamColor {
             param_id: Uuid::nil(),
         }),
-        "param_position" | "param_pos" => Ok(GraphNodeKind::ParamPosition {
+        "param_position" | "param_pos" | "parameter_position" => Ok(GraphNodeKind::ParamPosition {
             param_id: Uuid::nil(),
         }),
-        "output_object" | "output" => Ok(GraphNodeKind::OutputObject),
-        "video_player" | "player" => Ok(GraphNodeKind::VideoPlayer),
+        "output_object" | "output" | "sink" => Ok(GraphNodeKind::OutputObject),
+        "video_player" | "player" | "vid_player" => Ok(GraphNodeKind::VideoPlayer),
+        "object_septic" | "septic" | "sepscrr" => Ok(GraphNodeKind::ObjectSeptic {
+            path: args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        }),
+        "object_mouse" | "mouse" | "mouse_object" => Ok(GraphNodeKind::ObjectMouse {
+            path: args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        }),
+        "septic_player" | "septicplayer" => Ok(GraphNodeKind::SepticPlayer),
+        "mouse_encoder" | "mouse_enc" | "mouse_player" | "mouseplayer" | "mouse_fx" => {
+            Ok(GraphNodeKind::MouseEncoder {
+                time_threshold: args
+                    .get("time_threshold")
+                    .or_else(|| args.get("threshold"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.20),
+                gain: args.get("gain").and_then(|v| v.as_f64()).unwrap_or(6.0),
+            })
+        }
         _ => Err(format!(
             "Unknown graph node kind \"{kind}\". Use list_graph_node_kinds for valid names."
         )),
     }
+}
+
+/// Resolve a port id/name/alias for connect_graph_nodes (`want_output` = from_port side).
+pub fn resolve_port_id(
+    g: &crate::document::NodeGraph,
+    node_id: Uuid,
+    raw: &str,
+    want_output: bool,
+) -> Result<String, String> {
+    let node = g
+        .nodes
+        .get(&node_id)
+        .ok_or_else(|| format!("graph node {node_id} not found"))?;
+    let want_dir = if want_output {
+        PortDir::Output
+    } else {
+        PortDir::Input
+    };
+    let ports: Vec<_> = node
+        .kind
+        .ports()
+        .into_iter()
+        .filter(|p| p.dir == want_dir)
+        .collect();
+    if ports.is_empty() {
+        return Err(format!(
+            "node has no {} ports",
+            if want_output { "output" } else { "input" }
+        ));
+    }
+    let key = raw.trim().to_ascii_lowercase().replace('-', "_");
+    // Exact id
+    if let Some(p) = ports.iter().find(|p| p.id.eq_ignore_ascii_case(&key)) {
+        return Ok(p.id.clone());
+    }
+    // Display name
+    if let Some(p) = ports
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(raw.trim()))
+    {
+        return Ok(p.id.clone());
+    }
+    // Common aliases
+    let aliases: &[&str] = match key.as_str() {
+        "result" | "value" | "out" | "output" => &["out", "result", "video", "image"],
+        "image" | "img" | "in" | "input" => &["in", "image", "out", "video"],
+        "shake" | "shakiness" | "shaky" => &["shakiness"],
+        "position" | "pos" | "xy" => &["pos"],
+        "zoom" | "zoom_amount" | "z" | "scale" => &["zoom", "amount"],
+        "amount" | "amt" => &["amount", "zoom", "factor"],
+        "factor" => &["factor", "amount"],
+        "sound" | "audio" | "sfx" => &["sound", "audio"],
+        "septic" | "session" => &["septic", "out"],
+        "mouse" => &["mouse", "out"],
+        "time" | "t" => &["time", "time_out", "out"],
+        "time_out" | "timeout" => &["time_out", "time"],
+        "video" | "vid" => &["video", "out"],
+        "x" => &["x"],
+        "y" => &["y"],
+        "event" | "click" => &["event"],
+        "threshold" => &["threshold"],
+        "gain" => &["gain"],
+        "run_till" | "runtill" | "duration" => &["run_till", "total_duration", "duration"],
+        "total_duration" | "length" => &["total_duration", "duration"],
+        "width" | "w" => &["width"],
+        "height" | "h" => &["height"],
+        "start" => &["start"],
+        "clip" => &["duration"],
+        "hue" => &["hue"],
+        "sat" | "saturation" => &["sat"],
+        _ => &[],
+    };
+    for a in aliases {
+        if let Some(p) = ports.iter().find(|p| p.id.eq_ignore_ascii_case(a)) {
+            return Ok(p.id.clone());
+        }
+    }
+    // Single port of that direction → accept anything reasonable
+    if ports.len() == 1 {
+        return Ok(ports[0].id.clone());
+    }
+    let available: Vec<_> = ports.iter().map(|p| p.id.as_str()).collect();
+    Err(format!(
+        "port \"{raw}\" not found on node (available: {})",
+        available.join(", ")
+    ))
 }
 
 pub fn parse_uuid_list(v: Option<&Value>) -> Vec<Uuid> {
@@ -278,6 +396,7 @@ pub fn kind_label(kind: &GraphNodeKind) -> String {
         GraphNodeKind::Brightness => "brightness".into(),
         GraphNodeKind::ColorChanger => "color_changer".into(),
         GraphNodeKind::LinearBlur => "linear_blur".into(),
+        GraphNodeKind::Zoom => "zoom".into(),
         GraphNodeKind::Speed => "speed".into(),
         GraphNodeKind::Equalizer => "equalizer".into(),
         GraphNodeKind::Visualizer { .. } => "visualizer".into(),
@@ -292,6 +411,10 @@ pub fn kind_label(kind: &GraphNodeKind) -> String {
         GraphNodeKind::ObjectAudio { .. } => "object_audio".into(),
         GraphNodeKind::ObjectFromApp { .. } => "object_from_app".into(),
         GraphNodeKind::VideoPlayer => "video_player".into(),
+        GraphNodeKind::ObjectSeptic { .. } => "object_septic".into(),
+        GraphNodeKind::ObjectMouse { .. } => "object_mouse".into(),
+        GraphNodeKind::SepticPlayer => "septic_player".into(),
+        GraphNodeKind::MouseEncoder { .. } => "mouse_encoder".into(),
         GraphNodeKind::ParamReal { .. } => "param_real".into(),
         GraphNodeKind::ParamColor { .. } => "param_color".into(),
         GraphNodeKind::ParamPosition { .. } => "param_position".into(),
@@ -307,10 +430,17 @@ pub fn node_fields_json(kind: &GraphNodeKind) -> Value {
         | GraphNodeKind::ExprXyz { expr } => json!({ "expr": expr }),
         GraphNodeKind::ObjectImage { path }
         | GraphNodeKind::ObjectVideo { path }
-        | GraphNodeKind::ObjectAudio { path } => json!({ "path": path }),
+        | GraphNodeKind::ObjectAudio { path }
+        | GraphNodeKind::ObjectSeptic { path }
+        | GraphNodeKind::ObjectMouse { path } => json!({ "path": path }),
         GraphNodeKind::ObjectFromApp { node_ids } => json!({
             "app_object_ids": node_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>()
         }),
+        GraphNodeKind::MouseEncoder {
+            time_threshold,
+            gain,
+        } => json!({ "time_threshold": time_threshold, "gain": gain }),
+        GraphNodeKind::Visualizer { gain } => json!({ "gain": gain }),
         GraphNodeKind::ParamReal { param_id }
         | GraphNodeKind::ParamColor { param_id }
         | GraphNodeKind::ParamPosition { param_id } => {
@@ -385,6 +515,7 @@ pub fn list_kinds_json() -> String {
         ("brightness", "Effect"),
         ("color_changer", "Effect"),
         ("linear_blur", "Effect"),
+        ("zoom", "Effect (image + pos + zoom ≥1)"),
         ("speed", "Effect"),
         ("equalizer", "Effect"),
         ("geo_size", "Geometry"),
@@ -398,6 +529,10 @@ pub fn list_kinds_json() -> String {
         ("object_audio", "File audio source"),
         ("object_from_app", "Document object reference"),
         ("video_player", "Video + Time + Start/Duration → Image; Audio→Sound"),
+        ("object_septic", "Septic session (.sepscrr)"),
+        ("object_mouse", "Mouse object — needs Mouse Encoder"),
+        ("septic_player", "Septic + Time → Video, Mouse, truth Time"),
+        ("mouse_encoder", "Mouse → Pos, Shakiness (threshold+gain), Event 0/1"),
         ("visualizer", "Audio + Freq → Level 0..1"),
         ("param_real", "Animatable real parameter"),
         ("param_color", "Animatable color parameter"),

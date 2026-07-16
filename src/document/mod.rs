@@ -7,6 +7,7 @@ mod music;
 mod shading;
 pub mod flowchart;
 mod node_graph;
+pub mod septic;
 
 pub use av_clip::*;
 pub use node::*;
@@ -16,6 +17,7 @@ pub use animation::*;
 pub use music::*;
 pub use shading::*;
 pub use node_graph::*;
+pub use septic::*;
 pub mod expr;
 pub use expr::{eval_expr, eval_expr_vars, ExprError, ExprVars};
 
@@ -92,6 +94,8 @@ pub enum LayerKind {
     Flowchart,
     /// Node-based processing graph (typed ports, Output Object as continuous video sink).
     NodeEditor,
+    /// OS screen/window capture → `.sepscrr` (video + mouse; no keyboard in v1).
+    ScreenRecord,
 }
 
 /// Role of an AV layer in the media queue (video / audio / DAW tracks stay separate).
@@ -182,6 +186,27 @@ pub struct Layer {
     /// P6b: selectable canvas proxy for Output Object (`NodeKind::Image` with live FX texture).
     #[serde(default)]
     pub ne_output_proxy: Option<Uuid>,
+    /// ScreenRecord: last `.sepscrr` session file (for Septic Player / open).
+    #[serde(default)]
+    pub septic_path: String,
+    /// ScreenRecord: folder where new takes are written (pick folder, not file).
+    #[serde(default)]
+    pub capture_dir: String,
+    /// ScreenRecord: include system cursor in captured pixels.
+    #[serde(default = "default_true")]
+    pub capture_cursor: bool,
+    /// ScreenRecord: capture system/default audio (Pulse/PipeWire monitor).
+    #[serde(default = "default_true")]
+    pub capture_audio: bool,
+    /// ScreenRecord: target container FPS (portal still limited by shot rate; pads to this).
+    #[serde(default = "default_capture_fps")]
+    pub capture_fps: u32,
+    /// ScreenRecord: video bitrate in kbps (`0` = auto from resolution × fps).
+    #[serde(default = "default_capture_bitrate_kbps")]
+    pub capture_bitrate_kbps: u32,
+    /// ScreenRecord: true while a capture session is active (runtime; not required on disk).
+    #[serde(default)]
+    pub screen_recording: bool,
 }
 
 impl Document {
@@ -215,6 +240,15 @@ fn default_height() -> f32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_capture_fps() -> u32 {
+    60
+}
+
+/// `0` keeps auto bitrate (scale with encode size × fps).
+fn default_capture_bitrate_kbps() -> u32 {
+    0
 }
 
 impl Layer {
@@ -252,6 +286,13 @@ impl Layer {
             shading_passes: Vec::new(),
             node_graph: None,
             ne_output_proxy: None,
+            septic_path: String::new(),
+            capture_dir: String::new(),
+            capture_cursor: true,
+            capture_audio: true,
+            capture_fps: 60,
+            capture_bitrate_kbps: 0,
+            screen_recording: false,
         }
     }
 
@@ -294,6 +335,13 @@ impl Layer {
             shading_passes: Vec::new(),
             node_graph: None,
             ne_output_proxy: None,
+            septic_path: String::new(),
+            capture_dir: String::new(),
+            capture_cursor: true,
+            capture_audio: true,
+            capture_fps: 60,
+            capture_bitrate_kbps: 0,
+            screen_recording: false,
         }
     }
 
@@ -343,6 +391,13 @@ impl Layer {
             shading_passes: Vec::new(),
             node_graph: None,
             ne_output_proxy: None,
+            septic_path: String::new(),
+            capture_dir: String::new(),
+            capture_cursor: true,
+            capture_audio: true,
+            capture_fps: 60,
+            capture_bitrate_kbps: 0,
+            screen_recording: false,
         }
     }
 
@@ -380,6 +435,13 @@ impl Layer {
             shading_passes: Vec::new(),
             node_graph: None,
             ne_output_proxy: None,
+            septic_path: String::new(),
+            capture_dir: String::new(),
+            capture_cursor: true,
+            capture_audio: true,
+            capture_fps: 60,
+            capture_bitrate_kbps: 0,
+            screen_recording: false,
         }
     }
 
@@ -417,6 +479,57 @@ impl Layer {
             shading_passes: Vec::new(),
             node_graph: Some(NodeGraph::new_empty()),
             ne_output_proxy: None,
+            septic_path: String::new(),
+            capture_dir: String::new(),
+            capture_cursor: true,
+            capture_audio: true,
+            capture_fps: 60,
+            capture_bitrate_kbps: 0,
+            screen_recording: false,
+        }
+    }
+
+    pub fn new_screen_record_layer(id: Uuid, name: String) -> Self {
+        Self {
+            id,
+            name,
+            visible: true,
+            locked: false,
+            nodes: vec![],
+            kind: LayerKind::ScreenRecord,
+            video_path: String::new(),
+            volume: 1.0,
+            is_renderer: false,
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            width: A4_WIDTH_PX as f32,
+            height: A4_HEIGHT_PX as f32,
+            aspect_ratio_locked: true,
+            hue: 0.0,
+            saturation: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            eq_bass: 0.0,
+            eq_mid: 0.0,
+            eq_treble: 0.0,
+            video_start_offset: 0.0,
+            video_play_length: 3600.0,
+            video_timeline_start: 0.0,
+            media_source_duration: None,
+            av_clips: Vec::new(),
+            music_clips: Vec::new(),
+            av_role: AvRole::Video,
+            shading_passes: Vec::new(),
+            node_graph: None,
+            ne_output_proxy: None,
+            septic_path: String::new(),
+            capture_dir: String::new(),
+            capture_cursor: true,
+            capture_audio: true,
+            capture_fps: 60,
+            capture_bitrate_kbps: 0,
+            screen_recording: false,
         }
     }
 
@@ -908,6 +1021,12 @@ impl Document {
 
     pub fn add_flowchart_layer(&mut self, name: impl Into<String>) -> usize {
         let layer = Layer::new_flowchart_layer(Uuid::new_v4(), name.into());
+        self.layers.push(layer);
+        self.layers.len() - 1
+    }
+
+    pub fn add_screen_record_layer(&mut self, name: impl Into<String>) -> usize {
+        let layer = Layer::new_screen_record_layer(Uuid::new_v4(), name.into());
         self.layers.push(layer);
         self.layers.len() - 1
     }

@@ -79,6 +79,8 @@ pub enum BrushType {
     Standard,
     Pen,
     Calligraphy,
+    /// Grid-aligned pixel stamps (size in grid cells).
+    Pixel,
 }
 
 /// Which input device mode controls brush behaviour
@@ -129,6 +131,13 @@ pub struct BrushSession {
     pub calli_rotate_tip: bool,
     pub calli_fountain_size: f32,         // nib width multiplier 0.1..3.0
     pub calli_dynamic: bool,
+
+    /// Pixel brush: stamp size in grid cells (1 = one box).
+    pub pixel_cells: u32,
+    /// Ctrl+drag line: document point at press (line origin).
+    pub pixel_line_anchor: Option<(f64, f64)>,
+    /// Shift+erase: node snapshots before this erase stroke (one undo on release).
+    pub pixel_erase_before: Vec<(crate::document::NodeId, crate::document::Node)>,
 }
 
 impl Default for BrushSession {
@@ -165,8 +174,80 @@ impl Default for BrushSession {
             calli_rotate_tip: false,
             calli_fountain_size: 1.0,
             calli_dynamic: false,
+            pixel_cells: 1,
+            pixel_line_anchor: None,
+            pixel_erase_before: Vec::new(),
         }
     }
+}
+
+/// Snap a document point to a pixel-brush stamp (grid-aligned).
+/// Returns `(center_x, center_y, width_doc, height_doc)`.
+pub fn pixel_stamp_at(
+    doc: (f64, f64),
+    step_x: f64,
+    step_y: f64,
+    cells: u32,
+) -> (f64, f64, f64, f64) {
+    let gx = step_x.max(0.5);
+    let gy = step_y.max(0.5);
+    let n = cells.max(1) as f64;
+    let i0 = (doc.0 / gx).floor();
+    let j0 = (doc.1 / gy).floor();
+    let w = n * gx;
+    let h = n * gy;
+    // Align stamp so the cell under the cursor is the top-left of the n×n block
+    // for n==1 that is the single cell; for n>1 expands right/down.
+    let cx = i0 * gx + w * 0.5;
+    let cy = j0 * gy + h * 0.5;
+    (cx, cy, w, h)
+}
+
+/// Cell index under document position (top-left of stamp block).
+pub fn pixel_cell_index(doc: (f64, f64), step_x: f64, step_y: f64) -> (i64, i64) {
+    let gx = step_x.max(0.5);
+    let gy = step_y.max(0.5);
+    (
+        (doc.0 / gx).floor() as i64,
+        (doc.1 / gy).floor() as i64,
+    )
+}
+
+/// Fill every grid stamp from `from` → `to` (inclusive).
+/// Dense sampling along the segment so fast pointer motion never skips cells.
+pub fn pixel_stamps_along(
+    from: (f64, f64),
+    to: (f64, f64),
+    step_x: f64,
+    step_y: f64,
+    cells: u32,
+) -> Vec<(f64, f64, f64, f64)> {
+    let gx = step_x.max(0.5);
+    let gy = step_y.max(0.5);
+    let (i0, j0) = pixel_cell_index(from, gx, gy);
+    let (i1, j1) = pixel_cell_index(to, gx, gy);
+
+    let di = (i1 - i0).unsigned_abs();
+    let dj = (j1 - j0).unsigned_abs();
+    // At least one sample per crossed cell, extra density on long diagonals.
+    let steps = (di.max(dj).max(1) as usize).saturating_mul(2).max(1);
+
+    let mut out = Vec::with_capacity(steps + 1);
+    let mut seen = std::collections::HashSet::new();
+    for s in 0..=steps {
+        let t = s as f64 / steps as f64;
+        let x = from.0 + (to.0 - from.0) * t;
+        let y = from.1 + (to.1 - from.1) * t;
+        let (cx, cy, w, h) = pixel_stamp_at((x, y), gx, gy, cells);
+        let key = (
+            (cx * 1000.0).round() as i64,
+            (cy * 1000.0).round() as i64,
+        );
+        if seen.insert(key) {
+            out.push((cx, cy, w, h));
+        }
+    }
+    out
 }
 
 

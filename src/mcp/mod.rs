@@ -483,10 +483,13 @@ fn is_mcp_notification(method: &str) -> bool {
 
 fn host_call(shared: &McpShared, req: McpHostRequest) -> Value {
     // Capture / heavy tools need a longer wait (raster runs off the UI thread).
+    // Drawing/NE tools: longer timeout so unfocused / low-FPS UI can still answer.
     let timeout = match &req {
         McpHostRequest::CaptureCanvasRaster { .. } => std::time::Duration::from_secs(60),
         McpHostRequest::ProjectJson => std::time::Duration::from_secs(15),
-        _ => std::time::Duration::from_secs(8),
+        McpHostRequest::DrawingTool { .. } => std::time::Duration::from_secs(30),
+        McpHostRequest::UiHealth | McpHostRequest::Snapshot => std::time::Duration::from_secs(20),
+        _ => std::time::Duration::from_secs(12),
     };
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if shared.request_tx.send((req, reply_tx)).is_err() {

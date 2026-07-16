@@ -17,16 +17,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "vadadee-berry"
 path = "src/main.rs"
-required-features = ["desktop"]
 
 [[bin]]
 name = "vadadee-mcp-stdio"
 path = "src/bin/vadadee_mcp_stdio.rs"
-required-features = ["desktop"]
-
-[features]
-default = ["desktop"]
-desktop = []
 
 [dependencies]
 eframe = { version = "0.34.3", default-features = false, features = ["default_fonts", "wgpu", "persistence", "wgpu_no_default_features"] }
@@ -62,8 +56,7 @@ rodio = { version = "0.22.2", default-features = false, features = ["playback", 
 symphonia = { version = "0.5.5", default-features = false, features = ["aac", "flac", "isomp4", "mkv", "mp3", "vorbis", "wav"] }
 hound = "3.5.1"
 rayon = "1.10"
-
-# ── Desktop (non-Android) shared deps ─────────────────────────────────────────
+# ── Host (non-Android) shared deps ────────────────────────────────────────────
 [target.'cfg(not(target_os = "android"))'.dependencies]
 env_logger = "0.11.8"
 rfd = "0.15.4"
@@ -76,10 +69,13 @@ aes-gcm = "0.10"
 rand = "0.8"
 sha2 = "0.10"
 
-# ── Linux-only: Wayland / X11 window backends ──────────────────────────────────
+# ── Linux: Wayland/X11 + ScreenCast (ashpd) + PipeWire continuous capture ─────
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "wayland", "x11"] }
 arboard = { version = "3", features = ["wayland-data-control"] }
+# async-io only — not Tokio (avoids zbus reactor panics with accesskit).
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "screencast"] }
+pipewire = { version = "0.8", features = ["v0_3_44"] }
 
 # ── macOS / Windows: no Wayland ────────────────────────────────────────────────
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]

@@ -27,6 +27,8 @@ pub mod export_worker;
 pub mod export_audio;
 pub mod recorder;
 pub mod audio_extract;
+#[cfg(not(target_os = "android"))]
+pub mod screen_capture;
 pub mod collab;
 pub mod sys_stats;
 #[cfg(not(target_os = "android"))]
@@ -81,6 +83,15 @@ fn init_logging() {
             // usvg spams WARN for every SVG text element using a font not in its DB;
             // our canvas handles font loading separately so this is always safe to mute.
             .filter_module("usvg::parser::text", log::LevelFilter::Off)
+            // Portal ScreenCast / zbus Request noise during capture (Linux).
+            // zbus INFO/WARN about proxy cache + GetAll is noise, not a real failure.
+            .filter_module("zbus", log::LevelFilter::Error)
+            .filter_module("zbus::proxy", log::LevelFilter::Error)
+            .filter_module("zbus::connection", log::LevelFilter::Error)
+            .filter_module("ashpd", log::LevelFilter::Warn)
+            // rodio underrun spam while UI is busy
+            .filter_module("rodio", log::LevelFilter::Error)
+            .filter_module("cpal", log::LevelFilter::Error)
             .try_init();
     }
 }

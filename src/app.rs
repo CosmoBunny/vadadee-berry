@@ -240,6 +240,8 @@ pub struct VadadeeBerryApp {
     audio_player_last_file_pos: std::collections::HashMap<uuid::Uuid, f32>,
     /// Playback rate used when the player was created (VideoPlayer Expr x*2 → 2.0).
     audio_player_playback_rate: std::collections::HashMap<uuid::Uuid, f32>,
+    /// Media path the player was opened with — recreate when septic/video file changes.
+    audio_player_media_path: std::collections::HashMap<uuid::Uuid, String>,
     /// Do not retry rodio open/decode for these layers until playback stops.
     audio_layers_skip: std::collections::HashSet<uuid::Uuid>,
     /// MP4/MOV/… → one-shot symphonia PCM wav for rodio.
@@ -249,6 +251,9 @@ pub struct VadadeeBerryApp {
     /// Background audio decode → main thread attaches rodio players.
     audio_prepare_rx:
         std::collections::HashMap<uuid::Uuid, std::sync::mpsc::Receiver<Option<crate::audio_extract::AudioPrepareResult>>>,
+    /// Active OS screen captures (Screen Record layers) — desktop only.
+    #[cfg(not(target_os = "android"))]
+    pub screen_captures: std::collections::HashMap<uuid::Uuid, crate::screen_capture::ScreenCaptureSession>,
 
     pub project: ProjectFile,
     pub viewport: Viewport,
@@ -312,6 +317,8 @@ pub struct VadadeeBerryApp {
     on_page_text_newly_created: bool,
     pub cursor_doc: Option<(f64, f64)>,
     pub canvas_focused: bool,
+    /// Previous `ctx.input(|i| i.focused)` — for Unfocused / Switched status.
+    pub window_was_focused: bool,
     pub action_bar_open: bool,
     pub action_bar_width: f32,
     pub action_tab: ui::ActionTab,
@@ -810,6 +817,10 @@ impl VadadeeBerryApp {
         let (layer_cache_result_tx, layer_cache_result_rx) = std::sync::mpsc::channel();
         let wgpu_render = cc.wgpu_render_state.clone();
 
+        // Drop stale regenerable extracts left from previous runs (crash / no clean exit).
+        #[cfg(not(target_os = "android"))]
+        purge_vadadee_disk_caches(CachePurgeOpts::on_startup());
+
         let app = Self {
             live_snap_guides: Vec::new(),
             snap_magnet: true,
@@ -879,10 +890,13 @@ impl VadadeeBerryApp {
             audio_player_buffer_offset: std::collections::HashMap::new(),
             audio_player_last_file_pos: std::collections::HashMap::new(),
             audio_player_playback_rate: std::collections::HashMap::new(),
+            audio_player_media_path: std::collections::HashMap::new(),
             audio_layers_skip: std::collections::HashSet::new(),
             audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             audio_prepare_rx: std::collections::HashMap::new(),
+            #[cfg(not(target_os = "android"))]
+            screen_captures: std::collections::HashMap::new(),
 
             project: initial_project,
             viewport: Viewport::default(),
@@ -1071,6 +1085,7 @@ impl VadadeeBerryApp {
             cached_draw_order_revision: u64::MAX,
             audio_output_warned: false,
             canvas_focused: false,
+            window_was_focused: true,
         };
         if let Some(rs) = &app.wgpu_render {
             crate::shading::init_callback_resources(rs, crate::VIEWPORT_MSAA_SAMPLES);
@@ -1098,10 +1113,19 @@ impl VadadeeBerryApp {
         if self.audio_device.is_some() {
             return true;
         }
+        // Device was dropped (underrun / hotplug / OS sleep) — rebuild so audio
+        // recovers without restarting the whole app.
         match rodio::DeviceSinkBuilder::open_default_sink() {
             Ok(sink) => {
                 self.audio_device = Some(sink);
                 self.audio_output_warned = false;
+                self.audio_players.clear();
+                self.audio_player_buffer_offset.clear();
+                self.audio_player_last_file_pos.clear();
+                self.audio_player_playback_rate.clear();
+                self.audio_player_media_path.clear();
+                self.audio_layers_skip.clear();
+                log::info!("audio output device opened");
                 true
             }
             Err(e) => {
@@ -1114,6 +1138,18 @@ impl VadadeeBerryApp {
                 false
             }
         }
+    }
+
+    /// Drop the audio device so the next frame reopens it (recovery path).
+    fn reset_audio_output(&mut self, reason: &str) {
+        log::warn!("resetting audio output: {reason}");
+        self.audio_players.clear();
+        self.audio_player_buffer_offset.clear();
+        self.audio_player_last_file_pos.clear();
+        self.audio_player_playback_rate.clear();
+        self.audio_player_media_path.clear();
+        self.audio_device = None;
+        self.audio_output_warned = false;
     }
 
     fn save_project_to_path(&mut self, path: &std::path::Path) -> Result<(), String> {
@@ -2372,6 +2408,19 @@ impl VadadeeBerryApp {
         }
 
         let fps = self.anim_fps.max(1) as f32;
+        // Node Editor Output Object `run_till` (seconds) extends / caps the timeline.
+        for l in &self.project.document.layers {
+            if l.kind != crate::document::LayerKind::NodeEditor {
+                continue;
+            }
+            if let Some(g) = l.node_graph.as_ref() {
+                let run_till = g.output_run_till_secs();
+                if run_till > 1e-6 {
+                    let end_frame = (run_till as f32 * fps).ceil().max(0.0) as usize;
+                    max_f = max_f.max(end_frame);
+                }
+            }
+        }
         for l in &self.project.document.layers {
             if l.kind != crate::document::LayerKind::AV {
                 continue;
@@ -3031,6 +3080,146 @@ impl VadadeeBerryApp {
             self.action_tab = crate::ui::ActionTab::Parameter;
         }
         self.status_message = "Node Editor layer created".into();
+    }
+
+    pub fn add_screen_record_layer(&mut self, name: &str) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let idx = after.add_screen_record_layer(name);
+        after.active_layer_index = idx;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+        if let Some(layer) = self.project.document.layers.get(idx) {
+            self.selection = vec![layer.id];
+        }
+        self.status_message =
+            "Screen Record layer — press Record (needs ffmpeg + DISPLAY)".into();
+    }
+
+    /// Start OS screen capture for a Screen Record layer.
+    #[cfg(not(target_os = "android"))]
+    pub fn start_screen_record(&mut self, layer_idx: usize) {
+        let Some(layer) = self.project.document.layers.get(layer_idx).cloned() else {
+            return;
+        };
+        if layer.kind != crate::document::LayerKind::ScreenRecord {
+            self.status_message = "Not a Screen Record layer".into();
+            return;
+        }
+        if self.screen_captures.contains_key(&layer.id) {
+            self.status_message = "Already recording this layer".into();
+            return;
+        }
+        // Prefer capture_dir (folder); fall back to parent of last septic file / default cache.
+        let dir_hint = if !layer.capture_dir.trim().is_empty() {
+            layer.capture_dir.clone()
+        } else if !layer.septic_path.trim().is_empty() {
+            let p = std::path::Path::new(layer.septic_path.trim());
+            if p.is_dir() {
+                layer.septic_path.clone()
+            } else {
+                p.parent()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            }
+        } else {
+            String::new()
+        };
+        let sepscrr =
+            crate::screen_capture::resolve_sepscrr_for_record(&dir_hint, &layer.name);
+        match crate::screen_capture::ScreenCaptureSession::start(
+            crate::screen_capture::ScreenCaptureStart {
+                layer_id: layer.id,
+                sepscrr_path: sepscrr.clone(),
+                capture_cursor: layer.capture_cursor,
+                capture_audio: layer.capture_audio,
+                fps: layer.capture_fps.max(1).min(120),
+                bitrate_kbps: layer.capture_bitrate_kbps,
+            },
+        ) {
+            Ok(session) => {
+                if let Some(l) = self.project.document.layers.get_mut(layer_idx) {
+                    l.septic_path = sepscrr.to_string_lossy().into_owned();
+                    if l.capture_dir.trim().is_empty() {
+                        if let Some(parent) = sepscrr.parent() {
+                            l.capture_dir = parent.to_string_lossy().into_owned();
+                        }
+                    }
+                    l.screen_recording = true;
+                }
+                self.screen_captures.insert(layer.id, session);
+                self.status_message = format!(
+                    "Recording screen → {}",
+                    sepscrr.file_name().and_then(|s| s.to_str()).unwrap_or("…")
+                );
+            }
+            Err(e) => {
+                self.status_message = status_one_line(&format!("Record failed: {e}"));
+            }
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn start_screen_record(&mut self, _layer_idx: usize) {
+        self.status_message = "Screen record not available on Android".into();
+    }
+
+    /// Stop capture and write `.sepscrr` + sibling `.mp4`.
+    #[cfg(not(target_os = "android"))]
+    pub fn stop_screen_record(&mut self, layer_idx: usize) {
+        let Some(layer) = self.project.document.layers.get(layer_idx) else {
+            return;
+        };
+        let id = layer.id;
+        let Some(session) = self.screen_captures.remove(&id) else {
+            if let Some(l) = self.project.document.layers.get_mut(layer_idx) {
+                l.screen_recording = false;
+            }
+            self.status_message = "Not recording".into();
+            return;
+        };
+        let elapsed = session.elapsed_sec();
+        let n = session.sample_count();
+        match session.stop() {
+            Ok(path) => {
+                if let Some(l) = self.project.document.layers.get_mut(layer_idx) {
+                    l.septic_path = path.to_string_lossy().into_owned();
+                    l.screen_recording = false;
+                    l.media_source_duration = Some(elapsed as f32);
+                }
+                self.status_message = status_one_line(&format!(
+                    "Saved {:.1}s · {n} mouse → {}",
+                    elapsed,
+                    path.file_name().and_then(|s| s.to_str()).unwrap_or("sepscrr")
+                ));
+            }
+            Err(e) => {
+                if let Some(l) = self.project.document.layers.get_mut(layer_idx) {
+                    l.screen_recording = false;
+                }
+                self.status_message = status_one_line(&format!("Stop failed: {e}"));
+            }
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn stop_screen_record(&mut self, _layer_idx: usize) {
+        self.status_message = "Screen record not available on Android".into();
+    }
+
+    /// True if this layer id has an active capture.
+    pub fn is_screen_recording(&self, layer_id: uuid::Uuid) -> bool {
+        #[cfg(not(target_os = "android"))]
+        {
+            self.screen_captures.contains_key(&layer_id)
+        }
+        #[cfg(target_os = "android")]
+        {
+            let _ = layer_id;
+            false
+        }
     }
 
     pub fn add_graph_node_to_active(&mut self, kind: crate::document::GraphNodeKind) {
@@ -3767,12 +3956,29 @@ impl VadadeeBerryApp {
     }
 
     pub(crate) fn is_ephemeral_status_event(msg: &str) -> bool {
+        // Sticky: screen-record outcomes must stay until the next real status change.
+        if msg.starts_with("Recording")
+            || msg.starts_with("Record ")
+            || msg.starts_with("Saved screen")
+            || msg.starts_with("Stop ")
+            || msg.starts_with("Already recording")
+            || msg.starts_with("Not recording")
+            || msg.starts_with("Not a Screen Record")
+            || msg.starts_with("Screen record")
+        {
+            return false;
+        }
+        // Unfocused is sticky while the window stays blurred; Switched is a one-shot flash.
+        if msg == "Unfocused" {
+            return false;
+        }
         msg == "Undo"
             || msg == "Redo"
             || msg == "Pasted"
             || msg == "Pasted image"
             || msg == "Nothing to paste"
             || msg == "Layer locked"
+            || msg == "Switched"
             || msg.starts_with("Copied")
             || msg.starts_with("Cut ")
             || msg.starts_with("Open")
@@ -3780,9 +3986,27 @@ impl VadadeeBerryApp {
             || msg.starts_with("Export")
             || msg.starts_with("New ")
             || msg.contains("failed")
+            || msg.contains("Failed")
             || msg.starts_with("Pen cancelled")
             || msg.starts_with("Removed point")
             || msg.starts_with("Polyline cleared")
+    }
+
+    /// Track OS/window focus: status **Unfocused** when leaving, **Switched** when returning.
+    /// Keeps the event loop alive while blurred so MCP tools still answer.
+    pub fn update_window_focus_status(&mut self, ctx: &Context) {
+        let focused = ctx.input(|i| i.focused);
+        if self.window_was_focused && !focused {
+            self.status_message = "Unfocused".into();
+        } else if !self.window_was_focused && focused {
+            // User switched back (workspace / alt-tab / other app).
+            self.status_message = "Switched".into();
+        }
+        self.window_was_focused = focused;
+        if !focused {
+            // Without this, paint/MCP poll stops while unfocused → tool timeouts.
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
 
     /// Second status-bar segment: live action, short event line, else **Idle**.
@@ -3796,10 +4020,36 @@ impl VadadeeBerryApp {
         if self.anim_keyframing_mode {
             return format!("Recording keyframes (Frame {})", self.anim_current_frame);
         }
+        // Sticky / important messages (recording, hard errors) must outrank idle tools.
+        if !self.status_message.is_empty()
+            && (self.status_message.starts_with("Recording")
+                || self.status_message.starts_with("Record ")
+                || self.status_message.starts_with("Saved screen")
+                || self.status_message.starts_with("Stop ")
+                || self.status_message.contains("failed")
+                || self.status_message.contains("Failed"))
+        {
+            return self.status_message.clone();
+        }
+        if !self.screen_captures.is_empty() {
+            let n = self.screen_captures.len();
+            return if n == 1 {
+                "Recording screen…".into()
+            } else {
+                format!("Recording {n} screens…")
+            };
+        }
+        // Window / workspace not active — show before tool live status.
+        if !ctx.input(|i| i.focused) {
+            return "Unfocused".into();
+        }
         if let Some(live) = self.live_action_status(ctx) {
             return live;
         }
         if Self::is_ephemeral_status_event(&self.status_message) {
+            return self.status_message.clone();
+        }
+        if !self.status_message.is_empty() {
             return self.status_message.clone();
         }
         "Idle".into()
@@ -6945,6 +7195,29 @@ fn run_video_decode_thread(
                 active_source_paths.contains(key) || active_wav_paths.contains(key)
             });
         }
+
+        // Disk sweep: remove orphan extract WAVs not referenced by any active source.
+        // Previous sessions left files that status_map no longer knows about.
+        if let Ok(rd) = std::fs::read_dir(&cache_dir) {
+            for ent in rd.flatten() {
+                let path = ent.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let is_wav = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("wav"))
+                    .unwrap_or(false);
+                if !is_wav {
+                    continue;
+                }
+                let key = path.to_string_lossy().to_string();
+                if !active_wav_paths.contains(&key) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
     }
 
 
@@ -7098,6 +7371,8 @@ fn run_video_decode_thread(
         if ui.is_rect_visible(rect) {
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, theme::colors::CANVAS_BG);
+            // Page fill first, then grid on top (grid used to paint under the opaque page).
+            render::draw_page_shadow(&painter, page, self.project.document.page_color_egui());
             render::draw_grid(&painter, &self.viewport, origin, page);
             if self.pixel_art_mode {
                 let cell = self.pixel_cell_size as f64;
@@ -7116,7 +7391,6 @@ fn run_video_decode_thread(
                     y += cell;
                 }
             }
-            render::draw_page_shadow(&painter, page, self.project.document.page_color_egui());
 
             let order = self.draw_order_cached().to_vec();
             let ctx = ui.ctx().clone();
@@ -7494,6 +7768,9 @@ fn run_video_decode_thread(
                             ctx.request_repaint_after(std::time::Duration::from_millis(33));
                         }
                     }
+                    crate::document::LayerKind::ScreenRecord => {
+                        // Capture layer — no canvas draw (session is for Septic Player).
+                    }
                     crate::document::LayerKind::NodeEditor => {
                         // P2/P4: composite Output Object + effect chain onto the canvas.
                         if let Some(g) = &layer.node_graph {
@@ -7627,7 +7904,8 @@ fn run_video_decode_thread(
                                         } else {
                                             1.0
                                         };
-                                        paint_rotated_image_mirrored_tint(
+                                        // Zoom = UV crop (GPU) — never CPU rebake on zoom alone.
+                                        paint_rotated_image_mirrored_tint_uv(
                                             &painter,
                                             tex_id,
                                             rect,
@@ -7636,6 +7914,7 @@ fn run_video_decode_thread(
                                             rgb_mul,
                                             mirror & 1 != 0,
                                             mirror & 2 != 0,
+                                            eval.zoom_uv_rect(),
                                         );
                                         // Selection stroke when proxy is selected (not drawn via draw_nodes).
                                         if let Some(pid) = layer.ne_output_proxy {
@@ -8200,17 +8479,26 @@ fn run_video_decode_thread(
             crate::left_dock::draw_local_cursor_bubble(self, ui, origin);
             crate::left_dock::draw_remote_cursors(self, ui, origin);
 
-            if self.tools.active == ToolKind::Brush && !self.tools.brush.points.is_empty() {
-                 let stroke_color = match &self.build_brush_fill() {
-                    Fill::Solid(p) => p.to_egui(),
-                    Fill::LinearGradient { stops, .. } | Fill::RadialGradient { stops, .. } => {
-                        if let Some(s) = stops.first() {
-                            s.color.to_egui()
-                        } else {
-                            egui::Color32::from_rgb(0, 120, 215)
+            if self.tools.active == ToolKind::Brush
+                && (!self.tools.brush.points.is_empty()
+                    || self.tools.brush.brush_type == crate::tools::BrushType::Pixel)
+            {
+                let erasing = !self.tools.brush.pixel_erase_before.is_empty();
+                let stroke_color = if erasing {
+                    egui::Color32::from_rgba_unmultiplied(220, 60, 60, 180)
+                } else {
+                    match &self.build_brush_fill() {
+                        Fill::Solid(p) => p.to_egui(),
+                        Fill::LinearGradient { stops, .. }
+                        | Fill::RadialGradient { stops, .. } => {
+                            if let Some(s) = stops.first() {
+                                s.color.to_egui()
+                            } else {
+                                egui::Color32::from_rgb(0, 120, 215)
+                            }
                         }
+                        Fill::None => egui::Color32::from_rgb(0, 120, 215),
                     }
-                    Fill::None => egui::Color32::from_rgb(0, 120, 215),
                 };
                 render::draw_brush_preview(
                     &painter,
@@ -8478,6 +8766,8 @@ fn run_video_decode_thread(
                     }
                     None
                 });
+                // Prefer raw doc for pixel brush so grid snap is applied inside tool
+                // (snapped point is fine; pixel stamp floors cells).
                 self.tool_brush(
                     doc_snapped,
                     time,
@@ -8485,6 +8775,8 @@ fn run_video_decode_thread(
                     primary_down,
                     primary_released_anywhere,
                     pressure,
+                    shift,
+                    ctrl,
                 );
             }
 
@@ -8883,6 +9175,7 @@ fn run_video_decode_thread(
             return true;
         };
         let mixer = device.mixer();
+        let mut reset_audio_reason: Option<String> = None;
 
         // Drain any legacy prepare threads (no longer started for NE stream path).
         self.audio_prepare_rx.retain(|clip_id, rx| {
@@ -8914,8 +9207,32 @@ fn run_video_decode_thread(
                     self.audio_player_buffer_offset.remove(&clip_id);
                     self.audio_player_last_file_pos.remove(&clip_id);
                     self.audio_player_playback_rate.remove(&clip_id);
+                    self.audio_player_media_path.remove(&clip_id);
                     need_create = true;
                 }
+            }
+            // Septic / video file path changed mid-play → must not keep old audio stream.
+            let path_changed = self
+                .audio_player_media_path
+                .get(&clip_id)
+                .is_some_and(|p| p != media_path);
+            if path_changed {
+                let old = self.audio_player_media_path.remove(&clip_id);
+                self.audio_players.remove(&clip_id);
+                self.audio_player_buffer_offset.remove(&clip_id);
+                self.audio_player_last_file_pos.remove(&clip_id);
+                self.audio_player_playback_rate.remove(&clip_id);
+                // Drop extract status for the old path so a new WAV is built.
+                if let Some(prev_path) = old {
+                    if let Ok(mut st) = self.audio_extract_status.lock() {
+                        st.remove(&prev_path);
+                    }
+                }
+                need_create = true;
+                log::info!(
+                    "audio media path changed for {clip_id}: reopening {}",
+                    media_path
+                );
             }
 
             if let Some(player) = self.audio_players.get(&clip_id) {
@@ -8944,6 +9261,7 @@ fn run_video_decode_thread(
                     self.audio_player_buffer_offset.remove(&clip_id);
                     self.audio_player_last_file_pos.remove(&clip_id);
                     self.audio_player_playback_rate.remove(&clip_id);
+                    self.audio_player_media_path.remove(&clip_id);
                     need_create = true;
                 }
             }
@@ -8973,6 +9291,8 @@ fn run_video_decode_thread(
                                 self.audio_player_last_file_pos.insert(clip_id, file_pos);
                                 self.audio_player_buffer_offset.insert(clip_id, file_pos);
                                 self.audio_player_playback_rate.insert(clip_id, play_rate);
+                                self.audio_player_media_path
+                                    .insert(clip_id, media_path.clone());
                                 self.audio_players.insert(clip_id, player);
                                 self.audio_layers_skip.remove(&clip_id);
                                 // Surface once so silent graphs (Visualizer Level is synthetic) are diagnosable.
@@ -8991,11 +9311,21 @@ fn run_video_decode_thread(
                             Err(e) => {
                                 log::warn!("audio stream failed {media_path}: {e}");
                                 self.status_message = format!("Audio: {e}");
-                                // Soft skip AV layers only; NE retries next frames.
-                                if !self.project.document.layers.iter().any(|l| {
+                                let msg = e.to_string().to_ascii_lowercase();
+                                // Dead device / broken stream → reopen sink (no full app restart).
+                                if msg.contains("device")
+                                    || msg.contains("stream")
+                                    || msg.contains("disconnected")
+                                    || msg.contains("closed")
+                                    || msg.contains("i/o")
+                                    || msg.contains("io error")
+                                {
+                                    reset_audio_reason = Some(e.to_string());
+                                } else if !self.project.document.layers.iter().any(|l| {
                                     l.id == clip_id
                                         && l.kind == crate::document::LayerKind::NodeEditor
                                 }) {
+                                    // Soft skip AV layers only; NE retries next frames.
                                     self.audio_layers_skip.insert(clip_id);
                                 }
                             }
@@ -9046,8 +9376,15 @@ fn run_video_decode_thread(
             .retain(|id, _| active_clip_ids.contains(id));
         self.audio_player_playback_rate
             .retain(|id, _| active_clip_ids.contains(id));
+        self.audio_player_media_path
+            .retain(|id, _| active_clip_ids.contains(id));
         self.audio_prepare_rx
             .retain(|id, _| active_clip_ids.contains(id));
+
+        if let Some(reason) = reset_audio_reason {
+            self.reset_audio_output(&reason);
+            return true; // reopen device next frame
+        }
 
         // Only repaint for in-flight prepare (streaming path rarely needs this).
         !self.audio_prepare_rx.is_empty()
@@ -13919,22 +14256,88 @@ fn run_video_decode_thread(
         down: bool,
         released: bool,
         pressure: Option<f32>,
+        shift: bool,
+        ctrl: bool,
     ) {
+        let pixel = self.tools.brush.brush_type == crate::tools::BrushType::Pixel;
+        // Shift = erase; Ctrl = straight line (Shift wins if both).
+        let erase = pixel && shift;
+        let line_mode = pixel && ctrl && !shift;
+
         if pressed {
             self.tools.brush.points.clear();
-            let size = self.tools.brush.size;
-            let initial_w = if self.tools.brush.brush_type == crate::tools::BrushType::Pen {
-                let v = if let Some(p) = pressure { p as f64 } else { 1.0 };
-                let max_r = size as f64 / 2.0;
-                let y = (1.0 - v) * max_r;
-                let r = (max_r * max_r - y * y).max(0.0).sqrt();
-                (r * 2.0).max(1.0) as f32
+            self.tools.brush.pixel_line_anchor = None;
+            self.tools.brush.pixel_erase_before.clear();
+            if erase {
+                // Snapshot nodes we may patch for one undo on release.
+                self.pixel_erase_begin();
+                self.pixel_erase_at(doc, time);
+            } else if pixel {
+                let (cx, cy, w, _h) = crate::tools::pixel_stamp_at(
+                    doc,
+                    self.viewport.step_x(),
+                    self.viewport.step_y(),
+                    self.tools.brush.pixel_cells,
+                );
+                self.tools.brush.points.push(([cx, cy], time, w as f32));
+                if line_mode {
+                    self.tools.brush.pixel_line_anchor = Some(doc);
+                }
             } else {
-                size
-            };
-            self.tools.brush.points.push(([doc.0, doc.1], time, initial_w));
+                let size = self.tools.brush.size;
+                let initial_w = if self.tools.brush.brush_type == crate::tools::BrushType::Pen {
+                    let v = if let Some(p) = pressure { p as f64 } else { 1.0 };
+                    let max_r = size as f64 / 2.0;
+                    let y = (1.0 - v) * max_r;
+                    let r = (max_r * max_r - y * y).max(0.0).sqrt();
+                    (r * 2.0).max(1.0) as f32
+                } else {
+                    size
+                };
+                self.tools.brush.points.push(([doc.0, doc.1], time, initial_w));
+            }
         } else if down {
-            if let Some(&(prev_pos, prev_time, prev_w)) = self.tools.brush.points.last() {
+            if erase {
+                self.pixel_erase_at(doc, time);
+            } else if pixel && line_mode {
+                // Straight line preview: only stamps from anchor → cursor.
+                let anchor = self
+                    .tools
+                    .brush
+                    .pixel_line_anchor
+                    .unwrap_or(doc);
+                let gx = self.viewport.step_x();
+                let gy = self.viewport.step_y();
+                let cells = self.tools.brush.pixel_cells;
+                let stamps =
+                    crate::tools::pixel_stamps_along(anchor, doc, gx, gy, cells);
+                self.tools.brush.points.clear();
+                for (cx, cy, w, _h) in stamps {
+                    self.tools.brush.points.push(([cx, cy], time, w as f32));
+                }
+            } else if pixel {
+                // Freehand: fill every cell along the segment (no gaps when moving fast).
+                let gx = self.viewport.step_x();
+                let gy = self.viewport.step_y();
+                let cells = self.tools.brush.pixel_cells;
+                let prev_doc = self
+                    .tools
+                    .brush
+                    .points
+                    .last()
+                    .map(|&(p, _, _)| (p[0], p[1]))
+                    .unwrap_or(doc);
+                let stamps =
+                    crate::tools::pixel_stamps_along(prev_doc, doc, gx, gy, cells);
+                for (cx, cy, w, _h) in stamps {
+                    let dup = self.tools.brush.points.iter().any(|&(p, _, _)| {
+                        (p[0] - cx).abs() < 1e-6 && (p[1] - cy).abs() < 1e-6
+                    });
+                    if !dup {
+                        self.tools.brush.points.push(([cx, cy], time, w as f32));
+                    }
+                }
+            } else if let Some(&(prev_pos, prev_time, prev_w)) = self.tools.brush.points.last() {
                 let size = self.tools.brush.size;
                 let heavy = self.tools.brush.heavy;
                 let smoothness = self.tools.brush.smoothness;
@@ -13996,18 +14399,44 @@ fn run_video_decode_thread(
         }
 
         if released {
+            if !self.tools.brush.pixel_erase_before.is_empty() {
+                self.pixel_erase_commit();
+                self.tools.brush.points.clear();
+                self.tools.brush.pixel_line_anchor = None;
+                return;
+            }
+
             let mut pts = self.tools.brush.points.clone();
-            if pts.len() >= 2 {
-                if self.tools.brush.brush_type != crate::tools::BrushType::Calligraphy {
+            if !pts.is_empty()
+                && (self.tools.brush.brush_type == crate::tools::BrushType::Pixel
+                    || pts.len() >= 2)
+            {
+                if self.tools.brush.brush_type != crate::tools::BrushType::Calligraphy
+                    && self.tools.brush.brush_type != crate::tools::BrushType::Pixel
+                {
                     if let Some(last) = pts.last_mut() {
                         last.2 = 0.0;
                     }
                 }
-                
-                let mut node = if self.tools.brush.brush_type == crate::tools::BrushType::Pen {
-                    Node::new(NodeKind::BrushStroke {
-                        points: pts.iter().map(|(p, _, w)| (*p, *w)).collect(),
-                    }, "Pen Stroke")
+
+                let mut node = if self.tools.brush.brush_type == crate::tools::BrushType::Pixel {
+                    let gx = self.viewport.step_x().max(0.5);
+                    let gy = self.viewport.step_y().max(0.5);
+                    let aspect = gy / gx;
+                    let bez = pixel_stamps_to_path(&pts, aspect);
+                    let name = if self.tools.brush.pixel_line_anchor.is_some() {
+                        "Pixel Line"
+                    } else {
+                        "Pixel Brush"
+                    };
+                    Node::path_from_bez(bez, name)
+                } else if self.tools.brush.brush_type == crate::tools::BrushType::Pen {
+                    Node::new(
+                        NodeKind::BrushStroke {
+                            points: pts.iter().map(|(p, _, w)| (*p, *w)).collect(),
+                        },
+                        "Pen Stroke",
+                    )
                 } else {
                     let bez = generate_brush_outline(
                         &pts,
@@ -14031,7 +14460,164 @@ fn run_video_decode_thread(
                 self.insert_node(node);
             }
             self.tools.brush.points.clear();
+            self.tools.brush.pixel_line_anchor = None;
         }
+    }
+
+    /// Begin a Shift-erase stroke: remember current Path nodes for undo.
+    fn pixel_erase_begin(&mut self) {
+        self.tools.brush.pixel_erase_before.clear();
+        let ids: Vec<NodeId> = self
+            .project
+            .document
+            .active_layer()
+            .map(|l| l.nodes.clone())
+            .unwrap_or_default();
+        for id in ids {
+            if let Some(n) = self.project.nodes.get(id) {
+                if matches!(n.kind, NodeKind::Path { .. }) {
+                    self.tools
+                        .brush
+                        .pixel_erase_before
+                        .push((id, n.clone()));
+                }
+            }
+        }
+    }
+
+    /// Erase grid stamps under `doc` from path geometry on the active layer.
+    fn pixel_erase_at(&mut self, doc: (f64, f64), time: f64) {
+        let gx = self.viewport.step_x();
+        let gy = self.viewport.step_y();
+        let cells = self.tools.brush.pixel_cells;
+        let stamps = if let Some(&(p, _, _)) = self.tools.brush.points.last() {
+            crate::tools::pixel_stamps_along((p[0], p[1]), doc, gx, gy, cells)
+        } else {
+            let (cx, cy, w, h) = crate::tools::pixel_stamp_at(doc, gx, gy, cells);
+            vec![(cx, cy, w, h)]
+        };
+        // Track for red erase preview.
+        for (cx, cy, w, _h) in &stamps {
+            let dup = self.tools.brush.points.iter().any(|&(p, _, _)| {
+                (p[0] - cx).abs() < 1e-6 && (p[1] - cy).abs() < 1e-6
+            });
+            if !dup {
+                self.tools
+                    .brush
+                    .points
+                    .push(([*cx, *cy], time, *w as f32));
+            }
+        }
+
+        let erase_rects: Vec<(f64, f64, f64, f64)> = stamps;
+        let ids: Vec<NodeId> = self
+            .project
+            .document
+            .active_layer()
+            .map(|l| l.nodes.clone())
+            .unwrap_or_default();
+        let mut empty_ids = Vec::new();
+        for id in ids {
+            let Some(node) = self.project.nodes.get_mut(id) else {
+                continue;
+            };
+            let NodeKind::Path { path } = &mut node.kind else {
+                continue;
+            };
+            let new_bez = strip_pixel_rects_from_bez(&path.to_bez(), &erase_rects);
+            let empty = !new_bez.elements().iter().any(|e| {
+                matches!(
+                    e,
+                    kurbo::PathEl::LineTo(_)
+                        | kurbo::PathEl::CurveTo(_, _, _)
+                        | kurbo::PathEl::QuadTo(_, _)
+                )
+            });
+            if empty {
+                empty_ids.push(id);
+            } else {
+                *path = crate::document::PathData::from_bez(&new_bez);
+            }
+        }
+        for id in empty_ids {
+            let _ = self.project.nodes.remove(id);
+            if let Some(layer) = self.project.document.active_layer_mut() {
+                layer.nodes.retain(|&n| n != id);
+            }
+        }
+    }
+
+    fn pixel_erase_commit(&mut self) {
+        let before = std::mem::take(&mut self.tools.brush.pixel_erase_before);
+        if before.is_empty() {
+            return;
+        }
+        let mut patches: Vec<(NodeId, Node, Node)> = Vec::new();
+        let mut removed: Vec<(NodeId, Node)> = Vec::new();
+        for (id, before_node) in before {
+            match self.project.nodes.get(id) {
+                Some(after) if after != &before_node => {
+                    patches.push((id, before_node, after.clone()));
+                }
+                None => removed.push((id, before_node)),
+                _ => {}
+            }
+        }
+        if patches.is_empty() && removed.is_empty() {
+            return;
+        }
+
+        // Record undo: restore `before` then let history re-apply current after.
+        for (id, before_n, _) in &patches {
+            if let Some(n) = self.project.nodes.get_mut(*id) {
+                *n = before_n.clone();
+            }
+        }
+        // Put deleted nodes back so RemoveNodes can remove them formally.
+        let layer_index = self.project.document.active_layer_index;
+        let layer_nodes_before: Vec<NodeId> = {
+            // layer order as it was at start of erase is in our before snapshots + survivors.
+            // Use current + removed ids for a workable restore.
+            let mut order = self
+                .project
+                .document
+                .layers
+                .get(layer_index)
+                .map(|l| l.nodes.clone())
+                .unwrap_or_default();
+            for (id, node) in &removed {
+                self.project.nodes.insert(node.clone());
+                if !order.contains(id) {
+                    order.push(*id);
+                }
+            }
+            if let Some(layer) = self.project.document.layers.get_mut(layer_index) {
+                layer.nodes = order.clone();
+            }
+            order
+        };
+
+        if !patches.is_empty() {
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchNodes {
+                    patches: patches.clone(),
+                },
+            );
+        }
+        if !removed.is_empty() {
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::RemoveNodes {
+                    removed,
+                    removed_anims: Vec::new(),
+                    layer_index,
+                    layer_nodes_before,
+                    ne_proxy_before: Vec::new(),
+                },
+            );
+        }
+        self.status_message = "Erased pixels".into();
     }
 
     fn hit_path_segment(
@@ -15009,14 +15595,18 @@ fn run_video_decode_thread(
                                 *value = v;
                             }
                         }
-                        crate::document::GraphNodeKind::ExprX { expr } => {
+                        crate::document::GraphNodeKind::ExprX { expr }
+                        | crate::document::GraphNodeKind::ExprXy { expr }
+                        | crate::document::GraphNodeKind::ExprXyz { expr } => {
                             if let Some(e) = args.get("expr").and_then(|x| x.as_str()) {
                                 *expr = e.to_string();
                             }
                         }
                         crate::document::GraphNodeKind::ObjectImage { path }
                         | crate::document::GraphNodeKind::ObjectVideo { path }
-                        | crate::document::GraphNodeKind::ObjectAudio { path } => {
+                        | crate::document::GraphNodeKind::ObjectAudio { path }
+                        | crate::document::GraphNodeKind::ObjectSeptic { path }
+                        | crate::document::GraphNodeKind::ObjectMouse { path } => {
                             if let Some(p) = args.get("path").and_then(|x| x.as_str()) {
                                 *path = p.to_string();
                             }
@@ -15024,6 +15614,26 @@ fn run_video_decode_thread(
                         crate::document::GraphNodeKind::ObjectFromApp { node_ids } => {
                             if args.get("app_object_ids").is_some() {
                                 *node_ids = ne::parse_uuid_list(args.get("app_object_ids"));
+                            }
+                        }
+                        crate::document::GraphNodeKind::MouseEncoder {
+                            time_threshold,
+                            gain,
+                        } => {
+                            if let Some(v) = args
+                                .get("time_threshold")
+                                .or_else(|| args.get("threshold"))
+                                .and_then(|x| x.as_f64())
+                            {
+                                *time_threshold = v.clamp(0.001, 5.0);
+                            }
+                            if let Some(v) = args.get("gain").and_then(|x| x.as_f64()) {
+                                *gain = v.clamp(0.0, 64.0);
+                            }
+                        }
+                        crate::document::GraphNodeKind::Visualizer { gain } => {
+                            if let Some(v) = args.get("gain").and_then(|x| x.as_f64()) {
+                                *gain = v.max(0.0);
                             }
                         }
                         _ => {}
@@ -15066,17 +15676,19 @@ fn run_video_decode_thread(
                     .ok_or("to_node required")?;
                 let from_id = uuid::Uuid::parse_str(from).map_err(|e| e.to_string())?;
                 let to_id = uuid::Uuid::parse_str(to).map_err(|e| e.to_string())?;
-                let from_port = args
+                let from_port_raw = args
                     .get("from_port")
                     .and_then(|v| v.as_str())
                     .unwrap_or("out");
-                let to_port = args
+                let to_port_raw = args
                     .get("to_port")
                     .and_then(|v| v.as_str())
                     .unwrap_or("image");
-                self.mcp_with_node_graph_mut(args, |g, _, _| {
-                    g.try_add_link(from_id, from_port, to_id, to_port)?;
-                    Ok(())
+                let (from_port, to_port) = self.mcp_with_node_graph_mut(args, |g, _, _| {
+                    let from_port = ne::resolve_port_id(g, from_id, from_port_raw, true)?;
+                    let to_port = ne::resolve_port_id(g, to_id, to_port_raw, false)?;
+                    g.try_add_link(from_id, &from_port, to_id, &to_port)?;
+                    Ok((from_port, to_port))
                 })?;
                 Ok(format!(
                     "Connected {from}:{from_port} → {to}:{to_port}"
@@ -16925,6 +17537,24 @@ fn run_video_decode_thread(
 }
 
 impl eframe::App for VadadeeBerryApp {
+    fn on_exit(&mut self) {
+        // Stop capture / audio first so we don't delete WAVs still held open.
+        #[cfg(not(target_os = "android"))]
+        {
+            self.screen_captures.clear();
+        }
+        self.audio_players.clear();
+        self.audio_player_media_path.clear();
+        if let Ok(mut m) = self.audio_extract_status.lock() {
+            m.clear();
+        }
+        if let Ok(mut m) = self.audio_pcm_cache.lock() {
+            m.clear();
+        }
+        #[cfg(not(target_os = "android"))]
+        purge_vadadee_disk_caches(CachePurgeOpts::on_exit());
+    }
+
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.update_clip_mask_textures(ctx);
         // Keep boolean result paths in sync when operands move (cheap if no effects).
@@ -17446,6 +18076,16 @@ impl eframe::App for VadadeeBerryApp {
         if self.sync_audio_playback() {
             ctx.request_repaint();
         }
+        #[cfg(not(target_os = "android"))]
+        {
+            // Screen record mouse track is global (X11 / evdev) — not the app window.
+            // Keep UI warm while recording so stop / status stay responsive.
+            if !self.screen_captures.is_empty() {
+                crate::screen_capture::clear_app_pointer();
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+        self.update_window_focus_status(ctx);
         self.tick_live_collaboration_poll(ctx);
         self.poll_mcp_bridge();
         self.process_pending_mcp_bulk_rects();
@@ -17455,6 +18095,133 @@ impl eframe::App for VadadeeBerryApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         ui::chrome(self, ui);
     }
+}
+
+/// Drop closed rectangular subpaths whose center falls inside any erase stamp.
+fn strip_pixel_rects_from_bez(
+    bez: &kurbo::BezPath,
+    erase: &[(f64, f64, f64, f64)],
+) -> kurbo::BezPath {
+    use kurbo::{BezPath, PathEl, Point};
+    if erase.is_empty() {
+        return bez.clone();
+    }
+
+    let should_drop = |start: Option<Point>, pts: &[Point], closed: bool| -> bool {
+        if !closed {
+            return false;
+        }
+        let mut all = Vec::new();
+        if let Some(s) = start {
+            all.push(s);
+        }
+        all.extend_from_slice(pts);
+        if all.len() < 4 {
+            return false;
+        }
+        let min_x = all.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+        let max_x = all.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
+        let min_y = all.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+        let max_y = all.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+        let w = max_x - min_x;
+        let h = max_y - min_y;
+        if w <= 1e-6 || h <= 1e-6 {
+            return false;
+        }
+        let is_rect = all.iter().all(|p| {
+            let on_v = (p.x - min_x).abs() < 1e-3 || (p.x - max_x).abs() < 1e-3;
+            let on_h = (p.y - min_y).abs() < 1e-3 || (p.y - max_y).abs() < 1e-3;
+            on_v && on_h
+        });
+        if !is_rect {
+            return false;
+        }
+        let cx = (min_x + max_x) * 0.5;
+        let cy = (min_y + max_y) * 0.5;
+        erase.iter().any(|&(ex, ey, ew, eh)| {
+            (cx - ex).abs() <= (w + ew) * 0.5 + 1e-3
+                && (cy - ey).abs() <= (h + eh) * 0.5 + 1e-3
+        })
+    };
+
+    let mut out = BezPath::new();
+    let mut sub_start: Option<Point> = None;
+    let mut sub_pts: Vec<Point> = Vec::new();
+
+    let emit = |start: Option<Point>, pts: &[Point], closed: bool, out: &mut BezPath| {
+        if start.is_none() && pts.is_empty() {
+            return;
+        }
+        if should_drop(start, pts, closed) {
+            return;
+        }
+        if let Some(s) = start {
+            out.move_to(s);
+            for p in pts {
+                out.line_to(*p);
+            }
+            if closed {
+                out.close_path();
+            }
+        }
+    };
+
+    for el in bez.elements() {
+        match el {
+            PathEl::MoveTo(p) => {
+                emit(sub_start, &sub_pts, false, &mut out);
+                sub_start = Some(*p);
+                sub_pts.clear();
+            }
+            PathEl::LineTo(p) => sub_pts.push(*p),
+            PathEl::QuadTo(_, p) => sub_pts.push(*p),
+            PathEl::CurveTo(_, _, p) => sub_pts.push(*p),
+            PathEl::ClosePath => {
+                emit(sub_start, &sub_pts, true, &mut out);
+                sub_start = None;
+                sub_pts.clear();
+            }
+        }
+    }
+    emit(sub_start, &sub_pts, false, &mut out);
+    out
+}
+
+/// Bake pixel-brush stamps into a path of axis-aligned rects (pixel look).
+/// `points` are (center, time, width_x); height = width_x * aspect (gy/gx).
+fn pixel_stamps_to_path(points: &[([f64; 2], f64, f32)], aspect: f64) -> kurbo::BezPath {
+    use kurbo::{BezPath, Rect};
+    let mut path = BezPath::new();
+    let aspect = aspect.max(1e-6);
+    // Dedup identical cells (re-entered stamps).
+    let mut seen = std::collections::HashSet::new();
+    for &(pos, _, w) in points {
+        let w = w as f64;
+        if w <= 0.0 {
+            continue;
+        }
+        let h = w * aspect;
+        let key = (
+            (pos[0] * 1000.0).round() as i64,
+            (pos[1] * 1000.0).round() as i64,
+            (w * 100.0).round() as i64,
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        let r = Rect::new(
+            pos[0] - w * 0.5,
+            pos[1] - h * 0.5,
+            pos[0] + w * 0.5,
+            pos[1] + h * 0.5,
+        );
+        path.move_to(r.origin());
+        path.line_to((r.x1, r.y0));
+        path.line_to((r.x1, r.y1));
+        path.line_to((r.x0, r.y1));
+        path.close_path();
+    }
+    path
 }
 
 fn generate_brush_outline(
@@ -17710,10 +18477,13 @@ mod tests {
                 audio_player_buffer_offset: std::collections::HashMap::new(),
                 audio_player_last_file_pos: std::collections::HashMap::new(),
                 audio_player_playback_rate: std::collections::HashMap::new(),
+                audio_player_media_path: std::collections::HashMap::new(),
                 audio_layers_skip: std::collections::HashSet::new(),
                 audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 audio_prepare_rx: std::collections::HashMap::new(),
+            #[cfg(not(target_os = "android"))]
+            screen_captures: std::collections::HashMap::new(),
 
                 project: Document::new_default_project(),
                 viewport: Viewport::default(),
@@ -17884,6 +18654,7 @@ mod tests {
                 cached_draw_order_revision: u64::MAX,
                 audio_output_warned: false,
                 canvas_focused: false,
+                window_was_focused: true,
             }
         }
     }
@@ -18029,6 +18800,23 @@ impl VadadeeBerryApp {
     }
 }
 
+/// Status bar powerline is single-row — collapse newlines / long panics into one line.
+fn status_one_line(s: &str) -> String {
+    let flat: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let joined = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 120;
+    if joined.chars().count() > MAX {
+        let mut out: String = joined.chars().take(MAX.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    } else {
+        joined
+    }
+}
+
 fn cached_wav_path_for_video(video_path: &str) -> std::path::PathBuf {
     use std::hash::{Hash, Hasher};
     // Prefer XDG cache (always writable). Sidecar next to video is a fallback.
@@ -18156,6 +18944,165 @@ fn dirs_next_audio_cache_dir() -> std::path::PathBuf {
             .join("audio");
     }
     std::env::temp_dir().join("vadadee-berry-audio")
+}
+
+fn dirs_vadadee_cache_root() -> std::path::PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if !xdg.is_empty() {
+            return std::path::PathBuf::from(xdg).join("vadadee-berry");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home)
+            .join(".cache")
+            .join("vadadee-berry");
+    }
+    std::env::temp_dir().join("vadadee-berry-cache")
+}
+
+/// Default screen-record folder under XDG cache (not user Videos).
+fn dirs_next_screen_cache_dir() -> std::path::PathBuf {
+    dirs_vadadee_cache_root().join("screen")
+}
+
+/// Remove regenerable extract WAVs + temp open-cache left behind after crash/exit.
+/// Safe: never touches user project files or Videos/… recordings.
+pub fn purge_vadadee_disk_caches(opts: CachePurgeOpts) {
+    let mut removed = 0u32;
+    let mut bytes: u64 = 0;
+
+    // 1) Audio extract WAVs under ~/.cache/vadadee-berry/audio
+    let audio_dir = dirs_next_audio_cache_dir();
+    removed += purge_dir_files(
+        &audio_dir,
+        &["wav", "WAV"],
+        opts.max_age,
+        opts.remove_all_in_audio,
+        &mut bytes,
+    );
+
+    // 2) Orphan screen cache only when age policy says so (default takes are often intentional).
+    if opts.purge_screen_cache {
+        let screen_dir = dirs_next_screen_cache_dir();
+        removed += purge_dir_files(
+            &screen_dir,
+            &["sepscrr", "mp4", "wav", "m4a"],
+            opts.max_age,
+            false,
+            &mut bytes,
+        );
+    }
+
+    // 3) Temp open-project cache
+    let open_cache = std::env::temp_dir().join(".vadadee-berry-open-cache.vadadee-berry.json");
+    if open_cache.is_file() {
+        if let Ok(meta) = open_cache.metadata() {
+            bytes += meta.len();
+        }
+        if std::fs::remove_file(&open_cache).is_ok() {
+            removed += 1;
+        }
+    }
+
+    // 4) AV temp dir leftovers
+    let av_tmp = std::env::temp_dir().join("vadadee-berry-av");
+    removed += purge_dir_files(&av_tmp, &[], opts.max_age, opts.remove_all_tmp, &mut bytes);
+
+    if removed > 0 {
+        log::info!(
+            "[cache] purged {removed} file(s), ~{:.1} MB from disk cache",
+            bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct CachePurgeOpts {
+    /// Delete files older than this (None = ignore age, only used with remove_all_*).
+    pub max_age: Option<std::time::Duration>,
+    /// Wipe entire audio extract cache (regenerable on next play).
+    pub remove_all_in_audio: bool,
+    /// Wipe vadadee-berry-av temp dir contents.
+    pub remove_all_tmp: bool,
+    /// Also age-prune ~/.cache/vadadee-berry/screen
+    pub purge_screen_cache: bool,
+}
+
+impl CachePurgeOpts {
+    /// Startup: drop stale extracts from previous sessions; keep recent ones for quick resume.
+    fn on_startup() -> Self {
+        Self {
+            max_age: Some(std::time::Duration::from_secs(60 * 60 * 24)), // 24h
+            remove_all_in_audio: false,
+            remove_all_tmp: false,
+            purge_screen_cache: true,
+        }
+    }
+
+    /// Exit: clear regenerable audio extracts + temp open cache so .cache doesn't grow forever.
+    fn on_exit() -> Self {
+        Self {
+            max_age: None,
+            remove_all_in_audio: true,
+            remove_all_tmp: true,
+            purge_screen_cache: false, // user may still want last take under cache/
+        }
+    }
+}
+
+fn purge_dir_files(
+    dir: &std::path::Path,
+    exts: &[&str],
+    max_age: Option<std::time::Duration>,
+    remove_all: bool,
+    bytes_out: &mut u64,
+) -> u32 {
+    if !dir.is_dir() {
+        return 0;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut n = 0u32;
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if !path.is_file() {
+            continue;
+        }
+        if !exts.is_empty() {
+            let ok = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
+                .unwrap_or(false);
+            if !ok {
+                continue;
+            }
+        }
+        let Ok(meta) = ent.metadata() else {
+            continue;
+        };
+        if !remove_all {
+            let Some(age) = max_age else {
+                continue;
+            };
+            let old = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .map(|d| d > age)
+                .unwrap_or(false);
+            if !old {
+                continue;
+            }
+        }
+        *bytes_out += meta.len();
+        if std::fs::remove_file(&path).is_ok() {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Rodio cannot stream most video containers; use extracted stereo WAV.
@@ -18319,6 +19266,31 @@ fn paint_rotated_image_mirrored_tint(
     flip_h: bool,
     flip_v: bool,
 ) {
+    paint_rotated_image_mirrored_tint_uv(
+        painter,
+        texture_id,
+        rect,
+        rotation_rad,
+        opacity,
+        rgb_mul,
+        flip_h,
+        flip_v,
+        (0.0, 0.0, 1.0, 1.0),
+    );
+}
+
+/// Paint with UV sub-rect (for free Zoom effect — no CPU rebake).
+fn paint_rotated_image_mirrored_tint_uv(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    rect: egui::Rect,
+    rotation_rad: f32,
+    opacity: f32,
+    rgb_mul: f32,
+    flip_h: bool,
+    flip_v: bool,
+    uv: (f32, f32, f32, f32),
+) {
     let mut mesh = egui::Mesh::with_texture(texture_id);
     // Vertex tint ≈ brightness: RGB *= m (m>1 clamps to white in egui).
     let m = rgb_mul.clamp(0.0, 8.0);
@@ -18345,10 +19317,13 @@ fn paint_rotated_image_mirrored_tint(
         }
     }
 
-    let u0 = if flip_h { 1.0 } else { 0.0 };
-    let u1 = if flip_h { 0.0 } else { 1.0 };
-    let v0 = if flip_v { 1.0 } else { 0.0 };
-    let v1 = if flip_v { 0.0 } else { 1.0 };
+    let (mut u0, mut v0, mut u1, mut v1) = uv;
+    if flip_h {
+        std::mem::swap(&mut u0, &mut u1);
+    }
+    if flip_v {
+        std::mem::swap(&mut v0, &mut v1);
+    }
 
     mesh.vertices.push(egui::epaint::Vertex {
         pos: points[0],

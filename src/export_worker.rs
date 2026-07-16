@@ -358,6 +358,7 @@ impl<'a> ExportSession<'a> {
                     pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
                 }
                 crate::document::LayerKind::NodeEditor => {}
+                crate::document::LayerKind::ScreenRecord => {}
                 _ => {}
             }
         }
@@ -1661,6 +1662,7 @@ impl<'a> ExportSession<'a> {
                             Some(render_state),
                         );
                     }
+                    crate::document::LayerKind::ScreenRecord => {}
                     crate::document::LayerKind::NodeEditor => {
                         // P5/P6b: composite Output Object image chain (proxy transform).
                         if let Some(g) = &layer.node_graph {
