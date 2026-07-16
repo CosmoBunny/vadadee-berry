@@ -439,6 +439,9 @@ fn is_drawing_tool(name: &str) -> bool {
         name,
         "create_rectangle"
             | "create_rectangles"
+            | "brush"
+            | "brush_stroke"
+            | "paint_brush"
             | "create_image"
             | "create_circle"
             | "create_ellipse"

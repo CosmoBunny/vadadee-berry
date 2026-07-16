@@ -93,5 +93,14 @@ lto = "fat"
 panic = "abort"
 strip = "symbols"
 
+# Release + debuginfo for cargo-flamegraph / perf (no symbol strip).
+#   cargo flamegraph --profile profiling --bin vadadee-berry
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+# Thin LTO: much faster rebuilds than fat while still optimized.
+lto = "thin"
+
 [profile.dev.package."*"]
 opt-level = 2

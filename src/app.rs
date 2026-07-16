@@ -300,6 +300,8 @@ pub struct VadadeeBerryApp {
     pub ui_stroke_width: f32,
     pub ui_text_content: String,
     pub ui_text_font_size: f32,
+    /// Text box width in document px; `0` = auto (no wrap).
+    pub ui_text_width: f32,
     pub ui_text_font_family: String,
     pub fonts: FontRegistry,
     pub ui_text_bold: bool,
@@ -969,6 +971,7 @@ impl VadadeeBerryApp {
             ui_stroke_width: 2.0,
             ui_text_content: "Text".into(),
             ui_text_font_size: 24.0,
+            ui_text_width: 0.0,
             ui_text_font_family: default_font,
             fonts,
             ui_text_bold: false,
@@ -1702,6 +1705,7 @@ impl VadadeeBerryApp {
                 if let NodeKind::Text { style, .. } = &n.kind {
                     self.ui_text_content = style.content.clone();
                     self.ui_text_font_size = style.font_size;
+                    self.ui_text_width = style.width;
                     self.ui_text_font_family = style.font_family.clone();
                     self.ui_text_bold = style.bold;
                     self.ui_text_italic = style.italic;
@@ -7590,7 +7594,7 @@ fn run_video_decode_thread(
                                 .filter(|id| layer_set.contains(id))
                                 .collect();
                             if !skip_overlay && !selection_overlay.is_empty() {
-                                render::draw_nodes(
+                                render::draw_nodes_ex(
                                     &painter,
                                     &self.project.nodes,
                                     &selection_overlay,
@@ -7603,6 +7607,7 @@ fn run_video_decode_thread(
                                     &loft_paths,
                                     &self.fonts,
                                     &self.image_textures,
+                                    self.project.document.page_color_egui(),
                                 );
                             }
                         } else {
@@ -7614,7 +7619,7 @@ fn run_video_decode_thread(
                                 .copied()
                                 .filter(|id| layer_set.contains(id))
                                 .collect();
-                            render::draw_nodes(
+                            render::draw_nodes_ex(
                                 &painter,
                                 &self.project.nodes,
                                 &layer_draw_order,
@@ -7627,6 +7632,7 @@ fn run_video_decode_thread(
                                 &loft_paths,
                                 &self.fonts,
                                 &self.image_textures,
+                                self.project.document.page_color_egui(),
                             );
                         }
                     }
@@ -7809,7 +7815,7 @@ fn run_video_decode_thread(
                                                     (-step * 0.7, -step * 0.7),
                                                 ];
                                                 // Primary draw once; offset hints only as faint overlay.
-                                                render::draw_nodes(
+                                                render::draw_nodes_ex(
                                                     &painter,
                                                     &self.project.nodes,
                                                     &order,
@@ -7822,10 +7828,11 @@ fn run_video_decode_thread(
                                                     &loft_paths,
                                                     &self.fonts,
                                                     &self.image_textures,
+                                                    self.project.document.page_color_egui(),
                                                 );
                                                 let _ = offsets; // full re-draw offset not available without node translate
                                             } else {
-                                                render::draw_nodes(
+                                                render::draw_nodes_ex(
                                                     &painter,
                                                     &self.project.nodes,
                                                     &order,
@@ -7838,6 +7845,7 @@ fn run_video_decode_thread(
                                                     &loft_paths,
                                                     &self.fonts,
                                                     &self.image_textures,
+                                                    self.project.document.page_color_egui(),
                                                 );
                                             }
                                             // Effect chip for live algebra-driven params.
@@ -7973,7 +7981,7 @@ fn run_video_decode_thread(
                             .copied()
                             .filter(|id| layer_set.contains(id))
                             .collect();
-                        crate::render::draw_nodes(
+                        crate::render::draw_nodes_ex(
                             &painter,
                             &self.project.nodes,
                             &layer_draw_order,
@@ -7986,6 +7994,7 @@ fn run_video_decode_thread(
                             &loft_paths,
                             &self.fonts,
                             &self.image_textures,
+                            self.project.document.page_color_egui(),
                         );
                         // Flowchart uses orthogonal routed paths via FlowchartPathData + rounded render
                     }
@@ -11594,6 +11603,7 @@ fn run_video_decode_thread(
         };
         self.ui_text_content = style.content.clone();
         self.ui_text_font_size = style.font_size;
+        self.ui_text_width = style.width;
         self.ui_text_font_family = style.font_family.clone();
         self.ui_text_bold = style.bold;
         self.ui_text_italic = style.italic;
@@ -11683,11 +11693,21 @@ fn run_video_decode_thread(
 
     pub(crate) fn patch_on_page_text_live(&mut self, id: NodeId) {
         let content = self.ui_text_content.clone();
+        let font_size = self.ui_text_font_size;
+        let width = self.ui_text_width;
+        let bold = self.ui_text_bold;
+        let italic = self.ui_text_italic;
+        let family = self.ui_text_font_family.clone();
         let Some(node) = self.project.nodes.get_mut(id) else {
             return;
         };
         if let NodeKind::Text { style, .. } = &mut node.kind {
             style.content = content.clone();
+            style.font_size = font_size;
+            style.width = width;
+            style.bold = bold;
+            style.italic = italic;
+            style.font_family = family;
             node.name = text_display_name(&content);
         }
     }
@@ -14236,6 +14256,7 @@ fn run_video_decode_thread(
             font_family: self.ui_text_font_family.clone(),
             bold: self.ui_text_bold,
             italic: self.ui_text_italic,
+            width: self.ui_text_width,
         };
         let mut node = self.styled_shape_node(Node::text(doc.0, doc.1, style));
         node.name = "Text".into();
@@ -15727,6 +15748,375 @@ fn run_video_decode_thread(
         }
     }
 
+    /// MCP brush: pixel grid stamps, pen stroke, or soft brush outline (mirrors in-app brush).
+    fn mcp_brush(
+        &mut self,
+        args: &serde_json::Value,
+        style: &crate::mcp::drawing::McpShapeStyle,
+    ) -> Result<String, String> {
+        use crate::document::{Fill, Node, NodeKind, Paint, Stroke};
+        use crate::mcp::drawing::{fill_from_style, parse_color_value, stroke_from_style};
+        use std::collections::BTreeMap;
+
+        let mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pixel")
+            .to_ascii_lowercase();
+        let erase = args
+            .get("erase")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let cells = args
+            .get("cells")
+            .and_then(|v| v.as_u64())
+            .map(|c| c as u32)
+            .unwrap_or(self.tools.brush.pixel_cells.max(1))
+            .max(1);
+        let size = args
+            .get("size")
+            .and_then(|v| v.as_f64())
+            .map(|s| s as f32)
+            .unwrap_or(self.tools.brush.size.max(1.0))
+            .max(0.5);
+        let smoothness = args
+            .get("smoothness")
+            .and_then(|v| v.as_f64())
+            .map(|s| s as f32)
+            .unwrap_or(self.tools.brush.smoothness)
+            .clamp(0.0, 1.0);
+
+        let gx = args
+            .get("step_x")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_else(|| self.viewport.step_x())
+            .max(0.5);
+        let gy = args
+            .get("step_y")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_else(|| self.viewport.step_y())
+            .max(0.5);
+
+        let default_fill = fill_from_style(style);
+        let default_rgb = style.fill_rgb.unwrap_or(0x5b8def);
+        let default_alpha = style.fill_alpha;
+
+        // (cx, cy, w, h, rgb, alpha)
+        let mut colored_stamps: Vec<(f64, f64, f64, f64, u32, f32)> = Vec::new();
+        // Soft/pen polyline in document space
+        let mut freehand: Vec<(f64, f64)> = Vec::new();
+
+        // --- pattern (2D pixel art) ---
+        if let Some(rows) = args.get("pattern").and_then(|v| v.as_array()) {
+            let ox = args
+                .get("origin_x")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let oy = args
+                .get("origin_y")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let (base_i, base_j) = crate::tools::pixel_cell_index((ox, oy), gx, gy);
+            for (row_i, row) in rows.iter().enumerate() {
+                let Some(cols) = row.as_array() else {
+                    return Err("pattern rows must be arrays".into());
+                };
+                for (col_i, cell) in cols.iter().enumerate() {
+                    let color = mcp_brush_cell_color(cell, default_rgb, default_alpha);
+                    let Some((rgb, a)) = color else {
+                        continue;
+                    };
+                    let doc_x = (base_i + col_i as i64) as f64 * gx + gx * 0.5;
+                    let doc_y = (base_j + row_i as i64) as f64 * gy + gy * 0.5;
+                    let (cx, cy, w, h) =
+                        crate::tools::pixel_stamp_at((doc_x, doc_y), gx, gy, cells);
+                    colored_stamps.push((cx, cy, w, h, rgb, a));
+                }
+            }
+        }
+
+        // --- stamps array ---
+        if let Some(arr) = args.get("stamps").and_then(|v| v.as_array()) {
+            for s in arr {
+                let rgb = s
+                    .get("fill_color")
+                    .and_then(parse_color_value)
+                    .unwrap_or(default_rgb);
+                let a = s
+                    .get("fill_alpha")
+                    .and_then(|v| v.as_f64())
+                    .map(|x| x.clamp(0.0, 1.0) as f32)
+                    .unwrap_or(default_alpha);
+                let doc = if let (Some(x), Some(y)) = (
+                    s.get("x").and_then(|v| v.as_f64()),
+                    s.get("y").and_then(|v| v.as_f64()),
+                ) {
+                    (x, y)
+                } else {
+                    let i = s
+                        .get("i")
+                        .or_else(|| s.get("col"))
+                        .and_then(|v| v.as_i64())
+                        .ok_or("stamp needs x,y or i/j (col/row)")?;
+                    let j = s
+                        .get("j")
+                        .or_else(|| s.get("row"))
+                        .and_then(|v| v.as_i64())
+                        .ok_or("stamp needs x,y or i/j (col/row)")?;
+                    (i as f64 * gx + gx * 0.5, j as f64 * gy + gy * 0.5)
+                };
+                let (cx, cy, w, h) = crate::tools::pixel_stamp_at(doc, gx, gy, cells);
+                colored_stamps.push((cx, cy, w, h, rgb, a));
+            }
+        }
+
+        // --- points polyline ---
+        if let Some(arr) = args.get("points").and_then(|v| v.as_array()) {
+            for p in arr {
+                let (x, y) = mcp_brush_xy(p).ok_or("points entries need x,y or [x,y]")?;
+                freehand.push((x, y));
+            }
+        }
+
+        // --- line x0,y0 → x1,y1 ---
+        let has_line = args.get("x0").is_some() || args.get("x1").is_some();
+        if has_line {
+            let x0 = args.get("x0").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y0 = args.get("y0").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let x1 = args.get("x1").and_then(|v| v.as_f64()).unwrap_or(x0);
+            let y1 = args.get("y1").and_then(|v| v.as_f64()).unwrap_or(y0);
+            freehand.push((x0, y0));
+            freehand.push((x1, y1));
+        }
+
+        // --- single x,y ---
+        if freehand.is_empty()
+            && colored_stamps.is_empty()
+            && (args.get("x").is_some() || args.get("y").is_some())
+        {
+            let x = args.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            freehand.push((x, y));
+        }
+
+        if freehand.is_empty() && colored_stamps.is_empty() {
+            return Err(
+                "brush needs points, stamps, pattern, x/y, or x0,y0,x1,y1".into(),
+            );
+        }
+
+        // Expand freehand into pixel stamps when mode=pixel and no pattern/stamps colors yet
+        // (or always for freehand in pixel mode).
+        let is_pixel = mode == "pixel" || mode == "pixel_brush" || mode.is_empty();
+        if is_pixel && !freehand.is_empty() {
+            // Dense stamps along each segment
+            let mut path_pts = freehand.clone();
+            if path_pts.len() == 1 {
+                path_pts.push(path_pts[0]);
+            }
+            for w in path_pts.windows(2) {
+                let stamps =
+                    crate::tools::pixel_stamps_along(w[0], w[1], gx, gy, cells);
+                for (cx, cy, w, h) in stamps {
+                    colored_stamps.push((cx, cy, w, h, default_rgb, default_alpha));
+                }
+            }
+        }
+
+        // --- erase ---
+        if erase {
+            if !is_pixel {
+                return Err("erase only supported for mode=pixel".into());
+            }
+            let prev_cells = self.tools.brush.pixel_cells;
+            self.tools.brush.pixel_cells = cells;
+            // Temporarily override viewport steps via direct erase using strip API
+            self.pixel_erase_begin();
+            self.tools.brush.points.clear();
+            let mut erased_cells = 0usize;
+            let mut seen = std::collections::HashSet::new();
+            // Batch all unique erase rects then strip once per node for speed.
+            let mut erase_rects: Vec<(f64, f64, f64, f64)> = Vec::new();
+            for &(cx, cy, w, h, _, _) in &colored_stamps {
+                let key = (
+                    (cx * 1000.0).round() as i64,
+                    (cy * 1000.0).round() as i64,
+                );
+                if !seen.insert(key) {
+                    continue;
+                }
+                erase_rects.push((cx, cy, w, h));
+                erased_cells += 1;
+            }
+            let ids: Vec<crate::document::NodeId> = self
+                .project
+                .document
+                .active_layer()
+                .map(|l| l.nodes.clone())
+                .unwrap_or_default();
+            let mut empty_ids = Vec::new();
+            for id in ids {
+                let Some(node) = self.project.nodes.get_mut(id) else {
+                    continue;
+                };
+                let NodeKind::Path { path } = &mut node.kind else {
+                    continue;
+                };
+                let new_bez = strip_pixel_rects_from_bez(&path.to_bez(), &erase_rects);
+                let empty = !new_bez.elements().iter().any(|e| {
+                    matches!(
+                        e,
+                        kurbo::PathEl::LineTo(_)
+                            | kurbo::PathEl::CurveTo(_, _, _)
+                            | kurbo::PathEl::QuadTo(_, _)
+                    )
+                });
+                if empty {
+                    empty_ids.push(id);
+                } else {
+                    *path = crate::document::PathData::from_bez(&new_bez);
+                }
+            }
+            for id in empty_ids {
+                let _ = self.project.nodes.remove(id);
+                if let Some(layer) = self.project.document.active_layer_mut() {
+                    layer.nodes.retain(|&n| n != id);
+                }
+            }
+            self.pixel_erase_commit();
+            self.tools.brush.pixel_cells = prev_cells;
+            self.tools.brush.points.clear();
+            return Ok(format!(
+                "Erased pixel stamps under {erased_cells} cells"
+            ));
+        }
+
+        // --- soft / pen modes ---
+        if !is_pixel {
+            if freehand.len() < 2 {
+                return Err("pen/brush mode needs at least 2 points (or a line)".into());
+            }
+            let brush_type = match mode.as_str() {
+                "pen" => crate::tools::BrushType::Pen,
+                "calligraphy" | "calli" => crate::tools::BrushType::Calligraphy,
+                _ => crate::tools::BrushType::Standard,
+            };
+            let mut pts: Vec<([f64; 2], f64, f32)> = Vec::with_capacity(freehand.len());
+            for (i, &(x, y)) in freehand.iter().enumerate() {
+                pts.push(([x, y], i as f64 * 0.016, size));
+            }
+            if brush_type != crate::tools::BrushType::Calligraphy {
+                if let Some(last) = pts.last_mut() {
+                    last.2 = 0.0;
+                }
+            }
+            let mut node = if brush_type == crate::tools::BrushType::Pen {
+                Node::new(
+                    NodeKind::BrushStroke {
+                        points: pts.iter().map(|(p, _, w)| (*p, *w)).collect(),
+                    },
+                    "Pen Stroke",
+                )
+            } else {
+                let bez = generate_brush_outline(&pts, smoothness, brush_type);
+                Node::path_from_bez(
+                    bez,
+                    if brush_type == crate::tools::BrushType::Calligraphy {
+                        "Calligraphy"
+                    } else {
+                        "Brush"
+                    },
+                )
+            };
+            node.style.fill = default_fill;
+            node.style.stroke = Stroke {
+                style: Fill::none(),
+                width: 0.0,
+                line_join: crate::document::LineJoin::Miter,
+                line_cap: crate::document::LineCap::Butt,
+                paint_order: crate::document::StrokePaintOrder::BehindFill,
+                start_marker: crate::document::PathMarker::default(),
+                mid_marker: crate::document::PathMarker::default(),
+                end_marker: crate::document::PathMarker::default(),
+            };
+            if style.stroke_rgb.is_some() && style.stroke_width > 0.0 {
+                node.style.stroke = stroke_from_style(style);
+            }
+            if let Some(n) = style.name.clone() {
+                node.name = n;
+            }
+            let id = node.id;
+            self.insert_node(node);
+            return Ok(format!("Created {mode} stroke {id} ({} pts)", freehand.len()));
+        }
+
+        // --- pixel paint: group by color → path of rects ---
+        if colored_stamps.is_empty() {
+            return Err("no stamps to paint".into());
+        }
+
+        let mut by_color: BTreeMap<(u32, u32), Vec<([f64; 2], f64, f32)>> = BTreeMap::new();
+        let aspect = gy / gx;
+        let mut seen = std::collections::HashSet::new();
+        for &(cx, cy, w, _h, rgb, a) in &colored_stamps {
+            let key = (
+                (cx * 1000.0).round() as i64,
+                (cy * 1000.0).round() as i64,
+                (w * 100.0).round() as i64,
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            // Pack alpha into discrete key (0..1000)
+            let a_key = (a.clamp(0.0, 1.0) * 1000.0).round() as u32;
+            by_color
+                .entry((rgb, a_key))
+                .or_default()
+                .push(([cx, cy], 0.0, w as f32));
+        }
+
+        let mut ids = Vec::new();
+        let multi = by_color.len() > 1;
+        for ((rgb, a_key), pts) in by_color {
+            let a = a_key as f32 / 1000.0;
+            let bez = pixel_stamps_to_path(&pts, aspect);
+            let name = style
+                .name
+                .clone()
+                .unwrap_or_else(|| {
+                    if multi {
+                        format!("Pixel Brush #{rgb:06x}")
+                    } else {
+                        "Pixel Brush".into()
+                    }
+                });
+            let mut node = Node::path_from_bez(bez, &name);
+            node.style.fill = Fill::Solid(Paint::from_hex(rgb, a));
+            node.style.stroke = Stroke {
+                style: Fill::none(),
+                width: 0.0,
+                line_join: crate::document::LineJoin::Miter,
+                line_cap: crate::document::LineCap::Butt,
+                paint_order: crate::document::StrokePaintOrder::BehindFill,
+                start_marker: crate::document::PathMarker::default(),
+                mid_marker: crate::document::PathMarker::default(),
+                end_marker: crate::document::PathMarker::default(),
+            };
+            ids.push(node.id);
+            self.insert_node(node);
+        }
+
+        Ok(format!(
+            "Created pixel brush ({} stamps → {} object(s): {})",
+            seen.len(),
+            ids.len(),
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
     fn mcp_drawing_tool(&mut self, name: &str, args: serde_json::Value) -> Result<String, String> {
         use crate::document::{ArcJoin, Fill, Node, NodeKind, TextStyle};
         use crate::mcp::drawing::{fill_from_style, parse_arc_join, style_from_args, stroke_from_style};
@@ -15813,6 +16203,7 @@ fn run_video_decode_thread(
                 }
                 Ok(format!("Created {} rectangles (queued for smooth creation)", n))
             }
+            "brush" | "brush_stroke" | "paint_brush" => self.mcp_brush(&args, &style),
             "create_circle" => {
                 let cx = args.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let cy = args.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -15894,9 +16285,16 @@ fn run_video_decode_thread(
                     .and_then(|v| v.as_f64())
                     .map(|s| s.max(1.0) as f32)
                     .unwrap_or(24.0);
+                let box_w = args
+                    .get("width")
+                    .or_else(|| args.get("max_width"))
+                    .and_then(|v| v.as_f64())
+                    .map(|w| w.max(0.0) as f32)
+                    .unwrap_or(0.0);
                 let mut text_style = TextStyle {
                     content,
                     font_size,
+                    width: box_w,
                     ..TextStyle::default()
                 };
                 let fill = fill_from_style(&style);
@@ -17131,6 +17529,13 @@ fn run_video_decode_thread(
                 if let Some(v) = patch.get("font_size").and_then(|v| v.as_f64()) {
                     style.font_size = v.max(1.0) as f32;
                 }
+                if let Some(v) = patch
+                    .get("width")
+                    .or_else(|| patch.get("max_width"))
+                    .and_then(|v| v.as_f64())
+                {
+                    style.width = v.max(0.0) as f32;
+                }
             }
             _ => {}
         }
@@ -18187,6 +18592,67 @@ fn strip_pixel_rects_from_bez(
     out
 }
 
+/// Parse brush point: `{x,y}` or `[x,y]`.
+fn mcp_brush_xy(v: &serde_json::Value) -> Option<(f64, f64)> {
+    if let Some(arr) = v.as_array() {
+        if arr.len() >= 2 {
+            return Some((arr[0].as_f64()?, arr[1].as_f64()?));
+        }
+        return None;
+    }
+    let x = v.get("x")?.as_f64()?;
+    let y = v.get("y")?.as_f64()?;
+    Some((x, y))
+}
+
+/// Pattern cell → Some(rgb, alpha) or None if empty.
+fn mcp_brush_cell_color(
+    cell: &serde_json::Value,
+    default_rgb: u32,
+    default_alpha: f32,
+) -> Option<(u32, f32)> {
+    use crate::mcp::drawing::parse_color_value;
+    if cell.is_null() {
+        return None;
+    }
+    if let Some(b) = cell.as_bool() {
+        return if b {
+            Some((default_rgb, default_alpha))
+        } else {
+            None
+        };
+    }
+    if let Some(n) = cell.as_i64() {
+        if n == 0 {
+            return None;
+        }
+        if n == 1 {
+            return Some((default_rgb, default_alpha));
+        }
+        return Some(((n as u32) & 0xFFFFFF, default_alpha));
+    }
+    if let Some(n) = cell.as_u64() {
+        if n == 0 {
+            return None;
+        }
+        if n == 1 {
+            return Some((default_rgb, default_alpha));
+        }
+        return Some((n as u32 & 0xFFFFFF, default_alpha));
+    }
+    if let Some(s) = cell.as_str() {
+        let t = s.trim();
+        if t.is_empty() || t == "0" || t.eq_ignore_ascii_case("null") || t == "-" {
+            return None;
+        }
+        if t == "1" || t.eq_ignore_ascii_case("true") {
+            return Some((default_rgb, default_alpha));
+        }
+        return parse_color_value(cell).map(|rgb| (rgb, default_alpha));
+    }
+    parse_color_value(cell).map(|rgb| (rgb, default_alpha))
+}
+
 /// Bake pixel-brush stamps into a path of axis-aligned rects (pixel look).
 /// `points` are (center, time, width_x); height = width_x * aspect (gy/gx).
 fn pixel_stamps_to_path(points: &[([f64; 2], f64, f32)], aspect: f64) -> kurbo::BezPath {
@@ -18532,6 +18998,7 @@ mod tests {
                 ui_stroke_width: 2.0,
                 ui_text_content: "Text".into(),
                 ui_text_font_size: 24.0,
+                ui_text_width: 0.0,
                 ui_text_font_family: default_font,
                 fonts,
                 ui_text_bold: false,

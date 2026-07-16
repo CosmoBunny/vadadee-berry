@@ -176,6 +176,8 @@ struct TextCacheKey {
     bold: bool,
     italic: bool,
     font_size_bits: u32,
+    /// Box width (0 = auto); must invalidate cache when wrap width changes.
+    width_bits: u32,
     fill_debug: String,
     stroke_style_debug: String,
     stroke_width_bits: u32,
@@ -224,7 +226,9 @@ fn build_text_path_relative(
         max_y = max_y.max(p.y);
     };
 
-    for (line_idx, line) in style.content.lines().enumerate() {
+    // Use wrap-aware layout lines so fixed `style.width` limits horizontal growth.
+    let layout_lines = style.layout_lines();
+    for (line_idx, line) in layout_lines.iter().enumerate() {
         let baseline_doc = ascender_doc as f64 + line_idx as f64 * line_height_doc as f64;
         let mut pen_x = 0.0f64;
 
@@ -310,6 +314,7 @@ pub fn draw_text_glyphs(
         bold: style.bold,
         italic: style.italic,
         font_size_bits: style.font_size.to_bits(),
+        width_bits: style.width.to_bits(),
         fill_debug: format!("{:?}", fill),
         stroke_style_debug: format!("{:?}", stroke_style),
         stroke_width_bits: stroke_width_screen.map(|w| w.to_bits()).unwrap_or(0),

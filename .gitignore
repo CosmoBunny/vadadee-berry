@@ -23,3 +23,9 @@ app/src/main/jniLibs/**/*.so
 
 # Distribution artifacts
 /dist/
+
+# Local agent/session caches & scratch
+.cache/
+scratch/
+.deps/
+*.deb

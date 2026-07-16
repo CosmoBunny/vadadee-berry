@@ -354,6 +354,88 @@ pub fn drawing_tools() -> Vec<Value> {
         &["rects"],
     ));
 
+    // Brush tool — mirrors in-app Pixel / Pen / Brush (grid snap + path bake).
+    {
+        let mut brush_props = json!({
+            "mode": {
+                "type": "string",
+                "description": "pixel (default, grid stamps) | pen | brush|standard (soft outline) | calligraphy"
+            },
+            "erase": {
+                "type": "boolean",
+                "description": "Pixel mode only: erase grid stamps under the stroke (like Shift+brush)"
+            },
+            "cells": {
+                "type": "integer",
+                "description": "Pixel stamp size in grid cells (n×n block). Default 1"
+            },
+            "size": {
+                "type": "number",
+                "description": "Pen/brush stroke width in document px (default 8)"
+            },
+            "smoothness": {
+                "type": "number",
+                "description": "Soft brush outline smoothness 0..1 (default 0.35)"
+            },
+            "step_x": {
+                "type": "number",
+                "description": "Override grid cell width (default viewport page_width/grid_cols)"
+            },
+            "step_y": {
+                "type": "number",
+                "description": "Override grid cell height (default viewport page_height/grid_rows)"
+            },
+            "x": { "type": "number", "description": "Single stamp / start X (document px)" },
+            "y": { "type": "number", "description": "Single stamp / start Y" },
+            "x0": { "type": "number", "description": "Line start X" },
+            "y0": { "type": "number", "description": "Line start Y" },
+            "x1": { "type": "number", "description": "Line end X" },
+            "y1": { "type": "number", "description": "Line end Y" },
+            "points": {
+                "type": "array",
+                "description": "Polyline freehand: [{x,y}, ...] or [[x,y], ...]",
+                "items": {}
+            },
+            "stamps": {
+                "type": "array",
+                "description": "Discrete stamps: {x,y} doc px, or {i,j}/{col,row} cell indices. Optional fill_color per stamp.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "number" },
+                        "y": { "type": "number" },
+                        "i": { "type": "integer", "description": "Column index (alias col)" },
+                        "j": { "type": "integer", "description": "Row index (alias row)" },
+                        "col": { "type": "integer" },
+                        "row": { "type": "integer" },
+                        "fill_color": { "type": "string" },
+                        "fill_alpha": { "type": "number" }
+                    }
+                }
+            },
+            "pattern": {
+                "type": "array",
+                "description": "2D row-major pixel art: array of rows; each cell is null/\"\"/0 (empty) or color #RRGGBB. Drawn from origin_x/origin_y in grid cells.",
+                "items": { "type": "array", "items": {} }
+            },
+            "origin_x": {
+                "type": "number",
+                "description": "Top-left X for pattern (default 0). Snapped via grid."
+            },
+            "origin_y": {
+                "type": "number",
+                "description": "Top-left Y for pattern (default 0)"
+            }
+        });
+        merge_props(&mut brush_props, &style);
+        tools.push(tool(
+            "brush",
+            "Paint with the app brush (pixel grid stamps, pen, or soft brush). Prefer mode=pixel + pattern/stamps/points for pixel art. Uses viewport grid (set View grid cols/rows) unless step_x/step_y override. erase=true removes pixel stamps under the stroke.",
+            brush_props,
+            &[],
+        ));
+    }
+
     tools.push(tool(
         "create_image",
         "Place a raster image on the active layer (PNG/JPEG/WebP). Use path for generated files, or image_base64 / raw rgba.",
@@ -460,12 +542,20 @@ pub fn drawing_tools() -> Vec<Value> {
         "x": { "type": "number" },
         "y": { "type": "number" },
         "text": { "type": "string" },
-        "font_size": { "type": "number" }
+        "font_size": { "type": "number" },
+        "width": {
+            "type": "number",
+            "description": "Box width in document px (real). 0/omit = auto (no wrap); >0 wraps text to this width"
+        },
+        "max_width": {
+            "type": "number",
+            "description": "Alias for width"
+        }
     });
     merge_props(&mut text_props, &style);
     tools.push(tool(
         "create_text",
-        "Create a text object",
+        "Create a text object. Optional width (>0) sets a fixed wrap box so long text does not grow infinitely wide.",
         text_props,
         &["x", "y", "text"],
     ));

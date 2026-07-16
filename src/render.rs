@@ -113,14 +113,15 @@ pub fn draw_page_shadow(painter: &Painter, page: Rect, page_color: Color32) {
 }
 
 fn paint_to_color(p: Paint, opacity: f32) -> Color32 {
-    let mut c = p.to_egui();
-    c = Color32::from_rgba_premultiplied(
-        c.r(),
-        c.g(),
-        c.b(),
-        (c.a() as f32 * opacity) as u8,
-    );
-    c
+    // Paint RGB is straight; multiply alpha by node opacity, then premultiply for egui meshes.
+    let c = p.to_egui();
+    let a = ((c.a() as f32 / 255.0) * opacity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    Color32::from_rgba_premultiplied(
+        (c.r() as f32 * a).round() as u8,
+        (c.g() as f32 * a).round() as u8,
+        (c.b() as f32 * a).round() as u8,
+        (a * 255.0).round() as u8,
+    )
 }
 
 fn stroke_width(node: &Node, viewport: &Viewport) -> Option<f32> {
@@ -2195,11 +2196,14 @@ pub fn draw_node(
                 let tl = viewport.doc_to_screen((*x, *y), origin);
                 let br = viewport.doc_to_screen((*x + *width, *y + *height), origin);
                 let rect = Rect::from_min_max(tl, br);
+                // Tint multiplies texture; premultiplied white×opacity = correct fade.
+                let a = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let tint = Color32::from_rgba_premultiplied(a, a, a, a);
                 painter.image(
                     tex.id(),
                     rect,
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
+                    tint,
                 );
             }
         }
@@ -2510,6 +2514,40 @@ pub fn draw_nodes(
     fonts: &crate::fonts::FontRegistry,
     image_textures: &std::collections::HashMap<NodeId, egui::TextureHandle>,
 ) {
+    draw_nodes_ex(
+        painter,
+        nodes,
+        order,
+        viewport,
+        origin,
+        page_w,
+        page_h,
+        selection,
+        hidden,
+        loft_paths,
+        fonts,
+        image_textures,
+        Color32::WHITE,
+    );
+}
+
+/// Like [`draw_nodes`] but uses `page_color` as blend-mode backdrop (prevents
+/// multiply/etc. against black making images vanish).
+pub fn draw_nodes_ex(
+    painter: &Painter,
+    nodes: &NodeStore,
+    order: &[NodeId],
+    viewport: &Viewport,
+    origin: Pos2,
+    page_w: f32,
+    page_h: f32,
+    selection: &[NodeId],
+    hidden: &HashSet<NodeId>,
+    loft_paths: &HashSet<NodeId>,
+    fonts: &crate::fonts::FontRegistry,
+    image_textures: &std::collections::HashMap<NodeId, egui::TextureHandle>,
+    page_color: Color32,
+) {
     if crate::blend::document_needs_blend_composite(nodes, order, hidden) {
         draw_nodes_with_blend(
             painter,
@@ -2524,6 +2562,7 @@ pub fn draw_nodes(
             loft_paths,
             fonts,
             image_textures,
+            page_color,
         );
         return;
     }
@@ -2598,8 +2637,10 @@ pub fn draw_nodes(
     }
 }
 
-/// Fixed pixel budget for blend ROIs — independent of zoom (high zoom just upscales).
-const BLEND_ROI_MAX_EDGE: u32 = 192;
+/// Pixel budget for blend ROIs. Larger = sharper when zoomed; still capped for CPU.
+const BLEND_ROI_MAX_EDGE: u32 = 512;
+/// While moving/zooming, allow a slightly smaller budget if rebuilds thrash.
+const BLEND_ROI_INTERACT_EDGE: u32 = 256;
 
 /// Cached CPU blend ROI texture (rebuild when content/zoom changes, not every pan).
 #[derive(Clone)]
@@ -2655,6 +2696,7 @@ fn draw_nodes_with_blend(
     loft_paths: &HashSet<NodeId>,
     fonts: &crate::fonts::FontRegistry,
     image_textures: &std::collections::HashMap<NodeId, egui::TextureHandle>,
+    page_color: Color32,
 ) {
     let _ = (page_w, page_h);
     let vis = painter.clip_rect();
@@ -2735,67 +2777,61 @@ fn draw_nodes_with_blend(
         }
         let key = blend_content_key(viewport.zoom, id, &under_refs);
 
-        let cache_id = egui::Id::new("blend_roi_v3").with(id);
+        let cache_id = egui::Id::new("blend_roi_v4").with(id);
         let cached_tex = painter.ctx().data(|d| {
             d.get_temp::<BlendRoiCache>(cache_id)
                 .filter(|e| e.key == key)
                 .map(|e| e.tex.clone())
         });
 
+        // Prefer cache; if miss, try stale tex while pointer is busy (smooth pan/zoom).
+        let interact = painter.ctx().input(|inp| {
+            inp.pointer.any_down() || inp.smooth_scroll_delta != egui::Vec2::ZERO
+        });
         let tex = if let Some(t) = cached_tex {
             t
         } else {
-            // Always build a tiny buffer (≤192px edge) — zoom only changes display scale.
-            let full_w = roi.width().max(1.0);
-            let full_h = roi.height().max(1.0);
-            let down = (BLEND_ROI_MAX_EDGE as f32 / full_w.max(full_h)).min(1.0);
-            let rw = (full_w * down).round().max(1.0) as u32;
-            let rh = (full_h * down).round().max(1.0) as u32;
-            let sx = rw as f32 / full_w;
-            let sy = rh as f32 / full_h;
-
-            let mut layer = vec![255u8; (rw * rh * 4) as usize];
-            for j in 0..=i {
-                let (uid, _) = paint_ids[j];
-                let Some(un) = nodes.get(uid) else {
-                    continue;
-                };
-                let lofted_u = loft_override(uid, un);
-                let under_n = lofted_u.as_ref().unwrap_or(un);
-                if matches!(under_n.kind, NodeKind::Group { .. }) {
-                    continue;
+            let stale = painter.ctx().data(|d| {
+                d.get_temp::<BlendRoiCache>(cache_id).map(|e| e.tex.clone())
+            });
+            if interact {
+                if let Some(t) = stale {
+                    painter.ctx().request_repaint();
+                    t
+                } else {
+                    rebuild_blend_roi_tex(
+                        painter,
+                        cache_id,
+                        key,
+                        id,
+                        &paint_ids,
+                        i,
+                        nodes,
+                        loft_override,
+                        roi,
+                        viewport,
+                        origin,
+                        page_color,
+                        BLEND_ROI_INTERACT_EDGE,
+                    )
                 }
-                stamp_node_into_blend_roi(
-                    &mut layer,
-                    rw,
-                    rh,
-                    roi,
-                    sx,
-                    sy,
-                    under_n,
+            } else {
+                rebuild_blend_roi_tex(
+                    painter,
+                    cache_id,
+                    key,
+                    id,
+                    &paint_ids,
+                    i,
                     nodes,
+                    loft_override,
+                    roi,
                     viewport,
                     origin,
-                );
+                    page_color,
+                    BLEND_ROI_MAX_EDGE,
+                )
             }
-
-            let image =
-                egui::ColorImage::from_rgba_premultiplied([rw as usize, rh as usize], &layer);
-            let tex = painter.ctx().load_texture(
-                format!("blend_roi_{id}"),
-                image,
-                egui::TextureOptions::LINEAR,
-            );
-            painter.ctx().data_mut(|d| {
-                d.insert_temp(
-                    cache_id,
-                    BlendRoiCache {
-                        key,
-                        tex: tex.clone(),
-                    },
-                );
-            });
-            tex
         };
 
         painter.image(
@@ -2805,6 +2841,87 @@ fn draw_nodes_with_blend(
             Color32::WHITE,
         );
     }
+}
+
+fn rebuild_blend_roi_tex(
+    painter: &Painter,
+    cache_id: egui::Id,
+    key: u64,
+    blend_id: NodeId,
+    paint_ids: &[(NodeId, bool)],
+    blend_index: usize,
+    nodes: &NodeStore,
+    loft_override: impl Fn(NodeId, &Node) -> Option<Node>,
+    roi: Rect,
+    viewport: &Viewport,
+    origin: Pos2,
+    page_color: Color32,
+    max_edge: u32,
+) -> egui::TextureHandle {
+    let full_w = roi.width().max(1.0);
+    let full_h = roi.height().max(1.0);
+    let down = (max_edge as f32 / full_w.max(full_h)).min(1.0);
+    let rw = (full_w * down).round().max(1.0) as u32;
+    let rh = (full_h * down).round().max(1.0) as u32;
+    let sx = rw as f32 / full_w;
+    let sy = rh as f32 / full_h;
+
+    // Page-color opaque backdrop so Multiply/Screen/etc. blend against the page,
+    // not black (black backdrop made images look crushed or “vanished”).
+    let pr = page_color.r();
+    let pg = page_color.g();
+    let pb = page_color.b();
+    let mut layer = vec![0u8; (rw * rh * 4) as usize];
+    for px in layer.chunks_exact_mut(4) {
+        px[0] = pr;
+        px[1] = pg;
+        px[2] = pb;
+        px[3] = 255;
+    }
+    for j in 0..=blend_index {
+        let (uid, _) = paint_ids[j];
+        let Some(un) = nodes.get(uid) else {
+            continue;
+        };
+        let lofted_u = loft_override(uid, un);
+        let under_n = lofted_u.as_ref().unwrap_or(un);
+        if matches!(under_n.kind, NodeKind::Group { .. }) {
+            continue;
+        }
+        stamp_node_into_blend_roi(
+            &mut layer,
+            rw,
+            rh,
+            roi,
+            sx,
+            sy,
+            under_n,
+            nodes,
+            viewport,
+            origin,
+        );
+    }
+
+    // Premultiply for egui: composite_stamp already writes premultiplied for Normal
+    // and mode path; ColorImage::from_rgba_unmultiplied if straight — our buffer is
+    // premultiplied (Normal path) / approximately premultiplied (modes).
+    let image = egui::ColorImage::from_rgba_premultiplied([rw as usize, rh as usize], &layer);
+    // NEAREST: avoid soft blur when stretching ROI to screen (esp. raw images).
+    let tex = painter.ctx().load_texture(
+        format!("blend_roi_{blend_id}"),
+        image,
+        egui::TextureOptions::NEAREST,
+    );
+    painter.ctx().data_mut(|d| {
+        d.insert_temp(
+            cache_id,
+            BlendRoiCache {
+                key,
+                tex: tex.clone(),
+            },
+        );
+    });
+    tex
 }
 
 /// Stamp a node into an ROI buffer at exact pixel size of the ROI∩node intersection
@@ -2897,11 +3014,12 @@ fn rasterize_node_region(
             let resized = if crop.width() == out_w && crop.height() == out_h {
                 crop
             } else {
+                // Nearest: sharp (and faster) — Triangle made blended images look soft/muddy.
                 image::imageops::resize(
                     &crop,
                     out_w,
                     out_h,
-                    image::imageops::FilterType::Triangle,
+                    image::imageops::FilterType::Nearest,
                 )
             };
             Some(resized.into_raw())
@@ -4069,15 +4187,22 @@ fn draw_text_node(
     let pos = viewport.doc_to_screen((x, y), origin);
     let fill_color = sample_fill_at(fill, opacity, 0.5, 0.5);
     let font_id = text_font_id(style, viewport.zoom);
-    if style.bold || style.italic {
+    let layout_text = style.layout_lines().join("\n");
+    let wrap_px = style
+        .wrap_width()
+        .map(|w| (w * viewport.zoom).max(8.0));
+    if style.bold || style.italic || wrap_px.is_some() {
         let mut job = egui::text::LayoutJob::default();
         let mut fmt = egui::TextFormat::simple(font_id, fill_color);
         fmt.italics = style.italic;
-        job.append(&style.content, 0.0, fmt);
+        if let Some(w) = wrap_px {
+            job.wrap.max_width = w;
+        }
+        job.append(&layout_text, 0.0, fmt);
         let galley = painter.layout_job(job);
         painter.galley(pos, galley, fill_color);
     } else {
-        painter.text(pos, Align2::LEFT_TOP, style.content.as_str(), font_id, fill_color);
+        painter.text(pos, Align2::LEFT_TOP, layout_text.as_str(), font_id, fill_color);
     }
 }
 

@@ -7780,6 +7780,7 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             origin_y,
             width,
             height,
+            box_width,
             content,
             font_size,
             font_family,
@@ -7797,6 +7798,49 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ui.label(format!("W: {width:.1}"));
                     ui.label(format!("H: {height:.1}"));
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Box width");
+                    let mut auto = box_width <= 0.5;
+                    if ui
+                        .checkbox(&mut auto, "Auto")
+                        .on_hover_text("Auto: grow with content (no wrap). Off: fixed wrap width.")
+                        .changed()
+                    {
+                        app.ui_text_width = if auto {
+                            0.0
+                        } else {
+                            width.max(40.0) as f32
+                        };
+                        changed = true;
+                    }
+                    if !auto {
+                        let mut bw = if app.ui_text_width > 0.5 {
+                            app.ui_text_width
+                        } else {
+                            box_width.max(width as f32).max(40.0)
+                        };
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut bw)
+                                    .speed(1.0)
+                                    .range(8.0..=8000.0)
+                                    .suffix(" px"),
+                            )
+                            .on_hover_text("Fixed layout width (document px). Text wraps to this.")
+                            .changed()
+                        {
+                            app.ui_text_width = bw;
+                            changed = true;
+                        }
+                    } else {
+                        app.ui_text_width = 0.0;
+                        ui.label(
+                            RichText::new(format!("(measured {width:.0} px)"))
+                                .small()
+                                .color(colors::TEXT_MUTED),
+                        );
+                    }
+                });
             });
             let mut style = TextStyle {
                 content,
@@ -7804,6 +7848,7 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 font_family,
                 bold,
                 italic,
+                width: box_width,
             };
             if text_style_panel(app, ui, false) {
                 style.content = app.ui_text_content.clone();
@@ -7811,9 +7856,11 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 style.font_family = app.ui_text_font_family.clone();
                 style.bold = app.ui_text_bold;
                 style.italic = app.ui_text_italic;
+                style.width = app.ui_text_width;
                 changed = true;
             }
             if changed {
+                style.width = app.ui_text_width;
                 app.set_text_style(id, style, x, y);
             }
         }
@@ -7962,7 +8009,7 @@ pub fn show_on_page_text_editor(
         app.text_editor_rect = None;
         return;
     };
-    let (doc_x, doc_y, font_size, font_family) = {
+    let (doc_x, doc_y, font_size, font_family, box_w) = {
         let Some(node) = app.project.nodes.get(id) else {
             app.on_page_text_edit = None;
             return;
@@ -7971,7 +8018,13 @@ pub fn show_on_page_text_editor(
             app.on_page_text_edit = None;
             return;
         };
-        (*x, *y, style.font_size, style.font_family.clone())
+        (
+            *x,
+            *y,
+            style.font_size,
+            style.font_family.clone(),
+            style.width,
+        )
     };
 
     let screen_pos = app.viewport.doc_to_screen((doc_x, doc_y), origin);
@@ -7981,7 +8034,12 @@ pub fn show_on_page_text_editor(
         .get(id)
         .map(|n| n.bounds())
         .unwrap_or_default();
-    let min_w = ((bounds.x1 - bounds.x0) as f32 * app.viewport.zoom).max(160.0);
+    // Prefer fixed box width when set; else measured bounds with a usable minimum.
+    let min_w = if box_w > 0.5 {
+        (box_w * app.viewport.zoom).max(80.0)
+    } else {
+        ((bounds.x1 - bounds.x0) as f32 * app.viewport.zoom).max(160.0)
+    };
 
     let ctx = ui.ctx().clone();
     app.fonts.ensure_loaded(&ctx, &font_family);
@@ -8147,6 +8205,28 @@ fn text_style_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, for_new_text: bool) 
         changed |= ui
             .add(egui::Slider::new(&mut app.ui_text_font_size, 8.0..=128.0).text("Size"))
             .changed();
+        ui.horizontal(|ui| {
+            ui.label("Box width");
+            let mut auto = app.ui_text_width <= 0.5;
+            if ui
+                .checkbox(&mut auto, "Auto")
+                .on_hover_text("Auto grows with text. Uncheck for a fixed wrap width (px).")
+                .changed()
+            {
+                app.ui_text_width = if auto { 0.0 } else { 240.0 };
+                changed = true;
+            }
+            if !auto {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut app.ui_text_width)
+                            .speed(1.0)
+                            .range(8.0..=8000.0)
+                            .suffix(" px"),
+                    )
+                    .changed();
+            }
+        });
         ui.horizontal(|ui| {
             ui.label("Font");
             let selected = app.ui_text_font_family.clone();

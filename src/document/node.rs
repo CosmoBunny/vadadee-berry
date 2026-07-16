@@ -142,8 +142,11 @@ pub enum GeometryProfile {
     Text {
         origin_x: f64,
         origin_y: f64,
+        /// Measured / layout bounds width (document px).
         width: f64,
         height: f64,
+        /// Configured box width: `0` = auto, `>0` = wrap width.
+        box_width: f32,
         content: String,
         font_size: f32,
         font_family: String,
@@ -224,6 +227,11 @@ pub struct TextStyle {
     pub font_family: String,
     pub bold: bool,
     pub italic: bool,
+    /// Layout box width in document px (real number).
+    /// - `0` = **auto**: width follows content (no wrap).
+    /// - `> 0` = fixed wrap width; lines wrap and height grows.
+    #[serde(default, alias = "max_width")]
+    pub width: f32,
 }
 
 impl Default for TextStyle {
@@ -234,7 +242,113 @@ impl Default for TextStyle {
             font_family: default_font_family(),
             bold: false,
             italic: false,
+            width: 0.0,
         }
+    }
+}
+
+impl TextStyle {
+    /// True when a fixed wrap box is active.
+    pub fn has_fixed_width(&self) -> bool {
+        self.width.is_finite() && self.width > 0.5
+    }
+
+    /// Effective wrap width in document px, or `None` for auto (no wrap).
+    pub fn wrap_width(&self) -> Option<f32> {
+        if self.has_fixed_width() {
+            Some(self.width.max(1.0))
+        } else {
+            None
+        }
+    }
+
+    /// Approximate advance width of a string (document px) for layout/wrap.
+    pub fn estimate_text_width(&self, s: &str) -> f32 {
+        let size = self.font_size.max(1.0);
+        // Average Latin advance ≈ 0.55em; CJK closer to 1em — use len-based hybrid.
+        let mut w = 0.0f32;
+        for ch in s.chars() {
+            w += if ch <= '\u{00ff}' {
+                size * 0.55
+            } else {
+                size * 0.95
+            };
+        }
+        w
+    }
+
+    /// Soft-wrap `content` to [`Self::width`] when fixed; otherwise split on newlines only.
+    pub fn layout_lines(&self) -> Vec<String> {
+        Self::layout_lines_ex(&self.content, self.font_size, self.wrap_width())
+    }
+
+    /// Layout lines for arbitrary content / wrap width (shared by bounds + render).
+    pub fn layout_lines_ex(content: &str, font_size: f32, wrap_width: Option<f32>) -> Vec<String> {
+        if content.is_empty() {
+            return vec![String::new()];
+        }
+        let measure = |s: &str| {
+            let size = font_size.max(1.0);
+            let mut w = 0.0f32;
+            for ch in s.chars() {
+                w += if ch <= '\u{00ff}' {
+                    size * 0.55
+                } else {
+                    size * 0.95
+                };
+            }
+            w
+        };
+        let Some(max_w) = wrap_width else {
+            let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+            return if lines.is_empty() {
+                vec![String::new()]
+            } else {
+                lines
+            };
+        };
+        let max_w = max_w.max(1.0);
+
+        let mut out: Vec<String> = Vec::new();
+        for para in content.split('\n') {
+            if para.is_empty() {
+                out.push(String::new());
+                continue;
+            }
+            let mut line = String::new();
+            for word in para.split_inclusive(char::is_whitespace) {
+                let candidate = if line.is_empty() {
+                    word.to_string()
+                } else {
+                    format!("{line}{word}")
+                };
+                if measure(&candidate) <= max_w {
+                    line = candidate;
+                    continue;
+                }
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                if measure(word) <= max_w {
+                    line = word.trim_start().to_string();
+                } else {
+                    let mut chunk = String::new();
+                    for ch in word.chars() {
+                        let next = format!("{chunk}{ch}");
+                        if !chunk.is_empty() && measure(&next) > max_w {
+                            out.push(std::mem::take(&mut chunk));
+                        }
+                        chunk.push(ch);
+                    }
+                    line = chunk.trim_start().to_string();
+                }
+            }
+            out.push(line);
+        }
+        if out.is_empty() {
+            out.push(String::new());
+        }
+        out
     }
 }
 
@@ -2108,6 +2222,7 @@ impl Node {
                     origin_y: *y,
                     width: bounds.width(),
                     height: bounds.height(),
+                    box_width: style.width,
                     content: style.content.clone(),
                     font_size: style.font_size,
                     font_family: style.font_family.clone(),
@@ -3583,21 +3698,19 @@ pub fn text_bounds(x: f64, y: f64, style: &TextStyle) -> Rect {
     } else {
         style.content.as_str()
     };
-    let line_count = content.lines().count().max(1) as f64;
-    // Prefer byte-length proxy for long lines; full unicode scan is costly on megabyte text.
-    let max_chars = content
-        .lines()
-        .map(|l| {
-            if l.len() > 4096 {
-                l.len() // over-estimate for CJK-safe layout width
-            } else {
-                l.chars().count()
-            }
-        })
-        .max()
-        .unwrap_or(1) as f64;
+    let lines = TextStyle::layout_lines_ex(content, style.font_size, style.wrap_width());
+    let line_count = lines.len().max(1) as f64;
     let size = style.font_size as f64;
-    let w = max_chars * size * 0.55 + size * 0.25;
+    let content_w = lines
+        .iter()
+        .map(|l| style.estimate_text_width(l) as f64)
+        .fold(0.0_f64, f64::max);
+    // Fixed box width is an explicit real limit; auto uses measured content width.
+    let w = if let Some(box_w) = style.wrap_width() {
+        box_w as f64
+    } else {
+        content_w + size * 0.25
+    };
     let h = line_count * size * 1.25 + size * 0.15;
     Rect::new(x, y, x + w.max(size), y + h.max(size))
 }
