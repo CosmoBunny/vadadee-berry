@@ -3325,11 +3325,14 @@ impl VadadeeBerryApp {
         if src.is_empty() {
             return Err("wgsl must not be empty".into());
         }
-        // Fail early with a clear message (e.g. compute multipass from other engines).
-        crate::shading::validate_shading_wgsl(src)?;
+        // Static + GPU probe before mutating the document (no blank white page).
+        crate::shading::probe_compile_shading_wgsl(self.wgpu_render.as_ref(), src)?;
         let mut pass = ShadingPass::new_preset(pass_name, src);
         if let Some(u) = uniforms {
             pass.uniforms = u;
+        }
+        if let Ok(mut err) = pass.compile_error.lock() {
+            *err = None;
         }
         self.add_shading_layer_with_passes(layer_name, vec![pass]);
         Ok(())
@@ -3351,6 +3354,9 @@ impl VadadeeBerryApp {
     }
 
     /// MCP / API: replace WGSL on an existing shading layer (no new layer).
+    ///
+    /// Runs static validation + GPU pipeline compile probe when wgpu is available.
+    /// On failure, the document is left unchanged and the error is returned to MCP.
     pub fn set_shading_wgsl(
         &mut self,
         layer_index: usize,
@@ -3362,7 +3368,8 @@ impl VadadeeBerryApp {
         if src.is_empty() {
             return Err("wgsl must not be empty".into());
         }
-        crate::shading::validate_shading_wgsl(src)?;
+        // Must pass GPU compile before history patch — broken WGSL used to paint white.
+        crate::shading::probe_compile_shading_wgsl(self.wgpu_render.as_ref(), src)?;
         let before = snapshot_document(&self.project.document);
         let mut after = before.clone();
         let layer = after
@@ -3384,10 +3391,8 @@ impl VadadeeBerryApp {
         }
         // Prefer full-page under content by default for procedural galaxy/stars.
         pass.stack = crate::document::ShadingStack::Behind;
-        if let Err(msg) = crate::shading::validate_shading_wgsl(&pass.wgsl) {
-            if let Ok(mut err) = pass.compile_error.lock() {
-                *err = Some(msg);
-            }
+        if let Ok(mut err) = pass.compile_error.lock() {
+            *err = None;
         }
         after.active_layer_index = layer_index;
         self.history.push(
@@ -7916,7 +7921,9 @@ fn run_video_decode_thread(
                             gpu,
                         );
                         if layer.shading_passes.iter().any(|p| p.enabled) {
-                            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                            // During export, paint shade but repaint slower so CPU encode keeps cores.
+                            let ms = if self.video_export.rendering { 100 } else { 33 };
+                            ctx.request_repaint_after(std::time::Duration::from_millis(ms));
                         }
                     }
                     crate::document::LayerKind::ScreenRecord => {
@@ -15630,7 +15637,7 @@ fn run_video_decode_thread(
         use base64::Engine;
         let view = io::resolve_capture_view(&self.project, x, y, w, h);
         let pct = resolution_percent.clamp(1.0, 100.0);
-        let (pw, ph, rgba) = io::rasterize_document_view(
+        let (pw, ph, mut rgba) = io::rasterize_document_view(
             &self.project,
             view,
             pct,
@@ -15638,6 +15645,24 @@ fn run_video_decode_thread(
             &std::collections::HashMap::new(),
         )
         .ok_or("Rasterize failed (empty region or SVG error)")?;
+        // CPU raster only knows named presets (galaxy/starfield/blackhole). Custom WGSL
+        // was left as page color (white). GPU-composite procedural shading when possible.
+        let mut shading_gpu = false;
+        if let Some(rs) = self.wgpu_render.as_ref() {
+            // Wall-clock so time-based wave isn't frozen at frame 0.
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f32())
+                .unwrap_or(0.0);
+            shading_gpu = crate::shading::composite_shading_layers_into_rgba(
+                rs,
+                &self.project,
+                &mut rgba,
+                pw,
+                ph,
+                t,
+            );
+        }
         if let Some(path) = save_path {
             let p = std::path::PathBuf::from(path);
             io::write_image_file(&p, io::ExportImageFormat::Png, pw, ph, &rgba)
@@ -15666,6 +15691,7 @@ fn run_video_decode_thread(
             "pixel_width": pw,
             "pixel_height": ph,
             "resolution_percent": pct,
+            "shading_gpu": shading_gpu,
             "bounds": {
                 "x": view.x0,
                 "y": view.y0,
@@ -15677,7 +15703,7 @@ fn run_video_decode_thread(
                 "h": self.project.document.height,
             },
             "objects_remain_editable": true,
-            "hint": "Use list_all_objects + get_object/update_object/set_object_* to edit vectors after preview."
+            "hint": "Use list_all_objects + get_object/update_object/set_object_* to edit vectors after preview. shading_gpu=true means custom WGSL was GPU-composited."
         });
         Ok(crate::mcp::McpHostResponse::RasterPreview {
             meta_json: serde_json::to_string_pretty(&meta).unwrap_or_default(),
@@ -16913,10 +16939,61 @@ fn run_video_decode_thread(
                         .filter_map(|x| x.as_f64().map(|f| f as f32))
                         .collect::<Vec<f32>>()
                 });
-                self.add_shading_layer_with_wgsl(name, pass_name, wgsl, uniforms)?;
-                Ok(format!(
-                    "Added shading layer \"{name}\" with runtime WGSL pass \"{pass_name}\""
-                ))
+                // Default: edit the active / targeted shading layer in place (no stack spam).
+                // Pass `"new": true` to always create a fresh layer.
+                let force_new = args.get("new").and_then(|v| v.as_bool()).unwrap_or(false);
+                let has_target = args.get("layer_id").is_some() || args.get("layer_index").is_some();
+                let active_is_shading = self
+                    .project
+                    .document
+                    .layers
+                    .get(self.project.document.active_layer_index)
+                    .is_some_and(|l| l.kind == crate::document::LayerKind::Shading);
+                let any_shading = self
+                    .project
+                    .document
+                    .layers
+                    .iter()
+                    .any(|l| l.kind == crate::document::LayerKind::Shading);
+                if !force_new && (has_target || active_is_shading || any_shading) {
+                    let layer_index = if let Some(i) =
+                        args.get("layer_index").and_then(|v| v.as_u64())
+                    {
+                        i as usize
+                    } else if let Some(id) = args.get("layer_id").and_then(|v| v.as_str()) {
+                        let uid = uuid::Uuid::parse_str(id).map_err(|_| "bad layer_id")?;
+                        self.project
+                            .document
+                            .layers
+                            .iter()
+                            .position(|l| l.id == uid)
+                            .ok_or("layer_id not found")?
+                    } else if active_is_shading {
+                        self.project.document.active_layer_index
+                    } else {
+                        self.project
+                            .document
+                            .layers
+                            .iter()
+                            .position(|l| l.kind == crate::document::LayerKind::Shading)
+                            .ok_or("no shading layer")?
+                    };
+                    self.set_shading_wgsl(layer_index, wgsl, Some(pass_name), uniforms)?;
+                    // Optionally rename the layer when editing in place.
+                    if let Some(l) = self.project.document.layers.get_mut(layer_index) {
+                        if name != "Shading" {
+                            l.name = name.to_string();
+                        }
+                    }
+                    Ok(format!(
+                        "Updated shading layer index {layer_index} (in-place) pass \"{pass_name}\" — GPU compile OK"
+                    ))
+                } else {
+                    self.add_shading_layer_with_wgsl(name, pass_name, wgsl, uniforms)?;
+                    Ok(format!(
+                        "Added shading layer \"{name}\" with runtime WGSL pass \"{pass_name}\" — GPU compile OK"
+                    ))
+                }
             }
             "set_shading_wgsl" => {
                 let wgsl = args
@@ -16958,7 +17035,7 @@ fn run_video_decode_thread(
                 });
                 self.set_shading_wgsl(layer_index, wgsl, pass_name, uniforms)?;
                 Ok(format!(
-                    "Updated shading WGSL on layer index {layer_index}"
+                    "Updated shading WGSL on layer index {layer_index} — GPU compile OK"
                 ))
             }
             "list_animatable_properties" => {

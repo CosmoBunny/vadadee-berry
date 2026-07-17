@@ -275,34 +275,40 @@ pub fn mcp_tools_list_result() -> Value {
         mcp_tool("get_ui_health", "UI health metrics: current FPS (smoothed), object count, current frame. Use to diagnose lag with many objects (e.g. pixel art).", empty_tool_schema()),
         mcp_tool(
             "add_shading_layer",
-            "Add a shading layer with WGSL source compiled at runtime on the GPU (no preset — pass wgsl string)",
+            "Set shading WGSL. By default **edits the active/first shading layer in place** (no stack spam). Pass new:true to always create a new layer. Optional layer_id / layer_index to target a specific layer. **After apply: static + GPU pipeline compile is probed; on failure the document is unchanged and the tool returns the compile error (no white blank canvas).** Success message includes \"GPU compile OK\".",
             json!({
                 "type": "object",
                 "properties": {
                     "wgsl": {
                         "type": "string",
-                        "description": "WGSL fragment module (@fragment fn main). Dynamic load — not a preset. Vertex auto-prepended if missing. Compose: input_tex@0, sampler@1, uniform@2. Procedural: uniform@0 only. Compute multipass (e.g. Cuneus) is not supported."
+                        "description": "WGSL fragment module (@fragment fn main). Dynamic load — not a preset. Vertex auto-prepended if missing. Compose: input_tex@0, sampler@1, uniform@2. Procedural: uniform@0 only. Compute multipass (e.g. Cuneus) is not supported. No GLSL mod() — use % or floor-based mod."
                     },
-                    "name": { "type": "string", "description": "Layer name (default Shading)" },
+                    "name": { "type": "string", "description": "Layer name (default Shading); renames when editing in place" },
                     "pass_name": { "type": "string", "description": "Pass label in UI (default Shader)" },
                     "uniforms": {
                         "type": "array",
                         "items": { "type": "number" },
                         "description": "Uniform floats; runtime adds time to [0] and page aspect to [3]"
-                    }
+                    },
+                    "new": {
+                        "type": "boolean",
+                        "description": "If true, always create a new shading layer. Default false = edit existing."
+                    },
+                    "layer_id": { "type": "string", "description": "Target shading layer UUID for in-place edit" },
+                    "layer_index": { "type": "integer", "description": "Target shading layer index for in-place edit" }
                 },
                 "required": ["wgsl"]
             }),
         ),
         mcp_tool(
             "set_shading_wgsl",
-            "Replace WGSL on an existing shading layer (edit in place — prefer this over adding a new layer). Target by layer_id, layer_index, or active/first shading layer.",
+            "Replace WGSL on an existing shading layer (edit in place). Target by layer_id, layer_index, or active/first shading layer. Same as add_shading_layer without new:true. **Verifies GPU compile before committing; failure leaves prior shader and returns error text.** Success: \"GPU compile OK\".",
             json!({
                 "type": "object",
                 "properties": {
                     "wgsl": {
                         "type": "string",
-                        "description": "WGSL fragment module (@fragment fn main). Procedural: uniform@0 only. Compose may use input_tex@0,sampler@1,uniform@2."
+                        "description": "WGSL fragment module (@fragment fn main). Procedural: uniform@0 only. Compose may use input_tex@0,sampler@1,uniform@2. No GLSL mod()."
                     },
                     "layer_id": { "type": "string", "description": "Shading layer UUID" },
                     "layer_index": { "type": "integer", "description": "Layer index" },

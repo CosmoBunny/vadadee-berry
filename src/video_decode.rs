@@ -2155,7 +2155,18 @@ pub struct VideoStream {
     avformat_major: u32,
     pub width: u32,
     pub height: u32,
+    /// Last **requested** export frame index we satisfied.
     current_frame: Option<usize>,
+    /// Presentation time (seconds) of `last_rgba`.
+    last_pts_sec: Option<f64>,
+    /// Cached packed RGBA for hold-frame / same-index hits (export fps > source fps).
+    last_rgba: Option<(u32, u32, Vec<u8>)>,
+    /// Cached swscale context (recreating every frame was a major export cost).
+    sws: *mut SwsContext,
+    sws_src_w: i32,
+    sws_src_h: i32,
+    sws_src_fmt: i32,
+    sws_dst_fmt: i32,
 }
 
 unsafe impl Send for VideoStream {}
@@ -2166,10 +2177,12 @@ impl VideoStream {
         let _guard = libav_guard();
         let libs = FFMPEG_LIBS.get()?.as_ref()?;
         let path_c = CString::new(path).ok()?;
-        
+
         unsafe {
             let mut fmt: *mut AVFormatContext = std::ptr::null_mut();
-            if (libs.avformat_open_input)(&mut fmt, path_c.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut()) < 0 { return None; }
+            if (libs.avformat_open_input)(&mut fmt, path_c.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut()) < 0 {
+                return None;
+            }
             if (libs.avformat_find_stream_info)(fmt, std::ptr::null_mut()) < 0 {
                 (libs.avformat_close_input)(&mut fmt);
                 return None;
@@ -2208,8 +2221,12 @@ impl VideoStream {
             let pkt = (libs.av_packet_alloc)();
             let frame = (libs.av_frame_alloc)();
             if pkt.is_null() || frame.is_null() {
-                if !pkt.is_null() { (libs.av_packet_free)(&mut pkt.cast::<AVPacket>()); }
-                if !frame.is_null() { (libs.av_frame_free)(&mut frame.cast::<AVFrame>()); }
+                if !pkt.is_null() {
+                    (libs.av_packet_free)(&mut pkt.cast::<AVPacket>());
+                }
+                if !frame.is_null() {
+                    (libs.av_frame_free)(&mut frame.cast::<AVFrame>());
+                }
                 (libs.avcodec_free_context)(&mut cc.cast::<AVCodecContext>());
                 (libs.avformat_close_input)(&mut fmt);
                 return None;
@@ -2226,80 +2243,257 @@ impl VideoStream {
                 width: w as u32,
                 height: h as u32,
                 current_frame: None,
+                last_pts_sec: None,
+                last_rgba: None,
+                sws: std::ptr::null_mut(),
+                sws_src_w: 0,
+                sws_src_h: 0,
+                sws_src_fmt: -1,
+                sws_dst_fmt: -1,
             })
         }
     }
 
+    fn frame_pts_sec(&self) -> Option<f64> {
+        unsafe {
+            let pts = (self.frame as *const u8).add(136).cast::<i64>().read();
+            if pts == i64::MIN {
+                return None;
+            }
+            let stream = fmt_stream(self.fmt, self.stream_idx as u32);
+            let tb_n = stream_tb_num(stream, self.avformat_major) as f64;
+            let tb_d = stream_tb_den(stream, self.avformat_major) as f64;
+            if tb_d <= 0.0 || tb_n <= 0.0 {
+                return None;
+            }
+            Some(pts as f64 * tb_n / tb_d)
+        }
+    }
+
+    /// Convert current `self.frame` → packed RGBA, reusing a cached sws context.
+    unsafe fn frame_to_rgba_cached(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        let libs = self.libs;
+        let frame = self.frame;
+        if frame.is_null() {
+            return None;
+        }
+        let fw = frame_width(frame);
+        let fh = frame_height(frame);
+        let mut fmt_id = frame_format(frame);
+        if fw <= 0 || fh <= 0 || fw > 8192 || fh > 8192 {
+            return None;
+        }
+        let rgba_fmt = {
+            let name = CString::new("rgba").ok()?;
+            let id = (libs.av_get_pix_fmt)(name.as_ptr());
+            if id >= 0 {
+                id
+            } else {
+                AV_PIX_FMT_RGBA
+            }
+        };
+        if fmt_id < 0 {
+            fmt_id = AV_PIX_FMT_NONE;
+        }
+
+        // (Re)build sws only when geometry / pixel format changes.
+        if self.sws.is_null()
+            || self.sws_src_w != fw
+            || self.sws_src_h != fh
+            || self.sws_src_fmt != fmt_id
+            || self.sws_dst_fmt != rgba_fmt
+        {
+            if !self.sws.is_null() {
+                (libs.sws_freeContext)(self.sws);
+                self.sws = std::ptr::null_mut();
+            }
+            let sws = (libs.sws_getContext)(
+                fw,
+                fh,
+                fmt_id,
+                fw,
+                fh,
+                rgba_fmt,
+                SWS_BILINEAR,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if sws.is_null() {
+                return None;
+            }
+            self.sws = sws;
+            self.sws_src_w = fw;
+            self.sws_src_h = fh;
+            self.sws_src_fmt = fmt_id;
+            self.sws_dst_fmt = rgba_fmt;
+        }
+
+        let stride = rgba_aligned_stride(fw);
+        let alloc_h = (fh as usize).saturating_add(8);
+        let mut aligned = vec![0u8; stride.saturating_mul(alloc_h)];
+
+        let src0 = frame_data(frame, 0);
+        let src1 = frame_data(frame, 1);
+        let src2 = frame_data(frame, 2);
+        let src3 = frame_data(frame, 3);
+        let src_data: [*const u8; 4] = [src0, src1, src2, src3];
+        let src_ls: [c_int; 4] = [
+            frame_linesize(frame, 0),
+            frame_linesize(frame, 1),
+            frame_linesize(frame, 2),
+            frame_linesize(frame, 3),
+        ];
+        for &ls in &src_ls {
+            if ls < 0 || ls > 1 << 24 {
+                return None;
+            }
+        }
+        if src0.is_null() {
+            return None;
+        }
+
+        let mut dst_data: [*mut u8; 4] = [
+            aligned.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ];
+        let dst_ls: [c_int; 4] = [stride as c_int, 0, 0, 0];
+
+        let scaled = (libs.sws_scale)(
+            self.sws,
+            src_data.as_ptr(),
+            src_ls.as_ptr(),
+            0,
+            fh,
+            dst_data.as_mut_ptr(),
+            dst_ls.as_ptr(),
+        );
+        if scaled <= 0 {
+            return None;
+        }
+
+        let row_bytes = (fw as usize) * 4;
+        let mut packed = vec![0u8; row_bytes.saturating_mul(fh as usize)];
+        for y in 0..fh as usize {
+            let src = y * stride;
+            let dst = y * row_bytes;
+            packed[dst..dst + row_bytes].copy_from_slice(&aligned[src..src + row_bytes]);
+        }
+        Some((fw as u32, fh as u32, packed))
+    }
+
+    /// Decode the frame for export/playback index `frame_idx` at timeline `fps`.
+    ///
+    /// Optimized for **sequential forward** export:
+    /// - time-based target (not brittle PTS→integer frame index)
+    /// - reuse last RGBA when it already covers `target_sec` (export fps > source fps)
+    /// - skip swscale on frames before the target
+    /// - cache sws context; seek only on reverse / large jumps
     pub fn get_frame(&mut self, frame_idx: usize, fps: f32) -> Option<(u32, u32, Vec<u8>)> {
         let _guard = libav_guard();
-        let time_sec = frame_idx as f64 / fps as f64;
-        
+        let fps = fps.max(1.0);
+        let target_sec = frame_idx as f64 / fps as f64;
+
+        // Exact same request.
+        if self.current_frame == Some(frame_idx) {
+            return self.last_rgba.clone();
+        }
+
+        // Already holding a decoded picture that presents at/after target → free.
+        // (Export 60fps from 30fps source: every other tick hits this.)
+        if let (Some(last_sec), Some(rgba)) = (self.last_pts_sec, &self.last_rgba) {
+            let going_back = self.current_frame.map(|c| frame_idx < c).unwrap_or(false);
+            if !going_back && last_sec + 1e-4 >= target_sec {
+                self.current_frame = Some(frame_idx);
+                return Some(rgba.clone());
+            }
+        }
+
         unsafe {
-            // Optimize seeking: only seek if target frame is backward OR too far forward (> 30 frames)
-            let seek_needed = match self.current_frame {
-                Some(curr) => frame_idx < curr || frame_idx > curr + 30,
-                None => true,
+            let seek_needed = match self.last_pts_sec {
+                None => self.last_rgba.is_none(),
+                Some(sec) if target_sec + 0.02 < sec => true, // reverse
+                Some(sec) if target_sec > sec + 1.25 => true, // skip ahead > ~1s
+                _ => false,
             };
-            
+
             if seek_needed {
                 let stream = fmt_stream(self.fmt, self.stream_idx as u32);
                 let tb_n = stream_tb_num(stream, self.avformat_major);
                 let tb_d = stream_tb_den(stream, self.avformat_major);
                 let ts = if tb_n > 0 && tb_d > 0 {
-                    (time_sec * tb_d as f64 / tb_n as f64) as i64
+                    (target_sec * tb_d as f64 / tb_n as f64) as i64
                 } else {
-                    (time_sec * 1_000_000.0) as i64
+                    (target_sec * 1_000_000.0) as i64
                 };
-                let _ = (self.libs.av_seek_frame)(self.fmt, self.stream_idx, ts, 1 /*AVSEEK_FLAG_BACKWARD*/);
+                let _ = (self.libs.av_seek_frame)(
+                    self.fmt,
+                    self.stream_idx,
+                    ts,
+                    1, /* AVSEEK_FLAG_BACKWARD */
+                );
                 (self.libs.avcodec_flush_buffers)(self.cc.cast::<AVCodecContext>());
                 self.current_frame = None;
+                self.last_pts_sec = None;
             }
-            
-            let mut decoded = self.current_frame;
-            
+
             'read: loop {
-                if (self.libs.av_read_frame)(self.fmt, self.pkt.cast::<AVPacket>()) < 0 { break; }
+                if (self.libs.av_read_frame)(self.fmt, self.pkt.cast::<AVPacket>()) < 0 {
+                    break;
+                }
                 if pkt_stream_index(self.pkt.cast::<AVPacket>()) != self.stream_idx {
                     (self.libs.av_packet_unref)(self.pkt.cast::<AVPacket>());
                     continue;
                 }
-                if (self.libs.avcodec_send_packet)(self.cc.cast::<AVCodecContext>(), self.pkt.cast::<AVPacket>()) < 0 {
+                if (self.libs.avcodec_send_packet)(
+                    self.cc.cast::<AVCodecContext>(),
+                    self.pkt.cast::<AVPacket>(),
+                ) < 0
+                {
                     (self.libs.av_packet_unref)(self.pkt.cast::<AVPacket>());
                     continue;
                 }
                 (self.libs.av_packet_unref)(self.pkt.cast::<AVPacket>());
-                
+
                 loop {
-                    let r = (self.libs.avcodec_receive_frame)(self.cc.cast::<AVCodecContext>(), self.frame.cast::<AVFrame>());
-                    if r == AVERROR_EAGAIN || r < -1000 { break; }
-                    if r < 0 { break 'read; }
-                    
-                    // Retrieve exact presentation timestamp (pts) at offset 136 of AVFrame to compute true frame index
-                    let pts = (self.frame as *const u8).add(136).cast::<i64>().read();
-                    let stream = fmt_stream(self.fmt, self.stream_idx as u32);
-                    let tb_n = stream_tb_num(stream, self.avformat_major) as f64;
-                    let tb_d = stream_tb_den(stream, self.avformat_major) as f64;
-                    
-                    let frame_idx_decoded = if pts != i64::MIN && tb_d > 0.0 {
-                        let sec = pts as f64 * tb_n / tb_d;
-                        (sec * fps as f64).round() as usize
-                    } else {
-                        decoded.map(|d| d + 1).unwrap_or(0)
-                    };
-                    
-                    decoded = Some(frame_idx_decoded);
-                    
-                    if frame_idx_decoded < frame_idx {
+                    let r = (self.libs.avcodec_receive_frame)(
+                        self.cc.cast::<AVCodecContext>(),
+                        self.frame.cast::<AVFrame>(),
+                    );
+                    if r == AVERROR_EAGAIN || r < -1000 {
+                        break;
+                    }
+                    if r < 0 {
+                        break 'read;
+                    }
+
+                    let pts_sec = self.frame_pts_sec().unwrap_or_else(|| {
+                        self.last_pts_sec
+                            .map(|s| s + 1.0 / fps as f64)
+                            .unwrap_or(target_sec)
+                    });
+
+                    // Before target — no RGBA convert (big win while catching up after seek).
+                    if pts_sec + 1e-4 < target_sec {
+                        self.last_pts_sec = Some(pts_sec);
                         continue;
                     }
-                    
-                    if let Some(rgba) =
-                        frame_to_rgba8_packed(self.libs, self.frame.cast::<AVFrame>())
-                    {
-                        self.current_frame = Some(frame_idx_decoded);
+
+                    if let Some(rgba) = self.frame_to_rgba_cached() {
+                        self.last_pts_sec = Some(pts_sec);
+                        self.current_frame = Some(frame_idx);
+                        self.last_rgba = Some(rgba.clone());
                         return Some(rgba);
                     }
                 }
+            }
+
+            // EOF: freeze last good frame.
+            if let Some(rgba) = self.last_rgba.clone() {
+                self.current_frame = Some(frame_idx);
+                return Some(rgba);
             }
             None
         }
@@ -2310,10 +2504,22 @@ impl Drop for VideoStream {
     fn drop(&mut self) {
         let _guard = libav_guard();
         unsafe {
-            if !self.pkt.is_null() { (self.libs.av_packet_free)(&mut self.pkt.cast::<AVPacket>()); }
-            if !self.frame.is_null() { (self.libs.av_frame_free)(&mut self.frame.cast::<AVFrame>()); }
-            if !self.cc.is_null() { (self.libs.avcodec_free_context)(&mut self.cc.cast::<AVCodecContext>()); }
-            if !self.fmt.is_null() { (self.libs.avformat_close_input)(&mut self.fmt); }
+            if !self.sws.is_null() {
+                (self.libs.sws_freeContext)(self.sws);
+                self.sws = std::ptr::null_mut();
+            }
+            if !self.pkt.is_null() {
+                (self.libs.av_packet_free)(&mut self.pkt.cast::<AVPacket>());
+            }
+            if !self.frame.is_null() {
+                (self.libs.av_frame_free)(&mut self.frame.cast::<AVFrame>());
+            }
+            if !self.cc.is_null() {
+                (self.libs.avcodec_free_context)(&mut self.cc.cast::<AVCodecContext>());
+            }
+            if !self.fmt.is_null() {
+                (self.libs.avformat_close_input)(&mut self.fmt);
+            }
         }
     }
 }

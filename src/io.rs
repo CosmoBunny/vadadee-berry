@@ -1272,6 +1272,15 @@ pub fn composite_export_frame(
     Some((pixel_w, pixel_h, pixmap.take()))
 }
 
+/// CPU shading for named presets (galaxy / starfield / blackhole). Used by export fast path.
+pub fn apply_shading_passes_skia_public(
+    pixmap: &mut resvg::tiny_skia::Pixmap,
+    passes: &[crate::document::ShadingPass],
+    time_secs: f32,
+) {
+    apply_shading_passes_skia(pixmap, passes, time_secs);
+}
+
 fn apply_shading_passes_skia(
     pixmap: &mut resvg::tiny_skia::Pixmap,
     passes: &[crate::document::ShadingPass],

@@ -166,6 +166,10 @@ struct ExportSession<'a> {
     fonts: crate::fonts::FontRegistry,
     /// P7a: EMA of wall time per frame on the worker (drives UI speed, not UI poll gaps).
     sec_per_frame_ema: f32,
+    /// Stage EMAs (milliseconds) — shows up in progress so we can see decode vs raster vs encode.
+    ema_decode_ms: f32,
+    ema_raster_ms: f32,
+    ema_encode_ms: f32,
     encode_loop_started: Option<Instant>,
     last_frame_end: Option<Instant>,
     /// Last NE bake key + pixels (skip re-bake/clone when FX key unchanged).
@@ -230,10 +234,22 @@ impl<'a> ExportSession<'a> {
             ne_tex_fx_key: std::collections::HashMap::new(),
             fonts: crate::fonts::FontRegistry::new(),
             sec_per_frame_ema: 0.0,
+            ema_decode_ms: 0.0,
+            ema_raster_ms: 0.0,
+            ema_encode_ms: 0.0,
             encode_loop_started: None,
             last_frame_end: None,
             last_ne_bake_key: None,
             last_ne_bake_rgba: None,
+        }
+    }
+
+    #[inline]
+    fn bump_ema(ema: &mut f32, sample_ms: f32) {
+        if *ema < 1e-6 {
+            *ema = sample_ms;
+        } else {
+            *ema = *ema * 0.85 + sample_ms * 0.15;
         }
     }
 
@@ -248,20 +264,29 @@ impl<'a> ExportSession<'a> {
         self.config.fx_quality.blur_step()
     }
 
-    /// GPU only when WGSL shading is active. Vector Image layers use resvg CPU (below).
-    /// Previous can_fast required empty Image layers — any shape forced the 8–15s GPU path.
+    /// Full egui/GPU export only when a **compose** pass samples a real `input_tex` binding.
+    /// Never trip on comments / unused names. Procedural WGSL stays on the CPU worker path
+    /// (shared wgpu from a bg thread was cooking export to ~1 fps).
     fn needs_gpu_export(&self) -> bool {
         self.project.document.layers.iter().any(|l| {
-            l.visible
-                && l.is_renderer
-                && l.kind == crate::document::LayerKind::Shading
-                && l.shading_passes.iter().any(|p| p.enabled)
+            if !l.visible || !l.is_renderer || l.kind != crate::document::LayerKind::Shading {
+                return false;
+            }
+            l.shading_passes.iter().any(|p| {
+                if !p.enabled {
+                    return false;
+                }
+                let wgsl = p.compiled_wgsl.as_ref().unwrap_or(&p.wgsl);
+                // Real compose: texture binding + sample.
+                (wgsl.contains("var input_tex") || wgsl.contains("var input_tex:"))
+                    && (wgsl.contains("textureSample(input_tex")
+                        || wgsl.contains("textureSampleLevel(input_tex"))
+            })
         })
     }
 
-    /// Prefer CPU whenever possible (NE FilePath / AppObjects + vectors + AV).
+    /// Prefer CPU whenever possible (NE FilePath / AppObjects + vectors + AV + procedural shade).
     fn can_fast_cpu_export(&self) -> bool {
-        // Only WGSL shading requires the GPU/egui path.
         !self.needs_gpu_export()
     }
 
@@ -356,6 +381,40 @@ impl<'a> ExportSession<'a> {
                     let mut paint = PixmapPaint::default();
                     paint.opacity = opacity;
                     pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
+                }
+                crate::document::LayerKind::Shading => {
+                    // Worker thread: **no shared wgpu** (contention with live canvas ≈ 1 fps).
+                    // Hex chain → parallel CPU. Named presets → skia CPU. Other custom → skip.
+                    let Some(pass) = layer
+                        .shading_passes
+                        .iter()
+                        .rev()
+                        .find(|p| p.enabled)
+                    else {
+                        continue;
+                    };
+                    if crate::shading::cpu_hex_export::try_fill_pixmap_hex(
+                        &mut pixmap,
+                        pass,
+                        time_secs,
+                    ) {
+                        continue;
+                    }
+                    let name = pass.name.to_ascii_lowercase();
+                    let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl);
+                    let is_cpu_preset = name == "starfield"
+                        || name.contains("galaxy")
+                        || name == "blackhole"
+                        || name.starts_with("blackhole ")
+                        || wgsl.contains("// Starfield — rendered via CPU starfield path.")
+                        || wgsl.contains("Procedural galaxy");
+                    if is_cpu_preset {
+                        crate::io::apply_shading_passes_skia_public(
+                            &mut pixmap,
+                            &layer.shading_passes,
+                            time_secs,
+                        );
+                    }
                 }
                 crate::document::LayerKind::NodeEditor => {}
                 crate::document::LayerKind::ScreenRecord => {}
@@ -597,9 +656,13 @@ impl<'a> ExportSession<'a> {
         self.check_cancel()?;
         // Cap x264 threads: 0 = all cores was fine when encode was the only
         // CPU consumer this frame; leave a sensible default for FullPower.
+        // Leave cores free for decode + CPU shade. threads=0 (all cores) + full-frame
+        // CPU work thrash → ~1 fps. Cap x264 so the rest of the pipeline can breathe.
         let threads = match self.config.power {
             ExportPowerLevel::PowerSaving => 1,
-            ExportPowerLevel::FullPower => 0,
+            ExportPowerLevel::FullPower => std::thread::available_parallelism()
+                .map(|n| (n.get() / 2).max(2) as u32)
+                .unwrap_or(4),
         };
         let output = self
             .temp_video
@@ -704,13 +767,31 @@ impl<'a> ExportSession<'a> {
             "estimating…".to_string()
         };
         let rate = if spf > 1e-6 { 1.0 / spf } else { 0.0 };
+        let path = if self.can_fast_cpu_export() {
+            "cpu"
+        } else {
+            "gpu"
+        };
+        let build = if cfg!(debug_assertions) {
+            "DEBUG"
+        } else {
+            "release"
+        };
         let _ = self.tx.send(ExportWorkerEvent::Progress {
             phase: self.phase,
             frame_done,
             total: self.config.total_frames,
             message: format!(
-                "Encoding frame {}/{} · {:.1} fps · ETA {}",
-                frame_done, self.config.total_frames, rate, eta_str
+                "Encoding frame {}/{} · {:.1} fps · ETA {} · path={} · {} · dec {:.0}ms rast {:.0}ms enc {:.0}ms",
+                frame_done,
+                self.config.total_frames,
+                rate,
+                eta_str,
+                path,
+                build,
+                self.ema_decode_ms,
+                self.ema_raster_ms,
+                self.ema_encode_ms,
             ),
             elapsed_secs: elapsed,
             sec_per_frame: spf,
@@ -734,15 +815,28 @@ impl<'a> ExportSession<'a> {
     fn encode_all_frames(&mut self) -> Result<(), String> {
         let use_cpu = self.can_fast_cpu_export();
         let path_label = if use_cpu { "cpu" } else { "gpu" };
+        let build = if cfg!(debug_assertions) {
+            "DEBUG"
+        } else {
+            "release"
+        };
         self.encode_loop_started = Some(Instant::now());
         self.last_frame_end = None;
         self.sec_per_frame_ema = 0.0;
+        self.ema_decode_ms = 0.0;
+        self.ema_raster_ms = 0.0;
+        self.ema_encode_ms = 0.0;
+        let debug_warn = if cfg!(debug_assertions) {
+            " · ⚠ DEBUG build is 10–50× slower — use cargo build --release"
+        } else {
+            ""
+        };
         let _ = self.tx.send(ExportWorkerEvent::Progress {
             phase: ExportPhase::Encoding,
             frame_done: 0,
             total: self.config.total_frames,
             message: format!(
-                "Export path={path_label} · {}% · FX {} · {} frames",
+                "Export path={path_label} · {build} · {}% · FX {} · {} frames{debug_warn}",
                 self.config.resolution_pct,
                 self.config.fx_quality.label(),
                 self.config.total_frames
@@ -762,9 +856,13 @@ impl<'a> ExportSession<'a> {
                 .min(self.config.max_anim_frame);
             apply_animation_for_frame_project(self.project, anim_frame);
 
+            let t_dec0 = Instant::now();
             self.decode_video_layers(timeline_sec)?;
+            let dec_ms = t_dec0.elapsed().as_secs_f32() * 1000.0;
+            Self::bump_ema(&mut self.ema_decode_ms, dec_ms);
 
             // Prefer CPU path — GPU/egui was 8–15s/frame for NE FilePath.
+            let t_rast0 = Instant::now();
             let (w, h, rgba) = if use_cpu {
                 self.rasterize_frame_fast_cpu(anim_frame, timeline_sec)
                     .ok_or_else(|| "Frame rasterize failed".to_string())?
@@ -811,9 +909,15 @@ impl<'a> ExportSession<'a> {
                 )
                 .ok_or_else(|| "Frame rasterize failed".to_string())?
             };
+            let rast_ms = t_rast0.elapsed().as_secs_f32() * 1000.0;
+            Self::bump_ema(&mut self.ema_raster_ms, rast_ms);
 
+            let t_enc0 = Instant::now();
             self.ensure_encoder(w, h)?;
             self.stream_frame(w, h, rgba)?;
+            let enc_ms = t_enc0.elapsed().as_secs_f32() * 1000.0;
+            Self::bump_ema(&mut self.ema_encode_ms, enc_ms);
+
             self.note_frame_timing();
             self.emit_progress(f + 1);
         }

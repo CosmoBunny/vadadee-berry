@@ -112,6 +112,22 @@ pub fn validate_shading_wgsl(wgsl: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    // Common GLSL leftovers that compile-fail only on GPU (white canvas + Validation Error).
+    if src.contains("mod(") || src.contains("mod (") {
+        return Err(
+            "WGSL has no GLSL-style `mod(a, b)` function.\n\
+             Use remainder: `a % b` (same-type floats/vecs), or:\n\
+               fn mod2(x: vec2<f32>, y: vec2<f32>) -> vec2<f32> { return x - y * floor(x / y); }"
+                .into(),
+        );
+    }
+    if src.contains("texture2D(") || src.contains("gl_FragColor") || src.contains("varying ") {
+        return Err(
+            "Looks like GLSL, not WGSL. Use textureSample / @location outputs / @location inputs."
+                .into(),
+        );
+    }
+
     let has_fragment = src.contains("@fragment");
     let has_compute = src.contains("@compute");
     if has_compute && !has_fragment {
@@ -153,6 +169,73 @@ pub fn validate_shading_wgsl(wgsl: &str) -> Result<(), String> {
                 "Unable to find fragment entry `{entry}`. Name it `main` or `fs_main` with @fragment."
             ));
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::validate_shading_wgsl;
+
+    #[test]
+    fn rejects_glsl_mod() {
+        let src = r#"
+@fragment
+fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let a = mod(uv, vec2(1.0));
+    return vec4(a, 0.0, 1.0);
+}
+"#;
+        let err = validate_shading_wgsl(src).unwrap_err();
+        assert!(err.contains("mod"), "{err}");
+    }
+
+    #[test]
+    fn accepts_fragment_main() {
+        let src = r#"
+struct Uniforms { time: f32, strength: f32, _pad2: f32, aspect: f32, }
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@fragment
+fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    return vec4(uv, 0.0, 1.0);
+}
+"#;
+        validate_shading_wgsl(src).unwrap();
+    }
+}
+
+/// GPU compile probe (full fragment pipeline). Call after apply from MCP so broken WGSL
+/// fails the tool instead of painting a blank white page with a Validation Error panel.
+///
+/// When `render_state` is `None` (headless tests), only static `validate_shading_wgsl` runs.
+pub fn probe_compile_shading_wgsl(
+    render_state: Option<&RenderState>,
+    wgsl: &str,
+) -> Result<(), String> {
+    validate_shading_wgsl(wgsl)?;
+    let Some(rs) = render_state else {
+        return Ok(());
+    };
+    // Ensure callback resources exist (first shading paint also does this).
+    {
+        let mut renderer = rs.renderer.write();
+        if !renderer.callback_resources.contains::<ShadingGpuResources>() {
+            let resources =
+                ShadingGpuResources::new(rs.device.clone(), rs.target_format, 1);
+            renderer.callback_resources.insert(resources);
+        }
+        let res = renderer
+            .callback_resources
+            .get_mut::<ShadingGpuResources>()
+            .ok_or_else(|| "shading GPU resources missing".to_string())?;
+        // Match live target format / MSAA from the eframe surface when possible.
+        res.target_format = rs.target_format;
+        res.pipeline(&rs.device, wgsl).map_err(|e| {
+            format!(
+                "WGSL GPU compile failed (shader not applied).\n\
+                 Fix the source and retry. Detail:\n{e}"
+            )
+        })?;
     }
     Ok(())
 }
@@ -632,4 +715,227 @@ pub fn shading_passes_need_input(passes: &[ShadingPass]) -> bool {
             wgsl_needs_compose(wgsl)
         })
         .unwrap_or(false)
+}
+
+/// Cache offscreen (Rgba8Unorm / MSAA1) pipelines so export doesn't recompile WGSL every frame.
+fn offscreen_pipeline(
+    device: &wgpu::Device,
+    wgsl: &str,
+) -> Result<Arc<CompiledShadingPipeline>, String> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<u64, Result<Arc<CompiledShadingPipeline>, String>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = source_key(wgsl, false);
+    {
+        let guard = cache.lock().map_err(|e| e.to_string())?;
+        if let Some(hit) = guard.get(&key) {
+            return hit.clone();
+        }
+    }
+    let compiled = compile_pipeline(device, wgpu::TextureFormat::Rgba8Unorm, 1, wgsl, false)
+        .map(Arc::new);
+    let mut guard = cache.lock().map_err(|e| e.to_string())?;
+    // Another thread may have filled it; prefer existing.
+    if let Some(hit) = guard.get(&key) {
+        return hit.clone();
+    }
+    guard.insert(key, compiled.clone());
+    compiled
+}
+
+/// Offscreen GPU render of one procedural (or compose) shading pass → tightly packed RGBA8.
+/// Used by MCP capture / export preview so custom WGSL is not left as blank page color.
+///
+/// Pipelines are cached — safe to call every export frame without recompiling WGSL.
+pub fn render_shading_pass_to_rgba(
+    render_state: &RenderState,
+    pass: &ShadingPass,
+    width: u32,
+    height: u32,
+    time_secs: f32,
+) -> Result<Vec<u8>, String> {
+    let width = width.clamp(1, 4096);
+    let height = height.clamp(1, 4096);
+    if is_cpu_only_pass(pass) {
+        return Err("CPU-only pass; use starfield path".into());
+    }
+    let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl).trim();
+    if wgsl.is_empty() {
+        return Err("empty WGSL".into());
+    }
+    let compose = wgsl_needs_compose(wgsl);
+    if compose {
+        // Compose needs an input tex; MCP capture does not feed one yet.
+        return Err("compose shaders need input_tex; capture supports procedural only".into());
+    }
+
+    let device = &render_state.device;
+    let queue = &render_state.queue;
+    let aspect = (width as f32 / (height as f32).max(1.0)).max(0.25);
+    let uniforms = uniform_floats(pass, time_secs, aspect);
+
+    // Always Rgba8Unorm + 1 sample for readback (independent of swapchain format).
+    let pipeline = offscreen_pipeline(device, wgsl)?;
+
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shading_capture_tex"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&Default::default());
+
+    let ub_size = UNIFORM_BUFFER_SIZE;
+    let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("shading_capture_uniforms"),
+        size: ub_size,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut ubuf = [0u8; UNIFORM_BUFFER_SIZE as usize];
+    let n = uniforms.len().min(UNIFORM_BUFFER_SIZE as usize / 4);
+    ubuf[..n * 4].copy_from_slice(bytemuck::cast_slice(&uniforms[..n]));
+    queue.write_buffer(&uniform_buffer, 0, &ubuf);
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shading_capture_bg"),
+        layout: &pipeline.bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("shading_capture_enc"),
+    });
+    {
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("shading_capture_rp"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(&pipeline.pipeline);
+        rp.set_bind_group(0, &bind_group, &[]);
+        rp.draw(0..3, 0..1);
+    }
+
+    let unpadded = width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = (unpadded + align - 1) / align * align;
+    let buf_size = (padded * height) as u64;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("shading_capture_read"),
+        size: buf_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &out_buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = out_buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx.recv()
+        .map_err(|e| format!("map channel: {e}"))?
+        .map_err(|e| format!("map failed: {e}"))?;
+
+    let data = slice.get_mapped_range();
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height as usize {
+        let src = y * padded as usize;
+        let dst = y * unpadded as usize;
+        rgba[dst..dst + unpadded as usize]
+            .copy_from_slice(&data[src..src + unpadded as usize]);
+    }
+    drop(data);
+    out_buf.unmap();
+    Ok(rgba)
+}
+
+/// Composite every enabled procedural shading layer into `rgba` (full frame, bottom→top).
+/// Returns true if at least one pass was drawn.
+pub fn composite_shading_layers_into_rgba(
+    render_state: &RenderState,
+    project: &crate::document::ProjectFile,
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    time_secs: f32,
+) -> bool {
+    if rgba.len() < (width * height * 4) as usize {
+        return false;
+    }
+    let mut any = false;
+    for layer in &project.document.layers {
+        if !layer.visible || !layer.is_renderer {
+            continue;
+        }
+        if layer.kind != crate::document::LayerKind::Shading {
+            continue;
+        }
+        let Some(pass) = active_shading_pass(&layer.shading_passes) else {
+            continue;
+        };
+        if is_cpu_only_pass(pass) {
+            continue;
+        }
+        match render_shading_pass_to_rgba(render_state, pass, width, height, time_secs) {
+            Ok(src) => {
+                // Procedural passes are opaque full-page — replace (they sit on page bg).
+                rgba.copy_from_slice(&src);
+                any = true;
+            }
+            Err(e) => {
+                log::warn!("shading capture failed for \"{}\": {e}", pass.name);
+            }
+        }
+    }
+    any
 }

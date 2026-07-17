@@ -1,14 +1,16 @@
 //! WGSL shading passes composited over the canvas.
 
 pub mod cpu_effects;
+pub mod cpu_hex_export;
 pub mod graph_blur;
 pub mod procedural_blackhole;
 pub mod wgpu_pass;
 
 pub use cpu_effects::draw_shading_passes;
 pub use wgpu_pass::{
-    init_callback_resources, queue_shading_input, shading_passes_need_input, validate_shading_wgsl,
-    ShadingRenderer,
+    composite_shading_layers_into_rgba, init_callback_resources, probe_compile_shading_wgsl,
+    queue_shading_input, render_shading_pass_to_rgba, shading_passes_need_input,
+    validate_shading_wgsl, ShadingRenderer,
 };
 
 /// Load WGSL text from a filesystem path (desktop / host tooling).
