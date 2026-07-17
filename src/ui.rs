@@ -2172,16 +2172,26 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         .speed(0.1)
                         .suffix(" s"),
                 )
+                .on_hover_text(
+                    "Exact export length. Not forced up to media length. Auto = full timeline.",
+                )
                 .changed()
             {
                 app.video_export.export_duration_secs = dur;
             }
             if ui
                 .button(RichText::new("Auto").small())
-                .on_hover_text(format!("Use timeline content ({content_secs:.2}s)"))
+                .on_hover_text(format!("Use full timeline content ({content_secs:.2}s)"))
                 .clicked()
             {
                 app.video_export.export_duration_secs = 0.0;
+            }
+            if app.video_export.export_duration_secs > 0.05 && content_secs > 0.05 {
+                ui.label(
+                    RichText::new(format!("(content {content_secs:.1}s)"))
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
             }
         });
 

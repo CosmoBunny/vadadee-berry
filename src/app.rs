@@ -547,14 +547,17 @@ impl ExportPowerLevel {
 }
 
 /// P7f: Node Editor / FX bake quality for export (max side + blur quantization).
+///
+/// Long-side caps must stay in the HD range — older 128/256/512 values made
+/// 1080p exports look like soft mush after upscale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ExportFxQuality {
-    /// Fast: 128px bake, 2px blur steps.
+    /// Fast draft: 720p-class bake.
     Draft,
-    /// Default: 256px bake, 1px blur steps.
+    /// Default: full HD long side.
     #[default]
     Normal,
-    /// Best: 512px bake, 0.5px blur steps.
+    /// Best: 1440p-class bake (still capped by page size in the worker).
     High,
 }
 
@@ -570,9 +573,9 @@ impl ExportFxQuality {
     /// Longest side of NE FilePath bake (pixels).
     pub fn max_side(self) -> u32 {
         match self {
-            Self::Draft => 128,
-            Self::Normal => 256,
-            Self::High => 512,
+            Self::Draft => 720,
+            Self::Normal => 1080,
+            Self::High => 1440,
         }
     }
 
@@ -4081,7 +4084,11 @@ impl VadadeeBerryApp {
             self.status_message = "Switched".into();
         }
         self.window_was_focused = focused;
-        if !focused {
+        if self.video_export.rendering {
+            // Hybrid export uses shared wgpu on the worker. If we throttle paints while
+            // unfocused/switched workspace, device work stalls → export falls below 1fps.
+            ctx.request_repaint();
+        } else if !focused {
             // Without this, paint/MCP poll stops while unfocused → tool timeouts.
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -4246,28 +4253,22 @@ impl VadadeeBerryApp {
     pub fn begin_video_export(&mut self, output: std::path::PathBuf, ctx: egui::Context) {
         // Refresh media caps only; do not reset user Play Duration (e.g. 10s trim).
         self.sync_stale_media_layer_durations();
-        let content_max_frame = self.get_max_animation_frame();
         let anim_fps = self.anim_fps.max(1);
         let export_fps = self.video_export.fps.max(1);
         let content_secs = self.animation_content_duration_secs();
-        let cycle_secs = if self.video_export.export_duration_secs > 0.05 {
-            self.video_export.export_duration_secs.max(content_secs)
-        } else {
-            content_secs
-        }
-        .max(1.0 / anim_fps as f32);
         let cycles = self.video_export.export_cycles.max(1);
-        let export_secs = cycle_secs * cycles as f32;
-        // Animation loops within one cycle; frames beyond wrap via modulo in the worker.
-        let max_frame = ((cycle_secs * anim_fps as f32).ceil() as usize)
-            .saturating_sub(1)
-            .max(content_max_frame);
-        let cycle_frame_count = ((cycle_secs * export_fps as f32).ceil().max(1.0) as usize).max(1);
+        // User Duration (e.g. 10s) is exact — never clamp up to full media length.
+        let plan = crate::export_worker::plan_export_duration(
+            self.video_export.export_duration_secs,
+            content_secs,
+            cycles,
+            anim_fps,
+            export_fps,
+        );
         let temp =
             std::env::temp_dir().join(format!("vadadee_video_{}", uuid::Uuid::new_v4().as_simple()));
         let _ = std::fs::create_dir_all(&temp);
         let restore = self.anim_current_frame;
-        let total_frames = cycle_frame_count.saturating_mul(cycles as usize).max(1);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4281,10 +4282,10 @@ impl VadadeeBerryApp {
             format: self.video_export.format,
             power: self.video_export.power_level,
             fx_quality: self.video_export.fx_quality,
-            total_frames,
+            total_frames: plan.total_frames,
             anim_fps,
-            max_anim_frame: max_frame,
-            cycle_frame_count,
+            max_anim_frame: plan.max_anim_frame,
+            cycle_frame_count: plan.cycle_frame_count,
             export_cycles: cycles,
         };
 
@@ -4300,7 +4301,7 @@ impl VadadeeBerryApp {
         self.video_export.restore_anim_frame = restore;
         self.video_export.frame_done = 0;
         self.video_export.worker_frame_done = 0;
-        self.video_export.total_frames = total_frames;
+        self.video_export.total_frames = plan.total_frames;
         self.video_export.frames_dir = Some(temp);
         self.video_export.rendering = true;
         self.video_export.progress = Some(0.0);
@@ -4311,8 +4312,9 @@ impl VadadeeBerryApp {
         self.video_export.export_rx = Some(rx);
         self.video_export.export_cancel = Some(cancel);
         self.video_export.status_msg = format!(
-            "Rendering {} frames @ {} fps, {}% · {} cycle(s)…",
-            total_frames,
+            "Rendering {} frames ({:.1}s) @ {} fps, {}% · {} cycle(s)…",
+            plan.total_frames,
+            plan.cycle_secs * cycles as f32,
             self.video_export.fps,
             self.video_export.resolution_pct,
             cycles
@@ -4483,8 +4485,10 @@ impl VadadeeBerryApp {
             self.finish_video_export_ui(cancelled);
         }
         if self.video_export.rendering {
-            // ~30 Hz UI updates keep the bar smooth without pegging the main thread.
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            // Keep the egui/wgpu event loop alive even when the window is unfocused /
+            // on another workspace. Hybrid export blits shading on the shared device;
+            // if the main thread sleeps, device.poll stalls and export collapses to <1fps.
+            ctx.request_repaint();
         }
     }
 
@@ -7913,6 +7917,8 @@ fn run_video_decode_thread(
                                 }
                             }
                         }
+                        // Always paint live shaders (including during export). Event loop stays
+                        // warm via request_repaint() while rendering so hybrid export + canvas share GPU.
                         crate::shading::draw_shading_passes(
                             &painter,
                             page,
@@ -7920,10 +7926,10 @@ fn run_video_decode_thread(
                             shade_time,
                             gpu,
                         );
-                        if layer.shading_passes.iter().any(|p| p.enabled) {
-                            // During export, paint shade but repaint slower so CPU encode keeps cores.
-                            let ms = if self.video_export.rendering { 100 } else { 33 };
-                            ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+                        if layer.shading_passes.iter().any(|p| p.enabled)
+                            && !self.video_export.rendering
+                        {
+                            ctx.request_repaint_after(std::time::Duration::from_millis(33));
                         }
                     }
                     crate::document::LayerKind::ScreenRecord => {

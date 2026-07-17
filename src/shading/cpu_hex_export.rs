@@ -119,8 +119,7 @@ pub fn fill_hex_chain_rgba(
     }
 }
 
-/// Export-oriented fill: shade at most ~960px on the long side, nearest-neighbor upscale.
-/// ~4–16× fewer pixels than full 1080p/4K, still looks fine in video.
+/// Export fill at **full export resolution** (no half-res upscale — that looked fake).
 pub fn fill_hex_chain_rgba_export(
     rgba: &mut [u8],
     width: u32,
@@ -128,41 +127,7 @@ pub fn fill_hex_chain_rgba_export(
     time_secs: f32,
     glow: f32,
 ) {
-    let w = width.max(1);
-    let h = height.max(1);
-    if rgba.len() < (w * h * 4) as usize {
-        return;
-    }
-    const MAX_SIDE: u32 = 960;
-    let long = w.max(h);
-    if long <= MAX_SIDE {
-        fill_hex_chain_rgba(rgba, w, h, time_secs, glow);
-        return;
-    }
-    let s = MAX_SIDE as f32 / long as f32;
-    let sw = ((w as f32 * s).round() as u32).max(2);
-    let sh = ((h as f32 * s).round() as u32).max(2);
-    let mut small = vec![0u8; (sw * sh * 4) as usize];
-    fill_hex_chain_rgba(&mut small, sw, sh, time_secs, glow);
-
-    // Nearest-neighbor upscale (fast, sharp hex edges).
-    let sw_f = sw as f32;
-    let sh_f = sh as f32;
-    for y in 0..h as usize {
-        let sy = ((y as f32 + 0.5) * sh_f / h as f32).floor() as u32;
-        let sy = sy.min(sh - 1) as usize;
-        let row = y * w as usize * 4;
-        for x in 0..w as usize {
-            let sx = ((x as f32 + 0.5) * sw_f / w as f32).floor() as u32;
-            let sx = sx.min(sw - 1) as usize;
-            let si = (sy * sw as usize + sx) * 4;
-            let di = row + x * 4;
-            rgba[di] = small[si];
-            rgba[di + 1] = small[si + 1];
-            rgba[di + 2] = small[si + 2];
-            rgba[di + 3] = 255;
-        }
-    }
+    fill_hex_chain_rgba(rgba, width.max(1), height.max(1), time_secs, glow);
 }
 
 /// Fill pixmap from a shading pass when it looks like hex chain; returns true if filled.

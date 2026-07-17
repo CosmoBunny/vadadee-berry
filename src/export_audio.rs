@@ -33,11 +33,15 @@ pub fn export_mux_with_audio(
 
     if layers.is_empty() || !supports_audio_mux {
         if layers.is_empty() {
-            log::info!("export: no timeline audio/video layers for mux — video only");
+            log::warn!(
+                "export: no audio sources found — writing video-only. \
+                 Wire Output Object ← sound (Septic/Video/Audio), keep the NE layer as a renderer, \
+                 and use MP4/MKV/MOV/WebM."
+            );
         }
         std::fs::copy(temp_video, output_path)
             .map_err(|e| format!("Could not copy video to output: {e}"))?;
-        return Ok(true);
+        return Ok(false); // false = video-only (caller can surface this)
     }
 
     log::info!(
@@ -73,12 +77,11 @@ pub fn export_mux_with_audio(
     if pcm.is_empty() || !pcm_has_audible_samples(&pcm) {
         log::warn!(
             "export audio: mixed PCM is silent (peak {mix_peak}) — exporting video without audio. \
-             Check that audio clips overlap 0..{duration_secs:.2}s on the timeline, \
-             volume > 0, and the layer is an AV renderer layer."
+             Check media path exists, volume > 0, and sources overlap 0..{duration_secs:.2}s."
         );
         std::fs::copy(temp_video, output_path)
             .map_err(|e| format!("Could not copy video to output: {e}"))?;
-        return Ok(true);
+        return Ok(false);
     }
 
     let temp_audio = work_dir.join("temp_export_audio.m4a");
@@ -91,31 +94,37 @@ pub fn export_mux_with_audio(
     )?;
 
     // If remux fails, warn and fall back to video-only rather than failing the export.
-    match crate::video_decode::remux_video_and_audio_libav(temp_video, &temp_audio, output_path) {
-        Ok(()) => {}
+    let muxed = match crate::video_decode::remux_video_and_audio_libav(
+        temp_video,
+        &temp_audio,
+        output_path,
+    ) {
+        Ok(()) => true,
         Err(e) => {
             log::warn!("export audio: remux failed ({e}) — falling back to video without audio");
             std::fs::copy(temp_video, output_path)
                 .map_err(|ce| format!("Could not copy video to output: {ce}"))?;
+            false
         }
-    }
+    };
     let _ = std::fs::remove_file(&temp_audio);
-    Ok(true)
+    Ok(muxed)
 }
 
 fn collect_export_audio_layers(project: &ProjectFile) -> Vec<ExportAudioLayer> {
     let mut out = Vec::new();
     for layer in &project.document.layers {
         // P5: Node Editor Output Object sound chain.
-        if layer.visible
-            && layer.is_renderer
-            && matches!(layer.kind, LayerKind::NodeEditor)
-        {
+        // Include even when layer is **hidden** — users often hide NE for canvas
+        // layout while sound is still wired (was a common “export has no audio” bug).
+        if layer.is_renderer && matches!(layer.kind, LayerKind::NodeEditor) {
             if let Some(g) = layer.node_graph.as_ref() {
-                let snd = g.resolve_output_sound();
+                // Must use export resolver — live resolve_output_sound() returns Empty
+                // when the playhead is past Output.run_till after a preview.
+                let snd = g.resolve_output_sound_for_export();
                 if let Some(path) = snd.path() {
                     let vol = (layer.volume as f64 * snd.volume).clamp(0.0, 4.0) as f32;
-                    // Full export span: start at 0, play entire export window (trim later by mux).
+                    // Export timeline starts at 0 → always demux media from the start.
                     out.push(ExportAudioLayer {
                         path: path.to_string(),
                         timeline_start: 0.0,
@@ -123,6 +132,18 @@ fn collect_export_audio_layers(project: &ProjectFile) -> Vec<ExportAudioLayer> {
                         play_secs: 3600.0, // clipped by export duration in mixer
                         volume: vol,
                     });
+                    log::info!(
+                        "export audio: NE layer {:?} sound {:?} vol {:.2}",
+                        layer.name,
+                        path,
+                        vol
+                    );
+                } else {
+                    log::warn!(
+                        "export audio: NE layer {:?} has no resolved sound path \
+                         (wire Output.sound ← SepticPlayer.sound or VideoPlayer.sound)",
+                        layer.name
+                    );
                 }
             }
             continue;

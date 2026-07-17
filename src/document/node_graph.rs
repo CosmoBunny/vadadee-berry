@@ -1259,11 +1259,9 @@ impl GraphOutputEval {
         e.zoom = ((e.zoom * 1000.0).round() / 1000.0).clamp(1.0, 64.0);
         e.zoom_cx = ((e.zoom_cx * 1000.0).round() / 1000.0).clamp(0.0, 1.0);
         e.zoom_cy = ((e.zoom_cy * 1000.0).round() / 1000.0).clamp(0.0, 1.0);
-        // Snap video time to whole frames so texture cache hits while scrubbing/playing.
-        e.video_time_sec = e.video_time_sec.map(|t| {
-            let fps = 30.0_f64; // display quantize; actual decode uses app fps
-            ((t * fps).floor() / fps).max(0.0)
-        });
+        // Snap video time to ms so texture cache hits while scrubbing without
+        // forcing a fixed 30fps grid that fought export/anim fps.
+        e.video_time_sec = e.video_time_sec.map(|t| ((t * 1000.0).floor() / 1000.0).max(0.0));
         e
     }
 }
@@ -1474,8 +1472,8 @@ pub fn bake_graph_output_rgba(
     let mut q = eval.quantized_for_cache(true);
     let step = blur_step.max(0.25) as f64;
     q.blur_px = ((q.blur_px / step).round() * step).clamp(0.0, 64.0);
-    // Cap bake size — image is scaled onto the page; High allows 512.
-    let max_side = max_side.max(64).min(1024);
+    // Cap bake size to page-scale (High is 1440). Old 1024 min fought HD export.
+    let max_side = max_side.max(64).min(4096);
     let media_tag = q
         .video_time_sec
         .map(|t| format!("|t{t:.3}"))
@@ -1498,7 +1496,8 @@ pub fn bake_graph_output_rgba(
     }
 
     let load_base = || {
-        load_graph_media_rgba(path, q.video_time_sec, 30.0).unwrap_or_else(|| {
+        // 60 for frame index: target_sec = frame/fps ≈ video_time (time-based, not 30fps locked).
+        load_graph_media_rgba(path, q.video_time_sec, 60.0).unwrap_or_else(|| {
             eprintln!(
                 "Warning: Failed to open media {:?}, using fallback placeholder.",
                 path
@@ -2052,13 +2051,32 @@ impl NodeGraph {
         GraphOutputEval::default()
     }
 
-    /// Resolve Output Object sound input for playback / export (P5).
+    /// Resolve Output Object sound input for **live** playback (P5).
     /// Silent when past Output Object `run_till` (seconds, if wired > 0).
     pub fn resolve_output_sound(&self) -> GraphOutputSound {
         let run_till = self.output_run_till_secs();
         if run_till > 1e-9 && self.last_time_secs() >= run_till - 1e-9 {
             return GraphOutputSound::default();
         }
+        self.resolve_output_sound_source()
+    }
+
+    /// Resolve the sound **file path** for export mux — ignores live playhead / `run_till`.
+    ///
+    /// Export used to call [`Self::resolve_output_sound`], which returns Empty when the
+    /// canvas playhead is past `run_till` (common after a full preview) → silent MP4s
+    /// even with SepticPlayer → Output.sound correctly wired.
+    pub fn resolve_output_sound_for_export(&self) -> GraphOutputSound {
+        let mut s = self.resolve_output_sound_source();
+        // Export timeline always starts at 0; do not seek into the media at the live playhead.
+        s.media_time_sec = None;
+        s.playback_rate = s.playback_rate.max(1e-6);
+        s
+    }
+
+    /// Only paths **wired into Output Object `sound`** (or another Output's sound pin).
+    /// No "auto play any SepticPlayer" fallback — unwired graphs stay silent.
+    fn resolve_output_sound_source(&self) -> GraphOutputSound {
         let mut tried = std::collections::HashSet::new();
         if let Some(out_id) = self.primary_output_id() {
             tried.insert(out_id);
@@ -2108,13 +2126,19 @@ impl NodeGraph {
             GraphNodeKind::VideoPlayer => {
                 // Timed window: media_t = start + time*speed; blank outside [start, start+duration).
                 // Prefer optional `audio` input (ObjectVideo.sound / ObjectAudio); else demux video file.
+                // Always expose the path when media exists — "silent" only blanks the image,
+                // not the export mux source (end-of-timeline resolve used to drop all audio).
                 let (path, t, rate, silent) = self.video_player_media_window(src_id, depth + 1);
-                if silent || path.is_empty() {
+                if path.is_empty() {
                     out.sound = GraphSoundSource::Empty;
                 } else {
                     out.sound = GraphSoundSource::FilePath(path);
-                    out.media_time_sec = Some(t);
-                    out.playback_rate = rate;
+                    if !silent {
+                        out.media_time_sec = Some(t);
+                        out.playback_rate = rate;
+                    } else {
+                        out.playback_rate = rate.max(1e-6);
+                    }
                 }
             }
             GraphNodeKind::SepticPlayer => {
@@ -3648,6 +3672,70 @@ mod tests {
         assert!((ev.saturation - 1.5).abs() < 1e-9);
         assert!((ev.speed - 2.0).abs() < 1e-9);
         assert!(ev.needs_pixel_fx());
+    }
+
+    #[test]
+    fn export_sound_ignores_run_till_playhead() {
+        // Live resolve is silent past run_till; export must still see the media path.
+        let mut g = NodeGraph::new_empty();
+        let out_id = g.output_node_id.expect("seeded output");
+        let vid = g.add_node(
+            GraphNodeKind::ObjectVideo {
+                path: "/tmp/fake_export_audio.mp4".into(),
+            },
+            0.0,
+            0.0,
+        );
+        let time = g.add_node(GraphNodeKind::Time, -80.0, 0.0);
+        let run = g.add_node(GraphNodeKind::Value { value: 1.0 }, -40.0, 40.0);
+        g.try_add_link(vid, "sound", out_id, "sound").unwrap();
+        g.try_add_link(run, "out", out_id, "run_till").unwrap();
+        g.try_add_link(time, "out", out_id, "time").ok();
+        // Pretend playhead is past run_till (preview finished).
+        g.last_real_values.insert(time, 99.0);
+        g.last_real_values.insert(run, 1.0);
+        g.eval_reals(3000, 30.0);
+
+        let live = g.resolve_output_sound();
+        assert!(
+            live.path().is_none(),
+            "live should mute past run_till, got {:?}",
+            live.path()
+        );
+        let exp = g.resolve_output_sound_for_export();
+        assert_eq!(
+            exp.path(),
+            Some("/tmp/fake_export_audio.mp4"),
+            "export must still resolve the sound file"
+        );
+        assert!(exp.media_time_sec.is_none(), "export starts media at 0");
+    }
+
+    #[test]
+    fn unwired_player_does_not_autoplay_sound() {
+        // Image may be wired; sound must stay silent until Output.sound is connected.
+        let mut g = NodeGraph::new_empty();
+        let out_id = g.output_node_id.expect("seeded output");
+        let vid = g.add_node(
+            GraphNodeKind::ObjectVideo {
+                path: "/tmp/only_for_image.mp4".into(),
+            },
+            0.0,
+            0.0,
+        );
+        let player = g.add_node(GraphNodeKind::VideoPlayer, 100.0, 0.0);
+        g.try_add_link(vid, "out", player, "video").unwrap();
+        g.try_add_link(player, "out", out_id, "image").unwrap();
+        // Deliberately no sound → Output.sound
+        g.eval_reals(0, 30.0);
+        assert!(
+            g.resolve_output_sound().path().is_none(),
+            "live must not invent sound"
+        );
+        assert!(
+            g.resolve_output_sound_for_export().path().is_none(),
+            "export must not invent sound"
+        );
     }
 
     #[test]

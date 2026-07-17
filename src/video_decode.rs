@@ -2606,10 +2606,9 @@ impl LibavEncoder {
                         continue;
                     }
                 };
-                // Export prioritizes speed: ultrafast + explicit thread count.
-                // (medium was used when threads>1 and cut export to ~3fps.)
+                // Quality-first defaults: `veryfast` + CRF beats ultrafast+zerolatency mush.
+                // (ultrafast+zerolatency was unwatchably soft on long HD exports.)
                 let threads_n = if encoder_threads == 0 {
-                    // "auto" → leave one logical core free for blur bake / OS.
                     std::thread::available_parallelism()
                         .map(|n| n.get().saturating_sub(1).max(1))
                         .unwrap_or(2)
@@ -2617,15 +2616,18 @@ impl LibavEncoder {
                     encoder_threads.max(1) as usize
                 };
                 let threads_str = CString::new(threads_n.to_string()).unwrap();
-                let preset_c = CString::new("ultrafast").unwrap();
-                let tune_c = CString::new("zerolatency").unwrap();
+                let preset_c = CString::new("veryfast").unwrap();
                 let threads_key = CString::new("threads").unwrap();
                 let preset_key = CString::new("preset").unwrap();
-                let tune_key = CString::new("tune").unwrap();
+                let crf_key = CString::new("crf").unwrap();
+                let crf_val = CString::new("20").unwrap();
+                let profile_key = CString::new("profile").unwrap();
+                let profile_val = CString::new("high").unwrap();
 
                 let mut opts: *mut () = std::ptr::null_mut();
                 let _ = (libs.av_dict_set)(&mut opts, preset_key.as_ptr(), preset_c.as_ptr(), 0);
-                let _ = (libs.av_dict_set)(&mut opts, tune_key.as_ptr(), tune_c.as_ptr(), 0);
+                let _ = (libs.av_dict_set)(&mut opts, crf_key.as_ptr(), crf_val.as_ptr(), 0);
+                let _ = (libs.av_dict_set)(&mut opts, profile_key.as_ptr(), profile_val.as_ptr(), 0);
                 let _ = (libs.av_dict_set)(&mut opts, threads_key.as_ptr(), threads_str.as_ptr(), 0);
 
                 let ret = (libs.avcodec_open2)(cc, codec, &mut opts);

@@ -744,10 +744,80 @@ fn offscreen_pipeline(
     compiled
 }
 
-/// Offscreen GPU render of one procedural (or compose) shading pass → tightly packed RGBA8.
-/// Used by MCP capture / export preview so custom WGSL is not left as blank page color.
-///
-/// Pipelines are cached — safe to call every export frame without recompiling WGSL.
+/// Reused GPU targets for export/MCP shade readback (avoids multi‑GB alloc thrash).
+struct OffscreenShadePool {
+    width: u32,
+    height: u32,
+    tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    uniform_buffer: wgpu::Buffer,
+    out_buf: wgpu::Buffer,
+    padded_row: u32,
+}
+
+impl OffscreenShadePool {
+    fn ensure(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> Result<std::sync::MutexGuard<'static, Option<Self>>, String> {
+        use std::sync::{Mutex, OnceLock};
+        static POOL: OnceLock<Mutex<Option<OffscreenShadePool>>> = OnceLock::new();
+        let mut guard = POOL
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let need_new = match guard.as_ref() {
+            Some(p) => p.width != width || p.height != height,
+            None => true,
+        };
+        if need_new {
+            let unpadded = width * 4;
+            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let padded = (unpadded + align - 1) / align * align;
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("shading_capture_tex_pooled"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("shading_capture_uniforms_pooled"),
+                size: UNIFORM_BUFFER_SIZE,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("shading_capture_read_pooled"),
+                size: (padded * height) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            *guard = Some(OffscreenShadePool {
+                width,
+                height,
+                tex,
+                view,
+                uniform_buffer,
+                out_buf,
+                padded_row: padded,
+            });
+        }
+        Ok(guard)
+    }
+}
+
+/// Offscreen GPU render of one procedural shading pass → tightly packed RGBA8.
+/// Reuses a process-wide texture/buffer pool so export doesn't allocate ~16MB/frame.
 pub fn render_shading_pass_to_rgba(
     render_state: &RenderState,
     pass: &ShadingPass,
@@ -764,9 +834,7 @@ pub fn render_shading_pass_to_rgba(
     if wgsl.is_empty() {
         return Err("empty WGSL".into());
     }
-    let compose = wgsl_needs_compose(wgsl);
-    if compose {
-        // Compose needs an input tex; MCP capture does not feed one yet.
+    if wgsl_needs_compose(wgsl) {
         return Err("compose shaders need input_tex; capture supports procedural only".into());
     }
 
@@ -774,44 +842,22 @@ pub fn render_shading_pass_to_rgba(
     let queue = &render_state.queue;
     let aspect = (width as f32 / (height as f32).max(1.0)).max(0.25);
     let uniforms = uniform_floats(pass, time_secs, aspect);
-
-    // Always Rgba8Unorm + 1 sample for readback (independent of swapchain format).
     let pipeline = offscreen_pipeline(device, wgsl)?;
 
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("shading_capture_tex"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let view = tex.create_view(&Default::default());
+    let mut pool_guard = OffscreenShadePool::ensure(device, width, height)?;
+    let pool = pool_guard.as_mut().ok_or_else(|| "shade pool missing".to_string())?;
 
-    let ub_size = UNIFORM_BUFFER_SIZE;
-    let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("shading_capture_uniforms"),
-        size: ub_size,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
     let mut ubuf = [0u8; UNIFORM_BUFFER_SIZE as usize];
     let n = uniforms.len().min(UNIFORM_BUFFER_SIZE as usize / 4);
     ubuf[..n * 4].copy_from_slice(bytemuck::cast_slice(&uniforms[..n]));
-    queue.write_buffer(&uniform_buffer, 0, &ubuf);
+    queue.write_buffer(&pool.uniform_buffer, 0, &ubuf);
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("shading_capture_bg"),
         layout: &pipeline.bind_group_layout,
         entries: &[wgpu::BindGroupEntry {
             binding: 0,
-            resource: uniform_buffer.as_entire_binding(),
+            resource: pool.uniform_buffer.as_entire_binding(),
         }],
     });
 
@@ -822,7 +868,7 @@ pub fn render_shading_pass_to_rgba(
         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("shading_capture_rp"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
+                view: &pool.view,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -840,25 +886,17 @@ pub fn render_shading_pass_to_rgba(
         rp.draw(0..3, 0..1);
     }
 
+    let padded = pool.padded_row;
     let unpadded = width * 4;
-    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    let padded = (unpadded + align - 1) / align * align;
-    let buf_size = (padded * height) as u64;
-    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("shading_capture_read"),
-        size: buf_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
-            texture: &tex,
+            texture: &pool.tex,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::TexelCopyBufferInfo {
-            buffer: &out_buf,
+            buffer: &pool.out_buf,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(padded),
@@ -873,7 +911,7 @@ pub fn render_shading_pass_to_rgba(
     );
     queue.submit(Some(encoder.finish()));
 
-    let slice = out_buf.slice(..);
+    let slice = pool.out_buf.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
@@ -895,7 +933,7 @@ pub fn render_shading_pass_to_rgba(
             .copy_from_slice(&data[src..src + unpadded as usize]);
     }
     drop(data);
-    out_buf.unmap();
+    pool.out_buf.unmap();
     Ok(rgba)
 }
 

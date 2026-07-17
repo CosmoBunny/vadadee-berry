@@ -44,6 +44,51 @@ pub struct ExportJobConfig {
     pub export_cycles: u32,
 }
 
+/// Pure export length plan (unit-tested).
+///
+/// - `export_duration_secs > 0.05` → **exact** user duration (not clamped up to content).
+/// - `export_duration_secs ≈ 0` (Auto) → full timeline `content_secs`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExportDurationPlan {
+    pub cycle_secs: f32,
+    pub cycle_frame_count: usize,
+    pub total_frames: usize,
+    pub max_anim_frame: usize,
+}
+
+/// Compute frame counts for video export from UI settings.
+pub fn plan_export_duration(
+    export_duration_secs: f32,
+    content_secs: f32,
+    cycles: u32,
+    anim_fps: u32,
+    export_fps: u32,
+) -> ExportDurationPlan {
+    let anim_fps = anim_fps.max(1) as f32;
+    let export_fps = export_fps.max(1) as f32;
+    let content_secs = content_secs.max(0.0);
+    // User drag value wins; Auto is 0 → content length. Never force max(content).
+    let cycle_secs = if export_duration_secs > 0.05 {
+        export_duration_secs
+    } else {
+        content_secs
+    }
+    .max(1.0 / anim_fps);
+    let cycles = cycles.max(1);
+    let cycle_frame_count = ((cycle_secs * export_fps).ceil().max(1.0) as usize).max(1);
+    let total_frames = cycle_frame_count.saturating_mul(cycles as usize).max(1);
+    // Animation sample range for one cycle (do not force full content max frame).
+    let max_anim_frame = ((cycle_secs * anim_fps).ceil() as usize)
+        .saturating_sub(1)
+        .max(0);
+    ExportDurationPlan {
+        cycle_secs,
+        cycle_frame_count,
+        total_frames,
+        max_anim_frame,
+    }
+}
+
 /// Readiness phases — worker only advances when the previous step is complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportPhase {
@@ -264,10 +309,10 @@ impl<'a> ExportSession<'a> {
         self.config.fx_quality.blur_step()
     }
 
-    /// Full egui/GPU export only when a **compose** pass samples a real `input_tex` binding.
-    /// Never trip on comments / unused names. Procedural WGSL stays on the CPU worker path
-    /// (shared wgpu from a bg thread was cooking export to ~1 fps).
-    fn needs_gpu_export(&self) -> bool {
+    /// Full egui **painter** offscreen only when a compose pass needs `input_tex`
+    /// (samples the scene). Everything else uses the hybrid path:
+    /// CPU composite + **real WGSL** GPU blit for shading (same shader as preview).
+    fn needs_full_painter_export(&self) -> bool {
         self.project.document.layers.iter().any(|l| {
             if !l.visible || !l.is_renderer || l.kind != crate::document::LayerKind::Shading {
                 return false;
@@ -277,7 +322,6 @@ impl<'a> ExportSession<'a> {
                     return false;
                 }
                 let wgsl = p.compiled_wgsl.as_ref().unwrap_or(&p.wgsl);
-                // Real compose: texture binding + sample.
                 (wgsl.contains("var input_tex") || wgsl.contains("var input_tex:"))
                     && (wgsl.contains("textureSample(input_tex")
                         || wgsl.contains("textureSampleLevel(input_tex"))
@@ -285,9 +329,10 @@ impl<'a> ExportSession<'a> {
         })
     }
 
-    /// Prefer CPU whenever possible (NE FilePath / AppObjects + vectors + AV + procedural shade).
+    /// Hybrid path: CPU layout + real GPU WGSL for procedural shaders.
+    /// Full painter path only for compose shading.
     fn can_fast_cpu_export(&self) -> bool {
-        !self.needs_gpu_export()
+        !self.needs_full_painter_export()
     }
 
     /// Fast CPU composite: page + AV frames + NE FilePath (cached bake). No egui/GPU.
@@ -383,8 +428,9 @@ impl<'a> ExportSession<'a> {
                     pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
                 }
                 crate::document::LayerKind::Shading => {
-                    // Worker thread: **no shared wgpu** (contention with live canvas ≈ 1 fps).
-                    // Hex chain → parallel CPU. Named presets → skia CPU. Other custom → skip.
+                    // Prefer **real WGSL** via GPU offscreen (same module as live canvas paint
+                    // callback) — not the painter's full scene buffer, but the same shader.
+                    // CPU hex is only a last-resort fallback (looks "fake").
                     let Some(pass) = layer
                         .shading_passes
                         .iter()
@@ -393,13 +439,6 @@ impl<'a> ExportSession<'a> {
                     else {
                         continue;
                     };
-                    if crate::shading::cpu_hex_export::try_fill_pixmap_hex(
-                        &mut pixmap,
-                        pass,
-                        time_secs,
-                    ) {
-                        continue;
-                    }
                     let name = pass.name.to_ascii_lowercase();
                     let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl);
                     let is_cpu_preset = name == "starfield"
@@ -414,7 +453,40 @@ impl<'a> ExportSession<'a> {
                             &layer.shading_passes,
                             time_secs,
                         );
+                        continue;
                     }
+                    if let Some(rs) = self.wgpu_render.as_ref() {
+                        match crate::shading::render_shading_pass_to_rgba(
+                            rs,
+                            pass,
+                            pixel_w,
+                            pixel_h,
+                            time_secs,
+                        ) {
+                            Ok(src) if src.len() == pixmap.data().len() => {
+                                pixmap.data_mut().copy_from_slice(&src);
+                                continue;
+                            }
+                            Ok(_) => {
+                                log::warn!(
+                                    "export shading GPU size mismatch for \"{}\"",
+                                    pass.name
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "export shading GPU failed ({}): {e} — CPU fallback",
+                                    pass.name
+                                );
+                            }
+                        }
+                    }
+                    // Fallback only if GPU unavailable / failed.
+                    let _ = crate::shading::cpu_hex_export::try_fill_pixmap_hex(
+                        &mut pixmap,
+                        pass,
+                        time_secs,
+                    );
                 }
                 crate::document::LayerKind::NodeEditor => {}
                 crate::document::LayerKind::ScreenRecord => {}
@@ -474,16 +546,22 @@ impl<'a> ExportSession<'a> {
             let fx_key = format!("{}|ms{max_side}|s{step}", q.fx_cache_key(&path));
 
             if self.last_ne_bake_key.as_ref() != Some(&fx_key) {
+                // Do **not** grow base/fx HashMaps across timed video frames — each
+                // key is unique (|t0.000, |t0.033, …) and was blowing RSS to multi‑GB.
+                // Sticky last_ne_bake_rgba is enough for the current frame.
                 let baked = crate::document::bake_graph_output_rgba(
                     &path,
                     &eval,
                     max_side,
                     blur_step,
-                    Some(&mut self.base_image_cache),
-                    Some(&mut self.fx_image_cache),
+                    None,
+                    None,
                 )?;
                 self.last_ne_bake_key = Some(fx_key);
                 self.last_ne_bake_rgba = Some(baked);
+                // Drop any leftover maps from older code paths / still bakes.
+                self.base_image_cache.clear();
+                self.fx_image_cache.clear();
             }
             let rgba = self.last_ne_bake_rgba.as_ref()?;
 
@@ -603,14 +681,18 @@ impl<'a> ExportSession<'a> {
             eval,
             max_side,
             self.ne_blur_step(),
-            Some(&mut self.base_image_cache),
-            Some(&mut self.fx_image_cache),
+            None, // no unbounded timed-frame cache (see rasterize_frame_fast_cpu)
+            None,
         )?;
         let (tw, th) = rgba.dimensions();
         let color_image = egui::ColorImage::from_rgba_unmultiplied(
             [tw as usize, th as usize],
             &rgba.into_raw(),
         );
+        // Free previous texture for this layer before allocating a new one.
+        if let Some(old) = self.image_textures.remove(&layer_id) {
+            let _ = old; // drop TextureHandle → frees egui GPU tex
+        }
         let handle = self.export_ctx.load_texture(
             format!("export-ne-fx-{layer_id}"),
             color_image,
@@ -767,10 +849,11 @@ impl<'a> ExportSession<'a> {
             "estimating…".to_string()
         };
         let rate = if spf > 1e-6 { 1.0 / spf } else { 0.0 };
+        // hybrid = CPU composite + real WGSL GPU shade; gpu = full egui painter offscreen
         let path = if self.can_fast_cpu_export() {
-            "cpu"
+            "hybrid"
         } else {
-            "gpu"
+            "painter"
         };
         let build = if cfg!(debug_assertions) {
             "DEBUG"
@@ -814,7 +897,7 @@ impl<'a> ExportSession<'a> {
 
     fn encode_all_frames(&mut self) -> Result<(), String> {
         let use_cpu = self.can_fast_cpu_export();
-        let path_label = if use_cpu { "cpu" } else { "gpu" };
+        let path_label = if use_cpu { "hybrid" } else { "painter" };
         let build = if cfg!(debug_assertions) {
             "DEBUG"
         } else {
@@ -854,7 +937,7 @@ impl<'a> ExportSession<'a> {
             let timeline_sec = f_in_cycle as f32 / self.export_fps;
             let anim_frame = ((timeline_sec * self.anim_fps).round() as usize)
                 .min(self.config.max_anim_frame);
-            apply_animation_for_frame_project(self.project, anim_frame);
+            apply_animation_for_frame_project(self.project, anim_frame, self.anim_fps);
 
             let t_dec0 = Instant::now();
             self.decode_video_layers(timeline_sec)?;
@@ -944,6 +1027,13 @@ impl<'a> ExportSession<'a> {
 
         let duration_secs =
             self.config.total_frames as f32 / self.config.fps.max(1) as f32;
+        // Reset NE Time to 0 before sound resolve. After the last encode frame,
+        // playhead is at the end → VideoPlayer reports silent → "no sound path".
+        for layer in self.project.document.layers.iter_mut() {
+            if let Some(g) = layer.node_graph.as_mut() {
+                g.eval_reals(0, self.anim_fps.max(1.0));
+            }
+        }
         // Evaluate mux result before cleanup so work_dir is always removed.
         let mux_result = if self.temp_video.exists() {
             crate::export_audio::export_mux_with_audio(
@@ -1002,12 +1092,19 @@ fn run_export(
         }
     }
 
-    let success = session.finalize()?;
-    let message = if success {
-        format!("Saved {}", config.output_path.display())
+    let has_audio = session.finalize()?;
+    let message = if has_audio {
+        format!("Saved {} (with audio)", config.output_path.display())
+    } else if config.output_path.exists() {
+        format!(
+            "Saved {} — video only (no audio muxed; check NE sound wiring / logs)",
+            config.output_path.display()
+        )
     } else {
         "Export failed while writing output file.".into()
     };
+    // success=true if the file landed (audio optional)
+    let success = config.output_path.exists();
     let _ = tx.send(ExportWorkerEvent::Finished { success, message });
     Ok(())
 }
@@ -1180,10 +1277,14 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
 
 /// Apply timeline at `frame` to a detached project clone (export thread).
 ///
+/// `fps` must match the rate used to compute `frame` from timeline seconds
+/// (`anim_frame = timeline_sec * anim_fps`). Using a hardcoded 30 while the
+/// encode loop used 60 made NE Time run 2× and video finish mid-export.
+///
 /// Must match live preview: **stack animation functions** win inside their span
 /// (via [`crate::document::NodeAnimation::sample_mut`]), then keyframe interpolation.
-/// Using keyframe-only sampling would export linear start→end ramps instead of f(t).
-pub fn apply_animation_for_frame_project(project: &mut ProjectFile, frame: usize) {
+pub fn apply_animation_for_frame_project(project: &mut ProjectFile, frame: usize, fps: f32) {
+    let fps = fps.max(1.0);
     let node_ids: Vec<NodeId> = project.anim_timeline.nodes.keys().copied().collect();
     let mut updates: Vec<(
         NodeId,
@@ -1393,12 +1494,11 @@ pub fn apply_animation_for_frame_project(project: &mut ProjectFile, frame: usize
     }
 
     // P5: sample Node Editor param tracks + eval Reals so blur/FX match the playhead.
-    apply_node_editor_params_project(project, frame);
+    apply_node_editor_params_project(project, frame, fps);
 }
 
-/// Apply `param:{uuid}` animation into GraphParam values and `eval_reals` for export.
-fn apply_node_editor_params_project(project: &mut ProjectFile, frame: usize) {
-    let fps = 30.0_f32; // frame/time nodes; wall anim_fps not critical for export consistency
+fn apply_node_editor_params_project(project: &mut ProjectFile, frame: usize, fps: f32) {
+    let fps = fps.max(1.0);
     let layer_ids: Vec<uuid::Uuid> = project
         .document
         .layers
@@ -2088,4 +2188,57 @@ fn paint_rotated_image(
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
     painter.add(mesh);
+}
+
+#[cfg(test)]
+mod duration_plan_tests {
+    use super::plan_export_duration;
+
+    #[test]
+    fn user_duration_10s_not_clamped_to_content() {
+        // Content is 114s but user asked for 10s test export.
+        let p = plan_export_duration(10.0, 114.0, 1, 60, 60);
+        assert!(
+            (p.cycle_secs - 10.0).abs() < 1e-3,
+            "cycle_secs={}",
+            p.cycle_secs
+        );
+        assert_eq!(p.cycle_frame_count, 600, "10s @ 60fps");
+        assert_eq!(p.total_frames, 600);
+        assert_eq!(p.max_anim_frame, 599);
+    }
+
+    #[test]
+    fn auto_zero_uses_content_length() {
+        let p = plan_export_duration(0.0, 114.366, 1, 60, 60);
+        assert!((p.cycle_secs - 114.366).abs() < 1e-3);
+        assert_eq!(p.total_frames, (114.366_f32 * 60.0).ceil() as usize);
+    }
+
+    #[test]
+    fn cycles_multiply_total_frames_not_cycle_secs() {
+        let p = plan_export_duration(10.0, 999.0, 3, 30, 30);
+        assert!((p.cycle_secs - 10.0).abs() < 1e-3);
+        assert_eq!(p.cycle_frame_count, 300);
+        assert_eq!(p.total_frames, 900);
+    }
+
+    #[test]
+    fn user_duration_shorter_than_one_frame_minimum() {
+        let p = plan_export_duration(0.001, 100.0, 1, 24, 24);
+        // 0.001 <= 0.05 threshold → treated as Auto → content
+        assert!((p.cycle_secs - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn anim_frame_and_eval_fps_must_agree_on_time() {
+        // timeline 1s @ 60fps export anim → frame 60; eval must use 60 not 30.
+        let timeline_sec = 1.0_f32;
+        let anim_fps = 60.0_f32;
+        let frame = ((timeline_sec * anim_fps).round() as usize).max(0);
+        let time_wrong = frame as f64 / 30.0;
+        let time_right = frame as f64 / anim_fps as f64;
+        assert!((time_wrong - 2.0).abs() < 1e-6, "bug: hardcode 30 → 2s");
+        assert!((time_right - 1.0).abs() < 1e-6, "fix: same fps → 1s");
+    }
 }
