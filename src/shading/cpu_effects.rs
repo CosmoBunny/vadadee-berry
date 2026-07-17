@@ -34,13 +34,17 @@ fn draw_shading_passes_cpu(
     };
     let name = pass.name.to_ascii_lowercase();
     let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl);
-    let is_blackhole =
-        name.contains("blackhole") || wgsl.contains("blackhole") || wgsl.contains("black hole");
+    let is_blackhole = name == "blackhole"
+        || name.starts_with("blackhole ")
+        || (name.contains("blackhole") && !name.contains("galaxy"));
     let is_starfield =
         name == "starfield" || wgsl.contains("// Starfield — rendered via CPU starfield path.");
+    let is_galaxy = name.contains("galaxy") || wgsl.contains("Procedural galaxy");
     let is_water = name.contains("water") || wgsl.contains("Procedural water");
 
-    if is_blackhole {
+    if is_galaxy {
+        draw_galaxy_shader(painter, page_rect, time_secs, pass);
+    } else if is_blackhole {
         draw_blackhole_shader(painter, page_rect, time_secs, pass);
     } else if is_starfield {
         draw_starfield_shader(painter, page_rect, time_secs, pass);
@@ -89,6 +93,46 @@ fn draw_starfield_shader(painter: &Painter, page: Rect, time_secs: f32, pass: &S
             );
             let color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
             append_quad(&mut mesh, x0, y0, x1, y1, color);
+        }
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+fn draw_galaxy_shader(painter: &Painter, page: Rect, time_secs: f32, pass: &ShadingPass) {
+    let t = if !pass.uniforms.is_empty() {
+        pass.uniforms[0] + time_secs
+    } else {
+        time_secs
+    };
+    let aspect = (page.width() / page.height().max(1.0)).max(0.25);
+    let cols: usize = 140;
+    let rows: usize = ((cols as f32 * page.height() / page.width()).ceil() as usize).clamp(80, 180);
+    let cw = page.width() / cols as f32;
+    let ch = page.height() / rows as f32;
+    let mut mesh = Mesh::default();
+    for row in 0..rows {
+        for col in 0..cols {
+            let x0 = page.left() + col as f32 * cw;
+            let y0 = page.top() + row as f32 * ch;
+            let x1 = x0 + cw;
+            let y1 = y0 + ch;
+            let u0 = col as f32 / cols as f32;
+            let v0 = row as f32 / rows as f32;
+            let u1 = (col + 1) as f32 / cols as f32;
+            let v1 = (row + 1) as f32 / rows as f32;
+            let rgb = crate::shading::procedural_blackhole::sample_galaxy(
+                ((u0 + u1) * 0.5, (v0 + v1) * 0.5),
+                t,
+                aspect,
+            );
+            append_quad(
+                &mut mesh,
+                x0,
+                y0,
+                x1,
+                y1,
+                Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+            );
         }
     }
     painter.add(Shape::mesh(mesh));

@@ -294,6 +294,28 @@ pub fn mcp_tools_list_result() -> Value {
                 "required": ["wgsl"]
             }),
         ),
+        mcp_tool(
+            "set_shading_wgsl",
+            "Replace WGSL on an existing shading layer (edit in place — prefer this over adding a new layer). Target by layer_id, layer_index, or active/first shading layer.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "wgsl": {
+                        "type": "string",
+                        "description": "WGSL fragment module (@fragment fn main). Procedural: uniform@0 only. Compose may use input_tex@0,sampler@1,uniform@2."
+                    },
+                    "layer_id": { "type": "string", "description": "Shading layer UUID" },
+                    "layer_index": { "type": "integer", "description": "Layer index" },
+                    "pass_name": { "type": "string", "description": "Pass label (default keep / Custom)" },
+                    "uniforms": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "description": "Uniform floats; runtime adds time to [0] and page aspect to [3]"
+                    }
+                },
+                "required": ["wgsl"]
+            }),
+        ),
     ];
     tools.extend(drawing::drawing_tools());
     tools.extend(node_editor::node_editor_tools());
@@ -457,6 +479,7 @@ fn is_drawing_tool(name: &str) -> bool {
             | "list_layers"
             | "set_active_layer"
             | "add_shading_layer"
+            | "set_shading_wgsl"
             | "create_path"
             | "set_keyframe"
             | "remove_keyframe"

@@ -4,6 +4,11 @@ use egui::{Key, Pos2, Ui, Vec2};
 
 use crate::document::{Node, NodeId, PathData, PathEditTarget, FillKind, GradientStop, Paint};
 
+pub mod weight_flow;
+pub use weight_flow::{
+    Falloff, MagneticPole, WeightFlowBrush, WeightFlowConfig, WeightFlowMode, WeightFlowStroke,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ToolKind {
     #[default]
@@ -386,6 +391,8 @@ pub struct ToolState {
     pub pen: PenSession,
     pub select: SelectSession,
     pub brush: BrushSession,
+    /// Path weight-flow sculpt (Geometry tab; Select/Node + path only).
+    pub weight_flow: WeightFlowBrush,
     pub space_pan: bool,
     /// Middle/right-button canvas pan in progress.
     pub canvas_pan_drag: bool,

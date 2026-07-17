@@ -316,7 +316,9 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 });
                 ui.menu_button("Object", |ui| {
                     if ui
-                        .button("Group")
+                        .button(
+                            RichText::new(format!("{} Group", icons::GROUP)).font(nerd_font_id(13.0)),
+                        )
                         .on_hover_text("Group selection — children move/rotate with parent")
                         .clicked()
                     {
@@ -324,7 +326,10 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         ui.close();
                     }
                     if ui
-                        .button("Ungroup")
+                        .button(
+                            RichText::new(format!("{} Ungroup", icons::UNGROUP))
+                                .font(nerd_font_id(13.0)),
+                        )
                         .on_hover_text("Dissolve selected group(s)")
                         .clicked()
                     {
@@ -5582,7 +5587,45 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     {
         match layer_kind {
             crate::document::LayerKind::Shading => {
-                ui.label(RichText::new(format!("{} Shading passes (WGSL)", icons::SHADING)).font(nerd_font_id(12.0)));
+                let sel = app.selection.contains(&layer_id);
+                let header = format!("{} {}", icons::SHADING, layer_name);
+                ui.horizontal(|ui| {
+                    let resp = ui.selectable_label(
+                        sel,
+                        RichText::new(header).font(nerd_font_id(12.0)),
+                    );
+                    if resp.clicked() {
+                        app.selection = vec![layer_id];
+                        if let Some(idx) = app
+                            .project
+                            .document
+                            .layers
+                            .iter()
+                            .position(|l| l.id == layer_id)
+                        {
+                            app.set_active_layer(idx);
+                        }
+                    }
+                    resp.on_hover_text(
+                        "Shader fills the page. Select + Raise/Lower (Ctrl+↑/↓) for stack order.",
+                    );
+                    if ui
+                        .small_button("↑")
+                        .on_hover_text("Raise shader in stack")
+                        .clicked()
+                    {
+                        app.selection = vec![layer_id];
+                        app.nudge_z_order(1);
+                    }
+                    if ui
+                        .small_button("↓")
+                        .on_hover_text("Lower shader in stack")
+                        .clicked()
+                    {
+                        app.selection = vec![layer_id];
+                        app.nudge_z_order(-1);
+                    }
+                });
             }
             crate::document::LayerKind::Flowchart => {
                 ui.label(RichText::new(format!("{} Flowchart", icons::FLOWCHART)).font(nerd_font_id(12.0)));
@@ -5719,7 +5762,8 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             }
                             app.node_editor_ui.selected = Some(row.id);
                             app.node_editor_ui.selected_link = None;
-                            promote_action_tab(app, ActionTab::Parameter);
+                            // Output Object is for transform / z-order — keep Geometry tab.
+                            promote_action_tab(app, ActionTab::Geometry);
                         }
                         if resp.double_clicked() {
                             if let Some(idx) = app
@@ -5971,7 +6015,8 @@ fn ne_output_proxy_inspector(
                 app.node_editor_ui.selected = Some(oid);
                 app.node_editor_ui.selected_link = None;
             }
-            promote_action_tab(app, ActionTab::Parameter);
+            // Stay on Geometry when focusing Output for placement / order.
+            promote_action_tab(app, ActionTab::Geometry);
         }
         if ui
             .small_button("Select layer")
@@ -7114,15 +7159,57 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     let is_layer = app.project.document.layers.iter().any(|l| l.id == id);
     if is_layer {
         if let Some(pos) = app.project.document.layers.iter().position(|l| l.id == id) {
-            let layer = &mut app.project.document.layers[pos];
-            let display_name = if layer.name.chars().count() > 16 {
-                format!("{}...", layer.name.chars().take(14).collect::<String>())
-            } else {
-                layer.name.clone()
+            let (display_name, layer_kind, layer_id, layer_name) = {
+                let l = &app.project.document.layers[pos];
+                let display_name = if l.name.chars().count() > 16 {
+                    format!("{}...", l.name.chars().take(14).collect::<String>())
+                } else {
+                    l.name.clone()
+                };
+                (display_name, l.kind, l.id, l.name.clone())
             };
+            if layer_kind == crate::document::LayerKind::Shading {
+                theme::constraint_block(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("{} Shader: {}", icons::SHADING, display_name))
+                            .font(nerd_font_id(13.0))
+                            .strong()
+                            .color(colors::ACCENT),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Fills the full content canvas. Not movable — use Raise/Lower for stack order.",
+                        )
+                        .color(colors::TEXT_MUTED)
+                        .small(),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Raise ↑").on_hover_text("Ctrl+↑").clicked() {
+                            app.selection = vec![layer_id];
+                            app.nudge_z_order(1);
+                        }
+                        if ui.button("Lower ↓").on_hover_text("Ctrl+↓").clicked() {
+                            app.selection = vec![layer_id];
+                            app.nudge_z_order(-1);
+                        }
+                    });
+                });
+                return;
+            }
+            let layer = &mut app.project.document.layers[pos];
             theme::constraint_block(ui, |ui| {
-                let lbl = ui.label(RichText::new(format!("🎥 Video: {}", display_name)).strong().color(colors::ACCENT));
-                lbl.on_hover_text(&layer.name);
+                let title = match layer.kind {
+                    crate::document::LayerKind::AV => format!("🎥 Video: {}", display_name),
+                    _ => format!("Layer: {}", display_name),
+                };
+                let lbl = ui.label(
+                    RichText::new(title)
+                        .font(nerd_font_id(13.0))
+                        .strong()
+                        .color(colors::ACCENT),
+                );
+                lbl.on_hover_text(&layer_name);
                 ui.add_space(4.0);
                 
                 // Position X and Y
@@ -7427,6 +7514,19 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             if changed {
                 app.set_line_geometry(id, x0, y0, x1, y1);
             }
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Weight flow brush needs a Path. Convert line to path first.")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            if ui
+                .button("Convert to path")
+                .on_hover_text("Turn this line into an editable path for weight flow / node edit")
+                .clicked()
+            {
+                app.convert_selection_to_path();
+            }
         }
         GeometryProfile::ClosedPath {
             origin_x,
@@ -7449,6 +7549,7 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     .small()
                     .color(colors::TEXT_MUTED),
             );
+            weight_flow_geometry_panel(app, ui);
         }
         GeometryProfile::OpenPath {
             origin_x,
@@ -7471,6 +7572,7 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     .small()
                     .color(colors::TEXT_MUTED),
             );
+            weight_flow_geometry_panel(app, ui);
         }
         GeometryProfile::Plotter {
             origin_x,
@@ -8260,6 +8362,145 @@ fn text_style_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, for_new_text: bool) 
         });
     });
     changed
+}
+
+/// Weight flow brush controls — Geometry tab, paths only (default off).
+fn weight_flow_geometry_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+    use crate::tools::{Falloff, MagneticPole, WeightFlowMode};
+
+    ui.add_space(8.0);
+    theme::constraint_block(ui, |ui| {
+        ui.label(
+            RichText::new("Weight flow brush")
+                .small()
+                .color(colors::TEXT_MUTED),
+        );
+        let wf = &mut app.tools.weight_flow;
+        if ui
+            .checkbox(&mut wf.enabled, "Enable weight flow brush")
+            .on_hover_text(
+                "Sculpt path anchors with a soft brush (Select or Edit tool). Default off. LMB sculpts while enabled.",
+            )
+            .changed()
+            && !wf.enabled
+        {
+            wf.cancel_stroke();
+        }
+        if !wf.enabled {
+            ui.label(
+                RichText::new("Off — use Node tool (N) to drag points one by one.")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            return;
+        }
+        ui.label(
+            RichText::new("Drag on canvas to sculpt. Esc turns brush off. Release commits.")
+                .small()
+                .color(colors::TEXT_MUTED),
+        );
+        // Mode: ComboBox avoids horizontal overflow in the Geometry dock.
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            egui::ComboBox::from_id_salt("weight_flow_mode")
+                .selected_text(wf.config.mode.label())
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for m in [
+                        WeightFlowMode::Shrink,
+                        WeightFlowMode::Expand,
+                        WeightFlowMode::Drag,
+                        WeightFlowMode::Magnetic,
+                    ] {
+                        ui.selectable_value(&mut wf.config.mode, m, m.label());
+                    }
+                });
+        });
+        // DragValue = slidable + click-to-type label (no slider track).
+        ui.horizontal(|ui| {
+            ui.label("Radius");
+            ui.add(
+                egui::DragValue::new(&mut wf.config.radius)
+                    .range(8.0..=200.0)
+                    .speed(0.4)
+                    .suffix(" px")
+                    .update_while_editing(true),
+            )
+            .on_hover_text("Drag or click to type (document px).");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Strength");
+            ui.add(
+                egui::DragValue::new(&mut wf.config.strength)
+                    .range(0.05..=2.0)
+                    .speed(0.02)
+                    .update_while_editing(true),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Edge hold");
+            ui.add(
+                egui::DragValue::new(&mut wf.config.stiffness)
+                    .range(0.0..=1.0)
+                    .speed(0.01)
+                    .update_while_editing(true),
+            )
+            .on_hover_text(
+                "How hard neighboring points keep their spacing (rubber-band along the path). \
+                 High = resists stretch; low = freeform mush.",
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Damping");
+            ui.add(
+                egui::DragValue::new(&mut wf.config.damping)
+                    .range(0.0..=1.0)
+                    .speed(0.01)
+                    .update_while_editing(true),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Point mass");
+            ui.add(
+                egui::DragValue::new(&mut wf.config.point_mass)
+                    .range(0.2..=5.0)
+                    .speed(0.05)
+                    .update_while_editing(true),
+            )
+            .on_hover_text("Heavier points move less under the same force.");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Falloff");
+            egui::ComboBox::from_id_salt("weight_flow_falloff")
+                .selected_text(wf.config.falloff.label())
+                .width(100.0)
+                .show_ui(ui, |ui| {
+                    for f in [Falloff::Smooth, Falloff::Linear, Falloff::Hard] {
+                        ui.selectable_value(&mut wf.config.falloff, f, f.label());
+                    }
+                });
+        });
+        if wf.config.mode == WeightFlowMode::Magnetic {
+            ui.horizontal(|ui| {
+                ui.label("Brush pole");
+                egui::ComboBox::from_id_salt("weight_flow_pole")
+                    .selected_text(wf.config.magnetic_pole.label())
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        for p in [MagneticPole::North, MagneticPole::South] {
+                            ui.selectable_value(&mut wf.config.magnetic_pole, p, p.label());
+                        }
+                    });
+            });
+            ui.label(
+                RichText::new("Points = South. N attracts · S repels (Coulomb 1/r²).")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+        }
+        ui.checkbox(&mut wf.config.lock_endpoints, "Lock endpoints (open paths)");
+        ui.checkbox(&mut wf.config.preserve_closed, "Preserve closed loop");
+    });
 }
 
 fn node_icon(kind: &NodeKind) -> &'static str {

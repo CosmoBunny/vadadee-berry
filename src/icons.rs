@@ -7,7 +7,12 @@ pub const RECT: &str = "󰗆";
 pub const CIRCLE: &str = "󰕖";
 pub const LINE: &str = "󰕞";
 pub const POLY: &str = "󰕡";
+/// Generic object / group (nf-fa-object-group).
 pub const OBJECT: &str = "";
+/// Group selection into a parent.
+pub const GROUP: &str = "";
+/// Dissolve / ungroup.
+pub const UNGROUP: &str = "";
 pub const LAYER: &str = "󰌨";
 pub const COLOR: &str = "";
 pub const PEN: &str = "";
@@ -55,7 +60,8 @@ pub const GRAB: &str = "";
 /// Swap / reverse operands (nf-fa-exchange / ).
 pub const SWAP: &str = "";
 pub const RASTER: &str = "󰹑";
-pub const SHADING: &str = "󰌾";
+/// Shader / shading layer (full-page pass; stack-order flexible via raise/lower).
+pub const SHADING: &str = "󰽏";
 /// Live collaboration chat (Nerd Font).
 pub const CHAT: &str = "󰭹";
 pub const COLLAB: &str = "󰒗";

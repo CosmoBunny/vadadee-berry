@@ -262,6 +262,129 @@ unsafe fn frame_nb_samples(f: *mut AVFrame) -> i32 {
 }
 unsafe fn codecpar_codec_id(cp: *mut u8) -> i32 { unsafe { cp.add(4).cast::<i32>().read() } }
 
+/// Destination linesize for sws_scale must be SIMD-aligned.
+/// Using raw `width * 4` for odd widths (e.g. 1366 → 5464) is not 32/64-aligned:
+/// swscale then both (a) leaves the last columns black and (b) can write past the
+/// buffer → `malloc(): corrupted top size` on the next allocation.
+#[inline]
+fn rgba_aligned_stride(width: i32) -> usize {
+    let raw = (width.max(0) as usize).saturating_mul(4);
+    // 64-byte align (AVX-friendly; always ≥ raw).
+    (raw + 63) & !63
+}
+
+/// Convert decoded AVFrame → tightly-packed RGBA8 (`width * height * 4`).
+/// Returns `None` if swscale fails or dimensions look corrupt.
+unsafe fn frame_to_rgba8_packed(
+    libs: &FfmpegLibs,
+    frame: *mut AVFrame,
+) -> Option<(u32, u32, Vec<u8>)> {
+    if frame.is_null() {
+        return None;
+    }
+    let fw = frame_width(frame);
+    let fh = frame_height(frame);
+    let mut fmt_id = frame_format(frame);
+    // Guard against ABI misreads / corrupt frames.
+    if fw <= 0 || fh <= 0 || fw > 8192 || fh > 8192 {
+        return None;
+    }
+    // Prefer runtime enum lookup (ABI-safe across FFmpeg majors).
+    let rgba_fmt = {
+        let name = CString::new("rgba").ok()?;
+        let id = (libs.av_get_pix_fmt)(name.as_ptr());
+        if id >= 0 {
+            id
+        } else {
+            AV_PIX_FMT_RGBA
+        }
+    };
+    if fmt_id < 0 {
+        fmt_id = AV_PIX_FMT_NONE;
+    }
+
+    let stride = rgba_aligned_stride(fw);
+    // +8 rows of padding: some swscale builds over-read/write at slice edges.
+    let alloc_h = (fh as usize).saturating_add(8);
+    let mut aligned = vec![0u8; stride.saturating_mul(alloc_h)];
+
+    let sws = (libs.sws_getContext)(
+        fw,
+        fh,
+        fmt_id,
+        fw,
+        fh,
+        rgba_fmt,
+        SWS_BILINEAR,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null(),
+    );
+    if sws.is_null() {
+        return None;
+    }
+
+    // Keep pointer arrays in locals for the full sws_scale call (no temporary casts).
+    let src0 = frame_data(frame, 0);
+    let src1 = frame_data(frame, 1);
+    let src2 = frame_data(frame, 2);
+    let src3 = frame_data(frame, 3);
+    let src_data: [*const u8; 4] = [src0, src1, src2, src3];
+    let src_ls: [c_int; 4] = [
+        frame_linesize(frame, 0),
+        frame_linesize(frame, 1),
+        frame_linesize(frame, 2),
+        frame_linesize(frame, 3),
+    ];
+    // Reject absurd source strides (ABI misread → OOB read/write).
+    for &ls in &src_ls {
+        if ls < 0 || ls > 1 << 24 {
+            (libs.sws_freeContext)(sws);
+            return None;
+        }
+    }
+    if src0.is_null() {
+        (libs.sws_freeContext)(sws);
+        return None;
+    }
+
+    let mut dst_data: [*mut u8; 4] = [aligned.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()];
+    let dst_ls: [c_int; 4] = [stride as c_int, 0, 0, 0];
+
+    let scaled = (libs.sws_scale)(
+        sws,
+        src_data.as_ptr(),
+        src_ls.as_ptr(),
+        0,
+        fh,
+        dst_data.as_mut_ptr(),
+        dst_ls.as_ptr(),
+    );
+    (libs.sws_freeContext)(sws);
+    if scaled <= 0 {
+        return None;
+    }
+
+    // Pack tightly — egui/ColorImage expects width*4 stride (no padding).
+    let row_bytes = (fw as usize) * 4;
+    let mut packed = vec![0u8; row_bytes.saturating_mul(fh as usize)];
+    if stride == row_bytes {
+        // Same length only for the first fh rows (we allocated padding rows).
+        for y in 0..fh as usize {
+            let src = y * stride;
+            let dst = y * row_bytes;
+            packed[dst..dst + row_bytes].copy_from_slice(&aligned[src..src + row_bytes]);
+        }
+    } else {
+        for y in 0..fh as usize {
+            let src = y * stride;
+            let dst = y * row_bytes;
+            packed[dst..dst + row_bytes].copy_from_slice(&aligned[src..src + row_bytes]);
+        }
+    }
+    Some((fw as u32, fh as u32, packed))
+}
+
 unsafe fn stream_set_time_base(stream: *mut u8, num: i32, den: i32, avformat_major: u32) {
     unsafe {
         let (no, doff) = if avformat_major >= 59 {
@@ -2003,46 +2126,12 @@ fn decode_libav(libs: &FfmpegLibs, path: &str, source_frame: usize, fps: f32) ->
 
                 if decoded < skip_to { decoded += 1; continue; }
 
-                let fw = frame_width(frame.cast::<AVFrame>());
-                let fh = frame_height(frame.cast::<AVFrame>());
-                let fmt_id = frame_format(frame.cast::<AVFrame>());
-                if fw <= 0 || fh <= 0 { decoded += 1; continue; }
-
-                let stride = fw * 4;
-                let mut rgba = vec![0u8; (stride * fh) as usize];
-
-                let sws = (libs.sws_getContext)(
-                    fw, fh, fmt_id,
-                    fw, fh, AV_PIX_FMT_RGBA,
-                    SWS_BILINEAR, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
-                );
-                if sws.is_null() { decoded += 1; continue; }
-
-                let src_data: [*const u8; 8] = [
-                    frame_data(frame.cast::<AVFrame>(), 0),
-                    frame_data(frame.cast::<AVFrame>(), 1),
-                    frame_data(frame.cast::<AVFrame>(), 2),
-                    frame_data(frame.cast::<AVFrame>(), 3),
-                    std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
-                ];
-                let src_ls: [c_int; 8] = [
-                    frame_linesize(frame.cast::<AVFrame>(), 0),
-                    frame_linesize(frame.cast::<AVFrame>(), 1),
-                    frame_linesize(frame.cast::<AVFrame>(), 2),
-                    frame_linesize(frame.cast::<AVFrame>(), 3),
-                    0, 0, 0, 0,
-                ];
-                let dst_ptr = rgba.as_mut_ptr();
-                let dst_data: [*mut u8; 8] = [dst_ptr, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
-                                               std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()];
-                let dst_ls: [c_int; 8] = [stride, 0, 0, 0, 0, 0, 0, 0];
-
-                (libs.sws_scale)(sws, src_data.as_ptr(), src_ls.as_ptr(), 0, fh,
-                                  dst_data.as_ptr() as *const *mut u8, dst_ls.as_ptr());
-                (libs.sws_freeContext)(sws);
-
-                result = Some((fw as u32, fh as u32, rgba));
-                break 'read;
+                if let Some(rgba) = frame_to_rgba8_packed(libs, frame.cast::<AVFrame>()) {
+                    result = Some(rgba);
+                    break 'read;
+                }
+                decoded += 1;
+                continue;
             }
             decoded += 1;
         }
@@ -2204,46 +2293,12 @@ impl VideoStream {
                         continue;
                     }
                     
-                    let fw = frame_width(self.frame.cast::<AVFrame>());
-                    let fh = frame_height(self.frame.cast::<AVFrame>());
-                    let fmt_id = frame_format(self.frame.cast::<AVFrame>());
-                    if fw <= 0 || fh <= 0 { continue; }
-                    
-                    let stride = fw * 4;
-                    let mut rgba = vec![0u8; (stride * fh) as usize];
-                    
-                    let sws = (self.libs.sws_getContext)(
-                        fw, fh, fmt_id,
-                        fw, fh, AV_PIX_FMT_RGBA,
-                        SWS_BILINEAR, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
-                    );
-                    if sws.is_null() { continue; }
-                    
-                    let src_data: [*const u8; 8] = [
-                        frame_data(self.frame.cast::<AVFrame>(), 0),
-                        frame_data(self.frame.cast::<AVFrame>(), 1),
-                        frame_data(self.frame.cast::<AVFrame>(), 2),
-                        frame_data(self.frame.cast::<AVFrame>(), 3),
-                        std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
-                    ];
-                    let src_ls: [c_int; 8] = [
-                        frame_linesize(self.frame.cast::<AVFrame>(), 0),
-                        frame_linesize(self.frame.cast::<AVFrame>(), 1),
-                        frame_linesize(self.frame.cast::<AVFrame>(), 2),
-                        frame_linesize(self.frame.cast::<AVFrame>(), 3),
-                        0, 0, 0, 0,
-                    ];
-                    let dst_ptr = rgba.as_mut_ptr();
-                    let dst_data: [*mut u8; 8] = [dst_ptr, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
-                                                   std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()];
-                    let dst_ls: [c_int; 8] = [stride, 0, 0, 0, 0, 0, 0, 0];
-                    
-                    (self.libs.sws_scale)(sws, src_data.as_ptr(), src_ls.as_ptr(), 0, fh,
-                                      dst_data.as_ptr() as *const *mut u8, dst_ls.as_ptr());
-                    (self.libs.sws_freeContext)(sws);
-                    
-                    self.current_frame = Some(frame_idx_decoded);
-                    return Some((fw as u32, fh as u32, rgba));
+                    if let Some(rgba) =
+                        frame_to_rgba8_packed(self.libs, self.frame.cast::<AVFrame>())
+                    {
+                        self.current_frame = Some(frame_idx_decoded);
+                        return Some(rgba);
+                    }
                 }
             }
             None
@@ -2863,5 +2918,75 @@ mod libav_encoder_tests {
         assert!(max_amp > 500, "AAC sidecar should contain audible PCM (max={max_amp})");
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(wav);
+    }
+}
+
+#[cfg(test)]
+mod decode_edge_tests {
+    use super::*;
+    #[test]
+    fn stress_decode_many_frames() {
+        // Regression: second decode used to abort with `malloc(): corrupted top size`
+        // after an unaligned sws_scale destination stride smashed the heap.
+        let path = "/home/angsudo/Videos/Screen_Record_1_1784265073.mp4";
+        if !is_libav_available() {
+            return;
+        }
+        for f in [0usize, 1, 2, 10, 30, 60, 120, 300] {
+            let Some((w, h, rgba)) = decode_frame(path, f, 60.0) else {
+                continue;
+            };
+            assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
+        }
+        let mut stream = VideoStream::open(path).expect("open stream");
+        for f in [0usize, 5, 10, 50, 100] {
+            let Some((w, h, rgba)) = stream.get_frame(f, 60.0) else {
+                continue;
+            };
+            assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
+        }
+    }
+
+    #[test]
+    fn dump_decoded_frame_right_edge() {
+        let path = "/home/angsudo/Videos/Screen_Record_1_1784265073.mp4";
+        if !is_libav_available() {
+            eprintln!("skip: no libav");
+            return;
+        }
+        let (w, h, rgba) = decode_frame(path, 30, 60.0).expect("decode");
+        eprintln!("decoded {w}x{h} len={}", rgba.len());
+        assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
+        // mean of rightmost column RGB
+        let mut rsum = 0u64;
+        let mut lsum = 0u64;
+        for y in 0..h as usize {
+            let ri = (y * w as usize + w as usize - 1) * 4;
+            let li = y * w as usize * 4;
+            rsum += rgba[ri] as u64 + rgba[ri+1] as u64 + rgba[ri+2] as u64;
+            lsum += rgba[li] as u64 + rgba[li+1] as u64 + rgba[li+2] as u64;
+        }
+        let n = h as u64 * 3;
+        eprintln!("left mean {:.1} right mean {:.1}", lsum as f64 / n as f64, rsum as f64 / n as f64);
+        assert_eq!(w, 1366, "expected full stream width");
+        assert_eq!(h, 768);
+        // Critical: last columns must not be black (sws unaligned-stride bug).
+        let mut black = 0u32;
+        for y in 0..h as usize {
+            let ri = (y * w as usize + w as usize - 1) * 4;
+            if rgba[ri] == 0 && rgba[ri + 1] == 0 && rgba[ri + 2] == 0 {
+                black += 1;
+            }
+        }
+        assert!(
+            black < h / 4,
+            "right edge mostly black ({black}/{h} rows) — sws stride alignment bug"
+        );
+        // Save for visual inspect
+        let img = image::RgbaImage::from_raw(w, h, rgba).expect("img");
+        img.save("/tmp/vadadee_decoded.png").expect("save");
+        let right =
+            image::imageops::crop_imm(&img, w.saturating_sub(60), 0, 60, h.min(200)).to_image();
+        right.save("/tmp/vadadee_decoded_right.png").ok();
     }
 }

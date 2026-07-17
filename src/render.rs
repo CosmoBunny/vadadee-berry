@@ -3777,6 +3777,66 @@ fn draw_pixel_brush_preview(
     }
 }
 
+/// Weight-flow sculpt cursor: soft radius ring, mode tint, optional N/S label.
+pub fn draw_weight_flow_cursor(
+    painter: &Painter,
+    viewport: &Viewport,
+    origin: Pos2,
+    doc: (f64, f64),
+    wf: &crate::tools::WeightFlowBrush,
+    has_path: bool,
+) {
+    use crate::tools::{MagneticPole, WeightFlowMode};
+    let center = viewport.doc_to_screen(doc, origin);
+    let r_screen = (wf.config.radius * viewport.zoom).max(4.0);
+    let (fill, stroke) = match wf.config.mode {
+        WeightFlowMode::Shrink => (
+            Color32::from_rgba_unmultiplied(60, 140, 255, 28),
+            Color32::from_rgb(60, 140, 255),
+        ),
+        WeightFlowMode::Expand => (
+            Color32::from_rgba_unmultiplied(255, 80, 80, 28),
+            Color32::from_rgb(255, 90, 90),
+        ),
+        WeightFlowMode::Drag => (
+            Color32::from_rgba_unmultiplied(255, 200, 40, 28),
+            Color32::from_rgb(240, 180, 20),
+        ),
+        WeightFlowMode::Magnetic => (
+            Color32::from_rgba_unmultiplied(180, 80, 255, 28),
+            Color32::from_rgb(180, 80, 255),
+        ),
+    };
+    let stroke_c = if has_path {
+        stroke
+    } else {
+        Color32::from_rgba_unmultiplied(stroke.r(), stroke.g(), stroke.b(), 90)
+    };
+    painter.circle_filled(center, r_screen, fill);
+    painter.circle_stroke(center, r_screen, Stroke::new(1.5, stroke_c));
+    painter.circle_filled(center, 2.5, stroke_c);
+    if matches!(wf.config.mode, WeightFlowMode::Magnetic) {
+        let label = match wf.config.magnetic_pole {
+            MagneticPole::North => "N",
+            MagneticPole::South => "S",
+        };
+        painter.text(
+            center + egui::vec2(r_screen * 0.35, -r_screen * 0.55),
+            Align2::LEFT_BOTTOM,
+            label,
+            FontId::proportional(12.0),
+            stroke_c,
+        );
+    }
+    if wf.stroke.is_some() {
+        painter.circle_stroke(
+            center,
+            r_screen * 0.92,
+            Stroke::new(1.0, Color32::from_white_alpha(120)),
+        );
+    }
+}
+
 pub fn draw_brush_preview(
     painter: &Painter,
     viewport: &Viewport,

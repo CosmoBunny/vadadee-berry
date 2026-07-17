@@ -1543,7 +1543,7 @@ impl VadadeeBerryApp {
 
     pub fn do_undo(&mut self) {
         if self.history.undo(&mut self.project) {
-            self.selection.clear();
+            self.restore_selection_after_history();
             self.clear_transient_tool_state();
             self.status_message = "Undo".into();
             self.sync_inspector_from_selection();
@@ -1553,11 +1553,24 @@ impl VadadeeBerryApp {
 
     pub fn do_redo(&mut self) {
         if self.history.redo(&mut self.project) {
-            self.selection.clear();
+            self.restore_selection_after_history();
             self.clear_transient_tool_state();
             self.status_message = "Redo".into();
             self.sync_inspector_from_selection();
             self.sync_flowchart_paths_if_active_layer();
+        }
+    }
+
+    /// Keep selection when objects still exist (so weight-flow / path edit stay active after undo).
+    fn restore_selection_after_history(&mut self) {
+        let prev = self.selection.clone();
+        self.selection = prev
+            .into_iter()
+            .filter(|id| self.project.nodes.get(*id).is_some())
+            .collect();
+        // Drop sticky only if everything vanished.
+        if self.selection.is_empty() {
+            self.selection_sticky = false;
         }
     }
 
@@ -1570,6 +1583,8 @@ impl VadadeeBerryApp {
         self.tools.select.node_drag_origin = None;
         self.tools.select.node_drag_active = false;
         self.tools.canvas_pan_drag = false;
+        // Abort mid-stroke sim, but keep weight-flow *enabled* so undo doesn't "close" the brush.
+        self.cancel_weight_flow_stroke(false);
         self.dismiss_on_page_text_edit_without_history();
     }
 
@@ -3021,6 +3036,34 @@ impl VadadeeBerryApp {
 
     pub fn toggle_keyframing_mode(&mut self) {
         self.anim_keyframing_mode = !self.anim_keyframing_mode;
+        if self.anim_keyframing_mode {
+            // Seed baselines so the first path-point move is detected against pre-edit geom.
+            self.anim_last_applied_states.clear();
+            for id in self.selection.clone() {
+                if let Some(node) = self.project.nodes.get(id) {
+                    let gf = self.get_node_geom_floats(id);
+                    self.anim_last_applied_states.insert(
+                        id,
+                        AnimAppliedState {
+                            pos: node.get_pos(),
+                            rotation: node.get_rotation(),
+                            opacity: node.get_opacity(),
+                            color: node.get_color(),
+                            stroke_width: node.get_stroke_width(),
+                            stroke_color: node.get_stroke_color(),
+                            geom_floats: gf,
+                            fill: node.style.fill.clone(),
+                        },
+                    );
+                }
+            }
+            self.status_message = format!(
+                "Recording keyframes (Frame {}) — move object or path points",
+                self.anim_current_frame
+            );
+        } else {
+            self.status_message = "Keyframing stopped".into();
+        }
     }
 
     pub fn add_layer(&mut self, name: &str) {
@@ -3080,8 +3123,9 @@ impl VadadeeBerryApp {
             let proxy = layer.ne_output_proxy;
             self.selection = vec![proxy.unwrap_or(lid)];
             self.node_editor_ui.open(lid);
-            crate::ui::promote_action_tab(self, crate::ui::ActionTab::Parameter);
-            self.action_tab = crate::ui::ActionTab::Parameter;
+            // Geometry: Output is a canvas object (order/transform), not a graph Parameter.
+            crate::ui::promote_action_tab(self, crate::ui::ActionTab::Geometry);
+            self.action_tab = crate::ui::ActionTab::Geometry;
         }
         self.status_message = "Node Editor layer created".into();
     }
@@ -3303,9 +3347,25 @@ impl VadadeeBerryApp {
             .and_then(|s| s.to_str())
             .unwrap_or("Custom")
             .to_string();
-        let layer = self
-            .project
-            .document
+        self.set_shading_wgsl(layer_index, &src, Some(&stem), None)
+    }
+
+    /// MCP / API: replace WGSL on an existing shading layer (no new layer).
+    pub fn set_shading_wgsl(
+        &mut self,
+        layer_index: usize,
+        wgsl: &str,
+        pass_name: Option<&str>,
+        uniforms: Option<Vec<f32>>,
+    ) -> Result<(), String> {
+        let src = wgsl.trim();
+        if src.is_empty() {
+            return Err("wgsl must not be empty".into());
+        }
+        crate::shading::validate_shading_wgsl(src)?;
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let layer = after
             .layers
             .get_mut(layer_index)
             .ok_or("Layer not found")?;
@@ -3318,13 +3378,22 @@ impl VadadeeBerryApp {
                 .push(crate::document::ShadingPass::custom_template());
         }
         let pass = &mut layer.shading_passes[0];
-        pass.load_wgsl_source(src, Some(&stem));
-        // Soft pre-validate so the UI shows a clear error immediately if needed.
+        pass.load_wgsl_source(src, pass_name);
+        if let Some(u) = uniforms {
+            pass.uniforms = u;
+        }
+        // Prefer full-page under content by default for procedural galaxy/stars.
+        pass.stack = crate::document::ShadingStack::Behind;
         if let Err(msg) = crate::shading::validate_shading_wgsl(&pass.wgsl) {
             if let Ok(mut err) = pass.compile_error.lock() {
                 *err = Some(msg);
             }
         }
+        after.active_layer_index = layer_index;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
         Ok(())
     }
 
@@ -5620,6 +5689,15 @@ impl VadadeeBerryApp {
                 } else if self.node_editor_ui.open_layer_id.is_some() {
                     // Node Editor owns Esc (unfocus text field, then close dialog).
                     // Do not cancel tools / deselect canvas objects underneath.
+                } else if self.tools.weight_flow.stroke.is_some() {
+                    // Cancel in-progress sculpt (restore path) without full deselect.
+                    self.cancel_weight_flow_stroke(true);
+                    self.status_message = "Weight flow stroke cancelled".into();
+                } else if self.tools.weight_flow.enabled {
+                    // Keyboard exit from weight-flow mode so Select works again.
+                    self.tools.weight_flow.enabled = false;
+                    self.tools.weight_flow.cancel_stroke();
+                    self.status_message = "Weight flow brush off".into();
                 } else {
                     self.cancel_tool_to_select();
                 }
@@ -5805,6 +5883,11 @@ impl VadadeeBerryApp {
         self.tools.select.node_drag_origin = None;
         self.tools.select.node_drag_active = false;
         self.tools.select.drag_mode = None;
+        // Always leave weight-flow so Select is usable after keyboard cancel.
+        if self.tools.weight_flow.enabled || self.tools.weight_flow.stroke.is_some() {
+            self.cancel_weight_flow_stroke(true);
+            self.tools.weight_flow.enabled = false;
+        }
         if self.tools.active != ToolKind::Select {
             if self.tools.active != ToolKind::Eyedropper {
                 self.tools.last_active_tool = self.tools.active;
@@ -5822,6 +5905,18 @@ impl VadadeeBerryApp {
             self.hit_pick_menu = None;
             self.tools.select.select_rotation_mode = false;
             self.status_message = "Deselected".into();
+        }
+    }
+
+    /// Abort weight-flow stroke; if `restore`, put path back to pre-stroke snapshot.
+    fn cancel_weight_flow_stroke(&mut self, restore: bool) {
+        let Some(stroke) = self.tools.weight_flow.stroke.take() else {
+            return;
+        };
+        if restore {
+            if let Some(node) = self.project.nodes.get_mut(stroke.node_id) {
+                *node = stroke.before;
+            }
         }
     }
 
@@ -7114,13 +7209,32 @@ fn run_video_decode_thread(
         }
 
         // Rare memory prune only — never while playing (must not delete live WAV under rodio).
-        if !self.anim_is_playing && self.anim_current_frame % 300 == 0 {
-            self.cleanup_unused_audio_caches();
+        // Time-throttle: frame-0 every paused tick used to wipe extract WAVs mid-session.
+        if !self.anim_is_playing {
+            use std::time::{Duration, Instant};
+            static LAST_CLEAN: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> =
+                std::sync::OnceLock::new();
+            let slot = LAST_CLEAN.get_or_init(|| std::sync::Mutex::new(None));
+            let mut last = slot.lock().unwrap_or_else(|e| e.into_inner());
+            let due = last
+                .map(|t| t.elapsed() >= Duration::from_secs(120))
+                .unwrap_or(true);
+            if due {
+                *last = Some(Instant::now());
+                drop(last);
+                self.cleanup_unused_audio_caches();
+            }
         }
     }
 
     pub fn cleanup_unused_audio_caches(&mut self) {
         let mut active_source_paths = std::collections::HashSet::new();
+        // Paths currently streamed by rodio (keep their WAVs even if layer was just hidden).
+        for p in self.audio_player_media_path.values() {
+            if !p.is_empty() {
+                active_source_paths.insert(p.clone());
+            }
+        }
         for layer in &self.project.document.layers {
             if layer.kind == crate::document::LayerKind::AV {
                 let mut layer_clone = layer.clone();
@@ -7135,14 +7249,18 @@ fn run_video_decode_thread(
                 }
             }
             // Node Editor: graph media is what extract keys on — omitting this deleted
-            // Ready WAVs every ~300 frames and left speakers silent after a short play.
+            // Ready WAVs and left speakers silent after hide/show or short play.
+            // Keep paths for *all* NE layers (including hidden) so toggling visibility
+            // does not wipe the septic/session extract cache.
             if layer.kind == crate::document::LayerKind::NodeEditor {
                 if let Some(g) = layer.node_graph.as_ref() {
                     for node in g.nodes.values() {
                         match &node.kind {
                             crate::document::GraphNodeKind::ObjectImage { path }
                             | crate::document::GraphNodeKind::ObjectVideo { path }
-                            | crate::document::GraphNodeKind::ObjectAudio { path } => {
+                            | crate::document::GraphNodeKind::ObjectAudio { path }
+                            | crate::document::GraphNodeKind::ObjectSeptic { path }
+                            | crate::document::GraphNodeKind::ObjectMouse { path } => {
                                 if !path.is_empty() {
                                     active_source_paths.insert(path.clone());
                                 }
@@ -7169,28 +7287,39 @@ fn run_video_decode_thread(
         let cache_dir = dirs_next_audio_cache_dir();
         let mut active_wav_paths = std::collections::HashSet::new();
         if let Ok(mut status_map) = self.audio_extract_status.lock() {
-            // First pass: remember WAVs still in use.
+            // Keep *every* Ready WAV still on disk — only drop Failed / missing entries.
+            // Never delete extract files just because a layer is currently invisible.
             for (source_path, status) in status_map.iter() {
-                if active_source_paths.contains(source_path) {
-                    if let AudioExtractStatus::Ready(wav_path) = status {
-                        active_wav_paths.insert(wav_path.to_string_lossy().to_string());
-                    }
-                }
-            }
-            status_map.retain(|source_path, status| {
-                let keep = active_source_paths.contains(source_path);
-                if !keep {
-                    if let AudioExtractStatus::Ready(wav_path) = status {
-                        // Only remove orphan XDG-cache files; never delete sidecars next to user media.
-                        let under_cache = wav_path.starts_with(&cache_dir);
-                        let still_ref = active_wav_paths
-                            .contains(wav_path.to_string_lossy().as_ref());
-                        if under_cache && !still_ref {
-                            let _ = std::fs::remove_file(wav_path);
+                match status {
+                    AudioExtractStatus::Ready(wav_path) => {
+                        if crate::audio_extract::wav_is_playable(wav_path) {
+                            active_wav_paths.insert(wav_path.to_string_lossy().to_string());
+                            active_source_paths.insert(source_path.clone());
                         }
                     }
+                    AudioExtractStatus::Extracting { .. } => {
+                        active_source_paths.insert(source_path.clone());
+                    }
+                    AudioExtractStatus::Failed => {}
                 }
-                keep
+            }
+            status_map.retain(|source_path, status| match status {
+                AudioExtractStatus::Ready(wav_path) => {
+                    if crate::audio_extract::wav_is_playable(wav_path) {
+                        true
+                    } else {
+                        // Stale Ready (file deleted externally) — allow re-extract.
+                        log::debug!(
+                            "audio cache: clearing stale Ready for {source_path} (wav missing)"
+                        );
+                        false
+                    }
+                }
+                AudioExtractStatus::Extracting { .. } => true,
+                AudioExtractStatus::Failed => {
+                    // Keep Failed so we don't spin forever; still drop if source gone.
+                    active_source_paths.contains(source_path)
+                }
             });
         }
 
@@ -7200,9 +7329,10 @@ fn run_video_decode_thread(
             });
         }
 
-        // Disk sweep: remove orphan extract WAVs not referenced by any active source.
-        // Previous sessions left files that status_map no longer knows about.
+        // Soft disk sweep: only remove truly orphan extract WAVs that status no longer
+        // knows about AND that are older than 24h (never mid-session delete after extract).
         if let Ok(rd) = std::fs::read_dir(&cache_dir) {
+            let now = std::time::SystemTime::now();
             for ent in rd.flatten() {
                 let path = ent.path();
                 if !path.is_file() {
@@ -7217,7 +7347,17 @@ fn run_video_decode_thread(
                     continue;
                 }
                 let key = path.to_string_lossy().to_string();
-                if !active_wav_paths.contains(&key) {
+                if active_wav_paths.contains(&key) {
+                    continue;
+                }
+                let old_enough = ent
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d.as_secs() > 24 * 3600)
+                    .unwrap_or(false);
+                if old_enough {
                     let _ = std::fs::remove_file(&path);
                 }
             }
@@ -7745,6 +7885,13 @@ fn run_video_decode_thread(
                         }
                     }
                     crate::document::LayerKind::Shading => {
+                        // Full document page under content in stack order. Galaxy/stars
+                        // procedural is edge-weighted so glow shows around the video, not under it.
+                        let page = self.viewport.page_rect(
+                            origin,
+                            self.project.document.width as f32,
+                            self.project.document.height as f32,
+                        );
                         let shade_time = ctx.input(|i| i.time) as f32;
                         let gpu = self.gpu_shading.then(|| self.wgpu_render.as_ref()).flatten();
                         if let Some(rs) = gpu {
@@ -7768,8 +7915,6 @@ fn run_video_decode_thread(
                             shade_time,
                             gpu,
                         );
-                        // Throttle animated shading (~30 FPS) — unbounded request_repaint
-                        // with heavy raymarch WGSL was melting the UI (~7 FPS).
                         if layer.shading_passes.iter().any(|p| p.enabled) {
                             ctx.request_repaint_after(std::time::Duration::from_millis(33));
                         }
@@ -7874,8 +8019,8 @@ fn run_video_decode_thread(
                                     if let Some((tex_id, _tex_size)) =
                                         self.graph_fx_paint_tex(path, &eval)
                                     {
-                                        // P6b: placement from Output proxy (apply_animation already
-                                        // wrote pos/rot/size into the node for this frame).
+                                        // P6b: paint exactly the Output Object rect (user-resizable).
+                                        // Full-frame UV unless a Zoom node is in the graph chain.
                                         let (dx, dy, w, h, rot_rad) = layer.ne_output_paint_geom(
                                             &self.project.nodes,
                                             &eval,
@@ -7912,7 +8057,11 @@ fn run_video_decode_thread(
                                         } else {
                                             1.0
                                         };
-                                        // Zoom = UV crop (GPU) — never CPU rebake on zoom alone.
+                                        let uv = if eval.has_zoom() {
+                                            eval.zoom_uv_rect()
+                                        } else {
+                                            (0.0, 0.0, 1.0, 1.0)
+                                        };
                                         paint_rotated_image_mirrored_tint_uv(
                                             &painter,
                                             tex_id,
@@ -7922,7 +8071,7 @@ fn run_video_decode_thread(
                                             rgb_mul,
                                             mirror & 1 != 0,
                                             mirror & 2 != 0,
-                                            eval.zoom_uv_rect(),
+                                            uv,
                                         );
                                         // Selection stroke when proxy is selected (not drawn via draw_nodes).
                                         if let Some(pid) = layer.ne_output_proxy {
@@ -8521,6 +8670,25 @@ fn run_video_decode_thread(
                     self.tools.brush.brush_type,
                 );
             }
+
+            // Weight flow brush cursor (path sculpt)
+            if self.tools.weight_flow.enabled {
+                if let Some(doc) = self
+                    .tools
+                    .weight_flow
+                    .cursor_doc
+                    .or(self.cursor_doc)
+                {
+                    render::draw_weight_flow_cursor(
+                        &painter,
+                        &self.viewport,
+                        origin,
+                        doc,
+                        &self.tools.weight_flow,
+                        self.weight_flow_target_path().is_some(),
+                    );
+                }
+            }
         }
 
         let mut path_rect = None;
@@ -8721,6 +8889,20 @@ fn run_video_decode_thread(
             return;
         }
 
+        // Weight flow brush owns LMB when enabled + path selected (Select/Node).
+        if self.tools.weight_flow.enabled {
+            let dt = response.ctx.input(|i| i.stable_dt).max(1.0 / 240.0) as f32;
+            if self.tool_weight_flow(
+                doc_snapped,
+                primary_pressed,
+                primary_down,
+                primary_released_anywhere,
+                dt,
+            ) {
+                return;
+            }
+        }
+
         if self.tools.active == ToolKind::Pen {
             self.sync_pen_continue_from_selection();
         }
@@ -8836,9 +9018,15 @@ fn run_video_decode_thread(
                 moved_ids.push(id);
             }
         }
-        // Keep animation keyframes in sync so position does not snap back on apply.
+        // Keep animation keyframes in sync so position/path geom does not snap back on apply.
         for id in moved_ids {
             self.sync_anim_transform_from_node(id);
+            if self.anim_keyframing_mode && !self.anim_is_playing {
+                // Ensure path-point / weight-adjacent geom is captured even if REC only saw one frame.
+                self.record_geom_keyframes_for_node(id);
+            } else {
+                self.sync_anim_geom_from_node(id);
+            }
             self.sync_circular_ui_from_effect_id(id);
         }
         self.tools.select.circular_ring_drag_start.clear();
@@ -12230,6 +12418,240 @@ fn run_video_decode_thread(
         }
     }
 
+    /// Path node eligible for weight-flow sculpt (single Path selection).
+    pub fn weight_flow_target_path(&self) -> Option<NodeId> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let id = self.selection[0];
+        let node = self.project.nodes.get(id)?;
+        matches!(node.kind, NodeKind::Path { .. }).then_some(id)
+    }
+
+    /// True while the user is live-editing transform or path geometry (keyframing / skip apply).
+    fn is_live_geometry_editing(&self) -> bool {
+        self.tools.select.drag_mode.is_some()
+            || self.tools.select.node_drag_active
+            || self.tools.select.node_edit_target.is_some()
+            || self.tools.select.mid_curve_drag.is_some()
+            || self.tools.weight_flow.stroke.is_some()
+    }
+
+    /// When geom tracks already exist, keep them in sync with the live path (like pos/rot).
+    pub fn sync_anim_geom_from_node(&mut self, id: NodeId) {
+        let geom = self.get_node_geom_floats(id);
+        if geom.is_empty() {
+            return;
+        }
+        let frame = self.anim_current_frame;
+        let Some(entry) = self.project.anim_timeline.nodes.get_mut(&id) else {
+            return;
+        };
+        if entry.geom_tracks.is_empty()
+            || entry.geom_tracks.iter().all(|t| t.keyframes.is_empty())
+        {
+            return;
+        }
+        while entry.geom_tracks.len() < geom.len() {
+            entry.geom_tracks.push(KeyframeTrack::default());
+        }
+        for (i, &v) in geom.iter().enumerate() {
+            if !entry.geom_tracks[i].keyframes.is_empty() {
+                Self::write_anim_keyframe_at_edit(&mut entry.geom_tracks[i], frame, v);
+            }
+        }
+    }
+
+    /// Insert geom_* keyframes for the node at the current frame (REC mode / explicit capture).
+    /// Seeds frame 0 from the previous baseline when recording a later frame for the first time.
+    pub fn record_geom_keyframes_for_node(&mut self, id: NodeId) {
+        let geom = self.get_node_geom_floats(id);
+        if geom.is_empty() {
+            return;
+        }
+        let frame = self.anim_current_frame;
+        let baseline = self
+            .anim_last_applied_states
+            .get(&id)
+            .map(|s| s.geom_floats.clone())
+            .unwrap_or_else(|| geom.clone());
+
+        let before_timeline = self.project.anim_timeline.clone();
+        let entry = self.project.anim_timeline.nodes.entry(id).or_default();
+        while entry.geom_tracks.len() < geom.len() {
+            entry.geom_tracks.push(KeyframeTrack::default());
+        }
+        for i in 0..geom.len() {
+            let base_v = if i < baseline.len() {
+                baseline[i]
+            } else {
+                geom[i]
+            };
+            if entry.geom_tracks[i].keyframes.is_empty() && frame > 0 {
+                entry.geom_tracks[i].insert(0, base_v);
+            }
+            entry.geom_tracks[i].insert(frame, geom[i]);
+        }
+        let after_timeline = self.project.anim_timeline.clone();
+        if before_timeline != after_timeline {
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchTimeline {
+                    before: before_timeline,
+                    after: after_timeline,
+                },
+            );
+        }
+        // Update baseline so the next scrub doesn't re-trigger spuriously.
+        if let Some(node) = self.project.nodes.get(id) {
+            self.anim_last_applied_states.insert(
+                id,
+                AnimAppliedState {
+                    pos: node.get_pos(),
+                    rotation: node.get_rotation(),
+                    opacity: node.get_opacity(),
+                    color: node.get_color(),
+                    stroke_width: node.get_stroke_width(),
+                    stroke_color: node.get_stroke_color(),
+                    geom_floats: geom,
+                    fill: node.style.fill.clone(),
+                },
+            );
+        }
+    }
+
+    /// Returns true if the event was consumed (caller should not run Select/Node).
+    fn tool_weight_flow(
+        &mut self,
+        doc: (f64, f64),
+        pressed: bool,
+        down: bool,
+        released: bool,
+        dt: f32,
+    ) -> bool {
+        use crate::path_physics::PathPhysicsSim;
+        use crate::tools::{WeightFlowStroke, WeightFlowMode};
+        use glam::Vec2;
+
+        self.tools.weight_flow.cursor_doc = Some(doc);
+
+        // Only Select / Node tools; otherwise leave weight flow toggle on but don't steal LMB.
+        if !matches!(
+            self.tools.active,
+            crate::tools::ToolKind::Select | crate::tools::ToolKind::Node
+        ) {
+            if released || !down {
+                self.tools.weight_flow.cancel_stroke();
+            }
+            return false;
+        }
+
+        let Some(id) = self.weight_flow_target_path() else {
+            // No path selected: do not steal clicks — allow Select/marquee to pick objects.
+            if self.tools.weight_flow.stroke.is_some() {
+                self.cancel_weight_flow_stroke(true);
+            }
+            return false;
+        };
+
+        let brush = Vec2::new(doc.0 as f32, doc.1 as f32);
+        let cfg = self.tools.weight_flow.config.clone();
+
+        if pressed {
+            let Some(node) = self.project.nodes.get(id).cloned() else {
+                return true;
+            };
+            let NodeKind::Path { path } = &node.kind else {
+                return true;
+            };
+            let anchors = path.anchor_positions();
+            if anchors.len() < 2 {
+                self.status_message = "Weight flow needs a path with at least 2 points".into();
+                return true;
+            }
+            let closed = path.is_closed() && cfg.preserve_closed;
+            let sim = PathPhysicsSim::from_anchors(
+                &anchors,
+                closed,
+                cfg.point_mass,
+                cfg.lock_endpoints && !path.is_closed(),
+            );
+            self.tools.weight_flow.stroke = Some(WeightFlowStroke {
+                node_id: id,
+                before: node,
+                sim,
+                brush_prev: Some(brush),
+                brush_vel: Vec2::ZERO,
+            });
+            return true;
+        }
+
+        if down {
+            let Some(stroke) = self.tools.weight_flow.stroke.as_mut() else {
+                // No active stroke (e.g. press started outside canvas) — let Select handle it.
+                return false;
+            };
+            if stroke.node_id != id {
+                return false;
+            }
+            // Velocity from brush motion
+            let vel = if let Some(prev) = stroke.brush_prev {
+                (brush - prev) / dt.max(1e-4)
+            } else {
+                Vec2::ZERO
+            };
+            stroke.brush_vel = stroke.brush_vel.lerp(vel, 0.45);
+            stroke.brush_prev = Some(brush);
+
+            let mode = cfg.mode;
+            let substeps = if matches!(mode, WeightFlowMode::Drag) {
+                2
+            } else {
+                3
+            };
+            stroke
+                .sim
+                .step(brush, stroke.brush_vel, mode, &cfg, dt, substeps);
+
+            let new_anchors = stroke.sim.to_anchors();
+            if let Some(node) = self.project.nodes.get_mut(id) {
+                if let NodeKind::Path { path } = &mut node.kind {
+                    path.replace_anchors(&new_anchors);
+                }
+            }
+            return true;
+        }
+
+        if released {
+            if let Some(stroke) = self.tools.weight_flow.stroke.take() {
+                let id = stroke.node_id;
+                if let Some(after) = self.project.nodes.get(id).cloned() {
+                    if after != stroke.before {
+                        self.history.push(
+                            &mut self.project,
+                            ProjectEdit::PatchNode {
+                                id,
+                                before: stroke.before,
+                                after,
+                            },
+                        );
+                        self.status_message = "Weight flow stroke applied".into();
+                    }
+                }
+                // Record path geom keyframes if REC is on (stroke already ended; capture once).
+                if self.anim_keyframing_mode && !self.anim_is_playing {
+                    self.record_geom_keyframes_for_node(id);
+                } else {
+                    self.sync_anim_geom_from_node(id);
+                }
+            }
+            return true;
+        }
+
+        // Hovering with brush enabled + path selected: consume nothing extra unless stroke active
+        self.tools.weight_flow.stroke.is_some()
+    }
+
     fn tool_select(
         &mut self,
         screen: Pos2,
@@ -12311,21 +12733,33 @@ fn run_video_decode_thread(
                                 })
                                 .unwrap_or(l.id);
 
-                            let aspect = self.video_layers.get(&primary_id)
+                            let aspect = self
+                                .video_layers
+                                .get(&primary_id)
                                 .or_else(|| self.video_layers.get(&l.id))
                                 .and_then(|s| s.texture.as_ref())
                                 .map(|tex| {
                                     let tex_w = tex.size()[0] as f32;
                                     let tex_h = tex.size()[1] as f32;
-                                    if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                    if tex_h > 0.0 {
+                                        (tex_w / tex_h) as f64
+                                    } else {
+                                        1.0
+                                    }
                                 })
                                 .or_else(|| {
                                     self.video_frame_cache.as_ref()
-                                        .filter(|c| c.layer_id == primary_id || c.layer_id == l.id)
+                                        .filter(|c| {
+                                            c.layer_id == primary_id || c.layer_id == l.id
+                                        })
                                         .map(|c| {
                                             let tex_w = c.texture.size()[0] as f32;
                                             let tex_h = c.texture.size()[1] as f32;
-                                            if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                            if tex_h > 0.0 {
+                                                (tex_w / tex_h) as f64
+                                            } else {
+                                                1.0
+                                            }
                                         })
                                 })
                                 .unwrap_or(1.0);
@@ -12490,12 +12924,14 @@ fn run_video_decode_thread(
                 return;
             }
 
-            // Hit check visible Video Layers first (only while playhead is inside a clip)
+            // Hit check visible Video Layers first (only while playhead is inside a clip).
+            // Shading is full-page / stack-order only — never pick or drag on canvas.
             let mut hit_layer_id = None;
             let mut hit_layer_rect = None;
             let t_sec = self.anim_current_frame as f32 / self.anim_fps as f32;
             for layer in self.project.document.layers.iter().rev() {
                 if layer.visible
+                    && !layer.locked
                     && layer.kind == crate::document::LayerKind::AV
                     && layer.has_canvas_video()
                     && layer.shows_video_at(t_sec)
@@ -12514,20 +12950,31 @@ fn run_video_decode_thread(
                             rot = r;
                         }
                     }
-                    let aspect = self.video_layers.get(&layer.id)
+                    let aspect = self
+                        .video_layers
+                        .get(&layer.id)
                         .and_then(|s| s.texture.as_ref())
                         .map(|tex| {
                             let tex_w = tex.size()[0] as f32;
                             let tex_h = tex.size()[1] as f32;
-                            if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                            if tex_h > 0.0 {
+                                (tex_w / tex_h) as f64
+                            } else {
+                                1.0
+                            }
                         })
                         .or_else(|| {
-                            self.video_frame_cache.as_ref()
+                            self.video_frame_cache
+                                .as_ref()
                                 .filter(|c| c.layer_id == layer.id)
                                 .map(|c| {
                                     let tex_w = c.texture.size()[0] as f32;
                                     let tex_h = c.texture.size()[1] as f32;
-                                    if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                    if tex_h > 0.0 {
+                                        (tex_w / tex_h) as f64
+                                    } else {
+                                        1.0
+                                    }
                                 })
                         })
                         .unwrap_or(1.0);
@@ -12549,7 +12996,11 @@ fn run_video_decode_thread(
                     let sin = (-rot_rad).sin() as f64;
                     let local_x = px * cos - py * sin;
                     let local_y = px * sin + py * cos;
-                    if local_x >= -w/2.0 && local_x <= w/2.0 && local_y >= -h/2.0 && local_y <= h/2.0 {
+                    if local_x >= -w / 2.0
+                        && local_x <= w / 2.0
+                        && local_y >= -h / 2.0
+                        && local_y <= h / 2.0
+                    {
                         hit_layer_id = Some(layer.id);
                         hit_layer_rect = Some(kurbo::Rect::new(dx, dy, dx + w, dy + h));
                         break;
@@ -12776,6 +13227,10 @@ fn run_video_decode_thread(
                             for &sid in &selection_ids {
                                 let mut layer_pos = None;
                                 for (pos, l) in self.project.document.layers.iter().enumerate() {
+                                    // Shading is stack-order only — never translate on canvas.
+                                    if l.kind == crate::document::LayerKind::Shading {
+                                        continue;
+                                    }
                                     if l.id == sid || (l.kind == crate::document::LayerKind::AV && {
                                         let mut lc = l.clone();
                                         lc.ensure_av_clips();
@@ -12860,6 +13315,9 @@ fn run_video_decode_thread(
                                 tools::resize_bounds(self.tools.select.resize_anchor, handle, doc);
                             let mut layer_pos = None;
                             for (pos, l) in self.project.document.layers.iter().enumerate() {
+                                if l.kind == crate::document::LayerKind::Shading {
+                                    continue;
+                                }
                                 if l.id == id || (l.kind == crate::document::LayerKind::AV && {
                                     let mut lc = l.clone();
                                     lc.ensure_av_clips();
@@ -16123,7 +16581,7 @@ fn run_video_decode_thread(
         if crate::mcp::node_editor::is_node_editor_tool(name) {
             return self.mcp_node_editor_tool(name, &args);
         }
-        if !matches!(name, "add_layer" | "add_shading_layer") {
+        if !matches!(name, "add_layer" | "add_shading_layer" | "set_shading_wgsl") {
             self.mcp_ensure_editable()?;
         }
         let style = style_from_args(&args);
@@ -16458,6 +16916,49 @@ fn run_video_decode_thread(
                 self.add_shading_layer_with_wgsl(name, pass_name, wgsl, uniforms)?;
                 Ok(format!(
                     "Added shading layer \"{name}\" with runtime WGSL pass \"{pass_name}\""
+                ))
+            }
+            "set_shading_wgsl" => {
+                let wgsl = args
+                    .get("wgsl")
+                    .and_then(|v| v.as_str())
+                    .ok_or("set_shading_wgsl requires \"wgsl\"")?;
+                let layer_index = if let Some(i) = args.get("layer_index").and_then(|v| v.as_u64()) {
+                    i as usize
+                } else if let Some(id) = args.get("layer_id").and_then(|v| v.as_str()) {
+                    let uid = uuid::Uuid::parse_str(id).map_err(|_| "bad layer_id")?;
+                    self.project
+                        .document
+                        .layers
+                        .iter()
+                        .position(|l| l.id == uid)
+                        .ok_or("layer_id not found")?
+                } else {
+                    // Prefer active shading layer, else first shading.
+                    self.project
+                        .document
+                        .layers
+                        .get(self.project.document.active_layer_index)
+                        .filter(|l| l.kind == crate::document::LayerKind::Shading)
+                        .map(|_| self.project.document.active_layer_index)
+                        .or_else(|| {
+                            self.project
+                                .document
+                                .layers
+                                .iter()
+                                .position(|l| l.kind == crate::document::LayerKind::Shading)
+                        })
+                        .ok_or("no shading layer (pass layer_index or layer_id)")?
+                };
+                let pass_name = args.get("pass_name").and_then(|v| v.as_str());
+                let uniforms = args.get("uniforms").and_then(|v| v.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_f64().map(|f| f as f32))
+                        .collect::<Vec<f32>>()
+                });
+                self.set_shading_wgsl(layer_index, wgsl, pass_name, uniforms)?;
+                Ok(format!(
+                    "Updated shading WGSL on layer index {layer_index}"
                 ))
             }
             "list_animatable_properties" => {
@@ -17537,6 +18038,35 @@ fn run_video_decode_thread(
                     style.width = v.max(0.0) as f32;
                 }
             }
+            NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => {
+                // NE Output Object + image nodes: x,y,w,h (also accept width/height aliases).
+                if let Some(v) = patch.get("x").and_then(|v| v.as_f64()) {
+                    *x = v;
+                }
+                if let Some(v) = patch.get("y").and_then(|v| v.as_f64()) {
+                    *y = v;
+                }
+                if let Some(v) = patch
+                    .get("w")
+                    .or_else(|| patch.get("width"))
+                    .and_then(|v| v.as_f64())
+                {
+                    *width = v.max(1.0);
+                }
+                if let Some(v) = patch
+                    .get("h")
+                    .or_else(|| patch.get("height"))
+                    .and_then(|v| v.as_f64())
+                {
+                    *height = v.max(1.0);
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -18080,8 +18610,8 @@ impl eframe::App for VadadeeBerryApp {
         }
 
         let frame_scrubbed = self.anim_current_frame != self.anim_last_seen_frame;
-        // Never re-apply animation mid-drag — it would fight live position edits.
-        let dragging = self.tools.select.drag_mode.is_some();
+        // Never re-apply animation mid-drag — it would fight live position / path-point edits.
+        let dragging = self.is_live_geometry_editing();
         if (frame_scrubbed || frame_changed) && !dragging {
             self.apply_animation_for_frame(self.anim_current_frame);
             self.anim_last_seen_frame = self.anim_current_frame;
@@ -18106,7 +18636,8 @@ impl eframe::App for VadadeeBerryApp {
         // Node Editor algebra (Value / Frame / Time / Expr / ParamReal) every frame.
         self.eval_node_editor_graphs();
 
-        if self.anim_keyframing_mode && !self.anim_is_playing && self.tools.select.drag_mode.is_some() {
+        // Record keyframes while keyframing: whole-object drag, path node drag, weight-flow sculpt.
+        if self.anim_keyframing_mode && !self.anim_is_playing && self.is_live_geometry_editing() {
             // Ensure reference state is populated
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
@@ -18190,38 +18721,12 @@ impl eframe::App for VadadeeBerryApp {
                             }
                         }
                         
-                        let mut temp_geom = temp_node.get_geom_floats();
-                        if let Some(tiling) = self.project.document.tiling_effects.values().find(|e| e.source_id == *id) {
-                            temp_geom.push(tiling.gap_x);
-                            temp_geom.push(tiling.gap_y);
-                            temp_geom.push(tiling.count_x as f64);
-                            temp_geom.push(tiling.count_y as f64);
-                            temp_geom.push(tiling.offset_x);
-                            temp_geom.push(tiling.offset_y);
-                            temp_geom.push(tiling.row_rotation);
-                            temp_geom.push(tiling.col_rotation);
-                            temp_geom.push(tiling.row_scale);
-                            temp_geom.push(tiling.col_scale);
-                        }
-                        if let Some(circ) = self.project.document.circular_effects.values().find(|e| e.source_id == *id) {
-                            temp_geom.push(circ.origin_x);
-                            temp_geom.push(circ.origin_y);
-                            temp_geom.push(circ.radius);
-                            temp_geom.push(circ.copies as f64);
-                            temp_geom.push(circ.angle_offset);
-                            temp_geom.push(circ.base_x);
-                            temp_geom.push(circ.base_y);
-                        }
-                        if let Some(oop) = self.project.document.path_effects.values().find(|e| e.source_id == *id) {
-                            temp_geom.push(oop.gap);
-                            temp_geom.push(oop.count as f64);
-                            temp_geom.push(oop.start_offset);
-                        }
-                        
+                        // Compare live geom (path anchors / handles) directly — do not use
+                        // temp_node after un-translate (that shifts all path points and hides edits).
                         let mut geom_really_changed = false;
-                        if temp_geom.len() == last.geom_floats.len() {
-                            for i in 0..temp_geom.len() {
-                                if (temp_geom[i] - last.geom_floats[i]).abs() > 1e-6 {
+                        if geom.len() == last.geom_floats.len() {
+                            for i in 0..geom.len() {
+                                if (geom[i] - last.geom_floats[i]).abs() > 1e-6 {
                                     geom_really_changed = true;
                                     break;
                                 }
@@ -18229,7 +18734,6 @@ impl eframe::App for VadadeeBerryApp {
                         } else if !geom.is_empty() {
                             geom_really_changed = true;
                         }
-                        
                         if geom_really_changed {
                             changed_geom = true;
                         }
@@ -19217,7 +19721,9 @@ impl VadadeeBerryApp {
 
         let mut paths: Vec<String> = Vec::new();
         for layer in &self.project.document.layers {
-            if layer.kind != crate::document::LayerKind::NodeEditor || !layer.visible {
+            // Warm extract for hidden NE layers too — visibility toggle must not force
+            // a cold re-extract (and cache wipe) before sound can resume.
+            if layer.kind != crate::document::LayerKind::NodeEditor {
                 continue;
             }
             let Some(g) = layer.node_graph.as_ref() else {

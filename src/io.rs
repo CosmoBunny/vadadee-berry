@@ -818,6 +818,9 @@ pub fn resolve_capture_view(
 }
 
 /// Rasterize a document region. `resolution_percent` is 1..100 (100 = 1:1 px per doc unit).
+///
+/// Uses the same layer stack as export (Node Editor bake + shading + images), not SVG-only,
+/// so galaxy shaders and NE video appear in MCP snapshots / previews.
 pub fn rasterize_document_view(
     project: &ProjectFile,
     view: kurbo::Rect,
@@ -825,9 +828,54 @@ pub fn rasterize_document_view(
     current_frame: usize,
     video_frames: &std::collections::HashMap<uuid::Uuid, Vec<u8>>,
 ) -> Option<(u32, u32, Vec<u8>)> {
-    let svg = document_svg_for_view(project, view, current_frame, video_frames);
     let scale = (resolution_percent / 100.0).clamp(0.01, 2.0);
-    render_svg_to_rgba_even(&svg, scale)
+    // Prefer wall-clock-ish time for animated shaders when frame scrub is 0.
+    let time_secs = (current_frame as f32 / 24.0).max(0.0);
+    // Convert loose HashMap to Fx map for composite (empty AV still ok — NE bakes itself).
+    let mut vf: VideoFrameMap = rustc_hash::FxHashMap::default();
+    for (k, v) in video_frames {
+        // Only used if caller packs VideoLayerBuffer elsewhere; bare RGBA map is unused here.
+        let _ = (k, v);
+    }
+    let (pw, ph, mut rgba) =
+        composite_export_frame(project, current_frame, &vf, scale, time_secs)?;
+
+    // Crop to requested view when not the full page.
+    let doc_w = project.document.width;
+    let doc_h = project.document.height;
+    let full = (view.x0.abs() < 0.5
+        && view.y0.abs() < 0.5
+        && (view.width() - doc_w).abs() < 1.0
+        && (view.height() - doc_h).abs() < 1.0)
+        || view.width() >= doc_w - 1.0 && view.height() >= doc_h - 1.0;
+    if full {
+        return Some((pw, ph, rgba));
+    }
+    let x0 = ((view.x0 / doc_w) * pw as f64).floor().max(0.0) as u32;
+    let y0 = ((view.y0 / doc_h) * ph as f64).floor().max(0.0) as u32;
+    let x1 = (((view.x0 + view.width()) / doc_w) * pw as f64)
+        .ceil()
+        .min(pw as f64) as u32;
+    let y1 = (((view.y0 + view.height()) / doc_h) * ph as f64)
+        .ceil()
+        .min(ph as f64) as u32;
+    let cw = x1.saturating_sub(x0).max(1);
+    let ch = y1.saturating_sub(y0).max(1);
+    let mut out = vec![0u8; (cw * ch * 4) as usize];
+    for row in 0..ch {
+        let src_y = y0 + row;
+        if src_y >= ph {
+            break;
+        }
+        let src_off = ((src_y * pw + x0) * 4) as usize;
+        let dst_off = (row * cw * 4) as usize;
+        let n = (cw * 4) as usize;
+        if src_off + n <= rgba.len() && dst_off + n <= out.len() {
+            out[dst_off..dst_off + n].copy_from_slice(&rgba[src_off..src_off + n]);
+        }
+    }
+    let _ = &mut rgba;
+    Some((cw, ch, out))
 }
 
 pub fn render_svg_to_rgba(svg_data: &str, scale: f32) -> Option<(u32, u32, Vec<u8>)> {
@@ -1232,13 +1280,22 @@ fn apply_shading_passes_skia(
     if let Some(pass) = passes.first().filter(|p| p.enabled) {
         let name = pass.name.to_ascii_lowercase();
         let wgsl = pass.compiled_wgsl.as_ref().unwrap_or(&pass.wgsl);
-        let is_blackhole = name.contains("blackhole") || wgsl.contains("blackhole");
-        let is_starfield = name.contains("star") || name.contains("space") || wgsl.contains("starfield") || wgsl.contains("star");
-        
-        if is_starfield {
+        // Only named built-in presets use CPU heuristics — never hijack custom WGSL
+        // that merely mentions "star" (e.g. galaxy shaders).
+        let is_blackhole = name == "blackhole" || name.starts_with("blackhole ");
+        let is_starfield = matches!(
+            name.as_str(),
+            "starfield" | "stars" | "space" | "star field"
+        ) || name.starts_with("starfield");
+
+        let is_galaxy = name.contains("galaxy")
+            || wgsl.contains("Procedural galaxy")
+            || wgsl.contains("// Procedural galaxy");
+
+        if is_galaxy || is_starfield {
             let w = pixmap.width();
             let h = pixmap.height();
-            let aspect = (w as f32 / h as f32).max(0.25);
+            let aspect = (w as f32 / (h as f32).max(1.0)).max(0.25);
 
             let t = if pass.uniforms.len() >= 1 {
                 pass.uniforms[0] + time_secs
@@ -1252,11 +1309,19 @@ fn apply_shading_passes_skia(
                 let row_offset = y as usize * w as usize * 4;
                 for x in 0..w {
                     let u_val = (x as f32 + 0.5) / w as f32;
-                    let rgb = crate::shading::procedural_blackhole::sample_starfield(
-                        (u_val, v),
-                        t,
-                        aspect,
-                    );
+                    let rgb = if is_galaxy {
+                        crate::shading::procedural_blackhole::sample_galaxy(
+                            (u_val, v),
+                            t,
+                            aspect,
+                        )
+                    } else {
+                        crate::shading::procedural_blackhole::sample_starfield(
+                            (u_val, v),
+                            t,
+                            aspect,
+                        )
+                    };
                     let idx = row_offset + x as usize * 4;
                     data[idx] = rgb[0];
                     data[idx + 1] = rgb[1];

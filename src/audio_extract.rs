@@ -59,7 +59,8 @@ fn extract_once_map() -> &'static Mutex<HashMap<String, Arc<OnceLock<Result<Path
 }
 
 /// Ensure `output` WAV exists for `input` video/audio. Safe to call from many
-/// threads / every frame — demuxes **at most once** per output path.
+/// threads / every frame — demuxes **at most once** per output path while the
+/// file is present. If a previous extract's WAV was deleted from cache, re-runs.
 pub fn ensure_extracted_wav(
     input: &Path,
     output: &Path,
@@ -73,6 +74,23 @@ pub fn ensure_extracted_wav(
         return Ok(wav_path);
     }
 
+    // Stale OnceLock: a prior success/failure is useless if the WAV is gone (or
+    // extract failed and we want a retry after cache wipe / visibility churn).
+    {
+        let mut map = extract_once_map().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cell) = map.get(&key) {
+            match cell.get() {
+                Some(Ok(p)) if !wav_is_playable(p) => {
+                    map.remove(&key);
+                }
+                Some(Err(_)) => {
+                    map.remove(&key);
+                }
+                _ => {}
+            }
+        }
+    }
+
     let cell = {
         let mut map = extract_once_map().lock().unwrap_or_else(|e| e.into_inner());
         map.entry(key.clone())
@@ -81,14 +99,31 @@ pub fn ensure_extracted_wav(
     };
 
     // Exactly one thread runs the closure; others block until it finishes.
-    cell.get_or_init(|| {
-        // Re-check after waiting for another thread.
-        if wav_is_playable(&wav_path) {
-            return Ok(wav_path.clone());
+    let report_once = report.clone();
+    let result = cell
+        .get_or_init(|| {
+            // Re-check after waiting for another thread.
+            if wav_is_playable(&wav_path) {
+                return Ok(wav_path.clone());
+            }
+            extract_audio_to_wav_inner(input, &wav_path, report_once)
+        })
+        .clone();
+
+    // If another thread "succeeded" but the file vanished mid-flight, force one retry.
+    match &result {
+        Ok(p) if wav_is_playable(p) => result,
+        Ok(_) | Err(_) => {
+            {
+                let mut map = extract_once_map().lock().unwrap_or_else(|e| e.into_inner());
+                map.remove(&key);
+            }
+            if wav_is_playable(&wav_path) {
+                return Ok(wav_path);
+            }
+            extract_audio_to_wav_inner(input, &wav_path, report)
         }
-        extract_audio_to_wav_inner(input, &wav_path, report)
-    })
-    .clone()
+    }
 }
 
 fn normalize_wav_path(output: &Path) -> PathBuf {

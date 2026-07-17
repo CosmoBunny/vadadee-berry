@@ -1653,7 +1653,14 @@ impl<'a> ExportSession<'a> {
                         }
                     }
                     crate::document::LayerKind::Shading => {
-                        let page_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(self.project.document.width as f32 * self.scale, self.project.document.height as f32 * self.scale));
+                        // Always full content canvas (document page), not layer x/y/w/h.
+                        let page_rect = egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(
+                                self.project.document.width as f32 * self.scale,
+                                self.project.document.height as f32 * self.scale,
+                            ),
+                        );
                         crate::shading::draw_shading_passes(
                             &painter,
                             page_rect,

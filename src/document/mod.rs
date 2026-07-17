@@ -369,6 +369,7 @@ impl Layer {
             x: 0.0,
             y: 0.0,
             rotation: 0.0,
+            // Display size follows the document page; shaders are not free-transform objects.
             width: A4_WIDTH_PX as f32,
             height: A4_HEIGHT_PX as f32,
             aspect_ratio_locked: true,
@@ -639,8 +640,8 @@ impl Layer {
         (dx, dy, w, h, rot)
     }
 
-    /// One-shot: if the Output proxy is still page-sized (default), fit it to the
-    /// image's natural pixel size (capped to the page).
+    /// One-shot fit: only when the Output proxy is still the default page/A4 box.
+    /// Never overrides user resize — free transform stays free.
     pub fn fit_ne_output_proxy_to_image(
         &mut self,
         nodes: &mut NodeStore,
@@ -659,12 +660,15 @@ impl Layer {
             return;
         };
         let NodeKind::Image {
-            width, height, ..
+            x,
+            y,
+            width,
+            height,
+            ..
         } = &mut node.kind
         else {
             return;
         };
-        // Still the ensure-default box (layer page size or A4).
         let def_w = self.width as f64;
         let def_h = self.height as f64;
         let near_default = (*width - def_w).abs() < 2.0 && (*height - def_h).abs() < 2.0;
@@ -672,17 +676,22 @@ impl Layer {
         if !near_default && !near_a4 {
             return;
         }
-        let mut w = img_w as f64;
-        let mut h = img_h as f64;
         let max_w = page_w.max(1.0);
         let max_h = page_h.max(1.0);
-        if w > max_w || h > max_h {
-            let s = (max_w / w).min(max_h / h);
-            w *= s;
-            h *= s;
-        }
-        *width = w.max(1.0);
-        *height = h.max(1.0);
+        let (tw, th) = (img_w as f64, img_h as f64);
+        let (w, h) = if (max_w / tw) <= (max_h / th) {
+            let w = max_w;
+            let h = th * (max_w / tw);
+            (w.min(max_w).max(1.0), h.min(max_h).max(1.0))
+        } else {
+            let h = max_h;
+            let w = tw * (max_h / th);
+            (w.min(max_w).max(1.0), h.min(max_h).max(1.0))
+        };
+        *width = w;
+        *height = h;
+        *x = ((max_w - w) * 0.5).max(0.0);
+        *y = ((max_h - h) * 0.5).max(0.0);
     }
 
     /// Migrate legacy single-clip fields into `av_clips` (idempotent).
@@ -1013,10 +1022,14 @@ impl Document {
         idx
     }
 
+    /// Insert shading at the **bottom** of the stack by default. It always fills the
+    /// document page; stack order is changeable via Raise/Lower (not canvas drag).
     pub fn add_shading_layer(&mut self, name: impl Into<String>) -> usize {
         let layer = Layer::new_shading_layer(Uuid::new_v4(), name.into());
-        self.layers.push(layer);
-        self.layers.len() - 1
+        self.layers.insert(0, layer);
+        // Existing layer indices shift up; active points at the new shading layer.
+        self.active_layer_index = 0;
+        0
     }
 
     pub fn add_flowchart_layer(&mut self, name: impl Into<String>) -> usize {
