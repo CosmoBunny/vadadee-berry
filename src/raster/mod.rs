@@ -67,8 +67,7 @@ impl RasterBuffer {
         Self::new(width, height).encode_png()
     }
 
-    /// Stamp a circular brush. `radius` in pixels. `hardness` 0=soft … 1=hard edge.
-    /// `color` RGBA 0–255 unpremultiplied. `erase` multiplies destination alpha down.
+    /// Optional pixel-space clip rect `[x0,y0)…[x1,y1)` (None = full buffer).
     pub fn stamp_circle(
         &mut self,
         cx: f32,
@@ -79,16 +78,39 @@ impl RasterBuffer {
         opacity: f32,
         erase: bool,
     ) {
+        self.stamp_circle_clipped(cx, cy, radius, hardness, color, opacity, erase, None);
+    }
+
+    /// Stamp a circular brush. `radius` in pixels. `hardness` 0=soft … 1=hard edge.
+    /// `color` RGBA 0–255 unpremultiplied. `erase` multiplies destination alpha down.
+    /// `clip` limits painting to a pixel AABB (selection mask).
+    pub fn stamp_circle_clipped(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        hardness: f32,
+        color: [u8; 4],
+        opacity: f32,
+        erase: bool,
+        clip: Option<(i32, i32, i32, i32)>,
+    ) {
         let r = radius.max(0.5);
         let hard = hardness.clamp(0.0, 1.0);
         let op = opacity.clamp(0.0, 1.0);
         if op <= 1e-6 {
             return;
         }
-        let x0 = (cx - r - 1.0).floor().max(0.0) as i32;
-        let y0 = (cy - r - 1.0).floor().max(0.0) as i32;
-        let x1 = ((cx + r + 1.0).ceil() as i32).min(self.width as i32);
-        let y1 = ((cy + r + 1.0).ceil() as i32).min(self.height as i32);
+        let mut x0 = (cx - r - 1.0).floor().max(0.0) as i32;
+        let mut y0 = (cy - r - 1.0).floor().max(0.0) as i32;
+        let mut x1 = ((cx + r + 1.0).ceil() as i32).min(self.width as i32);
+        let mut y1 = ((cy + r + 1.0).ceil() as i32).min(self.height as i32);
+        if let Some((cx0, cy0, cx1, cy1)) = clip {
+            x0 = x0.max(cx0);
+            y0 = y0.max(cy0);
+            x1 = x1.min(cx1);
+            y1 = y1.min(cy1);
+        }
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -164,6 +186,101 @@ impl RasterBuffer {
                         self.rgba[idx + c] = (o * 255.0).clamp(0.0, 255.0) as u8;
                     }
                     self.rgba[idx + 3] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+
+    /// Smudge: blend each pixel toward a sample offset opposite the stroke direction
+    /// (smears colors along the stroke). `strength` 0..1.
+    pub fn smudge_circle(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        hardness: f32,
+        strength: f32,
+        dir: (f32, f32),
+        clip: Option<(i32, i32, i32, i32)>,
+    ) {
+        let r = radius.max(0.5);
+        let hard = hardness.clamp(0.0, 1.0);
+        let str = strength.clamp(0.0, 1.0);
+        if str <= 1e-6 {
+            return;
+        }
+        let dlen = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(1e-6);
+        // Sample offset ~ 0.4 radius opposite motion (pull color from behind tip).
+        let ox = -dir.0 / dlen * r * 0.4;
+        let oy = -dir.1 / dlen * r * 0.4;
+
+        let mut x0 = (cx - r - 1.0).floor().max(0.0) as i32;
+        let mut y0 = (cy - r - 1.0).floor().max(0.0) as i32;
+        let mut x1 = ((cx + r + 1.0).ceil() as i32).min(self.width as i32);
+        let mut y1 = ((cy + r + 1.0).ceil() as i32).min(self.height as i32);
+        if let Some((cx0, cy0, cx1, cy1)) = clip {
+            x0 = x0.max(cx0);
+            y0 = y0.max(cy0);
+            x1 = x1.min(cx1);
+            y1 = y1.min(cy1);
+        }
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let r2 = r * r;
+        let hard_r = hard * r;
+        let hard_r2 = hard_r * hard_r;
+        let soft_span = (r - hard_r).max(1e-3);
+        let w = self.width as usize;
+        let h = self.height as i32;
+        let ww = self.width as i32;
+
+        // Read from a snapshot so multi-pixel smudge is stable.
+        let src = self.rgba.clone();
+        let sample = |sx: f32, sy: f32| -> [f32; 4] {
+            let ix = sx.round() as i32;
+            let iy = sy.round() as i32;
+            if ix < 0 || iy < 0 || ix >= ww || iy >= h {
+                return [0.0, 0.0, 0.0, 0.0];
+            }
+            let i = (iy as usize * w + ix as usize) * 4;
+            [
+                src[i] as f32,
+                src[i + 1] as f32,
+                src[i + 2] as f32,
+                src[i + 3] as f32,
+            ]
+        };
+
+        for y in y0..y1 {
+            let row = y as usize * w;
+            let dy = y as f32 + 0.5 - cy;
+            let dy2 = dy * dy;
+            for x in x0..x1 {
+                let dx = x as f32 + 0.5 - cx;
+                let d2 = dx * dx + dy2;
+                if d2 >= r2 {
+                    continue;
+                }
+                let cover = if d2 <= hard_r2 {
+                    1.0
+                } else {
+                    let d = d2.sqrt();
+                    let t = ((d - hard_r) / soft_span).clamp(0.0, 1.0);
+                    let t = t * t * (3.0 - 2.0 * t);
+                    1.0 - t
+                };
+                let t = (cover * str).clamp(0.0, 1.0);
+                if t <= 1e-6 {
+                    continue;
+                }
+                let px = x as f32 + 0.5;
+                let py = y as f32 + 0.5;
+                let s = sample(px + ox, py + oy);
+                let idx = (row + x as usize) * 4;
+                for c in 0..4 {
+                    let d = self.rgba[idx + c] as f32;
+                    self.rgba[idx + c] = (d + (s[c] - d) * t).clamp(0.0, 255.0) as u8;
                 }
             }
         }

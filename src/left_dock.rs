@@ -712,6 +712,7 @@ fn tool_kind_from_label(label: &str) -> Option<ToolKind> {
         "Paint" => Some(ToolKind::RasterBrush),
         "Eraser" => Some(ToolKind::Eraser),
         "Fill" => Some(ToolKind::BucketFill),
+        "Smudge" => Some(ToolKind::Smudge),
         "Eyedropper" => Some(ToolKind::Eyedropper),
         _ => None,
     }
@@ -730,6 +731,7 @@ impl DrawingTool for ToolKind {
                 | ToolKind::RasterBrush
                 | ToolKind::Eraser
                 | ToolKind::BucketFill
+                | ToolKind::Smudge
                 | ToolKind::Rectangle
                 | ToolKind::Circle
                 | ToolKind::Ellipse
@@ -759,6 +761,7 @@ fn collab_tool_icon(label: &str) -> &'static str {
         Some(ToolKind::RasterBrush) => icons::RASTER_BRUSH,
         Some(ToolKind::Eraser) => icons::ERASER,
         Some(ToolKind::BucketFill) => icons::BUCKET,
+        Some(ToolKind::Smudge) => icons::SMUDGE,
         Some(ToolKind::Eyedropper) => icons::EYE_DROPPER,
         None => icons::SELECT,
     }

@@ -550,6 +550,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::RasterBrush,
             ToolKind::Eraser,
             ToolKind::BucketFill,
+            ToolKind::Smudge,
             ToolKind::Eyedropper,
         ]
     };
@@ -590,6 +591,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::RasterBrush => icons::RASTER_BRUSH,
             ToolKind::Eraser => icons::ERASER,
             ToolKind::BucketFill => icons::BUCKET,
+            ToolKind::Smudge => icons::SMUDGE,
             ToolKind::Eyedropper => icons::EYE_DROPPER,
         }
     };
@@ -611,6 +613,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::RasterBrush => "Raster paint (K) — paints Image pixels · Alt=pick",
             ToolKind::Eraser => "Eraser (X) — erase Image alpha · Alt=pick",
             ToolKind::BucketFill => "Flood fill (F) — fill contiguous pixels on Image",
+            ToolKind::Smudge => "Smudge (U) — smear Image pixels",
             ToolKind::Eyedropper => "Eyedropper (I)",
         }
     };
@@ -6930,12 +6933,13 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
     if matches!(
         app.tools.active,
-        ToolKind::RasterBrush | ToolKind::Eraser | ToolKind::BucketFill
+        ToolKind::RasterBrush | ToolKind::Eraser | ToolKind::BucketFill | ToolKind::Smudge
     ) {
         theme::constraint_block(ui, |ui| {
             let title = match app.tools.active {
                 ToolKind::Eraser => format!("{} Eraser (raster)", icons::ERASER),
                 ToolKind::BucketFill => format!("{} Fill (raster)", icons::BUCKET),
+                ToolKind::Smudge => format!("{} Smudge (raster)", icons::SMUDGE),
                 _ => format!("{} Paint (raster)", icons::RASTER_BRUSH),
             };
             ui.label(
@@ -6955,6 +6959,10 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 if brush_numeric_row(ui, "Tolerance", &mut tol, 0.0..=128.0, 1.0) {
                     app.tools.raster.fill_tolerance = tol.round().clamp(0.0, 128.0) as u8;
                 }
+                ui.checkbox(
+                    &mut app.tools.raster.clip_to_selection,
+                    "Clip to selection bounds",
+                );
                 ui.label(
                     RichText::new("Click to flood-fill · Color = Fill swatch · Alt=pick")
                         .small()
@@ -6969,9 +6977,16 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 if brush_numeric_row(ui, "Hardness", &mut hard, 0.0..=1.0, 0.01) {
                     app.tools.raster.hardness = hard;
                 }
-                let mut op = app.tools.raster.opacity;
-                if brush_numeric_row(ui, "Opacity", &mut op, 0.0..=1.0, 0.01) {
-                    app.tools.raster.opacity = op;
+                if app.tools.active == ToolKind::Smudge {
+                    let mut str = app.tools.raster.smudge_strength;
+                    if brush_numeric_row(ui, "Strength", &mut str, 0.0..=1.0, 0.01) {
+                        app.tools.raster.smudge_strength = str;
+                    }
+                } else {
+                    let mut op = app.tools.raster.opacity;
+                    if brush_numeric_row(ui, "Opacity", &mut op, 0.0..=1.0, 0.01) {
+                        app.tools.raster.opacity = op;
+                    }
                 }
                 let mut sp = app.tools.raster.spacing;
                 if brush_numeric_row(ui, "Spacing", &mut sp, 0.05..=1.0, 0.01) {
@@ -6981,13 +6996,23 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 if brush_numeric_row(ui, "Stabilizer", &mut stab, 0.0..=1.0, 0.01) {
                     app.tools.raster.stabilizer = stab;
                 }
+                ui.checkbox(
+                    &mut app.tools.raster.clip_to_selection,
+                    "Clip to selection bounds",
+                );
                 if app.tools.active == ToolKind::RasterBrush {
                     ui.label(
                         RichText::new(
-                            "Color = Fill  ·  Shift = erase  ·  Alt = pick  ·  Stabilizer smooths freehand",
+                            "Color = Fill  ·  Shift = erase  ·  Alt = pick  ·  multi-select clips paint",
                         )
                         .small()
                         .color(colors::TEXT_MUTED),
+                    );
+                } else if app.tools.active == ToolKind::Smudge {
+                    ui.label(
+                        RichText::new("Drag to smear pixels · select shapes to clip")
+                            .small()
+                            .color(colors::TEXT_MUTED),
                     );
                 } else {
                     ui.label(

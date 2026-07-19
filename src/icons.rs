@@ -66,6 +66,8 @@ pub const RASTER_BRUSH: &str = "󰃥";
 pub const ERASER: &str = "󰃢";
 /// Bucket / flood fill (nf-md-format-color-fill).
 pub const BUCKET: &str = "󰃡";
+/// Smudge / blur finger (nf-md-water).
+pub const SMUDGE: &str = "󰖌";
 /// Shader / shading layer (full-page pass; stack-order flexible via raise/lower).
 pub const SHADING: &str = "󰽏";
 /// Live collaboration chat (Nerd Font).

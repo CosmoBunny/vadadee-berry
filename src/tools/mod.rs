@@ -30,6 +30,8 @@ pub enum ToolKind {
     Eraser,
     /// Flood-fill Image RGBA (contiguous color).
     BucketFill,
+    /// Smudge / smear Image pixels.
+    Smudge,
     Eyedropper,
 }
 
@@ -51,6 +53,7 @@ impl ToolKind {
             Self::RasterBrush => "Paint",
             Self::Eraser => "Eraser",
             Self::BucketFill => "Fill",
+            Self::Smudge => "Smudge",
             Self::Eyedropper => "Eyedropper",
         }
     }
@@ -69,10 +72,11 @@ impl ToolKind {
             Self::Arc => Some(Key::A),
             Self::Plotter => Some(Key::M),
             Self::Brush => Some(Key::B),
-            // E = Ellipse already; use K (paint) / X eraser / F fill.
+            // E = Ellipse already; use K (paint) / X eraser / F fill / U smudge.
             Self::RasterBrush => Some(Key::K),
             Self::Eraser => Some(Key::X),
             Self::BucketFill => Some(Key::F),
+            Self::Smudge => Some(Key::U),
             Self::Eyedropper => Some(Key::I),
         }
     }
@@ -413,6 +417,10 @@ pub struct RasterSession {
     pub stable_px: Option<(f32, f32)>,
     /// Flood fill color tolerance 0..255 (RGB distance).
     pub fill_tolerance: u8,
+    /// When true and selection is not only the paint target, clip stamps to selection AABB.
+    pub clip_to_selection: bool,
+    /// Smudge strength 0..1.
+    pub smudge_strength: f32,
     /// Active paint target (Image node).
     pub target: Option<crate::document::NodeId>,
     /// Snapshot of Image.bytes before the stroke (undo).
@@ -451,6 +459,8 @@ impl Default for RasterSession {
             stabilizer: 0.35,
             stable_px: None,
             fill_tolerance: 24,
+            clip_to_selection: true,
+            smudge_strength: 0.55,
             target: None,
             before_bytes: None,
             before_w: 0.0,
@@ -570,6 +580,7 @@ impl ToolState {
                 ToolKind::RasterBrush,
                 ToolKind::Eraser,
                 ToolKind::BucketFill,
+                ToolKind::Smudge,
                 ToolKind::Eyedropper,
             ]
         };

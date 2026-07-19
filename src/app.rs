@@ -6921,7 +6921,10 @@ impl VadadeeBerryApp {
             force,
         );
         self.tools.raster.spacing_carry = carry;
+        let prev_px = self.tools.raster.last_px;
         self.tools.raster.last_px = Some((px, py));
+        let clip = self.raster_selection_clip_px(id, x, y, width, height, rot, pw, ph);
+        let smudge = self.tools.active == ToolKind::Smudge;
 
         if !stamps.is_empty() {
             if let Some(rgba) = self.tools.raster.live_rgba.as_mut() {
@@ -6930,8 +6933,22 @@ impl VadadeeBerryApp {
                     height: ph,
                     rgba: std::mem::take(rgba),
                 };
-                for (sx, sy) in stamps {
-                    buf.stamp_circle(sx, sy, radius, hardness, color, opacity, erase);
+                if smudge {
+                    let dir = if let Some((lx, ly)) = prev_px {
+                        (px - lx, py - ly)
+                    } else {
+                        (1.0, 0.0)
+                    };
+                    let str = self.tools.raster.smudge_strength * press;
+                    for (sx, sy) in stamps {
+                        buf.smudge_circle(sx, sy, radius, hardness, str, dir, clip);
+                    }
+                } else {
+                    for (sx, sy) in stamps {
+                        buf.stamp_circle_clipped(
+                            sx, sy, radius, hardness, color, opacity, erase, clip,
+                        );
+                    }
                 }
                 *rgba = buf.rgba;
             }
@@ -7139,7 +7156,9 @@ impl VadadeeBerryApp {
                 after,
             },
         );
-        self.status_message = if erase {
+        self.status_message = if self.tools.active == ToolKind::Smudge {
+            "Smudged".into()
+        } else if erase {
             "Erased".into()
         } else {
             "Painted".into()
@@ -7206,6 +7225,15 @@ impl VadadeeBerryApp {
             raw.push(p.b());
             raw.push(p.a());
         }
+        // Optional selection clip: if seed is outside clip, abort; fill still floods
+        // whole connected region (clip is enforced by zeroing outside after fill).
+        let clip = self.raster_selection_clip_px(id, x, y, width, height, rot, pw, ph);
+        if let Some((x0, y0, x1, y1)) = clip {
+            if sx < x0 || sy < y0 || sx >= x1 || sy >= y1 {
+                self.status_message = "Click inside selection to fill".into();
+                return;
+            }
+        }
         let fill = self.raster_paint_rgba();
         let n = crate::raster::flood_fill(
             &mut raw,
@@ -7219,6 +7247,21 @@ impl VadadeeBerryApp {
         if n == 0 {
             self.status_message = "Nothing to fill".into();
             return;
+        }
+        // Restore pixels outside selection clip from before_bytes snapshot.
+        if let Some((x0, y0, x1, y1)) = clip {
+            if let Some(orig) = crate::raster::RasterBuffer::from_png_bytes(&before_bytes) {
+                if orig.width == pw && orig.height == ph {
+                    for y in 0..ph as i32 {
+                        for x in 0..pw as i32 {
+                            if x < x0 || y < y0 || x >= x1 || y >= y1 {
+                                let i = (y as usize * pw as usize + x as usize) * 4;
+                                raw[i..i + 4].copy_from_slice(&orig.rgba[i..i + 4]);
+                            }
+                        }
+                    }
+                }
+            }
         }
         self.sync_image_texture_from_rgba(id, pw, ph, &raw, ctx);
         let Some(png) = (crate::raster::RasterBuffer {
@@ -7250,6 +7293,85 @@ impl VadadeeBerryApp {
             },
         );
         self.status_message = format!("Filled {n} px");
+    }
+
+    /// Map selection AABB → Image pixel clip when "clip to selection" is on and
+    /// selection is not only the paint target.
+    fn raster_selection_clip_px(
+        &self,
+        target_id: NodeId,
+        img_x: f64,
+        img_y: f64,
+        img_w: f64,
+        img_h: f64,
+        rot: f64,
+        pw: u32,
+        ph: u32,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if !self.tools.raster.clip_to_selection || self.selection.is_empty() {
+            return None;
+        }
+        if self.selection.len() == 1 && self.selection[0] == target_id {
+            return None;
+        }
+        let b = self.selection_bounds()?;
+        if b.width() < 1e-6 || b.height() < 1e-6 {
+            return None;
+        }
+        let corners = [
+            (b.x0, b.y0),
+            (b.x1, b.y0),
+            (b.x1, b.y1),
+            (b.x0, b.y1),
+        ];
+        let mut min_u = 1.0f64;
+        let mut min_v = 1.0f64;
+        let mut max_u = 0.0f64;
+        let mut max_v = 0.0f64;
+        let mut any = false;
+        for (dx, dy) in corners {
+            if let Some((u, v)) =
+                crate::document::image_doc_to_uv(img_x, img_y, img_w, img_h, rot, dx, dy)
+            {
+                any = true;
+                min_u = min_u.min(u);
+                min_v = min_v.min(v);
+                max_u = max_u.max(u);
+                max_v = max_v.max(v);
+            }
+        }
+        // Also sample selection center + edge mids so rotated images get a usable AABB.
+        for (dx, dy) in [
+            ((b.x0 + b.x1) * 0.5, (b.y0 + b.y1) * 0.5),
+            ((b.x0 + b.x1) * 0.5, b.y0),
+            ((b.x0 + b.x1) * 0.5, b.y1),
+            (b.x0, (b.y0 + b.y1) * 0.5),
+            (b.x1, (b.y0 + b.y1) * 0.5),
+        ] {
+            if let Some((u, v)) =
+                crate::document::image_doc_to_uv(img_x, img_y, img_w, img_h, rot, dx, dy)
+            {
+                any = true;
+                min_u = min_u.min(u);
+                min_v = min_v.min(v);
+                max_u = max_u.max(u);
+                max_v = max_v.max(v);
+            }
+        }
+        if !any {
+            // Selection outside image → empty clip (no paint).
+            return Some((0, 0, 0, 0));
+        }
+        let x0 = (min_u * pw as f64).floor() as i32;
+        let y0 = (min_v * ph as f64).floor() as i32;
+        let x1 = (max_u * pw as f64).ceil() as i32;
+        let y1 = (max_v * ph as f64).ceil() as i32;
+        Some((
+            x0.clamp(0, pw as i32),
+            y0.clamp(0, ph as i32),
+            x1.clamp(0, pw as i32),
+            y1.clamp(0, ph as i32),
+        ))
     }
 
     /// Sample Image (or canvas) color into Fill swatch while painting (Alt).
@@ -9409,7 +9531,7 @@ fn run_video_decode_thread(
             if self.tools.raster.painting
                 && matches!(
                     self.tools.active,
-                    ToolKind::RasterBrush | ToolKind::Eraser
+                    ToolKind::RasterBrush | ToolKind::Eraser | ToolKind::Smudge
                 )
             {
                 self.draw_raster_stroke_overlay(&painter, origin);
@@ -9719,9 +9841,9 @@ fn run_video_decode_thread(
                     ctrl,
                 );
             }
-            ToolKind::RasterBrush | ToolKind::Eraser => {
+            ToolKind::RasterBrush | ToolKind::Eraser | ToolKind::Smudge => {
                 let alt = response.ctx.input(|i| i.modifiers.alt);
-                if alt {
+                if alt && self.tools.active != ToolKind::Smudge {
                     // Alt+click / hold: pick color (pro paint workflow).
                     if primary_pressed || primary_down {
                         self.raster_pick_color_at(raw_doc);
