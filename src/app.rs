@@ -4555,28 +4555,68 @@ impl VadadeeBerryApp {
     }
 
     fn object_paste_offset(&self) -> (f64, f64) {
+        /// Offset so the first object's position lands on a grid cell (no “half-step gap”).
+        let snap_offset = |dx: f64, dy: f64, origin: (f64, f64)| -> (f64, f64) {
+            if !self.viewport.snap_grid {
+                return (dx, dy);
+            }
+            let g = self.viewport.grid_step as f64;
+            if g <= 0.0 {
+                return (dx, dy);
+            }
+            let tx = ((origin.0 + dx) / g).round() * g;
+            let ty = ((origin.1 + dy) / g).round() * g;
+            (tx - origin.0, ty - origin.1)
+        };
+
         if let Some((cx, cy)) = self.cursor_doc {
             if let Some(first) = self.clipboard.first() {
-                let pts = first.edit_handles();
-                if let Some(&(fx, fy)) = pts.first() {
-                    return (cx - fx + 16.0, cy - fy + 16.0);
-                }
+                let b = first.bounds();
+                let (fx, fy) = (b.x0, b.y0);
+                // Nudge one grid step so paste is not on top of the original.
+                let g = if self.viewport.snap_grid {
+                    self.viewport.grid_step as f64
+                } else {
+                    16.0
+                };
+                let raw = (cx - fx + g, cy - fy + g);
+                return snap_offset(raw.0, raw.1, (fx, fy));
             }
-            return (24.0, 24.0);
+            let g = if self.viewport.snap_grid {
+                self.viewport.grid_step as f64
+            } else {
+                24.0
+            };
+            return (g, g);
         }
         if let (Some(rect), origin) = (self.canvas_screen_rect, self.canvas_origin) {
             let center_screen = rect.center();
             let (cx, cy) =
                 tools::doc_point_from_screen(center_screen, origin, self.viewport.pan, self.viewport.zoom);
             if let Some(first) = self.clipboard.first() {
-                let pts = first.edit_handles();
-                if let Some(&(fx, fy)) = pts.first() {
-                    return (cx - fx + 16.0, cy - fy + 16.0);
-                }
+                let b = first.bounds();
+                let (fx, fy) = (b.x0, b.y0);
+                let g = if self.viewport.snap_grid {
+                    self.viewport.grid_step as f64
+                } else {
+                    16.0
+                };
+                let raw = (cx - fx + g, cy - fy + g);
+                return snap_offset(raw.0, raw.1, (fx, fy));
             }
-            return (24.0, 24.0);
+            let g = if self.viewport.snap_grid {
+                self.viewport.grid_step as f64
+            } else {
+                24.0
+            };
+            return (g, g);
         }
-        (24.0, 24.0)
+        let g = if self.viewport.snap_grid {
+            self.viewport.grid_step as f64
+        } else {
+            24.0
+        };
+        (g, g)
     }
 
     fn begin_system_image_paste(&mut self) {
@@ -13324,8 +13364,13 @@ fn run_video_decode_thread(
                     }
                     SelectDrag::Resize(handle) => {
                         if let Some(id) = self.selection.first().copied() {
-                            let new_bounds =
-                                tools::resize_bounds(self.tools.select.resize_anchor, handle, doc);
+                            // Magnetic + grid snap on the free handle (image, video, shapes).
+                            let snapped_doc = self.snap_gizmo_point(doc, Some(id));
+                            let new_bounds = tools::resize_bounds(
+                                self.tools.select.resize_anchor,
+                                handle,
+                                snapped_doc,
+                            );
                             let mut layer_pos = None;
                             for (pos, l) in self.project.document.layers.iter().enumerate() {
                                 if l.kind == crate::document::LayerKind::Shading {
@@ -13344,8 +13389,8 @@ fn run_video_decode_thread(
                                 let layer = &mut self.project.document.layers[pos];
                                 layer.x = new_bounds.x0 as f32;
                                 layer.y = new_bounds.y0 as f32;
-                                layer.width = new_bounds.width() as f32;
-                                layer.height = new_bounds.height() as f32;
+                                layer.width = new_bounds.width().max(1.0) as f32;
+                                layer.height = new_bounds.height().max(1.0) as f32;
                             } else if let Some(node) = self.project.nodes.get_mut(id) {
                                 node.set_bounds(new_bounds);
                             }
@@ -13626,20 +13671,21 @@ fn run_video_decode_thread(
 
     pub fn get_node_snap_points(&self, node: &Node) -> Vec<(f64, f64)> {
         let mut pts = Vec::new();
-        let b = node.bounds();
+        // Prefer world bounds (rotated text AABB, groups, …).
+        let b = node.bounds_with_store(&self.project.nodes);
         let cx = (b.x0 + b.x1) * 0.5;
         let cy = (b.y0 + b.y1) * 0.5;
+        // 9-box: center, 4 corners, 4 edge midpoints (all objects, including Image).
         pts.push((cx, cy));
         pts.push((b.x0, b.y0));
         pts.push((b.x1, b.y0));
         pts.push((b.x0, b.y1));
         pts.push((b.x1, b.y1));
-        // bbox midsides for center/corner/middle-line magnetic snap on all objects
         pts.push((cx, b.y0));
         pts.push((cx, b.y1));
         pts.push((b.x0, cy));
         pts.push((b.x1, cy));
-        
+
         match &node.kind {
             NodeKind::Polygon { cx, cy, r, sides, rotation_rad } => {
                 let verts = crate::document::regular_polygon_vertices(*cx, *cy, *r, *sides, *rotation_rad);
@@ -13653,24 +13699,58 @@ fn run_video_decode_thread(
                     }
                 }
             }
-            NodeKind::Rect { x, y, w, h, .. } => {
-                pts.push((x + w/2.0, *y));
-                pts.push((x + w/2.0, y + h));
-                pts.push((*x, y + h/2.0));
-                pts.push((x + w, y + h/2.0));
-                pts.push((x + w/2.0, y + h/2.0));
-            }
-            NodeKind::Ellipse { cx, cy, .. } => {
+            NodeKind::Ellipse { cx, cy, rx, ry } => {
                 pts.push((*cx, *cy));
+                // Cardinal extremes of the ellipse
+                pts.push((*cx + *rx, *cy));
+                pts.push((*cx - *rx, *cy));
+                pts.push((*cx, *cy + *ry));
+                pts.push((*cx, *cy - *ry));
             }
-            NodeKind::Arc { cx, cy, .. } => {
+            NodeKind::Arc { cx, cy, radius, .. } => {
                 pts.push((*cx, *cy));
+                pts.push((*cx + *radius, *cy));
+                pts.push((*cx - *radius, *cy));
+                pts.push((*cx, *cy + *radius));
+                pts.push((*cx, *cy - *radius));
             }
             NodeKind::Path { path } => {
-                // detailed path points + bbox mids/corners/center already added above
                 for p in &path.points {
                     pts.push((p[0], p[1]));
                 }
+            }
+            NodeKind::Image { x, y, width, height, .. } => {
+                let w = *width;
+                let h = *height;
+                // Explicit 9-box (matches transform handles)
+                pts.push((*x, *y));
+                pts.push((*x + w, *y));
+                pts.push((*x, *y + h));
+                pts.push((*x + w, *y + h));
+                pts.push((*x + w * 0.5, *y));
+                pts.push((*x + w * 0.5, *y + h));
+                pts.push((*x, *y + h * 0.5));
+                pts.push((*x + w, *y + h * 0.5));
+                pts.push((*x + w * 0.5, *y + h * 0.5));
+            }
+            NodeKind::Text { x, y, style } => {
+                let r = crate::document::text_bounds_rotated(
+                    *x,
+                    *y,
+                    style,
+                    node.transform.rotation_rad,
+                );
+                let tcx = (r.x0 + r.x1) * 0.5;
+                let tcy = (r.y0 + r.y1) * 0.5;
+                pts.push((tcx, tcy));
+                pts.push((r.x0, r.y0));
+                pts.push((r.x1, r.y0));
+                pts.push((r.x0, r.y1));
+                pts.push((r.x1, r.y1));
+                pts.push((tcx, r.y0));
+                pts.push((tcx, r.y1));
+                pts.push((r.x0, tcy));
+                pts.push((r.x1, tcy));
             }
             _ => {}
         }
@@ -13680,12 +13760,25 @@ fn run_video_decode_thread(
     pub fn get_canvas_snap_points(&self) -> Vec<(f64, f64)> {
         let w = self.project.document.width.max(1.0);
         let h = self.project.document.height.max(1.0);
-        vec![
-            (0.0, 0.0), (w, 0.0), (0.0, h), (w, h), // corners
-            (w * 0.5, 0.0), (w * 0.5, h), // top/bottom mid
-            (0.0, h * 0.5), (w, h * 0.5), // left/right mid
-            (w * 0.5, h * 0.5), // center
-        ]
+        let mut pts = vec![
+            (0.0, 0.0),
+            (w, 0.0),
+            (0.0, h),
+            (w, h),
+            (w * 0.5, 0.0),
+            (w * 0.5, h),
+            (0.0, h * 0.5),
+            (w, h * 0.5),
+            (w * 0.5, h * 0.5),
+        ];
+        // Quarter points along each edge (extra anchors for large pages)
+        for t in [0.25, 0.75] {
+            pts.push((w * t, 0.0));
+            pts.push((w * t, h));
+            pts.push((0.0, h * t));
+            pts.push((w, h * t));
+        }
+        pts
     }
 
     pub fn try_equal_spacing_snap(
@@ -13949,10 +14042,15 @@ fn run_video_decode_thread(
                 }
                 let cx = dx + w / 2.0;
                 let cy = dy + h / 2.0;
+                // Full 9-box for video/AV layers (corners, edge mids, center)
                 target_pts.push((dx, dy));
                 target_pts.push((dx + w, dy));
                 target_pts.push((dx, dy + h));
                 target_pts.push((dx + w, dy + h));
+                target_pts.push((cx, dy));
+                target_pts.push((cx, dy + h));
+                target_pts.push((dx, cy));
+                target_pts.push((dx + w, cy));
                 target_pts.push((cx, cy));
             }
         }
@@ -13971,11 +14069,17 @@ fn run_video_decode_thread(
 
         if !video_selection.is_empty() {
             let r = self.tools.select.resize_anchor;
+            let cx = r.center().x;
+            let cy = r.center().y;
             original_pts.push((r.x0, r.y0));
             original_pts.push((r.x1, r.y0));
             original_pts.push((r.x0, r.y1));
             original_pts.push((r.x1, r.y1));
-            original_pts.push((r.center().x, r.center().y));
+            original_pts.push((cx, r.y0));
+            original_pts.push((cx, r.y1));
+            original_pts.push((r.x0, cy));
+            original_pts.push((r.x1, cy));
+            original_pts.push((cx, cy));
         }
 
         // Try equal spacing snap first

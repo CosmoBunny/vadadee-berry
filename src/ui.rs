@@ -1300,9 +1300,15 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label("Rows");
-            changed |= ui.add(decimal_drag(&mut app.ui_tiling_rows).range(1..=20)).changed();
+            changed |= ui
+                .add(decimal_drag(&mut app.ui_tiling_rows).range(1..=9999).speed(1.0))
+                .on_hover_text("Rows — no small cap (was 20)")
+                .changed();
             ui.label("Cols");
-            changed |= ui.add(decimal_drag(&mut app.ui_tiling_cols).range(1..=20)).changed();
+            changed |= ui
+                .add(decimal_drag(&mut app.ui_tiling_cols).range(1..=9999).speed(1.0))
+                .on_hover_text("Columns — no small cap (was 20)")
+                .changed();
         });
         ui.horizontal(|ui| {
             ui.label("Col Gap");

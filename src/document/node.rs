@@ -1882,6 +1882,12 @@ impl Node {
             self.transform.rotation_rad = rad;
             return;
         }
+        // Text/Image: visual rotation is applied at paint around glyph/rect center.
+        // Do not walk geometry (that moved the top-left anchor and broke the pivot).
+        if matches!(self.kind, NodeKind::Text { .. } | NodeKind::Image { .. }) {
+            self.transform.rotation_rad = rad;
+            return;
+        }
         let delta = rad - self.transform.rotation_rad;
         if delta.abs() > 1e-9 {
             self.rotate_about_center(delta);
@@ -2453,7 +2459,9 @@ impl Node {
                 }
             }
             NodeKind::Path { path } => path.to_bez().bounding_box(),
-            NodeKind::Text { x, y, style } => text_bounds(*x, *y, style),
+            NodeKind::Text { x, y, style } => {
+                text_bounds_rotated(*x, *y, style, self.transform.rotation_rad)
+            }
             NodeKind::Group { .. } => Rect::ZERO,
             NodeKind::Image { x, y, width, height, .. } => Rect::new(*x, *y, *x + *width, *y + *height),
             NodeKind::Plotter { x, y, w, h, .. } => Rect::new(*x, *y, *x + *w, *y + *h),
@@ -2617,7 +2625,9 @@ impl Node {
         }
         if let NodeKind::Text { x, y, style } = &self.kind {
             let tol = stroke_slop.max(2.0);
-            return text_bounds(*x, *y, style).inflate(tol, tol).contains(pt);
+            return text_bounds_rotated(*x, *y, style, self.transform.rotation_rad)
+                .inflate(tol, tol)
+                .contains(pt);
         }
         if let NodeKind::Image { x, y, width, height, .. } = &self.kind {
             let tol = stroke_slop.max(1.0);
@@ -2719,14 +2729,8 @@ impl Node {
                 }
                 path.replace_anchors(&new_anchors);
             }
-            NodeKind::Text { x, y, .. } => {
-                let (nx, ny) = map(*x, *y);
-                *x = nx;
-                *y = ny;
-            }
-            NodeKind::Image { .. } => {
-                // Keep axis-aligned x/y/w/h for hit-test; visual rotation lives on
-                // `transform.rotation_rad` (see set_rotation / NE Output paint).
+            NodeKind::Text { .. } | NodeKind::Image { .. } => {
+                // Orientation only on `transform.rotation_rad` (paint pivots on center).
             }
             NodeKind::Arc { cx: acx, cy: acy, .. } => {
                 let (nx, ny) = map(*acx, *acy);
@@ -3704,15 +3708,49 @@ pub fn text_bounds(x: f64, y: f64, style: &TextStyle) -> Rect {
     let content_w = lines
         .iter()
         .map(|l| style.estimate_text_width(l) as f64)
-        .fold(0.0_f64, f64::max);
-    // Fixed box width is an explicit real limit; auto uses measured content width.
+        .fold(0.0_f64, f64::max)
+        .max(size * 0.15);
+    // Glyph-tight: auto width = measured content (no loose padding). Explicit wrap is a real box.
     let w = if let Some(box_w) = style.wrap_width() {
         box_w as f64
     } else {
-        content_w + size * 0.25
+        content_w
     };
-    let h = line_count * size * 1.25 + size * 0.15;
-    Rect::new(x, y, x + w.max(size), y + h.max(size))
+    // ~em-box line height (glyph cell), not inflated selection padding.
+    let h = line_count * size * 1.15;
+    Rect::new(x, y, x + w.max(size * 0.25), y + h.max(size * 0.5))
+}
+
+/// Axis-aligned bounds of text after rotation about the glyph-box center.
+pub fn text_bounds_rotated(x: f64, y: f64, style: &TextStyle, rotation_rad: f64) -> Rect {
+    let r = text_bounds(x, y, style);
+    if rotation_rad.abs() < 1e-12 {
+        return r;
+    }
+    let cx = (r.x0 + r.x1) * 0.5;
+    let cy = (r.y0 + r.y1) * 0.5;
+    let c = rotation_rad.cos();
+    let s = rotation_rad.sin();
+    let mut min_x = f64::MAX;
+    let mut min_y = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut max_y = f64::MIN;
+    for (px, py) in [
+        (r.x0, r.y0),
+        (r.x1, r.y0),
+        (r.x1, r.y1),
+        (r.x0, r.y1),
+    ] {
+        let dx = px - cx;
+        let dy = py - cy;
+        let wx = cx + dx * c - dy * s;
+        let wy = cy + dx * s + dy * c;
+        min_x = min_x.min(wx);
+        min_y = min_y.min(wy);
+        max_x = max_x.max(wx);
+        max_y = max_y.max(wy);
+    }
+    Rect::new(min_x, min_y, max_x, max_y)
 }
 
 fn path_anchor_positions(path: &PathData) -> Vec<(f64, f64)> {

@@ -428,10 +428,26 @@ pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> 
                 .replace('&', "&amp;")
                 .replace('<', "&lt;")
                 .replace('>', "&gt;");
-            format!(
-                r#"<text x="{x}" y="{y}" font-size="{}" font-family="{family}" font-weight="{weight}" font-style="{font_style}" {fill} {stroke} opacity="{op}">{escaped}</text>"#,
+            // Canvas treats (x,y) as top-left of the glyph box; SVG text y is baseline —
+            // hang so unrotated export matches on-canvas placement.
+            let text_el = format!(
+                r#"<text x="{x}" y="{y}" font-size="{}" font-family="{family}" font-weight="{weight}" font-style="{font_style}" dominant-baseline="hanging" {fill} {stroke} opacity="{op}">{escaped}</text>"#,
                 style.font_size
-            )
+            );
+            // Live paint rotates about glyph-box center via transform.rotation_rad.
+            // Export used to drop that → upright text after video export.
+            let rot = node.transform.rotation_rad;
+            if rot.abs() > 1e-12 {
+                let b = crate::document::text_bounds(*x, *y, style);
+                let cx = (b.x0 + b.x1) * 0.5;
+                let cy = (b.y0 + b.y1) * 0.5;
+                format!(
+                    r#"<g transform="rotate({} {cx} {cy})">{text_el}</g>"#,
+                    rot.to_degrees()
+                )
+            } else {
+                text_el
+            }
         }
         NodeKind::Group { children } => {
             let mut inner = String::new();
@@ -440,7 +456,18 @@ pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> 
                     inner.push_str(&node_to_svg_fragment(child, nodes));
                 }
             }
-            format!(r#"<g>{inner}</g>"#)
+            let rot = node.transform.rotation_rad;
+            if rot.abs() > 1e-12 {
+                let b = node.bounds_with_store(nodes);
+                let cx = (b.x0 + b.x1) * 0.5;
+                let cy = (b.y0 + b.y1) * 0.5;
+                format!(
+                    r#"<g transform="rotate({} {cx} {cy})">{inner}</g>"#,
+                    rot.to_degrees()
+                )
+            } else {
+                format!(r#"<g>{inner}</g>"#)
+            }
         }
         NodeKind::Image {
             x,
@@ -452,9 +479,20 @@ pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> 
         } => {
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-            format!(
+            let img_el = format!(
                 r#"<image x="{x}" y="{y}" width="{width}" height="{height}" href="data:image/png;base64,{b64}" opacity="{op}"/>"#
-            )
+            );
+            let rot = node.transform.rotation_rad;
+            if rot.abs() > 1e-12 {
+                let cx = *x + *width * 0.5;
+                let cy = *y + *height * 0.5;
+                format!(
+                    r#"<g transform="rotate({} {cx} {cy})">{img_el}</g>"#,
+                    rot.to_degrees()
+                )
+            } else {
+                img_el
+            }
         }
         NodeKind::Arc { cx, cy, radius, start_angle_rad, sweep_angle_rad, join } => {
             let bez = crate::document::build_arc_bez(*cx, *cy, *radius, *start_angle_rad, *sweep_angle_rad, *join);
@@ -1456,5 +1494,78 @@ mod tests {
         let d = path_to_svg_d(&path);
         assert!(d.contains('C') || d.contains('c'), "expected cubic in {d}");
         assert!(d.contains('Z') || d.contains('z'));
+    }
+
+    #[test]
+    fn text_svg_export_includes_transform_rotation() {
+        use crate::document::{Node, NodeStore, TextStyle};
+        let mut node = Node::text(10.0, 20.0, TextStyle {
+            content: "hello".into(),
+            font_size: 24.0,
+            ..Default::default()
+        });
+        node.set_rotation(std::f64::consts::FRAC_PI_4); // 45°
+        let store = NodeStore::default();
+        let svg = node_to_svg_fragment(&node, &store);
+        assert!(
+            svg.contains("rotate("),
+            "export SVG must keep text rotation, got: {svg}"
+        );
+        assert!(
+            svg.contains("dominant-baseline=\"hanging\""),
+            "top-left text origin for canvas parity"
+        );
+    }
+
+    /// End-to-end: hybrid export rasterizes Image-layer text via resvg SVG.
+    /// Rotated text must paint a different pixel footprint than upright text.
+    /// Uses the same font options as real video export (`fonts::usvg_options`).
+    #[test]
+    fn text_rotation_survives_svg_raster_export_path() {
+        use crate::document::{Fill, Node, NodeStore, Paint, TextStyle};
+        use resvg::tiny_skia::{Pixmap, Transform};
+
+        fn raster_text(rot_rad: f64) -> Pixmap {
+            let mut node = Node::text(
+                80.0,
+                80.0,
+                TextStyle {
+                    content: "EXPORT".into(),
+                    font_size: 48.0,
+                    ..Default::default()
+                },
+            );
+            // Opaque black so ink is unambiguous against white page.
+            node.style.fill = Fill::Solid(Paint::from_hex(0x000000, 1.0));
+            node.set_rotation(rot_rad);
+            let store = NodeStore::default();
+            let frag = node_to_svg_fragment(&node, &store);
+            let svg = format!(
+                r#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><rect width="240" height="240" fill="white"/>{frag}</svg>"#
+            );
+            // Must match hybrid export (`export_worker` + `document_svg_single_image_layer`).
+            let opt = crate::fonts::usvg_options();
+            let tree = usvg::Tree::from_str(&svg, &opt).expect("parse svg");
+            let mut pm = Pixmap::new(240, 240).expect("pixmap");
+            resvg::render(&tree, Transform::identity(), &mut pm.as_mut());
+            pm
+        }
+
+        let upright = raster_text(0.0);
+        let rotated = raster_text(std::f64::consts::FRAC_PI_4);
+        let ink = |pm: &Pixmap| {
+            pm.data()
+                .chunks(4)
+                .filter(|c| c[0] < 250 || c[1] < 250 || c[2] < 250)
+                .count()
+        };
+        assert!(ink(&upright) > 50, "upright text not painted (font/fill broken)");
+        assert!(ink(&rotated) > 50, "rotated text not painted (font/fill broken)");
+        // Pixel footprints must differ — proves rotation is not dropped before resvg.
+        assert_ne!(
+            upright.data(),
+            rotated.data(),
+            "rotated text raster identical to upright — export would still drop rotation"
+        );
     }
 }
