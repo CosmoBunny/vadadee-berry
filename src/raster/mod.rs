@@ -78,12 +78,13 @@ impl RasterBuffer {
         opacity: f32,
         erase: bool,
     ) {
-        self.stamp_circle_clipped(cx, cy, radius, hardness, color, opacity, erase, None);
+        self.stamp_circle_clipped(cx, cy, radius, hardness, color, opacity, erase, None, false);
     }
 
     /// Stamp a circular brush. `radius` in pixels. `hardness` 0=soft … 1=hard edge.
     /// `color` RGBA 0–255 unpremultiplied. `erase` multiplies destination alpha down.
     /// `clip` limits painting to a pixel AABB (selection mask).
+    /// `alpha_lock`: only paint where dest alpha is already non-zero; keep dest alpha.
     pub fn stamp_circle_clipped(
         &mut self,
         cx: f32,
@@ -94,6 +95,7 @@ impl RasterBuffer {
         opacity: f32,
         erase: bool,
         clip: Option<(i32, i32, i32, i32)>,
+        alpha_lock: bool,
     ) {
         let r = radius.max(0.5);
         let hard = hardness.clamp(0.0, 1.0);
@@ -146,6 +148,10 @@ impl RasterBuffer {
                     continue;
                 }
                 let idx = (row + x as usize) * 4;
+                if alpha_lock && !erase && self.rgba[idx + 3] < 8 {
+                    // Lock transparent: no new pixels.
+                    continue;
+                }
                 if erase {
                     let keep = 1.0 - a;
                     // Integer-ish multiply for speed when fully opaque erase.
@@ -160,6 +166,19 @@ impl RasterBuffer {
                         self.rgba[idx + 2] = (self.rgba[idx + 2] as f32 * keep) as u8;
                         self.rgba[idx + 3] = (self.rgba[idx + 3] as f32 * keep) as u8;
                     }
+                } else if alpha_lock {
+                    // Recolor existing silhouette only; preserve destination alpha.
+                    let da = self.rgba[idx + 3] as f32 / 255.0;
+                    if da <= 1e-6 {
+                        continue;
+                    }
+                    let t = a.clamp(0.0, 1.0);
+                    for c in 0..3 {
+                        let s = color[c] as f32;
+                        let d = self.rgba[idx + c] as f32;
+                        self.rgba[idx + c] = (d + (s - d) * t).clamp(0.0, 255.0) as u8;
+                    }
+                    // alpha unchanged
                 } else if fully_hard && color[3] == 255 {
                     // Opaque hard stamp: overwrite.
                     self.rgba[idx] = color[0];
@@ -564,6 +583,39 @@ mod tests {
         let idx = (16 * 32 + 16) * 4;
         assert!(buf.rgba[idx] > 200, "center red");
         assert_eq!(buf.rgba[idx + 3], 255);
+    }
+
+    #[test]
+    fn alpha_lock_skips_transparent() {
+        let mut buf = RasterBuffer::new(8, 8);
+        // Opaque white only on left half.
+        for y in 0..8 {
+            for x in 0..4 {
+                let i = (y * 8 + x) * 4;
+                buf.rgba[i] = 255;
+                buf.rgba[i + 1] = 255;
+                buf.rgba[i + 2] = 255;
+                buf.rgba[i + 3] = 255;
+            }
+        }
+        buf.stamp_circle_clipped(
+            4.0,
+            4.0,
+            6.0,
+            1.0,
+            [0, 0, 255, 255],
+            1.0,
+            false,
+            None,
+            true,
+        );
+        // Transparent right stays empty.
+        let r = (4 * 8 + 6) * 4;
+        assert_eq!(buf.rgba[r + 3], 0, "alpha lock must not paint empty");
+        // Left recolored blue-ish.
+        let l = (4 * 8 + 2) * 4;
+        assert!(buf.rgba[l + 2] > 100, "existing pixel recolored");
+        assert_eq!(buf.rgba[l + 3], 255);
     }
 
     #[test]

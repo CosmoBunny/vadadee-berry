@@ -6944,9 +6944,18 @@ impl VadadeeBerryApp {
                         buf.smudge_circle(sx, sy, radius, hardness, str, dir, clip);
                     }
                 } else {
+                    let alpha_lock = self.tools.raster.alpha_lock && !erase;
                     for (sx, sy) in stamps {
                         buf.stamp_circle_clipped(
-                            sx, sy, radius, hardness, color, opacity, erase, clip,
+                            sx,
+                            sy,
+                            radius,
+                            hardness,
+                            color,
+                            opacity,
+                            erase,
+                            clip,
+                            alpha_lock,
                         );
                     }
                 }

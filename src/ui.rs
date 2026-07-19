@@ -7000,10 +7000,37 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     &mut app.tools.raster.clip_to_selection,
                     "Clip to selection bounds",
                 );
+                if matches!(
+                    app.tools.active,
+                    ToolKind::RasterBrush | ToolKind::Eraser
+                ) {
+                    ui.checkbox(
+                        &mut app.tools.raster.alpha_lock,
+                        "Alpha lock (paint only existing pixels)",
+                    );
+                }
                 if app.tools.active == ToolKind::RasterBrush {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Preset").small().color(colors::TEXT_MUTED));
+                    ui.horizontal_wrapped(|ui| {
+                        for p in crate::tools::RasterBrushPreset::ALL {
+                            if ui
+                                .selectable_label(false, p.name)
+                                .on_hover_text(format!(
+                                    "size {:.0} · hard {:.0}% · op {:.0}%",
+                                    p.size,
+                                    p.hardness * 100.0,
+                                    p.opacity * 100.0
+                                ))
+                                .clicked()
+                            {
+                                p.apply(&mut app.tools.raster);
+                            }
+                        }
+                    });
                     ui.label(
                         RichText::new(
-                            "Color = Fill  ·  Shift = erase  ·  Alt = pick  ·  multi-select clips paint",
+                            "Color = Fill  ·  Shift = erase  ·  Alt = pick  ·  multi-select clips",
                         )
                         .small()
                         .color(colors::TEXT_MUTED),

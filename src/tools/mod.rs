@@ -421,6 +421,8 @@ pub struct RasterSession {
     pub clip_to_selection: bool,
     /// Smudge strength 0..1.
     pub smudge_strength: f32,
+    /// Only paint where destination already has alpha (lock transparent).
+    pub alpha_lock: bool,
     /// Active paint target (Image node).
     pub target: Option<crate::document::NodeId>,
     /// Snapshot of Image.bytes before the stroke (undo).
@@ -461,6 +463,7 @@ impl Default for RasterSession {
             fill_tolerance: 24,
             clip_to_selection: true,
             smudge_strength: 0.55,
+            alpha_lock: false,
             target: None,
             before_bytes: None,
             before_w: 0.0,
@@ -478,6 +481,78 @@ impl Default for RasterSession {
             tex_dirty: false,
             last_tex_upload: 0.0,
         }
+    }
+}
+
+/// Named paint settings (CSP/Krita-style presets).
+#[derive(Debug, Clone, Copy)]
+pub struct RasterBrushPreset {
+    pub name: &'static str,
+    pub size: f32,
+    pub hardness: f32,
+    pub opacity: f32,
+    pub spacing: f32,
+    pub stabilizer: f32,
+}
+
+impl RasterBrushPreset {
+    pub const ALL: &'static [RasterBrushPreset] = &[
+        RasterBrushPreset {
+            name: "Soft Round",
+            size: 28.0,
+            hardness: 0.15,
+            opacity: 0.9,
+            spacing: 0.1,
+            stabilizer: 0.35,
+        },
+        RasterBrushPreset {
+            name: "Hard Round",
+            size: 20.0,
+            hardness: 1.0,
+            opacity: 1.0,
+            spacing: 0.12,
+            stabilizer: 0.15,
+        },
+        RasterBrushPreset {
+            name: "Ink Pen",
+            size: 5.0,
+            hardness: 0.95,
+            opacity: 1.0,
+            spacing: 0.08,
+            stabilizer: 0.55,
+        },
+        RasterBrushPreset {
+            name: "Airbrush",
+            size: 48.0,
+            hardness: 0.0,
+            opacity: 0.35,
+            spacing: 0.14,
+            stabilizer: 0.25,
+        },
+        RasterBrushPreset {
+            name: "Marker",
+            size: 36.0,
+            hardness: 0.75,
+            opacity: 0.85,
+            spacing: 0.1,
+            stabilizer: 0.3,
+        },
+        RasterBrushPreset {
+            name: "Sketch",
+            size: 3.0,
+            hardness: 0.6,
+            opacity: 0.75,
+            spacing: 0.1,
+            stabilizer: 0.2,
+        },
+    ];
+
+    pub fn apply(self, s: &mut RasterSession) {
+        s.size = self.size;
+        s.hardness = self.hardness;
+        s.opacity = self.opacity;
+        s.spacing = self.spacing;
+        s.stabilizer = self.stabilizer;
     }
 }
 
