@@ -21,6 +21,7 @@ pub mod render;
 pub mod text_glyph;
 pub mod theme;
 pub mod tools;
+pub mod raster;
 pub mod path_physics;
 pub mod ui;
 pub mod video_decode;

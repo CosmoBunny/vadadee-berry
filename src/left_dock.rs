@@ -709,6 +709,8 @@ fn tool_kind_from_label(label: &str) -> Option<ToolKind> {
         "Arc" => Some(ToolKind::Arc),
         "Plotter" => Some(ToolKind::Plotter),
         "Brush" => Some(ToolKind::Brush),
+        "Paint" => Some(ToolKind::RasterBrush),
+        "Eraser" => Some(ToolKind::Eraser),
         "Eyedropper" => Some(ToolKind::Eyedropper),
         _ => None,
     }
@@ -724,6 +726,8 @@ impl DrawingTool for ToolKind {
             self,
             ToolKind::Pen
                 | ToolKind::Brush
+                | ToolKind::RasterBrush
+                | ToolKind::Eraser
                 | ToolKind::Rectangle
                 | ToolKind::Circle
                 | ToolKind::Ellipse
@@ -750,6 +754,8 @@ fn collab_tool_icon(label: &str) -> &'static str {
         Some(ToolKind::Plotter) => icons::PLOTTER,
         Some(ToolKind::Text) => icons::TEXT,
         Some(ToolKind::Brush) => icons::BRUSH,
+        Some(ToolKind::RasterBrush) => icons::RASTER_BRUSH,
+        Some(ToolKind::Eraser) => icons::ERASER,
         Some(ToolKind::Eyedropper) => icons::EYE_DROPPER,
         None => icons::SELECT,
     }

@@ -2196,14 +2196,13 @@ pub fn draw_node(
                 let tl = viewport.doc_to_screen((*x, *y), origin);
                 let br = viewport.doc_to_screen((*x + *width, *y + *height), origin);
                 let rect = Rect::from_min_max(tl, br);
-                // Tint multiplies texture; premultiplied white×opacity = correct fade.
-                let a = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
-                let tint = Color32::from_rgba_premultiplied(a, a, a, a);
-                painter.image(
+                // Match export / Ctrl+Shift+C: rotate about rect center (transform.rotation_rad).
+                paint_image_rotated(
+                    painter,
                     tex.id(),
                     rect,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    tint,
+                    node.transform.rotation_rad as f32,
+                    opacity,
                 );
             }
         }
@@ -4203,6 +4202,61 @@ fn text_font_id(style: &TextStyle, zoom: f32) -> FontId {
         size,
         FontFamily::Name(style.font_family.as_str().into()),
     )
+}
+
+/// Paint a textured rect, rotating vertices about `rect.center()` (document/export pivot).
+/// Shared by Image nodes so canvas preview matches SVG / Ctrl+Shift+C raster copy.
+pub fn paint_image_rotated(
+    painter: &Painter,
+    texture_id: egui::TextureId,
+    rect: Rect,
+    rotation_rad: f32,
+    opacity: f32,
+) {
+    let a = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    // Premultiplied white×opacity matches previous axis-aligned `painter.image` tint.
+    let color = Color32::from_rgba_premultiplied(a, a, a, a);
+
+    let mut points = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    if rotation_rad.abs() > 1e-8 {
+        let center = rect.center();
+        let cos = rotation_rad.cos();
+        let sin = rotation_rad.sin();
+        for pt in &mut points {
+            let d = *pt - center;
+            *pt = center + Vec2::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos);
+        }
+    }
+
+    let mut mesh = Mesh::with_texture(texture_id);
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[0],
+        uv: Pos2::new(0.0, 0.0),
+        color,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[1],
+        uv: Pos2::new(1.0, 0.0),
+        color,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[2],
+        uv: Pos2::new(1.0, 1.0),
+        color,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[3],
+        uv: Pos2::new(0.0, 1.0),
+        color,
+    });
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
 }
 
 fn draw_text_node(

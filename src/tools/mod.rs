@@ -24,6 +24,10 @@ pub enum ToolKind {
     Arc,
     Plotter,
     Brush,
+    /// Paint into Image RGBA (soft/hard continuous brush).
+    RasterBrush,
+    /// Erase alpha on Image RGBA.
+    Eraser,
     Eyedropper,
 }
 
@@ -42,6 +46,8 @@ impl ToolKind {
             Self::Arc => "Arc",
             Self::Plotter => "Plotter",
             Self::Brush => "Brush",
+            Self::RasterBrush => "Paint",
+            Self::Eraser => "Eraser",
             Self::Eyedropper => "Eyedropper",
         }
     }
@@ -60,6 +66,9 @@ impl ToolKind {
             Self::Arc => Some(Key::A),
             Self::Plotter => Some(Key::M),
             Self::Brush => Some(Key::B),
+            // E = Ellipse already; use K (paint) / Shift not available — X eraser common in apps.
+            Self::RasterBrush => Some(Key::K),
+            Self::Eraser => Some(Key::X),
             Self::Eyedropper => Some(Key::I),
         }
     }
@@ -383,6 +392,72 @@ pub struct SelectSession {
     pub effect_drag_doc_before: Option<crate::document::Document>,
 }
 
+/// Raster paint / eraser session (targets `NodeKind::Image` pixels).
+#[derive(Debug, Clone)]
+pub struct RasterSession {
+    /// Brush diameter in document units.
+    pub size: f32,
+    /// 0 = fully soft, 1 = hard edge.
+    pub hardness: f32,
+    /// 0..1 stamp opacity / flow.
+    pub opacity: f32,
+    /// Stamp spacing as fraction of radius (0.05..1.0). Lower = denser continuous stroke.
+    pub spacing: f32,
+    /// Active paint target (Image node).
+    pub target: Option<crate::document::NodeId>,
+    /// Snapshot of Image.bytes before the stroke (undo).
+    pub before_bytes: Option<Vec<u8>>,
+    pub before_w: f64,
+    pub before_h: f64,
+    pub before_x: f64,
+    pub before_y: f64,
+    /// Last pointer position in **image pixel** space.
+    pub last_px: Option<(f32, f32)>,
+    /// Recent samples (oldest → newest) for Catmull-Rom freehand smoothing.
+    pub sample_hist: Vec<(f32, f32)>,
+    /// Carry for continuous spacing.
+    pub spacing_carry: f32,
+    pub painting: bool,
+    /// True if any stamp landed this stroke.
+    pub dirty: bool,
+    /// Live paint buffer (RGBA8) for the active stroke — avoids Color32 round-trips.
+    pub live_w: u32,
+    pub live_h: u32,
+    pub live_rgba: Option<Vec<u8>>,
+    /// GPU texture needs re-upload from `live_rgba`.
+    pub tex_dirty: bool,
+    /// `ctx.input.time` of last GPU upload (throttle mid-stroke).
+    pub last_tex_upload: f64,
+}
+
+impl Default for RasterSession {
+    fn default() -> Self {
+        Self {
+            size: 24.0,
+            hardness: 0.85,
+            opacity: 1.0,
+            // Dense stamps for continuous freehand.
+            spacing: 0.08,
+            target: None,
+            before_bytes: None,
+            before_w: 0.0,
+            before_h: 0.0,
+            before_x: 0.0,
+            before_y: 0.0,
+            last_px: None,
+            sample_hist: Vec::new(),
+            spacing_carry: 0.0,
+            painting: false,
+            dirty: false,
+            live_w: 0,
+            live_h: 0,
+            live_rgba: None,
+            tex_dirty: false,
+            last_tex_upload: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ToolState {
     pub active: ToolKind,
@@ -391,6 +466,7 @@ pub struct ToolState {
     pub pen: PenSession,
     pub select: SelectSession,
     pub brush: BrushSession,
+    pub raster: RasterSession,
     /// Path weight-flow sculpt (Geometry tab; Select/Node + path only).
     pub weight_flow: WeightFlowBrush,
     pub space_pan: bool,
@@ -478,6 +554,8 @@ impl ToolState {
                 ToolKind::Arc,
                 ToolKind::Plotter,
                 ToolKind::Brush,
+                ToolKind::RasterBrush,
+                ToolKind::Eraser,
                 ToolKind::Eyedropper,
             ]
         };

@@ -2463,7 +2463,9 @@ impl Node {
                 text_bounds_rotated(*x, *y, style, self.transform.rotation_rad)
             }
             NodeKind::Group { .. } => Rect::ZERO,
-            NodeKind::Image { x, y, width, height, .. } => Rect::new(*x, *y, *x + *width, *y + *height),
+            NodeKind::Image { x, y, width, height, .. } => {
+                image_bounds_rotated(*x, *y, *width, *height, self.transform.rotation_rad)
+            }
             NodeKind::Plotter { x, y, w, h, .. } => Rect::new(*x, *y, *x + *w, *y + *h),
             NodeKind::Arc { cx, cy, radius, .. } => Rect::new(cx - radius, cy - radius, cx + radius, cy + radius),
             NodeKind::BrushStroke { points } => {
@@ -2631,7 +2633,16 @@ impl Node {
         }
         if let NodeKind::Image { x, y, width, height, .. } = &self.kind {
             let tol = stroke_slop.max(1.0);
-            return Rect::new(*x, *y, *x + *width, *y + *height).inflate(tol, tol).contains(pt);
+            return image_contains_rotated(
+                *x,
+                *y,
+                *width,
+                *height,
+                self.transform.rotation_rad,
+                doc_x,
+                doc_y,
+                tol,
+            );
         }
         if let NodeKind::FlowchartPath { path: fp } = &self.kind {
             return crate::document::flowchart::flowchart_stroke_hit_with_corner(
@@ -3724,6 +3735,27 @@ pub fn text_bounds(x: f64, y: f64, style: &TextStyle) -> Rect {
 /// Axis-aligned bounds of text after rotation about the glyph-box center.
 pub fn text_bounds_rotated(x: f64, y: f64, style: &TextStyle, rotation_rad: f64) -> Rect {
     let r = text_bounds(x, y, style);
+    rect_bounds_rotated(r, rotation_rad)
+}
+
+/// Unrotated image placement rect in document space (top-left origin).
+pub fn image_bounds(x: f64, y: f64, width: f64, height: f64) -> Rect {
+    Rect::new(x, y, x + width, y + height)
+}
+
+/// Axis-aligned bounds of an image after rotation about its rect center.
+pub fn image_bounds_rotated(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    rotation_rad: f64,
+) -> Rect {
+    rect_bounds_rotated(image_bounds(x, y, width, height), rotation_rad)
+}
+
+/// AABB of `r` after rotation about its center.
+pub fn rect_bounds_rotated(r: Rect, rotation_rad: f64) -> Rect {
     if rotation_rad.abs() < 1e-12 {
         return r;
     }
@@ -3751,6 +3783,70 @@ pub fn text_bounds_rotated(x: f64, y: f64, style: &TextStyle, rotation_rad: f64)
         max_y = max_y.max(wy);
     }
     Rect::new(min_x, min_y, max_x, max_y)
+}
+
+/// Hit-test a point against an image rect rotated about its center.
+pub fn image_contains_rotated(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    rotation_rad: f64,
+    doc_x: f64,
+    doc_y: f64,
+    tol: f64,
+) -> bool {
+    if width <= 0.0 || height <= 0.0 {
+        return false;
+    }
+    let cx = x + width * 0.5;
+    let cy = y + height * 0.5;
+    let (lx, ly) = if rotation_rad.abs() < 1e-12 {
+        (doc_x, doc_y)
+    } else {
+        // Inverse-rotate about center into unrotated local space.
+        let c = rotation_rad.cos();
+        let s = rotation_rad.sin();
+        let dx = doc_x - cx;
+        let dy = doc_y - cy;
+        (cx + dx * c + dy * s, cy - dx * s + dy * c)
+    };
+    Rect::new(x, y, x + width, y + height)
+        .inflate(tol, tol)
+        .contains(kurbo::Point::new(lx, ly))
+}
+
+/// Map a document point into unrotated image local UV [0,1]², or `None` if outside.
+pub fn image_doc_to_uv(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    rotation_rad: f64,
+    doc_x: f64,
+    doc_y: f64,
+) -> Option<(f64, f64)> {
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let cx = x + width * 0.5;
+    let cy = y + height * 0.5;
+    let (lx, ly) = if rotation_rad.abs() < 1e-12 {
+        (doc_x, doc_y)
+    } else {
+        let c = rotation_rad.cos();
+        let s = rotation_rad.sin();
+        let dx = doc_x - cx;
+        let dy = doc_y - cy;
+        (cx + dx * c + dy * s, cy - dx * s + dy * c)
+    };
+    let u = (lx - x) / width;
+    let v = (ly - y) / height;
+    if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
+        Some((u, v))
+    } else {
+        None
+    }
 }
 
 fn path_anchor_positions(path: &PathData) -> Vec<(f64, f64)> {
@@ -3973,5 +4069,48 @@ mod bezier_tests {
         assert!(bez.elements().iter().any(|e| matches!(e, PathEl::CurveTo(_, _, _))));
         let flat = flatten_path_points(&bez, 0.5);
         assert!(flat.len() > 3, "flat len {}", flat.len());
+    }
+
+    #[test]
+    fn image_rotation_expands_aabb_and_maps_uv() {
+        let x = 0.0;
+        let y = 0.0;
+        let w = 100.0;
+        let h = 50.0;
+        let upright = image_bounds_rotated(x, y, w, h, 0.0);
+        assert!((upright.width() - 100.0).abs() < 1e-9);
+        assert!((upright.height() - 50.0).abs() < 1e-9);
+
+        let rot = image_bounds_rotated(x, y, w, h, std::f64::consts::FRAC_PI_4);
+        // 45° AABB of 100×50 is larger than either side.
+        assert!(rot.width() > 100.0 && rot.height() > 50.0);
+
+        // Center stays pickable / UV mid after rotation.
+        let (u, v) = image_doc_to_uv(x, y, w, h, std::f64::consts::FRAC_PI_4, 50.0, 25.0)
+            .expect("center uv");
+        assert!((u - 0.5).abs() < 1e-9 && (v - 0.5).abs() < 1e-9);
+
+        // Local right-mid (100, 25) → +90° about center (50,25) lands at world (50, 75).
+        assert!(image_contains_rotated(
+            x,
+            y,
+            w,
+            h,
+            std::f64::consts::FRAC_PI_2,
+            50.0,
+            75.0,
+            0.5,
+        ));
+        // Far outside the rotated footprint.
+        assert!(!image_contains_rotated(
+            x,
+            y,
+            w,
+            h,
+            std::f64::consts::FRAC_PI_4,
+            200.0,
+            200.0,
+            0.0,
+        ));
     }
 }

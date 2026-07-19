@@ -1548,6 +1548,7 @@ impl VadadeeBerryApp {
         if self.history.undo(&mut self.project) {
             self.restore_selection_after_history();
             self.clear_transient_tool_state();
+            self.invalidate_image_textures();
             self.status_message = "Undo".into();
             self.sync_inspector_from_selection();
             self.sync_flowchart_paths_if_active_layer();
@@ -1558,6 +1559,7 @@ impl VadadeeBerryApp {
         if self.history.redo(&mut self.project) {
             self.restore_selection_after_history();
             self.clear_transient_tool_state();
+            self.invalidate_image_textures();
             self.status_message = "Redo".into();
             self.sync_inspector_from_selection();
             self.sync_flowchart_paths_if_active_layer();
@@ -1589,6 +1591,28 @@ impl VadadeeBerryApp {
         // Abort mid-stroke sim, but keep weight-flow *enabled* so undo doesn't "close" the brush.
         self.cancel_weight_flow_stroke(false);
         self.dismiss_on_page_text_edit_without_history();
+        self.abort_raster_stroke_uncommitted();
+    }
+
+    /// Drop in-progress raster stroke; clear GPU/CPU cache so next paint reloads from `Image.bytes`.
+    fn abort_raster_stroke_uncommitted(&mut self) {
+        let id = self.tools.raster.target.take();
+        self.tools.raster.before_bytes = None;
+        self.tools.raster.live_rgba = None;
+        self.tools.raster.live_w = 0;
+        self.tools.raster.live_h = 0;
+        self.tools.raster.painting = false;
+        self.tools.raster.dirty = false;
+        self.tools.raster.tex_dirty = false;
+        self.tools.raster.last_px = None;
+        self.tools.raster.sample_hist.clear();
+        self.tools.raster.spacing_carry = 0.0;
+        // Mid-stroke only mutates the texture cache (not node bytes until commit),
+        // so dropping the cache restores the committed image on next ensure_*.
+        if let Some(id) = id {
+            self.image_textures.remove(&id);
+            self.image_pixel_cache.remove(&id);
+        }
     }
 
     /// Drop on-page editor without pushing undo history (e.g. after undo/redo).
@@ -6606,11 +6630,502 @@ impl VadadeeBerryApp {
             let handle = ctx.load_texture(
                 format!("vadadee-berry-img-{}", id),
                 color_image.clone(),
-                egui::TextureOptions::default(),
+                egui::TextureOptions::LINEAR,
             );
             self.image_textures.insert(id, handle);
             self.image_pixel_cache.insert(id, color_image);
         }
+    }
+
+    /// Drop GPU/CPU image caches so they re-decode from `Image.bytes` (undo/redo / external edit).
+    fn invalidate_image_textures(&mut self) {
+        self.image_textures.clear();
+        self.image_pixel_cache.clear();
+    }
+
+    /// Push RGBA8 into egui texture + pixel cache (paint preview / commit).
+    fn sync_image_texture_from_rgba(
+        &mut self,
+        id: NodeId,
+        w: u32,
+        h: u32,
+        rgba: &[u8],
+        ctx: &Context,
+    ) {
+        if w == 0 || h == 0 || rgba.len() < (w as usize) * (h as usize) * 4 {
+            return;
+        }
+        let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba);
+        if let Some(tex) = self.image_textures.get_mut(&id) {
+            tex.set(ci.clone(), egui::TextureOptions::LINEAR);
+        } else {
+            let handle = ctx.load_texture(
+                format!("vadadee-berry-img-{}", id),
+                ci.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            self.image_textures.insert(id, handle);
+        }
+        self.image_pixel_cache.insert(id, ci);
+    }
+
+    /// Current solid paint color as RGBA8 (from fill inspector).
+    fn raster_paint_rgba(&self) -> [u8; 4] {
+        let p = match self.ui_fill_kind {
+            crate::document::FillKind::Solid => self
+                .ui_fill_stops
+                .first()
+                .map(|s| s.color)
+                .unwrap_or_else(|| crate::document::Paint::from_hex(0x1a1f2e, 1.0)),
+            _ => self
+                .ui_fill_stops
+                .first()
+                .map(|s| s.color)
+                .unwrap_or_else(|| crate::document::Paint::from_hex(0x1a1f2e, 1.0)),
+        };
+        [
+            (p.rgba[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (p.rgba[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (p.rgba[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (p.rgba[3] * 255.0).round().clamp(0.0, 255.0) as u8,
+        ]
+    }
+
+    /// Ensure a paint target Image exists; create a transparent full-page image if needed.
+    fn ensure_raster_paint_target(&mut self, ctx: &Context) -> Option<NodeId> {
+        // Prefer selected Image.
+        if let Some(&id) = self.selection.first() {
+            let bytes_opt = self.project.nodes.get(id).and_then(|n| match &n.kind {
+                NodeKind::Image { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            });
+            if let Some(bytes) = bytes_opt {
+                self.ensure_image_texture(id, &bytes, ctx);
+                return Some(id);
+            }
+        }
+        // Create new transparent paint surface (cap pixel size for interactive brush FPS).
+        let doc_w = self.project.document.width.max(1.0);
+        let doc_h = self.project.document.height.max(1.0);
+        // Prefer ≤1536 on the long edge so live paint stays interactive on typical pages.
+        const MAX_PAINT_EDGE: f64 = 1536.0;
+        let long = doc_w.max(doc_h);
+        let scale = if long > MAX_PAINT_EDGE {
+            MAX_PAINT_EDGE / long
+        } else {
+            1.0
+        };
+        let pw = (doc_w * scale).round().clamp(1.0, MAX_PAINT_EDGE) as u32;
+        let ph = (doc_h * scale).round().clamp(1.0, MAX_PAINT_EDGE) as u32;
+        let bytes = crate::raster::RasterBuffer::transparent_png(pw, ph)?;
+        // Image is still placed at full document size; pixels are lower-res paint buffer.
+        let node = self.styled_shape_node(Node::image(0.0, 0.0, doc_w, doc_h, bytes));
+        let id = node.id;
+        self.insert_node(node);
+        self.selection = vec![id];
+        let bytes = self
+            .project
+            .nodes
+            .get(id)
+            .and_then(|n| match &n.kind {
+                NodeKind::Image { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            })?;
+        self.ensure_image_texture(id, &bytes, ctx);
+        self.status_message = format!("New paint layer {pw}×{ph}px");
+        Some(id)
+    }
+
+    fn tool_raster_paint(
+        &mut self,
+        doc: (f64, f64),
+        pressed: bool,
+        down: bool,
+        released: bool,
+        pressure: Option<f32>,
+        erase: bool,
+        ctx: &Context,
+    ) {
+        if pressed {
+            let Some(id) = self.ensure_raster_paint_target(ctx) else {
+                self.status_message = "Could not create paint surface".into();
+                return;
+            };
+            let snap = self.project.nodes.get(id).and_then(|node| {
+                if let NodeKind::Image {
+                    x,
+                    y,
+                    width,
+                    height,
+                    bytes,
+                    ..
+                } = &node.kind
+                {
+                    Some((*x, *y, *width, *height, bytes.clone()))
+                } else {
+                    None
+                }
+            });
+            let Some((x, y, width, height, bytes)) = snap else {
+                return;
+            };
+            if !self.image_pixel_cache.contains_key(&id) {
+                self.ensure_image_texture(id, &bytes, ctx);
+            }
+            // Build live RGBA once for the whole stroke (no Color32 ↔ raw every move).
+            let live = if let Some(ci) = self.image_pixel_cache.get(&id) {
+                let mut raw = Vec::with_capacity(ci.pixels.len() * 4);
+                for p in &ci.pixels {
+                    raw.push(p.r());
+                    raw.push(p.g());
+                    raw.push(p.b());
+                    raw.push(p.a());
+                }
+                (
+                    ci.size[0] as u32,
+                    ci.size[1] as u32,
+                    raw,
+                )
+            } else if let Some(buf) = crate::raster::RasterBuffer::from_png_bytes(&bytes) {
+                (buf.width, buf.height, buf.rgba)
+            } else {
+                return;
+            };
+            self.tools.raster.target = Some(id);
+            self.tools.raster.before_bytes = Some(bytes);
+            self.tools.raster.before_x = x;
+            self.tools.raster.before_y = y;
+            self.tools.raster.before_w = width;
+            self.tools.raster.before_h = height;
+            self.tools.raster.live_w = live.0;
+            self.tools.raster.live_h = live.1;
+            self.tools.raster.live_rgba = Some(live.2);
+            self.tools.raster.last_px = None;
+            self.tools.raster.sample_hist.clear();
+            self.tools.raster.spacing_carry = 0.0;
+            self.tools.raster.painting = true;
+            self.tools.raster.dirty = false;
+            self.tools.raster.tex_dirty = false;
+            self.tools.raster.last_tex_upload = 0.0;
+            self.raster_stamp_at(doc, pressure, erase, true, ctx);
+        } else if down && self.tools.raster.painting {
+            self.raster_stamp_at(doc, pressure, erase, false, ctx);
+        }
+        if released && self.tools.raster.painting {
+            self.finish_raster_stroke(ctx);
+        }
+    }
+
+    fn raster_stamp_at(
+        &mut self,
+        doc: (f64, f64),
+        pressure: Option<f32>,
+        erase: bool,
+        force_first: bool,
+        ctx: &Context,
+    ) {
+        let Some(id) = self.tools.raster.target else {
+            return;
+        };
+        let meta = self.project.nodes.get(id).and_then(|node| {
+            if let NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } = &node.kind
+            {
+                Some((*x, *y, *width, *height, node.transform.rotation_rad))
+            } else {
+                None
+            }
+        });
+        let Some((x, y, width, height, rot)) = meta else {
+            return;
+        };
+        let uv = crate::document::image_doc_to_uv(x, y, width, height, rot, doc.0, doc.1);
+        let (pw, ph) = (self.tools.raster.live_w, self.tools.raster.live_h);
+        if pw == 0 || ph == 0 || self.tools.raster.live_rgba.is_none() {
+            return;
+        }
+        let (px, py) = if let Some((u, v)) = uv {
+            ((u * pw as f64) as f32, (v * ph as f64) as f32)
+        } else {
+            let cx = x + width * 0.5;
+            let cy = y + height * 0.5;
+            let (lx, ly) = if rot.abs() < 1e-12 {
+                (doc.0, doc.1)
+            } else {
+                let c = rot.cos();
+                let s = rot.sin();
+                let dx = doc.0 - cx;
+                let dy = doc.1 - cy;
+                (cx + dx * c + dy * s, cy - dx * s + dy * c)
+            };
+            let u = ((lx - x) / width).clamp(0.0, 1.0);
+            let v = ((ly - y) / height).clamp(0.0, 1.0);
+            ((u * pw as f64) as f32, (v * ph as f64) as f32)
+        };
+
+        // Skip near-duplicate samples (micro jitter) so history stays useful.
+        if let Some(&(lx, ly)) = self.tools.raster.sample_hist.last() {
+            let d = (px - lx).hypot(py - ly);
+            if d < 0.35 && !force_first {
+                return;
+            }
+        }
+
+        let press = pressure.unwrap_or(1.0).clamp(0.05, 1.0);
+        self.tools.raster.sample_hist.push((px, py));
+        // Keep full stroke history (no tiny ring). Bound only pathological cases.
+        if self.tools.raster.sample_hist.len() > 16_384 {
+            let drop_n = self.tools.raster.sample_hist.len() - 16_384;
+            self.tools.raster.sample_hist.drain(0..drop_n);
+        }
+
+        // Incremental bake like Krita/CSP: stamp only the *new* segment into live_rgba.
+        let radius = crate::raster::doc_size_to_pixel_radius(
+            self.tools.raster.size * press,
+            width,
+            height,
+            pw,
+            ph,
+        );
+        let spacing = (radius * self.tools.raster.spacing.max(0.04)).max(0.25);
+        let hardness = self.tools.raster.hardness;
+        let opacity = self.tools.raster.opacity * if erase { 1.0 } else { press };
+        let color = self.raster_paint_rgba();
+        let force = force_first || self.tools.raster.sample_hist.len() <= 1;
+        let (stamps, carry) = crate::raster::stamps_for_new_sample(
+            &self.tools.raster.sample_hist,
+            spacing,
+            self.tools.raster.spacing_carry,
+            force,
+        );
+        self.tools.raster.spacing_carry = carry;
+        self.tools.raster.last_px = Some((px, py));
+
+        if !stamps.is_empty() {
+            if let Some(rgba) = self.tools.raster.live_rgba.as_mut() {
+                let mut buf = crate::raster::RasterBuffer {
+                    width: pw,
+                    height: ph,
+                    rgba: std::mem::take(rgba),
+                };
+                for (sx, sy) in stamps {
+                    buf.stamp_circle(sx, sy, radius, hardness, color, opacity, erase);
+                }
+                *rgba = buf.rgba;
+            }
+            self.tools.raster.dirty = true;
+            self.tools.raster.tex_dirty = true;
+        }
+
+        // Throttled full-texture upload (pro apps update dirty tiles; we update whole
+        // layer ~20×/s — cheap once PNG clone-per-frame is gone).
+        let now = ctx.input(|i| i.time);
+        if self.tools.raster.tex_dirty
+            && now - self.tools.raster.last_tex_upload >= (1.0 / 20.0)
+        {
+            self.flush_raster_texture(ctx, false);
+        }
+        ctx.request_repaint();
+    }
+
+    /// Live stroke preview: continuous thick polyline through **all** samples (never freezes
+    /// mid-spiral). Tip always tracks the cursor even on long strokes.
+    fn draw_raster_stroke_overlay(&self, painter: &egui::Painter, origin: Pos2) {
+        let Some(id) = self.tools.raster.target else {
+            return;
+        };
+        // If texture is already showing live paint, still draw a light tip ring only.
+        let Some(node) = self.project.nodes.get(id) else {
+            return;
+        };
+        let NodeKind::Image {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } = &node.kind
+        else {
+            return;
+        };
+        let rot = node.transform.rotation_rad;
+        let pw = self.tools.raster.live_w.max(1) as f64;
+        let ph = self.tools.raster.live_h.max(1) as f64;
+        let hist = &self.tools.raster.sample_hist;
+        if hist.is_empty() {
+            return;
+        }
+        let erase = self.tools.active == ToolKind::Eraser;
+        let rgba = self.raster_paint_rgba();
+        let color = if erase {
+            egui::Color32::from_rgba_unmultiplied(220, 60, 60, 140)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(
+                rgba[0],
+                rgba[1],
+                rgba[2],
+                (rgba[3] as f32 * 0.55) as u8,
+            )
+        };
+        let stroke_w = (self.tools.raster.size * self.viewport.zoom).max(1.5);
+        let r_screen = stroke_w * 0.5;
+
+        // Pixel → document for every sample (cheap). Downsample body for PathShape only.
+        let to_doc = |px: f32, py: f32| -> (f64, f64) {
+            let u = px as f64 / pw;
+            let v = py as f64 / ph;
+            let lx = *x + u * *width;
+            let ly = *y + v * *height;
+            if rot.abs() < 1e-12 {
+                (lx, ly)
+            } else {
+                let cx = *x + *width * 0.5;
+                let cy = *y + *height * 0.5;
+                let c = rot.cos();
+                let s = rot.sin();
+                let rx = lx - cx;
+                let ry = ly - cy;
+                (cx + rx * c - ry * s, cy + rx * s + ry * c)
+            }
+        };
+
+        let n = hist.len();
+        // Always keep tip accurate: last ~64 samples at full density; older path thinned.
+        let tip_keep = 64usize;
+        let body_end = n.saturating_sub(tip_keep);
+        let stride = if body_end > 400 {
+            (body_end / 400).max(1)
+        } else {
+            1
+        };
+
+        let mut screen_pts: Vec<egui::Pos2> = Vec::with_capacity(n.min(500) + tip_keep);
+        for i in (0..body_end).step_by(stride) {
+            let (dx, dy) = to_doc(hist[i].0, hist[i].1);
+            screen_pts.push(self.viewport.doc_to_screen((dx, dy), origin));
+        }
+        let tip_start = body_end;
+        for i in tip_start..n {
+            let (dx, dy) = to_doc(hist[i].0, hist[i].1);
+            screen_pts.push(self.viewport.doc_to_screen((dx, dy), origin));
+        }
+
+        if screen_pts.len() >= 2 {
+            painter.add(egui::Shape::line(
+                screen_pts,
+                egui::Stroke::new(stroke_w, color),
+            ));
+        } else if let Some(&p) = screen_pts.first() {
+            painter.circle_filled(p, r_screen, color);
+        }
+
+        // Tip disc so the brush never “sticks” when body is thinned.
+        if let Some(&(px, py)) = hist.last() {
+            let (dx, dy) = to_doc(px, py);
+            let tip = self.viewport.doc_to_screen((dx, dy), origin);
+            painter.circle_filled(tip, r_screen, color);
+            painter.circle_stroke(
+                tip,
+                r_screen,
+                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 140)),
+            );
+        }
+    }
+
+    /// Upload live paint buffer to GPU. `force` = always (stroke end).
+    fn flush_raster_texture(&mut self, ctx: &Context, force: bool) {
+        if !self.tools.raster.tex_dirty && !force {
+            return;
+        }
+        let Some(id) = self.tools.raster.target else {
+            return;
+        };
+        let w = self.tools.raster.live_w;
+        let h = self.tools.raster.live_h;
+        // Take buffer temporarily so we can mutably update texture maps.
+        let Some(rgba) = self.tools.raster.live_rgba.take() else {
+            return;
+        };
+        self.sync_image_texture_from_rgba(id, w, h, &rgba, ctx);
+        self.tools.raster.live_rgba = Some(rgba);
+        self.tools.raster.tex_dirty = false;
+        self.tools.raster.last_tex_upload = ctx.input(|i| i.time);
+    }
+
+    fn finish_raster_stroke(&mut self, ctx: &Context) {
+        // Pixels were stamped incrementally while dragging — only flush + commit PNG.
+        self.flush_raster_texture(ctx, true);
+
+        let dirty = self.tools.raster.dirty;
+        let erase = self.tools.active == ToolKind::Eraser;
+        let Some(id) = self.tools.raster.target.take() else {
+            self.tools.raster.before_bytes = None;
+            self.tools.raster.live_rgba = None;
+            self.tools.raster.painting = false;
+            self.tools.raster.sample_hist.clear();
+            return;
+        };
+        let before_bytes = self.tools.raster.before_bytes.take();
+        let live_w = self.tools.raster.live_w;
+        let live_h = self.tools.raster.live_h;
+        let live_rgba = self.tools.raster.live_rgba.take();
+        self.tools.raster.sample_hist.clear();
+        self.tools.raster.painting = false;
+        self.tools.raster.last_px = None;
+        self.tools.raster.spacing_carry = 0.0;
+        self.tools.raster.tex_dirty = false;
+        if !dirty {
+            return;
+        }
+        let Some(before_bytes) = before_bytes else {
+            return;
+        };
+        let Some(rgba) = live_rgba else {
+            return;
+        };
+        let buf = crate::raster::RasterBuffer {
+            width: live_w,
+            height: live_h,
+            rgba,
+        };
+        let Some(png) = buf.encode_png() else {
+            self.status_message = "Paint encode failed".into();
+            return;
+        };
+        // Ensure GPU matches committed buffer.
+        self.sync_image_texture_from_rgba(id, live_w, live_h, &buf.rgba, ctx);
+
+        let Some(before_node) = self.project.nodes.get(id).cloned() else {
+            return;
+        };
+        let mut after = before_node.clone();
+        if let NodeKind::Image { bytes, .. } = &mut after.kind {
+            *bytes = png;
+        } else {
+            return;
+        }
+        let mut before = before_node;
+        if let NodeKind::Image { bytes, .. } = &mut before.kind {
+            *bytes = before_bytes;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchNode {
+                id,
+                before,
+                after,
+            },
+        );
+        self.status_message = if erase {
+            "Erased".into()
+        } else {
+            "Painted".into()
+        };
     }
 
     /// Load a filesystem image (or video frame when `video_time_sec` is set) for NE paths.
@@ -7596,10 +8111,18 @@ fn run_video_decode_thread(
             }
             self.fonts
                 .ensure_loaded(&ctx, &self.ui_text_font_family);
-            // Ensure textures for any Image nodes (decode from embedded bytes if needed)
-            let image_ids: Vec<_> = order.iter().copied().filter(|id| {
-                self.project.nodes.get(*id).map_or(false, |n| matches!(n.kind, NodeKind::Image { .. }))
-            }).collect();
+            // Ensure textures for any Image nodes (decode from embedded bytes if needed).
+            // CRITICAL: never clone PNG bytes when texture already warm — that was multi-MB/frame lag.
+            let image_ids: Vec<_> = order
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.project
+                        .nodes
+                        .get(*id)
+                        .map_or(false, |n| matches!(n.kind, NodeKind::Image { .. }))
+                })
+                .collect();
             // While on-page editing a text, suppress its normal draw so the in-place editor provides
             // the visible glyphs + caret with no duplicate/offset.
             let draw_order: Vec<NodeId> = if let Some(edit_id) = self.on_page_text_edit {
@@ -7608,43 +8131,51 @@ fn run_video_decode_thread(
                 order
             };
             for id in image_ids {
-                if let Some(bytes) = self.project.nodes.get(id).and_then(|n| {
-                    if let NodeKind::Image { bytes, .. } = &n.kind {
-                        Some(bytes.clone())
-                    } else {
-                        None
-                    }
-                }) {
+                if self.image_textures.contains_key(&id) && self.image_pixel_cache.contains_key(&id)
+                {
+                    continue;
+                }
+                // Clone only when we actually need to decode.
+                let bytes = self.project.nodes.get(id).and_then(|n| match &n.kind {
+                    NodeKind::Image { bytes, .. } => Some(bytes.clone()),
+                    _ => None,
+                });
+                if let Some(bytes) = bytes {
                     self.ensure_image_texture(id, &bytes, &ctx);
                 }
             }
 
-            // Async video decode: non-blocking poll + kick off background decode if needed
-            self.refresh_object_linked_av_clips(&ctx);
-            self.tick_video_layers(&ctx);
+            let freehand_busy = self.tools.raster.painting
+                || (self.tools.active == ToolKind::Brush && !self.tools.brush.points.is_empty());
+            // While brushing, skip AV/NE warm-up so the UI can hit max pointer sample rate.
+            if !freehand_busy {
+                // Async video decode: non-blocking poll + kick off background decode if needed
+                self.refresh_object_linked_av_clips(&ctx);
+                self.tick_video_layers(&ctx);
 
-            // P6b: ensure Output Object canvas proxies exist (selectable Image nodes).
-            {
-                let layer_indices: Vec<usize> = self
-                    .project
-                    .document
-                    .layers
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, l)| l.kind == crate::document::LayerKind::NodeEditor)
-                    .map(|(i, _)| i)
-                    .collect();
-                for i in layer_indices {
-                    let Some(layer) = self.project.document.layers.get_mut(i) else {
-                        continue;
-                    };
-                    let _ = layer.ensure_ne_output_proxy(&mut self.project.nodes);
+                // P6b: ensure Output Object canvas proxies exist (selectable Image nodes).
+                {
+                    let layer_indices: Vec<usize> = self
+                        .project
+                        .document
+                        .layers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.kind == crate::document::LayerKind::NodeEditor)
+                        .map(|(i, _)| i)
+                        .collect();
+                    for i in layer_indices {
+                        let Some(layer) = self.project.document.layers.get_mut(i) else {
+                            continue;
+                        };
+                        let _ = layer.ensure_ne_output_proxy(&mut self.project.nodes);
+                    }
                 }
-            }
 
-            // Start video→WAV extract ASAP (not only when Play is pressed). Contending
-            // with per-frame UI video decode delayed audio until ~hundreds of frames.
-            self.warm_ne_video_audio_extract();
+                // Start video→WAV extract ASAP (not only when Play is pressed). Contending
+                // with per-frame UI video decode delayed audio until ~hundreds of frames.
+                self.warm_ne_video_audio_extract();
+            }
 
             // Warm Node Editor Output Object textures (include blur bake when not playing).
             let graph_evals: Vec<(String, crate::document::GraphOutputEval)> = self
@@ -8724,6 +9255,16 @@ fn run_video_decode_thread(
                 );
             }
 
+            // Live raster paint preview (no full-texture reupload while dragging).
+            if self.tools.raster.painting
+                && matches!(
+                    self.tools.active,
+                    ToolKind::RasterBrush | ToolKind::Eraser
+                )
+            {
+                self.draw_raster_stroke_overlay(&painter, origin);
+            }
+
             // Weight flow brush cursor (path sculpt)
             if self.tools.weight_flow.enabled {
                 if let Some(doc) = self
@@ -9010,10 +9551,15 @@ fn run_video_decode_thread(
                     }
                     None
                 });
-                // Prefer raw doc for pixel brush so grid snap is applied inside tool
-                // (snapped point is fine; pixel stamp floors cells).
+                // Freehand + stabilizer must use raw pointer — grid snap makes polygonal strokes.
+                // Pixel brush still snaps to grid cells inside the tool.
+                let brush_doc = if self.tools.brush.brush_type == crate::tools::BrushType::Pixel {
+                    doc_snapped
+                } else {
+                    raw_doc
+                };
                 self.tool_brush(
-                    doc_snapped,
+                    brush_doc,
                     time,
                     primary_pressed,
                     primary_down,
@@ -9021,6 +9567,27 @@ fn run_video_decode_thread(
                     pressure,
                     shift,
                     ctrl,
+                );
+            }
+            ToolKind::RasterBrush | ToolKind::Eraser => {
+                let pressure = response.ctx.input(|i| {
+                    for event in &i.events {
+                        if let egui::Event::Touch { force, .. } = event {
+                            return *force;
+                        }
+                    }
+                    None
+                });
+                let erase = self.tools.active == ToolKind::Eraser || shift;
+                // MUST use raw (unsnapped) doc coords — grid snap makes paint look stepped.
+                self.tool_raster_paint(
+                    raw_doc,
+                    primary_pressed,
+                    primary_down,
+                    primary_released_anywhere,
+                    pressure,
+                    erase,
+                    &response.ctx,
                 );
             }
 
@@ -12296,12 +12863,23 @@ fn run_video_decode_thread(
             if width <= 0.0 || height <= 0.0 {
                 return None;
             }
+            let (u, v) = crate::document::image_doc_to_uv(
+                x,
+                y,
+                width,
+                height,
+                node.transform.rotation_rad,
+                doc.0,
+                doc.1,
+            )?;
             if let Some(color_image) = self.image_pixel_cache.get(&node.id) {
                 let iw = color_image.size[0] as u32;
                 let ih = color_image.size[1] as u32;
-                // Map doc position into pixel coordinates
-                let px = (((doc.0 - x) / width) * iw as f64).floor() as i64;
-                let py = (((doc.1 - y) / height) * ih as f64).floor() as i64;
+                if iw == 0 || ih == 0 {
+                    return None;
+                }
+                let px = (u * iw as f64).floor() as i64;
+                let py = (v * ih as f64).floor() as i64;
                 if px >= 0 && py >= 0 && (px as u32) < iw && (py as u32) < ih {
                     let pixel = color_image.pixels[(py as usize) * (iw as usize) + (px as usize)];
                     if pixel.a() == 0 {
@@ -14938,10 +15516,17 @@ fn run_video_decode_thread(
                 let heavy = self.tools.brush.heavy;
                 let smoothness = self.tools.brush.smoothness;
 
-                let r = (heavy * 60.0) as f64;
-                let raw_dist = ((doc.0 - prev_pos[0]).powi(2) + (doc.1 - prev_pos[1]).powi(2)).sqrt();
-                if raw_dist > r + 1.0 {
-                    let stabilized_pos = if r > 0.0001 {
+                // Stabilizer pull radius — keep it from starving samples on fast curves.
+                // Old: heavy*60 forced gaps of 13+ px → polygonal spirals.
+                let r = (heavy * 18.0) as f64;
+                let raw_dist =
+                    ((doc.0 - prev_pos[0]).powi(2) + (doc.1 - prev_pos[1]).powi(2)).sqrt();
+                // Always accept a sample when the cursor moved meaningfully (or always while down
+                // for dense freehand). Stabilizer still softens position, but we no longer
+                // drop entire frames when moving fast.
+                let min_step = (size as f64 * 0.08).max(0.75);
+                if raw_dist > min_step {
+                    let stabilized_pos = if r > 0.0001 && raw_dist > r {
                         let pull_ratio = r / raw_dist;
                         [
                             doc.0 - (doc.0 - prev_pos[0]) * pull_ratio,
@@ -14951,7 +15536,9 @@ fn run_video_decode_thread(
                         [doc.0, doc.1]
                     };
 
-                    let dist = ((stabilized_pos[0] - prev_pos[0]).powi(2) + (stabilized_pos[1] - prev_pos[1]).powi(2)).sqrt();
+                    let dist = ((stabilized_pos[0] - prev_pos[0]).powi(2)
+                        + (stabilized_pos[1] - prev_pos[1]).powi(2))
+                    .sqrt();
                     let dt = time - prev_time;
                     let speed = if dt > 0.0001 { dist / dt } else { 0.0 };
 
@@ -14965,8 +15552,8 @@ fn run_video_decode_thread(
                         };
                         let v = v.clamp(0.0, 1.0);
                         let y = (1.0 - v) * max_r;
-                        let r = (max_r * max_r - y * y).max(0.0).sqrt();
-                        (r * 2.0).max(1.0) as f32
+                        let rr = (max_r * max_r - y * y).max(0.0).sqrt();
+                        (rr * 2.0).max(1.0) as f32
                     } else {
                         let base_min = (size * 0.3).max(1.0);
                         let base_max = (size * 2.0).max(4.0);
@@ -14976,7 +15563,7 @@ fn run_video_decode_thread(
                         max_w - (max_w - min_w) * factor
                     };
 
-                    let pos_smooth = smoothness.min(0.9) as f64;
+                    let pos_smooth = (smoothness.min(0.85) as f64) * 0.85; // less lag than before
                     let smoothed_pos = [
                         prev_pos[0] * pos_smooth + stabilized_pos[0] * (1.0 - pos_smooth),
                         prev_pos[1] * pos_smooth + stabilized_pos[1] * (1.0 - pos_smooth),
@@ -14985,11 +15572,33 @@ fn run_video_decode_thread(
                     let prev_effective_w = if prev_w < 0.01 { target_w } else { prev_w };
                     let max_change = (dist * 0.3).max(0.5);
                     let delta = target_w - prev_effective_w;
-                    let target_w_limited = prev_effective_w + delta.clamp(-max_change as f32, max_change as f32);
+                    let target_w_limited =
+                        prev_effective_w + delta.clamp(-max_change as f32, max_change as f32);
 
                     let alpha_w = (0.3 - 0.28 * smoothness).clamp(0.01, 1.0);
                     let new_w = prev_effective_w * (1.0 - alpha_w) + target_w_limited * alpha_w;
+
+                    // Mid-stroke: one sample only (keeps preview cheap). Dense Catmull
+                    // resampling happens on release via densify_brush_centerline.
                     self.tools.brush.points.push((smoothed_pos, time, new_w));
+                    // If the frame jumped a long way, add a few mid-points (cap 4) so
+                    // release densify has anchors — without bloating live preview.
+                    if dist > (size as f64 * 0.5).max(4.0) {
+                        let n = ((dist / ((size as f64 * 0.35).max(3.0))).ceil() as usize)
+                            .clamp(2, 4);
+                        // Replace the single push with subdivided path (rewrite last).
+                        self.tools.brush.points.pop();
+                        for i in 1..=n {
+                            let t = i as f64 / n as f64;
+                            let p = [
+                                prev_pos[0] + (smoothed_pos[0] - prev_pos[0]) * t,
+                                prev_pos[1] + (smoothed_pos[1] - prev_pos[1]) * t,
+                            ];
+                            let w = prev_effective_w + (new_w - prev_effective_w) * t as f32;
+                            let ti = prev_time + (time - prev_time) * t;
+                            self.tools.brush.points.push((p, ti, w));
+                        }
+                    }
                 }
             }
         }
@@ -15003,6 +15612,14 @@ fn run_video_decode_thread(
             }
 
             let mut pts = self.tools.brush.points.clone();
+            // Catmull-resample freehand centerline so outline isn't a raw frame polyline.
+            if matches!(
+                self.tools.brush.brush_type,
+                crate::tools::BrushType::Standard | crate::tools::BrushType::Calligraphy
+            ) && pts.len() >= 3
+            {
+                pts = densify_brush_centerline(&pts, (self.tools.brush.size as f64 * 0.15).max(1.0));
+            }
             if !pts.is_empty()
                 && (self.tools.brush.brush_type == crate::tools::BrushType::Pixel
                     || pts.len() >= 2)
@@ -15027,9 +15644,14 @@ fn run_video_decode_thread(
                     };
                     Node::path_from_bez(bez, name)
                 } else if self.tools.brush.brush_type == crate::tools::BrushType::Pen {
+                    let pen_pts = if pts.len() >= 3 {
+                        densify_brush_centerline(&pts, (self.tools.brush.size as f64 * 0.12).max(0.8))
+                    } else {
+                        pts.clone()
+                    };
                     Node::new(
                         NodeKind::BrushStroke {
-                            points: pts.iter().map(|(p, _, w)| (*p, *w)).collect(),
+                            points: pen_pts.iter().map(|(p, _, w)| (*p, *w)).collect(),
                         },
                         "Pen Stroke",
                     )
@@ -18678,12 +19300,18 @@ impl eframe::App for VadadeeBerryApp {
     }
 
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        self.update_clip_mask_textures(ctx);
-        // Keep boolean result paths in sync when operands move (cheap if no effects).
-        if !self.project.document.boolean_effects.is_empty() {
-            self.refresh_boolean_effects_live();
+        let painting = self.tools.raster.painting
+            || (self.tools.active == ToolKind::Brush && !self.tools.brush.points.is_empty());
+        // While freehand is active, skip non-essential background work so every frame
+        // can sample the pointer (smooth strokes need high sample rate, not perfect caches).
+        if !painting {
+            self.update_clip_mask_textures(ctx);
+            // Keep boolean result paths in sync when operands move (cheap if no effects).
+            if !self.project.document.boolean_effects.is_empty() {
+                self.refresh_boolean_effects_live();
+            }
+            self.update_layer_raster_cache(ctx);
         }
-        self.update_layer_raster_cache(ctx);
         if self.cached_draw_order_revision != self.history.revision() {
             self.rebuild_spatial_index();
         }
@@ -19379,6 +20007,69 @@ fn pixel_stamps_to_path(points: &[([f64; 2], f64, f32)], aspect: f64) -> kurbo::
         path.close_path();
     }
     path
+}
+
+/// Resample brush centerline with Catmull-Rom so sparse frame samples become a smooth path.
+fn densify_brush_centerline(
+    points: &[([f64; 2], f64, f32)],
+    spacing: f64,
+) -> Vec<([f64; 2], f64, f32)> {
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+    let spacing = spacing.max(0.5);
+    let n = points.len();
+    let mut out = Vec::with_capacity(n * 4);
+    out.push(points[0]);
+
+    let pos = |i: isize| -> [f64; 2] {
+        let i = i.clamp(0, (n - 1) as isize) as usize;
+        points[i].0
+    };
+    let cat = |p0: f64, p1: f64, p2: f64, p3: f64, t: f64| -> f64 {
+        let t2 = t * t;
+        let t3 = t2 * t;
+        0.5 * ((2.0 * p1)
+            + (-p0 + p2) * t
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+    };
+
+    for seg in 0..n.saturating_sub(1) {
+        let p0 = pos(seg as isize - 1);
+        let p1 = pos(seg as isize);
+        let p2 = pos(seg as isize + 1);
+        let p3 = pos(seg as isize + 2);
+        let chord = (p2[0] - p1[0]).hypot(p2[1] - p1[1]);
+        if chord < 1e-6 {
+            continue;
+        }
+        let steps = ((chord / spacing).ceil() as usize).clamp(2, 64);
+        let w0 = points[seg].2;
+        let w1 = points[seg + 1].2;
+        let t0 = points[seg].1;
+        let t1 = points[seg + 1].1;
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let x = cat(p0[0], p1[0], p2[0], p3[0], t);
+            let y = cat(p0[1], p1[1], p2[1], p3[1], t);
+            let w = w0 + (w1 - w0) * t as f32;
+            let tm = t0 + (t1 - t0) * t;
+            // Skip near-duplicates of last out point.
+            if let Some(last) = out.last() {
+                let d = (x - last.0[0]).hypot(y - last.0[1]);
+                if d < spacing * 0.35 && i < steps {
+                    continue;
+                }
+            }
+            out.push(([x, y], tm, w));
+        }
+    }
+    if out.len() < 2 {
+        points.to_vec()
+    } else {
+        out
+    }
 }
 
 fn generate_brush_outline(

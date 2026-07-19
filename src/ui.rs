@@ -547,6 +547,8 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Plotter,
             ToolKind::Text,
             ToolKind::Brush,
+            ToolKind::RasterBrush,
+            ToolKind::Eraser,
             ToolKind::Eyedropper,
         ]
     };
@@ -584,6 +586,8 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Plotter => icons::PLOTTER,
             ToolKind::Text => icons::TEXT,
             ToolKind::Brush => icons::BRUSH,
+            ToolKind::RasterBrush => icons::RASTER_BRUSH,
+            ToolKind::Eraser => icons::ERASER,
             ToolKind::Eyedropper => icons::EYE_DROPPER,
         }
     };
@@ -602,6 +606,8 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Plotter => "Plotter f(x)/f(y) (M)",
             ToolKind::Text => "Text (T)",
             ToolKind::Brush => "Brush (B)",
+            ToolKind::RasterBrush => "Raster paint (K) — paints Image pixels",
+            ToolKind::Eraser => "Eraser (X) — erase Image alpha",
             ToolKind::Eyedropper => "Eyedropper (I)",
         }
     };
@@ -6917,6 +6923,60 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 }
             }
         }
+    }
+
+    if matches!(
+        app.tools.active,
+        ToolKind::RasterBrush | ToolKind::Eraser
+    ) {
+        theme::constraint_block(ui, |ui| {
+            let title = if app.tools.active == ToolKind::Eraser {
+                format!("{} Eraser (raster)", icons::ERASER)
+            } else {
+                format!("{} Paint (raster)", icons::RASTER_BRUSH)
+            };
+            ui.label(
+                RichText::new(title)
+                    .font(nerd_font_id(14.0))
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Paints Image pixels. Select an Image or a blank page-sized layer is created.")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(4.0);
+            let mut size = app.tools.raster.size;
+            if brush_numeric_row(ui, "Size (doc)", &mut size, 1.0..=512.0, 1.0) {
+                app.tools.raster.size = size;
+            }
+            let mut hard = app.tools.raster.hardness;
+            if brush_numeric_row(ui, "Hardness", &mut hard, 0.0..=1.0, 0.01) {
+                app.tools.raster.hardness = hard;
+            }
+            let mut op = app.tools.raster.opacity;
+            if brush_numeric_row(ui, "Opacity", &mut op, 0.0..=1.0, 0.01) {
+                app.tools.raster.opacity = op;
+            }
+            let mut sp = app.tools.raster.spacing;
+            if brush_numeric_row(ui, "Spacing", &mut sp, 0.05..=1.0, 0.01) {
+                app.tools.raster.spacing = sp;
+            }
+            if app.tools.active == ToolKind::RasterBrush {
+                ui.label(
+                    RichText::new("Color = Fill swatch  ·  Shift = temporary erase")
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
+            } else {
+                ui.label(
+                    RichText::new("Erases alpha on the target Image")
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
+            }
+        });
     }
 
     if app.tools.active == ToolKind::Brush {

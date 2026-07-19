@@ -60,6 +60,10 @@ pub const GRAB: &str = "";
 /// Swap / reverse operands (nf-fa-exchange / ).
 pub const SWAP: &str = "";
 pub const RASTER: &str = "󰹑";
+/// Raster paint brush (nf-md-brush).
+pub const RASTER_BRUSH: &str = "󰃥";
+/// Raster eraser (nf-md-eraser).
+pub const ERASER: &str = "󰃢";
 /// Shader / shading layer (full-page pass; stack-order flexible via raise/lower).
 pub const SHADING: &str = "󰽏";
 /// Live collaboration chat (Nerd Font).
