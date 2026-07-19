@@ -1605,6 +1605,7 @@ impl VadadeeBerryApp {
         self.tools.raster.dirty = false;
         self.tools.raster.tex_dirty = false;
         self.tools.raster.last_px = None;
+        self.tools.raster.stable_px = None;
         self.tools.raster.sample_hist.clear();
         self.tools.raster.spacing_carry = 0.0;
         // Mid-stroke only mutates the texture cache (not node bytes until commit),
@@ -6801,6 +6802,7 @@ impl VadadeeBerryApp {
             self.tools.raster.live_h = live.1;
             self.tools.raster.live_rgba = Some(live.2);
             self.tools.raster.last_px = None;
+            self.tools.raster.stable_px = None;
             self.tools.raster.sample_hist.clear();
             self.tools.raster.spacing_carry = 0.0;
             self.tools.raster.painting = true;
@@ -6866,6 +6868,21 @@ impl VadadeeBerryApp {
             let u = ((lx - x) / width).clamp(0.0, 1.0);
             let v = ((ly - y) / height).clamp(0.0, 1.0);
             ((u * pw as f64) as f32, (v * ph as f64) as f32)
+        };
+
+        // Streamline: pull stabilized tip toward pointer (CSP-style continuous pen).
+        let stab = self.tools.raster.stabilizer.clamp(0.0, 1.0);
+        let (px, py) = if force_first || stab < 1e-3 {
+            self.tools.raster.stable_px = Some((px, py));
+            (px, py)
+        } else {
+            let (sx, sy) = self.tools.raster.stable_px.unwrap_or((px, py));
+            // Higher stabilizer → stronger lag (smaller follow fraction).
+            let follow = (1.0 - stab * 0.92).clamp(0.05, 1.0);
+            let nx = sx + (px - sx) * follow;
+            let ny = sy + (py - sy) * follow;
+            self.tools.raster.stable_px = Some((nx, ny));
+            (nx, ny)
         };
 
         // Skip near-duplicate samples (micro jitter) so history stays useful.
@@ -7077,6 +7094,7 @@ impl VadadeeBerryApp {
         self.tools.raster.sample_hist.clear();
         self.tools.raster.painting = false;
         self.tools.raster.last_px = None;
+        self.tools.raster.stable_px = None;
         self.tools.raster.spacing_carry = 0.0;
         self.tools.raster.tex_dirty = false;
         if !dirty {
@@ -7126,6 +7144,138 @@ impl VadadeeBerryApp {
         } else {
             "Painted".into()
         };
+    }
+
+    /// Flood-fill Image at document point (BucketFill tool).
+    fn tool_bucket_fill(&mut self, doc: (f64, f64), pressed: bool, ctx: &Context) {
+        if !pressed {
+            return;
+        }
+        let Some(id) = self.ensure_raster_paint_target(ctx) else {
+            self.status_message = "Could not create paint surface".into();
+            return;
+        };
+        let snap = self.project.nodes.get(id).and_then(|node| {
+            if let NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                bytes,
+                ..
+            } = &node.kind
+            {
+                Some((
+                    *x,
+                    *y,
+                    *width,
+                    *height,
+                    node.transform.rotation_rad,
+                    bytes.clone(),
+                ))
+            } else {
+                None
+            }
+        });
+        let Some((x, y, width, height, rot, before_bytes)) = snap else {
+            return;
+        };
+        if !self.image_pixel_cache.contains_key(&id) {
+            self.ensure_image_texture(id, &before_bytes, ctx);
+        }
+        let Some(ci) = self.image_pixel_cache.get(&id) else {
+            return;
+        };
+        let pw = ci.size[0] as u32;
+        let ph = ci.size[1] as u32;
+        if pw == 0 || ph == 0 {
+            return;
+        }
+        let Some((u, v)) =
+            crate::document::image_doc_to_uv(x, y, width, height, rot, doc.0, doc.1)
+        else {
+            self.status_message = "Click inside the image to fill".into();
+            return;
+        };
+        let sx = (u * pw as f64).floor() as i32;
+        let sy = (v * ph as f64).floor() as i32;
+        let mut raw = Vec::with_capacity(ci.pixels.len() * 4);
+        for p in &ci.pixels {
+            raw.push(p.r());
+            raw.push(p.g());
+            raw.push(p.b());
+            raw.push(p.a());
+        }
+        let fill = self.raster_paint_rgba();
+        let n = crate::raster::flood_fill(
+            &mut raw,
+            pw,
+            ph,
+            sx,
+            sy,
+            fill,
+            self.tools.raster.fill_tolerance,
+        );
+        if n == 0 {
+            self.status_message = "Nothing to fill".into();
+            return;
+        }
+        self.sync_image_texture_from_rgba(id, pw, ph, &raw, ctx);
+        let Some(png) = (crate::raster::RasterBuffer {
+            width: pw,
+            height: ph,
+            rgba: raw,
+        })
+        .encode_png() else {
+            self.status_message = "Fill encode failed".into();
+            return;
+        };
+        let Some(before_node) = self.project.nodes.get(id).cloned() else {
+            return;
+        };
+        let mut after = before_node.clone();
+        if let NodeKind::Image { bytes, .. } = &mut after.kind {
+            *bytes = png;
+        }
+        let mut before = before_node;
+        if let NodeKind::Image { bytes, .. } = &mut before.kind {
+            *bytes = before_bytes;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchNode {
+                id,
+                before,
+                after,
+            },
+        );
+        self.status_message = format!("Filled {n} px");
+    }
+
+    /// Sample Image (or canvas) color into Fill swatch while painting (Alt).
+    fn raster_pick_color_at(&mut self, doc: (f64, f64)) {
+        let color = self.color_at_doc_pos(doc);
+        let r = color.r() as f32 / 255.0;
+        let g = color.g() as f32 / 255.0;
+        let b = color.b() as f32 / 255.0;
+        let a = color.a() as f32 / 255.0;
+        let paint = crate::document::Paint {
+            rgba: [r, g, b, a],
+        };
+        if let Some(stop) = self.ui_fill_stops.first_mut() {
+            stop.color = paint;
+        } else {
+            self.ui_fill_stops
+                .push(crate::document::GradientStop { pos: 0.0, color: paint });
+        }
+        self.ui_fill_kind = crate::document::FillKind::Solid;
+        self.fill_enabled = true;
+        self.status_message = format!(
+            "Picked #{:02X}{:02X}{:02X}",
+            color.r(),
+            color.g(),
+            color.b()
+        );
     }
 
     /// Load a filesystem image (or video frame when `video_time_sec` is set) for NE paths.
@@ -9570,25 +9720,41 @@ fn run_video_decode_thread(
                 );
             }
             ToolKind::RasterBrush | ToolKind::Eraser => {
-                let pressure = response.ctx.input(|i| {
-                    for event in &i.events {
-                        if let egui::Event::Touch { force, .. } = event {
-                            return *force;
-                        }
+                let alt = response.ctx.input(|i| i.modifiers.alt);
+                if alt {
+                    // Alt+click / hold: pick color (pro paint workflow).
+                    if primary_pressed || primary_down {
+                        self.raster_pick_color_at(raw_doc);
                     }
-                    None
-                });
-                let erase = self.tools.active == ToolKind::Eraser || shift;
-                // MUST use raw (unsnapped) doc coords — grid snap makes paint look stepped.
-                self.tool_raster_paint(
-                    raw_doc,
-                    primary_pressed,
-                    primary_down,
-                    primary_released_anywhere,
-                    pressure,
-                    erase,
-                    &response.ctx,
-                );
+                } else {
+                    let pressure = response.ctx.input(|i| {
+                        for event in &i.events {
+                            if let egui::Event::Touch { force, .. } = event {
+                                return *force;
+                            }
+                        }
+                        None
+                    });
+                    let erase = self.tools.active == ToolKind::Eraser || shift;
+                    // MUST use raw (unsnapped) doc coords — grid snap makes paint look stepped.
+                    self.tool_raster_paint(
+                        raw_doc,
+                        primary_pressed,
+                        primary_down,
+                        primary_released_anywhere,
+                        pressure,
+                        erase,
+                        &response.ctx,
+                    );
+                }
+            }
+            ToolKind::BucketFill => {
+                let alt = response.ctx.input(|i| i.modifiers.alt);
+                if alt && (primary_pressed || primary_down) {
+                    self.raster_pick_color_at(raw_doc);
+                } else {
+                    self.tool_bucket_fill(raw_doc, primary_pressed, &response.ctx);
+                }
             }
 
             ToolKind::Node => self.tool_node(

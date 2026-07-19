@@ -64,6 +64,8 @@ pub const RASTER: &str = "󰹑";
 pub const RASTER_BRUSH: &str = "󰃥";
 /// Raster eraser (nf-md-eraser).
 pub const ERASER: &str = "󰃢";
+/// Bucket / flood fill (nf-md-format-color-fill).
+pub const BUCKET: &str = "󰃡";
 /// Shader / shading layer (full-page pass; stack-order flexible via raise/lower).
 pub const SHADING: &str = "󰽏";
 /// Live collaboration chat (Nerd Font).

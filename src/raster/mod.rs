@@ -340,6 +340,80 @@ pub fn stamps_for_new_sample(
     }
 }
 
+/// Flood-fill contiguous pixels matching the seed (within `tolerance` RGB L∞).
+/// Writes `fill` into matching pixels. Returns number of pixels changed.
+pub fn flood_fill(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    seed_x: i32,
+    seed_y: i32,
+    fill: [u8; 4],
+    tolerance: u8,
+) -> usize {
+    let w = width as i32;
+    let h = height as i32;
+    if w <= 0 || h <= 0 || seed_x < 0 || seed_y < 0 || seed_x >= w || seed_y >= h {
+        return 0;
+    }
+    let idx = |x: i32, y: i32| -> usize { ((y as usize) * (w as usize) + (x as usize)) * 4 };
+    let get = |buf: &[u8], x: i32, y: i32| -> [u8; 4] {
+        let i = idx(x, y);
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    };
+    let target = get(rgba, seed_x, seed_y);
+    // No-op if already same color (and fully opaque match).
+    if color_match(target, fill, 0) && target[3] == fill[3] {
+        return 0;
+    }
+    let tol = tolerance as i16;
+    let matches = |c: [u8; 4]| -> bool {
+        (c[0] as i16 - target[0] as i16).abs() <= tol
+            && (c[1] as i16 - target[1] as i16).abs() <= tol
+            && (c[2] as i16 - target[2] as i16).abs() <= tol
+            // Treat nearly-transparent as matching transparent seed.
+            && ((target[3] < 8 && c[3] < 8) || (c[3] as i16 - target[3] as i16).abs() <= tol)
+    };
+    if !matches(target) {
+        return 0;
+    }
+
+    let mut stack = vec![(seed_x, seed_y)];
+    let mut visited = vec![false; (w * h) as usize];
+    let mut painted = 0usize;
+    while let Some((x, y)) = stack.pop() {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            continue;
+        }
+        let vi = (y * w + x) as usize;
+        if visited[vi] {
+            continue;
+        }
+        visited[vi] = true;
+        if !matches(get(rgba, x, y)) {
+            continue;
+        }
+        let i = idx(x, y);
+        rgba[i] = fill[0];
+        rgba[i + 1] = fill[1];
+        rgba[i + 2] = fill[2];
+        rgba[i + 3] = fill[3];
+        painted += 1;
+        stack.push((x + 1, y));
+        stack.push((x - 1, y));
+        stack.push((x, y + 1));
+        stack.push((x, y - 1));
+    }
+    painted
+}
+
+fn color_match(a: [u8; 4], b: [u8; 4], tol: u8) -> bool {
+    let t = tol as i16;
+    (a[0] as i16 - b[0] as i16).abs() <= t
+        && (a[1] as i16 - b[1] as i16).abs() <= t
+        && (a[2] as i16 - b[2] as i16).abs() <= t
+}
+
 /// Brush radius in **image pixels** from document-space brush size and image placement.
 pub fn doc_size_to_pixel_radius(
     size_doc: f32,
@@ -389,6 +463,25 @@ mod tests {
         let (pts, _) = stamps_along((0.0, 0.0), (20.0, 0.0), 5.0, 0.0, true);
         assert!(pts.len() >= 4, "got {} stamps", pts.len());
         assert!((pts[0].0 - 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn flood_fill_fills_region() {
+        let mut buf = RasterBuffer::new(8, 8);
+        // Vertical barrier of red down the middle.
+        for y in 0..8 {
+            let i = (y * 8 + 3) * 4;
+            buf.rgba[i] = 255;
+            buf.rgba[i + 3] = 255;
+        }
+        let n = flood_fill(&mut buf.rgba, 8, 8, 0, 0, [0, 255, 0, 255], 0);
+        assert!(n > 0);
+        // Left of barrier green
+        assert_eq!(buf.rgba[0], 0);
+        assert_eq!(buf.rgba[1], 255);
+        // Right of barrier still empty
+        let r = (0 * 8 + 5) * 4;
+        assert_eq!(buf.rgba[r + 3], 0);
     }
 
     #[test]

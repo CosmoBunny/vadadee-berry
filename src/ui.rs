@@ -549,6 +549,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Brush,
             ToolKind::RasterBrush,
             ToolKind::Eraser,
+            ToolKind::BucketFill,
             ToolKind::Eyedropper,
         ]
     };
@@ -588,6 +589,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Brush => icons::BRUSH,
             ToolKind::RasterBrush => icons::RASTER_BRUSH,
             ToolKind::Eraser => icons::ERASER,
+            ToolKind::BucketFill => icons::BUCKET,
             ToolKind::Eyedropper => icons::EYE_DROPPER,
         }
     };
@@ -606,8 +608,9 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Plotter => "Plotter f(x)/f(y) (M)",
             ToolKind::Text => "Text (T)",
             ToolKind::Brush => "Brush (B)",
-            ToolKind::RasterBrush => "Raster paint (K) — paints Image pixels",
-            ToolKind::Eraser => "Eraser (X) — erase Image alpha",
+            ToolKind::RasterBrush => "Raster paint (K) — paints Image pixels · Alt=pick",
+            ToolKind::Eraser => "Eraser (X) — erase Image alpha · Alt=pick",
+            ToolKind::BucketFill => "Flood fill (F) — fill contiguous pixels on Image",
             ToolKind::Eyedropper => "Eyedropper (I)",
         }
     };
@@ -6927,13 +6930,13 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
     if matches!(
         app.tools.active,
-        ToolKind::RasterBrush | ToolKind::Eraser
+        ToolKind::RasterBrush | ToolKind::Eraser | ToolKind::BucketFill
     ) {
         theme::constraint_block(ui, |ui| {
-            let title = if app.tools.active == ToolKind::Eraser {
-                format!("{} Eraser (raster)", icons::ERASER)
-            } else {
-                format!("{} Paint (raster)", icons::RASTER_BRUSH)
+            let title = match app.tools.active {
+                ToolKind::Eraser => format!("{} Eraser (raster)", icons::ERASER),
+                ToolKind::BucketFill => format!("{} Fill (raster)", icons::BUCKET),
+                _ => format!("{} Paint (raster)", icons::RASTER_BRUSH),
             };
             ui.label(
                 RichText::new(title)
@@ -6942,39 +6945,57 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             );
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Paints Image pixels. Select an Image or a blank page-sized layer is created.")
+                RichText::new("Targets Image pixels. Select an Image or a blank surface is created.")
                     .small()
                     .color(colors::TEXT_MUTED),
             );
             ui.add_space(4.0);
-            let mut size = app.tools.raster.size;
-            if brush_numeric_row(ui, "Size (doc)", &mut size, 1.0..=512.0, 1.0) {
-                app.tools.raster.size = size;
-            }
-            let mut hard = app.tools.raster.hardness;
-            if brush_numeric_row(ui, "Hardness", &mut hard, 0.0..=1.0, 0.01) {
-                app.tools.raster.hardness = hard;
-            }
-            let mut op = app.tools.raster.opacity;
-            if brush_numeric_row(ui, "Opacity", &mut op, 0.0..=1.0, 0.01) {
-                app.tools.raster.opacity = op;
-            }
-            let mut sp = app.tools.raster.spacing;
-            if brush_numeric_row(ui, "Spacing", &mut sp, 0.05..=1.0, 0.01) {
-                app.tools.raster.spacing = sp;
-            }
-            if app.tools.active == ToolKind::RasterBrush {
+            if app.tools.active == ToolKind::BucketFill {
+                let mut tol = app.tools.raster.fill_tolerance as f32;
+                if brush_numeric_row(ui, "Tolerance", &mut tol, 0.0..=128.0, 1.0) {
+                    app.tools.raster.fill_tolerance = tol.round().clamp(0.0, 128.0) as u8;
+                }
                 ui.label(
-                    RichText::new("Color = Fill swatch  ·  Shift = temporary erase")
+                    RichText::new("Click to flood-fill · Color = Fill swatch · Alt=pick")
                         .small()
                         .color(colors::TEXT_MUTED),
                 );
             } else {
-                ui.label(
-                    RichText::new("Erases alpha on the target Image")
+                let mut size = app.tools.raster.size;
+                if brush_numeric_row(ui, "Size (doc)", &mut size, 1.0..=512.0, 1.0) {
+                    app.tools.raster.size = size;
+                }
+                let mut hard = app.tools.raster.hardness;
+                if brush_numeric_row(ui, "Hardness", &mut hard, 0.0..=1.0, 0.01) {
+                    app.tools.raster.hardness = hard;
+                }
+                let mut op = app.tools.raster.opacity;
+                if brush_numeric_row(ui, "Opacity", &mut op, 0.0..=1.0, 0.01) {
+                    app.tools.raster.opacity = op;
+                }
+                let mut sp = app.tools.raster.spacing;
+                if brush_numeric_row(ui, "Spacing", &mut sp, 0.05..=1.0, 0.01) {
+                    app.tools.raster.spacing = sp;
+                }
+                let mut stab = app.tools.raster.stabilizer;
+                if brush_numeric_row(ui, "Stabilizer", &mut stab, 0.0..=1.0, 0.01) {
+                    app.tools.raster.stabilizer = stab;
+                }
+                if app.tools.active == ToolKind::RasterBrush {
+                    ui.label(
+                        RichText::new(
+                            "Color = Fill  ·  Shift = erase  ·  Alt = pick  ·  Stabilizer smooths freehand",
+                        )
                         .small()
                         .color(colors::TEXT_MUTED),
-                );
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Erases alpha · Alt = pick color")
+                            .small()
+                            .color(colors::TEXT_MUTED),
+                    );
+                }
             }
         });
     }

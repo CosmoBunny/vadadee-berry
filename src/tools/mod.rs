@@ -28,6 +28,8 @@ pub enum ToolKind {
     RasterBrush,
     /// Erase alpha on Image RGBA.
     Eraser,
+    /// Flood-fill Image RGBA (contiguous color).
+    BucketFill,
     Eyedropper,
 }
 
@@ -48,6 +50,7 @@ impl ToolKind {
             Self::Brush => "Brush",
             Self::RasterBrush => "Paint",
             Self::Eraser => "Eraser",
+            Self::BucketFill => "Fill",
             Self::Eyedropper => "Eyedropper",
         }
     }
@@ -66,9 +69,10 @@ impl ToolKind {
             Self::Arc => Some(Key::A),
             Self::Plotter => Some(Key::M),
             Self::Brush => Some(Key::B),
-            // E = Ellipse already; use K (paint) / Shift not available — X eraser common in apps.
+            // E = Ellipse already; use K (paint) / X eraser / F fill.
             Self::RasterBrush => Some(Key::K),
             Self::Eraser => Some(Key::X),
+            Self::BucketFill => Some(Key::F),
             Self::Eyedropper => Some(Key::I),
         }
     }
@@ -403,6 +407,12 @@ pub struct RasterSession {
     pub opacity: f32,
     /// Stamp spacing as fraction of radius (0.05..1.0). Lower = denser continuous stroke.
     pub spacing: f32,
+    /// Streamline / stabilizer 0..1 (CSP-style pull). 0 = raw pointer, 1 = strong lag.
+    pub stabilizer: f32,
+    /// Stabilized tip in image-pixel space (while stroke active).
+    pub stable_px: Option<(f32, f32)>,
+    /// Flood fill color tolerance 0..255 (RGB distance).
+    pub fill_tolerance: u8,
     /// Active paint target (Image node).
     pub target: Option<crate::document::NodeId>,
     /// Snapshot of Image.bytes before the stroke (undo).
@@ -438,6 +448,9 @@ impl Default for RasterSession {
             opacity: 1.0,
             // Dense stamps for continuous freehand.
             spacing: 0.08,
+            stabilizer: 0.35,
+            stable_px: None,
+            fill_tolerance: 24,
             target: None,
             before_bytes: None,
             before_w: 0.0,
@@ -556,6 +569,7 @@ impl ToolState {
                 ToolKind::Brush,
                 ToolKind::RasterBrush,
                 ToolKind::Eraser,
+                ToolKind::BucketFill,
                 ToolKind::Eyedropper,
             ]
         };
