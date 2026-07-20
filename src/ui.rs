@@ -7000,6 +7000,10 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     &mut app.tools.raster.clip_to_selection,
                     "Clip to selection bounds",
                 );
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut app.tools.raster.mirror_x, "Mirror X");
+                    ui.checkbox(&mut app.tools.raster.mirror_y, "Mirror Y");
+                });
                 if matches!(
                     app.tools.active,
                     ToolKind::RasterBrush | ToolKind::Eraser
@@ -7008,6 +7012,36 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         &mut app.tools.raster.alpha_lock,
                         "Alpha lock (paint only existing pixels)",
                     );
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Set paint mask")
+                        .on_hover_text("Use current selection AABB as sticky paint mask")
+                        .clicked()
+                    {
+                        app.raster_set_sticky_mask_from_selection();
+                    }
+                    if ui
+                        .button("Clear mask")
+                        .on_hover_text("Remove sticky paint mask")
+                        .clicked()
+                    {
+                        app.raster_clear_sticky_mask();
+                    }
+                    if app.tools.raster.sticky_mask_doc.is_some() {
+                        ui.label(
+                            RichText::new("mask on")
+                                .small()
+                                .color(colors::TEXT_MUTED),
+                        );
+                    }
+                });
+                if ui
+                    .button("Clear paint layer")
+                    .on_hover_text("Make selected Image fully transparent (undoable)")
+                    .clicked()
+                {
+                    app.raster_clear_layer(ui.ctx());
                 }
                 if app.tools.active == ToolKind::RasterBrush {
                     ui.add_space(4.0);
@@ -7030,7 +7064,7 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     });
                     ui.label(
                         RichText::new(
-                            "Color = Fill  ·  Shift = erase  ·  Alt = pick  ·  multi-select clips",
+                            "Color = Fill  ·  Shift = erase  ·  Alt = pick  ·  Mirror for symmetry",
                         )
                         .small()
                         .color(colors::TEXT_MUTED),

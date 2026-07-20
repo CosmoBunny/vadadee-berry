@@ -423,6 +423,12 @@ pub struct RasterSession {
     pub smudge_strength: f32,
     /// Only paint where destination already has alpha (lock transparent).
     pub alpha_lock: bool,
+    /// Mirror stamps across image vertical center (CSP symmetry-X).
+    pub mirror_x: bool,
+    /// Mirror stamps across image horizontal center.
+    pub mirror_y: bool,
+    /// Sticky paint mask in **document** space (x0,y0,x1,y1). Survives selection change.
+    pub sticky_mask_doc: Option<(f64, f64, f64, f64)>,
     /// Active paint target (Image node).
     pub target: Option<crate::document::NodeId>,
     /// Snapshot of Image.bytes before the stroke (undo).
@@ -464,6 +470,9 @@ impl Default for RasterSession {
             clip_to_selection: true,
             smudge_strength: 0.55,
             alpha_lock: false,
+            mirror_x: false,
+            mirror_y: false,
+            sticky_mask_doc: None,
             target: None,
             before_bytes: None,
             before_w: 0.0,

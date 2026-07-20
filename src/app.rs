@@ -6923,10 +6923,29 @@ impl VadadeeBerryApp {
         self.tools.raster.spacing_carry = carry;
         let prev_px = self.tools.raster.last_px;
         self.tools.raster.last_px = Some((px, py));
-        let clip = self.raster_selection_clip_px(id, x, y, width, height, rot, pw, ph);
+        let clip = self.raster_paint_clip_px(id, x, y, width, height, rot, pw, ph);
         let smudge = self.tools.active == ToolKind::Smudge;
+        let mirror_x = self.tools.raster.mirror_x;
+        let mirror_y = self.tools.raster.mirror_y;
+        let cx_img = pw as f32 * 0.5;
+        let cy_img = ph as f32 * 0.5;
 
-        if !stamps.is_empty() {
+        // Expand stamps with symmetry mirrors (CSP-style).
+        let mut all_stamps = Vec::with_capacity(stamps.len() * 4);
+        for (sx, sy) in stamps {
+            all_stamps.push((sx, sy));
+            if mirror_x {
+                all_stamps.push((2.0 * cx_img - sx, sy));
+            }
+            if mirror_y {
+                all_stamps.push((sx, 2.0 * cy_img - sy));
+            }
+            if mirror_x && mirror_y {
+                all_stamps.push((2.0 * cx_img - sx, 2.0 * cy_img - sy));
+            }
+        }
+
+        if !all_stamps.is_empty() {
             if let Some(rgba) = self.tools.raster.live_rgba.as_mut() {
                 let mut buf = crate::raster::RasterBuffer {
                     width: pw,
@@ -6940,12 +6959,20 @@ impl VadadeeBerryApp {
                         (1.0, 0.0)
                     };
                     let str = self.tools.raster.smudge_strength * press;
-                    for (sx, sy) in stamps {
-                        buf.smudge_circle(sx, sy, radius, hardness, str, dir, clip);
+                    for (sx, sy) in all_stamps {
+                        // Mirrored directions for mirrored tips.
+                        let d = if sx < cx_img - 0.5 && mirror_x {
+                            (-dir.0, dir.1)
+                        } else if sy < cy_img - 0.5 && mirror_y {
+                            (dir.0, -dir.1)
+                        } else {
+                            dir
+                        };
+                        buf.smudge_circle(sx, sy, radius, hardness, str, d, clip);
                     }
                 } else {
                     let alpha_lock = self.tools.raster.alpha_lock && !erase;
-                    for (sx, sy) in stamps {
+                    for (sx, sy) in all_stamps {
                         buf.stamp_circle_clipped(
                             sx,
                             sy,
@@ -7236,10 +7263,10 @@ impl VadadeeBerryApp {
         }
         // Optional selection clip: if seed is outside clip, abort; fill still floods
         // whole connected region (clip is enforced by zeroing outside after fill).
-        let clip = self.raster_selection_clip_px(id, x, y, width, height, rot, pw, ph);
+        let clip = self.raster_paint_clip_px(id, x, y, width, height, rot, pw, ph);
         if let Some((x0, y0, x1, y1)) = clip {
             if sx < x0 || sy < y0 || sx >= x1 || sy >= y1 {
-                self.status_message = "Click inside selection to fill".into();
+                self.status_message = "Click inside paint mask / selection to fill".into();
                 return;
             }
         }
@@ -7304,6 +7331,92 @@ impl VadadeeBerryApp {
         self.status_message = format!("Filled {n} px");
     }
 
+    /// Prefer sticky paint mask; else live multi-selection AABB → Image pixel clip.
+    fn raster_paint_clip_px(
+        &self,
+        target_id: NodeId,
+        img_x: f64,
+        img_y: f64,
+        img_w: f64,
+        img_h: f64,
+        rot: f64,
+        pw: u32,
+        ph: u32,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if let Some((x0, y0, x1, y1)) = self.tools.raster.sticky_mask_doc {
+            return self.doc_aabb_to_image_clip(
+                img_x,
+                img_y,
+                img_w,
+                img_h,
+                rot,
+                pw,
+                ph,
+                x0,
+                y0,
+                x1,
+                y1,
+            );
+        }
+        self.raster_selection_clip_px(target_id, img_x, img_y, img_w, img_h, rot, pw, ph)
+    }
+
+    fn doc_aabb_to_image_clip(
+        &self,
+        img_x: f64,
+        img_y: f64,
+        img_w: f64,
+        img_h: f64,
+        rot: f64,
+        pw: u32,
+        ph: u32,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let corners = [
+            (x0, y0),
+            (x1, y0),
+            (x1, y1),
+            (x0, y1),
+            ((x0 + x1) * 0.5, (y0 + y1) * 0.5),
+            ((x0 + x1) * 0.5, y0),
+            ((x0 + x1) * 0.5, y1),
+            (x0, (y0 + y1) * 0.5),
+            (x1, (y0 + y1) * 0.5),
+        ];
+        let mut min_u = 1.0f64;
+        let mut min_v = 1.0f64;
+        let mut max_u = 0.0f64;
+        let mut max_v = 0.0f64;
+        let mut any = false;
+        for (dx, dy) in corners {
+            if let Some((u, v)) =
+                crate::document::image_doc_to_uv(img_x, img_y, img_w, img_h, rot, dx, dy)
+            {
+                any = true;
+                min_u = min_u.min(u);
+                min_v = min_v.min(v);
+                max_u = max_u.max(u);
+                max_v = max_v.max(v);
+            }
+        }
+        if !any {
+            return Some((0, 0, 0, 0));
+        }
+        let ix0 = (min_u * pw as f64).floor() as i32;
+        let iy0 = (min_v * ph as f64).floor() as i32;
+        let ix1 = (max_u * pw as f64).ceil() as i32;
+        let iy1 = (max_v * ph as f64).ceil() as i32;
+        Some((
+            ix0.clamp(0, pw as i32),
+            iy0.clamp(0, ph as i32),
+            ix1.clamp(0, pw as i32),
+            iy1.clamp(0, ph as i32),
+        ))
+    }
+
     /// Map selection AABB → Image pixel clip when "clip to selection" is on and
     /// selection is not only the paint target.
     fn raster_selection_clip_px(
@@ -7327,60 +7440,94 @@ impl VadadeeBerryApp {
         if b.width() < 1e-6 || b.height() < 1e-6 {
             return None;
         }
-        let corners = [
-            (b.x0, b.y0),
-            (b.x1, b.y0),
-            (b.x1, b.y1),
-            (b.x0, b.y1),
-        ];
-        let mut min_u = 1.0f64;
-        let mut min_v = 1.0f64;
-        let mut max_u = 0.0f64;
-        let mut max_v = 0.0f64;
-        let mut any = false;
-        for (dx, dy) in corners {
-            if let Some((u, v)) =
-                crate::document::image_doc_to_uv(img_x, img_y, img_w, img_h, rot, dx, dy)
-            {
-                any = true;
-                min_u = min_u.min(u);
-                min_v = min_v.min(v);
-                max_u = max_u.max(u);
-                max_v = max_v.max(v);
+        self.doc_aabb_to_image_clip(
+            img_x,
+            img_y,
+            img_w,
+            img_h,
+            rot,
+            pw,
+            ph,
+            b.x0,
+            b.y0,
+            b.x1,
+            b.y1,
+        )
+    }
+
+    /// Capture current selection AABB as a sticky paint mask (or clear).
+    pub fn raster_set_sticky_mask_from_selection(&mut self) {
+        if let Some(b) = self.selection_bounds() {
+            if b.width() > 1.0 && b.height() > 1.0 {
+                self.tools.raster.sticky_mask_doc = Some((b.x0, b.y0, b.x1, b.y1));
+                self.status_message = "Paint mask set from selection".into();
+                return;
             }
         }
-        // Also sample selection center + edge mids so rotated images get a usable AABB.
-        for (dx, dy) in [
-            ((b.x0 + b.x1) * 0.5, (b.y0 + b.y1) * 0.5),
-            ((b.x0 + b.x1) * 0.5, b.y0),
-            ((b.x0 + b.x1) * 0.5, b.y1),
-            (b.x0, (b.y0 + b.y1) * 0.5),
-            (b.x1, (b.y0 + b.y1) * 0.5),
-        ] {
-            if let Some((u, v)) =
-                crate::document::image_doc_to_uv(img_x, img_y, img_w, img_h, rot, dx, dy)
-            {
-                any = true;
-                min_u = min_u.min(u);
-                min_v = min_v.min(v);
-                max_u = max_u.max(u);
-                max_v = max_v.max(v);
-            }
+        self.status_message = "Select something first to set paint mask".into();
+    }
+
+    pub fn raster_clear_sticky_mask(&mut self) {
+        self.tools.raster.sticky_mask_doc = None;
+        self.status_message = "Paint mask cleared".into();
+    }
+
+    /// Fill Image with transparent (clear paint layer) — undoable.
+    pub fn raster_clear_layer(&mut self, ctx: &egui::Context) {
+        let id = self
+            .selection
+            .first()
+            .copied()
+            .or(self.tools.raster.target)
+            .filter(|&id| {
+                self.project
+                    .nodes
+                    .get(id)
+                    .map_or(false, |n| matches!(n.kind, NodeKind::Image { .. }))
+            });
+        let Some(id) = id else {
+            self.status_message = "Select an Image to clear".into();
+            return;
+        };
+        let Some(node) = self.project.nodes.get(id) else {
+            return;
+        };
+        let NodeKind::Image { bytes, .. } = &node.kind else {
+            return;
+        };
+        let before_bytes = bytes.clone();
+        let Some(buf) = crate::raster::RasterBuffer::from_png_bytes(&before_bytes) else {
+            self.status_message = "Could not decode image".into();
+            return;
+        };
+        let cleared = crate::raster::RasterBuffer::new(buf.width, buf.height);
+        let Some(png) = cleared.encode_png() else {
+            return;
+        };
+        self.sync_image_texture_from_rgba(id, cleared.width, cleared.height, &cleared.rgba, ctx);
+        let Some(before_node) = self.project.nodes.get(id).cloned() else {
+            return;
+        };
+        let mut after = before_node.clone();
+        if let NodeKind::Image { bytes, .. } = &mut after.kind {
+            *bytes = png;
         }
-        if !any {
-            // Selection outside image → empty clip (no paint).
-            return Some((0, 0, 0, 0));
+        let mut before = before_node;
+        if let NodeKind::Image { bytes, .. } = &mut before.kind {
+            *bytes = before_bytes;
         }
-        let x0 = (min_u * pw as f64).floor() as i32;
-        let y0 = (min_v * ph as f64).floor() as i32;
-        let x1 = (max_u * pw as f64).ceil() as i32;
-        let y1 = (max_v * ph as f64).ceil() as i32;
-        Some((
-            x0.clamp(0, pw as i32),
-            y0.clamp(0, ph as i32),
-            x1.clamp(0, pw as i32),
-            y1.clamp(0, ph as i32),
-        ))
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchNode {
+                id,
+                before,
+                after,
+            },
+        );
+        self.tools.raster.live_rgba = None;
+        self.image_textures.remove(&id);
+        self.image_pixel_cache.remove(&id);
+        self.status_message = "Paint layer cleared".into();
     }
 
     /// Sample Image (or canvas) color into Fill swatch while painting (Alt).
