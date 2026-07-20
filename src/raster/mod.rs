@@ -476,6 +476,36 @@ pub fn stamps_for_new_sample(
     }
 }
 
+/// Expand stamp centers with **dihedral / circular** symmetry around `origin`.
+/// `divisions == 1` → no symmetry. `2` ≈ dual axis (like mirror pairs). `offset_rad`
+/// rotates the whole frame.
+pub fn expand_circular_symmetry(
+    stamps: &[(f32, f32)],
+    origin: (f32, f32),
+    divisions: u32,
+    offset_rad: f32,
+) -> Vec<(f32, f32)> {
+    let n = divisions.max(1);
+    if n <= 1 || stamps.is_empty() {
+        return stamps.to_vec();
+    }
+    let step = std::f32::consts::TAU / n as f32;
+    let mut out = Vec::with_capacity(stamps.len() * n as usize * 2);
+    for &(sx, sy) in stamps {
+        let dx = sx - origin.0;
+        let dy = sy - origin.1;
+        for i in 0..n {
+            let a = offset_rad + step * i as f32;
+            let (c, s) = (a.cos(), a.sin());
+            // Rotated copy
+            out.push((origin.0 + dx * c - dy * s, origin.1 + dx * s + dy * c));
+            // Reflected-then-rotated (dihedral) — N=2 behaves like dual mirrors
+            out.push((origin.0 + dx * c + dy * s, origin.1 + dx * s - dy * c));
+        }
+    }
+    out
+}
+
 /// Flood-fill contiguous pixels matching the seed (within `tolerance` RGB L∞).
 /// Writes `fill` into matching pixels. Returns number of pixels changed.
 pub fn flood_fill(
@@ -625,6 +655,15 @@ mod tests {
         buf.stamp_circle(8.0, 8.0, 6.0, 1.0, [0, 0, 0, 255], 1.0, true);
         let idx = (8 * 16 + 8) * 4;
         assert!(buf.rgba[idx + 3] < 10, "erased alpha");
+    }
+
+    #[test]
+    fn circular_symmetry_duplicates_stamps() {
+        let pts = [(10.0_f32, 0.0)];
+        let out = expand_circular_symmetry(&pts, (0.0, 0.0), 4, 0.0);
+        assert!(out.len() >= 4, "got {}", out.len());
+        // Original-ish tip should exist near (10,0)
+        assert!(out.iter().any(|(x, y)| (x - 10.0).abs() < 0.1 && y.abs() < 0.1));
     }
 
     #[test]

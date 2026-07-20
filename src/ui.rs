@@ -6859,6 +6859,74 @@ fn brush_numeric_row(
     changed
 }
 
+/// Small canvas: soft/hard tip disc + sine-wave stroke so the user can see brush feel.
+fn paint_brush_tip_preview(
+    ui: &mut Ui,
+    raster: &crate::tools::RasterSession,
+    color: [u8; 4],
+) {
+    let w = 168u32;
+    let h = 52u32;
+    let mut buf = crate::raster::RasterBuffer::new(w, h);
+    // Checkerboard-ish light bg so soft edges read.
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize * 4;
+            let c = if ((x / 6) + (y / 6)) % 2 == 0 {
+                245
+            } else {
+                232
+            };
+            buf.rgba[i] = c;
+            buf.rgba[i + 1] = c;
+            buf.rgba[i + 2] = c;
+            buf.rgba[i + 3] = 255;
+        }
+    }
+    // Map doc size to preview radius (clamped for the strip).
+    let r = (raster.size * 0.35).clamp(2.0, 14.0);
+    let hard = raster.hardness;
+    let op = raster.opacity.clamp(0.15, 1.0);
+    // Tip sample on the left
+    buf.stamp_circle(18.0, h as f32 * 0.5, r, hard, color, op, false);
+    // Sine wave stroke across the strip
+    let mut prev = (40.0_f32, h as f32 * 0.5);
+    let mut carry = 0.0_f32;
+    let spacing = (r * raster.spacing.max(0.05)).max(0.6);
+    for step in 0..=48 {
+        let t = step as f32 / 48.0;
+        let x = 40.0 + t * (w as f32 - 48.0);
+        let y = h as f32 * 0.5 + (t * std::f32::consts::TAU * 1.5).sin() * (h as f32 * 0.28);
+        let (stamps, c) =
+            crate::raster::stamps_along(prev, (x, y), spacing, carry, step == 0);
+        carry = c;
+        for (sx, sy) in stamps {
+            buf.stamp_circle(sx, sy, r, hard, color, op, false);
+        }
+        prev = (x, y);
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        &buf.rgba,
+    );
+    let tex = ui.ctx().load_texture(
+        "raster_brush_tip_preview",
+        image,
+        egui::TextureOptions::LINEAR,
+    );
+    let avail = ui.available_width().max(80.0);
+    let show_h = (avail * h as f32 / w as f32).clamp(36.0, 56.0);
+    ui.add(
+        egui::Image::new((tex.id(), egui::vec2(avail.min(w as f32 + 20.0), show_h)))
+            .bg_fill(egui::Color32::from_gray(40)),
+    );
+    ui.label(
+        RichText::new("Tip  ·  stroke preview")
+            .small()
+            .color(colors::TEXT_MUTED),
+    );
+}
+
 fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     // Path markers (arrows / point icons) belong in Geometry, not Color & Stroke
     if app.selection.len() == 1 {
@@ -6936,6 +7004,10 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         ToolKind::RasterBrush | ToolKind::Eraser | ToolKind::BucketFill | ToolKind::Smudge
     ) {
         theme::constraint_block(ui, |ui| {
+            // Constrain width so buttons wrap instead of overflowing the dock.
+            let panel_w = ui.available_width().max(120.0);
+            ui.set_max_width(panel_w);
+
             let title = match app.tools.active {
                 ToolKind::Eraser => format!("{} Eraser (raster)", icons::ERASER),
                 ToolKind::BucketFill => format!("{} Fill (raster)", icons::BUCKET),
@@ -6949,11 +7021,12 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             );
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Targets Image pixels. Select an Image or a blank surface is created.")
+                RichText::new("Image pixels · blank surface auto-created if needed")
                     .small()
                     .color(colors::TEXT_MUTED),
             );
             ui.add_space(4.0);
+
             if app.tools.active == ToolKind::BucketFill {
                 let mut tol = app.tools.raster.fill_tolerance as f32;
                 if brush_numeric_row(ui, "Tolerance", &mut tol, 0.0..=128.0, 1.0) {
@@ -6961,14 +7034,49 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 }
                 ui.checkbox(
                     &mut app.tools.raster.clip_to_selection,
-                    "Clip to selection bounds",
+                    "Clip to selection",
                 );
                 ui.label(
-                    RichText::new("Click to flood-fill · Color = Fill swatch · Alt=pick")
+                    RichText::new("Click to flood · animated expand · Alt=pick")
                         .small()
                         .color(colors::TEXT_MUTED),
                 );
             } else {
+                // --- Preset dropdown ---
+                if app.tools.active == ToolKind::RasterBrush {
+                    let presets = crate::tools::RasterBrushPreset::ALL;
+                    let cur = app
+                        .tools
+                        .raster
+                        .preset_idx
+                        .min(presets.len().saturating_sub(1));
+                    let cur_name = presets.get(cur).map(|p| p.name).unwrap_or("Custom");
+                    egui::ComboBox::from_id_salt("raster_brush_preset")
+                        .selected_text(cur_name)
+                        .width(panel_w - 8.0)
+                        .show_ui(ui, |ui| {
+                            for (i, p) in presets.iter().enumerate() {
+                                if ui
+                                    .selectable_label(i == cur, p.name)
+                                    .on_hover_text(format!(
+                                        "size {:.0} · hard {:.0}% · op {:.0}%",
+                                        p.size,
+                                        p.hardness * 100.0,
+                                        p.opacity * 100.0
+                                    ))
+                                    .clicked()
+                                {
+                                    p.apply(&mut app.tools.raster);
+                                    app.tools.raster.preset_idx = i;
+                                }
+                            }
+                        });
+                    ui.add_space(4.0);
+                    // Brush tip + wave stroke preview
+                    paint_brush_tip_preview(ui, &app.tools.raster, app.raster_paint_preview_color());
+                    ui.add_space(4.0);
+                }
+
                 let mut size = app.tools.raster.size;
                 if brush_numeric_row(ui, "Size (doc)", &mut size, 1.0..=512.0, 1.0) {
                     app.tools.raster.size = size;
@@ -6996,92 +7104,80 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 if brush_numeric_row(ui, "Stabilizer", &mut stab, 0.0..=1.0, 0.01) {
                     app.tools.raster.stabilizer = stab;
                 }
-                ui.checkbox(
-                    &mut app.tools.raster.clip_to_selection,
-                    "Clip to selection bounds",
-                );
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut app.tools.raster.mirror_x, "Mirror X");
-                    ui.checkbox(&mut app.tools.raster.mirror_y, "Mirror Y");
-                });
+
+                ui.checkbox(&mut app.tools.raster.clip_to_selection, "Clip to selection");
                 if matches!(
                     app.tools.active,
                     ToolKind::RasterBrush | ToolKind::Eraser
                 ) {
-                    ui.checkbox(
-                        &mut app.tools.raster.alpha_lock,
-                        "Alpha lock (paint only existing pixels)",
+                    ui.checkbox(&mut app.tools.raster.alpha_lock, "Alpha lock");
+                }
+
+                // --- Circular symmetry ---
+                ui.add_space(4.0);
+                ui.label(RichText::new("Circular symmetry").small().strong());
+                let mut divs = app.tools.raster.sym_divisions as f32;
+                if brush_numeric_row(ui, "Divisions", &mut divs, 1.0..=24.0, 1.0) {
+                    app.tools.raster.sym_divisions = divs.round().clamp(1.0, 24.0) as u32;
+                }
+                let mut off = app.tools.raster.sym_offset_deg;
+                if brush_numeric_row(ui, "Offset °", &mut off, -180.0..=180.0, 1.0) {
+                    app.tools.raster.sym_offset_deg = off;
+                }
+                ui.checkbox(
+                    &mut app.tools.raster.sym_locked,
+                    "Lock origin (dim guides)",
+                )
+                .on_hover_text(
+                    "When locked, drag-origin is disabled and blue guide lines fade",
+                );
+                if app.tools.raster.sym_divisions >= 2 && !app.tools.raster.sym_locked {
+                    ui.label(
+                        RichText::new("Drag ⊙ on canvas to move origin")
+                            .small()
+                            .color(colors::TEXT_MUTED),
                     );
                 }
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Set paint mask")
-                        .on_hover_text("Use current selection AABB as sticky paint mask")
-                        .clicked()
-                    {
-                        app.raster_set_sticky_mask_from_selection();
-                    }
-                    if ui
-                        .button("Clear mask")
-                        .on_hover_text("Remove sticky paint mask")
-                        .clicked()
-                    {
-                        app.raster_clear_sticky_mask();
-                    }
-                    if app.tools.raster.sticky_mask_doc.is_some() {
-                        ui.label(
-                            RichText::new("mask on")
-                                .small()
-                                .color(colors::TEXT_MUTED),
-                        );
-                    }
-                });
+
+                // Mask / clear — stacked full-width buttons (no horizontal overflow)
+                ui.add_space(4.0);
+                let btn_w = (panel_w - 4.0).max(80.0);
                 if ui
-                    .button("Clear paint layer")
+                    .add_sized([btn_w, 22.0], egui::Button::new("Set paint mask"))
+                    .on_hover_text("Use current selection AABB as sticky paint mask")
+                    .clicked()
+                {
+                    app.raster_set_sticky_mask_from_selection();
+                }
+                if ui
+                    .add_sized([btn_w, 22.0], egui::Button::new("Clear mask"))
+                    .on_hover_text("Remove sticky paint mask")
+                    .clicked()
+                {
+                    app.raster_clear_sticky_mask();
+                }
+                if app.tools.raster.sticky_mask_doc.is_some() {
+                    ui.label(
+                        RichText::new("Sticky paint mask: on")
+                            .small()
+                            .color(colors::TEXT_MUTED),
+                    );
+                }
+                if ui
+                    .add_sized([btn_w, 22.0], egui::Button::new("Clear paint layer"))
                     .on_hover_text("Make selected Image fully transparent (undoable)")
                     .clicked()
                 {
                     app.raster_clear_layer(ui.ctx());
                 }
-                if app.tools.active == ToolKind::RasterBrush {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Preset").small().color(colors::TEXT_MUTED));
-                    ui.horizontal_wrapped(|ui| {
-                        for p in crate::tools::RasterBrushPreset::ALL {
-                            if ui
-                                .selectable_label(false, p.name)
-                                .on_hover_text(format!(
-                                    "size {:.0} · hard {:.0}% · op {:.0}%",
-                                    p.size,
-                                    p.hardness * 100.0,
-                                    p.opacity * 100.0
-                                ))
-                                .clicked()
-                            {
-                                p.apply(&mut app.tools.raster);
-                            }
-                        }
-                    });
-                    ui.label(
-                        RichText::new(
-                            "Color = Fill  ·  Shift = erase  ·  Alt = pick  ·  Mirror for symmetry",
-                        )
-                        .small()
-                        .color(colors::TEXT_MUTED),
-                    );
-                } else if app.tools.active == ToolKind::Smudge {
-                    ui.label(
-                        RichText::new("Drag to smear pixels · select shapes to clip")
-                            .small()
-                            .color(colors::TEXT_MUTED),
-                    );
-                } else {
-                    ui.label(
-                        RichText::new("Erases alpha · Alt = pick color")
-                            .small()
-                            .color(colors::TEXT_MUTED),
-                    );
-                }
+
+                ui.add_space(2.0);
+                let tip = match app.tools.active {
+                    ToolKind::Smudge => "Drag to smear · circular symmetry supported",
+                    ToolKind::Eraser => "Erase alpha · Alt = pick · Shift N/A",
+                    _ => "Fill color · Shift=erase · Alt=pick · ⊙=symmetry origin",
+                };
+                ui.label(RichText::new(tip).small().color(colors::TEXT_MUTED));
             }
         });
     }

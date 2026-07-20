@@ -423,10 +423,18 @@ pub struct RasterSession {
     pub smudge_strength: f32,
     /// Only paint where destination already has alpha (lock transparent).
     pub alpha_lock: bool,
-    /// Mirror stamps across image vertical center (CSP symmetry-X).
-    pub mirror_x: bool,
-    /// Mirror stamps across image horizontal center.
-    pub mirror_y: bool,
+    /// Circular / kaleidoscope symmetry: 1 = off, 2+ = radial copies (2 ≈ dual mirror).
+    pub sym_divisions: u32,
+    /// Rotate the symmetry frame (degrees).
+    pub sym_offset_deg: f32,
+    /// Symmetry origin in **document** space; `None` = paint image center.
+    pub sym_origin_doc: Option<(f64, f64)>,
+    /// When true, origin gizmo cannot be dragged; guide lines dim.
+    pub sym_locked: bool,
+    /// UI: dragging the origin gizmo.
+    pub sym_dragging_origin: bool,
+    /// Selected brush preset index into [`RasterBrushPreset::ALL`] (for combo UI).
+    pub preset_idx: usize,
     /// Sticky paint mask in **document** space (x0,y0,x1,y1). Survives selection change.
     pub sticky_mask_doc: Option<(f64, f64, f64, f64)>,
     /// Active paint target (Image node).
@@ -470,8 +478,12 @@ impl Default for RasterSession {
             clip_to_selection: true,
             smudge_strength: 0.55,
             alpha_lock: false,
-            mirror_x: false,
-            mirror_y: false,
+            sym_divisions: 1,
+            sym_offset_deg: 0.0,
+            sym_origin_doc: None,
+            sym_locked: false,
+            sym_dragging_origin: false,
+            preset_idx: 0,
             sticky_mask_doc: None,
             target: None,
             before_bytes: None,
@@ -562,6 +574,10 @@ impl RasterBrushPreset {
         s.opacity = self.opacity;
         s.spacing = self.spacing;
         s.stabilizer = self.stabilizer;
+    }
+
+    pub fn index_of_name(name: &str) -> Option<usize> {
+        Self::ALL.iter().position(|p| p.name == name)
     }
 }
 

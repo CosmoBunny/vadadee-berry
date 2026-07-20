@@ -365,6 +365,8 @@ pub struct VadadeeBerryApp {
     image_textures: std::collections::HashMap<NodeId, egui::TextureHandle>,
     /// Cached decoded RGBA images for Eyedropper sampling to avoid massive decode frame drops.
     image_pixel_cache: std::collections::HashMap<NodeId, egui::ColorImage>,
+    /// Animated flood-fill (water-drop expand) — commits on completion.
+    flood_fill_anim: Option<FloodFillAnim>,
     /// Node Editor file-path image textures (ObjectImage / ObjectVideo stills).
     graph_path_textures: std::collections::HashMap<String, egui::TextureHandle>,
     /// GPU-baked FX textures (no CPU readback). Key = fx_cache_key; live path keys use `path|live`.
@@ -438,6 +440,26 @@ pub struct VadadeeBerryApp {
     cached_draw_order: Vec<NodeId>,
     cached_draw_order_revision: u64,
     audio_output_warned: bool,
+}
+
+/// In-progress flood-fill animation (expanding water-drop reveal).
+struct FloodFillAnim {
+    id: NodeId,
+    before_bytes: Vec<u8>,
+    /// Final filled RGBA (full buffer).
+    after_rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    seed_x: i32,
+    seed_y: i32,
+    /// Max distance of any filled pixel from seed (for normalize).
+    max_dist: f32,
+    /// Filled pixels as (x, y, dist_from_seed).
+    filled: Vec<(i32, i32, f32)>,
+    start: std::time::Instant,
+    duration_secs: f32,
+    /// Working base (before fill) RGBA for compositing frames.
+    base_rgba: Vec<u8>,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -990,6 +1012,7 @@ impl VadadeeBerryApp {
             on_page_text_newly_created: false,
             image_textures: std::collections::HashMap::new(),
             image_pixel_cache: std::collections::HashMap::new(),
+            flood_fill_anim: None,
             graph_path_textures: std::collections::HashMap::new(),
             graph_gpu_fx: std::collections::HashMap::new(),
             graph_base_rgba: std::collections::HashMap::new(),
@@ -6670,6 +6693,11 @@ impl VadadeeBerryApp {
         self.image_pixel_cache.insert(id, ci);
     }
 
+    /// Public for brush tip preview UI (same color as paint stamps).
+    pub fn raster_paint_preview_color(&self) -> [u8; 4] {
+        self.raster_paint_rgba()
+    }
+
     /// Current solid paint color as RGBA8 (from fill inspector).
     fn raster_paint_rgba(&self) -> [u8; 4] {
         let p = match self.ui_fill_kind {
@@ -6925,25 +6953,11 @@ impl VadadeeBerryApp {
         self.tools.raster.last_px = Some((px, py));
         let clip = self.raster_paint_clip_px(id, x, y, width, height, rot, pw, ph);
         let smudge = self.tools.active == ToolKind::Smudge;
-        let mirror_x = self.tools.raster.mirror_x;
-        let mirror_y = self.tools.raster.mirror_y;
-        let cx_img = pw as f32 * 0.5;
-        let cy_img = ph as f32 * 0.5;
-
-        // Expand stamps with symmetry mirrors (CSP-style).
-        let mut all_stamps = Vec::with_capacity(stamps.len() * 4);
-        for (sx, sy) in stamps {
-            all_stamps.push((sx, sy));
-            if mirror_x {
-                all_stamps.push((2.0 * cx_img - sx, sy));
-            }
-            if mirror_y {
-                all_stamps.push((sx, 2.0 * cy_img - sy));
-            }
-            if mirror_x && mirror_y {
-                all_stamps.push((2.0 * cx_img - sx, 2.0 * cy_img - sy));
-            }
-        }
+        let (ox, oy) = self.raster_sym_origin_px(id, x, y, width, height, rot, pw, ph);
+        let divs = self.tools.raster.sym_divisions.max(1);
+        let off = self.tools.raster.sym_offset_deg.to_radians();
+        let all_stamps =
+            crate::raster::expand_circular_symmetry(&stamps, (ox, oy), divs, off);
 
         if !all_stamps.is_empty() {
             if let Some(rgba) = self.tools.raster.live_rgba.as_mut() {
@@ -6959,16 +6973,25 @@ impl VadadeeBerryApp {
                         (1.0, 0.0)
                     };
                     let str = self.tools.raster.smudge_strength * press;
-                    for (sx, sy) in all_stamps {
-                        // Mirrored directions for mirrored tips.
-                        let d = if sx < cx_img - 0.5 && mirror_x {
-                            (-dir.0, dir.1)
-                        } else if sy < cy_img - 0.5 && mirror_y {
-                            (dir.0, -dir.1)
+                    for (sx, sy) in &all_stamps {
+                        // Rotate direction with symmetry frame for each copy.
+                        let ddx = sx - ox;
+                        let ddy = sy - oy;
+                        let base_dx = px - ox;
+                        let base_dy = py - oy;
+                        let d = if base_dx * base_dx + base_dy * base_dy > 1e-6
+                            && ddx * ddx + ddy * ddy > 1e-6
+                        {
+                            // Approximate: use stroke dir rotated same as tip relative to origin
+                            let a0 = base_dy.atan2(base_dx);
+                            let a1 = ddy.atan2(ddx);
+                            let da = a1 - a0;
+                            let (c, s) = (da.cos(), da.sin());
+                            (dir.0 * c - dir.1 * s, dir.0 * s + dir.1 * c)
                         } else {
                             dir
                         };
-                        buf.smudge_circle(sx, sy, radius, hardness, str, d, clip);
+                        buf.smudge_circle(*sx, *sy, radius, hardness, str, d, clip);
                     }
                 } else {
                     let alpha_lock = self.tools.raster.alpha_lock && !erase;
@@ -7201,10 +7224,36 @@ impl VadadeeBerryApp {
         };
     }
 
-    /// Flood-fill Image at document point (BucketFill tool).
+    /// Symmetry origin in image-pixel space.
+    fn raster_sym_origin_px(
+        &self,
+        id: NodeId,
+        img_x: f64,
+        img_y: f64,
+        img_w: f64,
+        img_h: f64,
+        rot: f64,
+        pw: u32,
+        ph: u32,
+    ) -> (f32, f32) {
+        let _ = id;
+        if let Some((dx, dy)) = self.tools.raster.sym_origin_doc {
+            if let Some((u, v)) =
+                crate::document::image_doc_to_uv(img_x, img_y, img_w, img_h, rot, dx, dy)
+            {
+                return ((u * pw as f64) as f32, (v * ph as f64) as f32);
+            }
+        }
+        (pw as f32 * 0.5, ph as f32 * 0.5)
+    }
+
+    /// Flood-fill Image at document point with water-drop expand animation.
     fn tool_bucket_fill(&mut self, doc: (f64, f64), pressed: bool, ctx: &Context) {
         if !pressed {
             return;
+        }
+        if self.flood_fill_anim.is_some() {
+            return; // wait for current anim
         }
         let Some(id) = self.ensure_raster_paint_target(ctx) else {
             self.status_message = "Could not create paint surface".into();
@@ -7254,15 +7303,13 @@ impl VadadeeBerryApp {
         };
         let sx = (u * pw as f64).floor() as i32;
         let sy = (v * ph as f64).floor() as i32;
-        let mut raw = Vec::with_capacity(ci.pixels.len() * 4);
+        let mut base = Vec::with_capacity(ci.pixels.len() * 4);
         for p in &ci.pixels {
-            raw.push(p.r());
-            raw.push(p.g());
-            raw.push(p.b());
-            raw.push(p.a());
+            base.push(p.r());
+            base.push(p.g());
+            base.push(p.b());
+            base.push(p.a());
         }
-        // Optional selection clip: if seed is outside clip, abort; fill still floods
-        // whole connected region (clip is enforced by zeroing outside after fill).
         let clip = self.raster_paint_clip_px(id, x, y, width, height, rot, pw, ph);
         if let Some((x0, y0, x1, y1)) = clip {
             if sx < x0 || sy < y0 || sx >= x1 || sy >= y1 {
@@ -7270,9 +7317,10 @@ impl VadadeeBerryApp {
                 return;
             }
         }
+        let mut after = base.clone();
         let fill = self.raster_paint_rgba();
         let n = crate::raster::flood_fill(
-            &mut raw,
+            &mut after,
             pw,
             ph,
             sx,
@@ -7284,51 +7332,125 @@ impl VadadeeBerryApp {
             self.status_message = "Nothing to fill".into();
             return;
         }
-        // Restore pixels outside selection clip from before_bytes snapshot.
         if let Some((x0, y0, x1, y1)) = clip {
-            if let Some(orig) = crate::raster::RasterBuffer::from_png_bytes(&before_bytes) {
-                if orig.width == pw && orig.height == ph {
-                    for y in 0..ph as i32 {
-                        for x in 0..pw as i32 {
-                            if x < x0 || y < y0 || x >= x1 || y >= y1 {
-                                let i = (y as usize * pw as usize + x as usize) * 4;
-                                raw[i..i + 4].copy_from_slice(&orig.rgba[i..i + 4]);
-                            }
-                        }
+            for yy in 0..ph as i32 {
+                for xx in 0..pw as i32 {
+                    if xx < x0 || yy < y0 || xx >= x1 || yy >= y1 {
+                        let i = (yy as usize * pw as usize + xx as usize) * 4;
+                        after[i..i + 4].copy_from_slice(&base[i..i + 4]);
                     }
                 }
             }
         }
-        self.sync_image_texture_from_rgba(id, pw, ph, &raw, ctx);
-        let Some(png) = (crate::raster::RasterBuffer {
+        // Build filled-pixel list with distance from seed for radial reveal.
+        let mut filled = Vec::with_capacity(n);
+        let mut max_dist = 1.0f32;
+        for yy in 0..ph as i32 {
+            for xx in 0..pw as i32 {
+                let i = (yy as usize * pw as usize + xx as usize) * 4;
+                if after[i..i + 4] != base[i..i + 4] {
+                    let d = ((xx - sx) as f32).hypot((yy - sy) as f32);
+                    max_dist = max_dist.max(d);
+                    filled.push((xx, yy, d));
+                }
+            }
+        }
+        // Duration scales slightly with area (0.35s–1.1s).
+        let duration = (0.35 + (n as f32).sqrt() * 0.008).clamp(0.35, 1.1);
+        self.flood_fill_anim = Some(FloodFillAnim {
+            id,
+            before_bytes,
+            after_rgba: after,
             width: pw,
             height: ph,
-            rgba: raw,
-        })
-        .encode_png() else {
-            self.status_message = "Fill encode failed".into();
+            seed_x: sx,
+            seed_y: sy,
+            max_dist,
+            filled,
+            start: std::time::Instant::now(),
+            duration_secs: duration,
+            base_rgba: base,
+        });
+        self.status_message = "Filling…".into();
+        ctx.request_repaint();
+    }
+
+    /// Advance water-drop flood animation; commits history when done.
+    fn tick_flood_fill_anim(&mut self, ctx: &Context) {
+        let Some(anim) = self.flood_fill_anim.as_ref() else {
             return;
         };
-        let Some(before_node) = self.project.nodes.get(id).cloned() else {
-            return;
-        };
-        let mut after = before_node.clone();
-        if let NodeKind::Image { bytes, .. } = &mut after.kind {
-            *bytes = png;
+        let t = anim.start.elapsed().as_secs_f32() / anim.duration_secs.max(0.05);
+        let ease = 1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3); // ease-out
+        let radius = anim.max_dist * ease + 2.0;
+        let id = anim.id;
+        let w = anim.width;
+        let h = anim.height;
+        let mut frame = anim.base_rgba.clone();
+        for &(x, y, d) in &anim.filled {
+            if d <= radius {
+                let i = (y as usize * w as usize + x as usize) * 4;
+                frame[i..i + 4].copy_from_slice(&anim.after_rgba[i..i + 4]);
+            }
         }
-        let mut before = before_node;
-        if let NodeKind::Image { bytes, .. } = &mut before.kind {
-            *bytes = before_bytes;
+        // Soft glow ring near the wavefront
+        let ring_w = (anim.max_dist * 0.04).clamp(2.0, 12.0);
+        let glow = self.raster_paint_rgba();
+        for &(x, y, d) in &anim.filled {
+            let dd = (d - radius).abs();
+            if dd < ring_w {
+                let a = (1.0 - dd / ring_w) * 0.45;
+                let i = (y as usize * w as usize + x as usize) * 4;
+                for c in 0..3 {
+                    let g = glow[c] as f32;
+                    let cur = frame[i + c] as f32;
+                    frame[i + c] = (cur + (g - cur) * a).clamp(0.0, 255.0) as u8;
+                }
+            }
         }
-        self.history.push(
-            &mut self.project,
-            ProjectEdit::PatchNode {
-                id,
-                before,
-                after,
-            },
-        );
-        self.status_message = format!("Filled {n} px");
+        self.sync_image_texture_from_rgba(id, w, h, &frame, ctx);
+
+        if t >= 1.0 {
+            let anim = self.flood_fill_anim.take().unwrap();
+            let Some(png) = (crate::raster::RasterBuffer {
+                width: anim.width,
+                height: anim.height,
+                rgba: anim.after_rgba.clone(),
+            })
+            .encode_png() else {
+                self.status_message = "Fill encode failed".into();
+                return;
+            };
+            self.sync_image_texture_from_rgba(
+                anim.id,
+                anim.width,
+                anim.height,
+                &anim.after_rgba,
+                ctx,
+            );
+            let Some(before_node) = self.project.nodes.get(anim.id).cloned() else {
+                return;
+            };
+            let mut after = before_node.clone();
+            if let NodeKind::Image { bytes, .. } = &mut after.kind {
+                *bytes = png;
+            }
+            let mut before = before_node;
+            if let NodeKind::Image { bytes, .. } = &mut before.kind {
+                *bytes = anim.before_bytes;
+            }
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchNode {
+                    id: anim.id,
+                    before,
+                    after,
+                },
+            );
+            self.status_message = format!("Filled {} px", anim.filled.len());
+        } else {
+            ctx.request_repaint();
+        }
     }
 
     /// Prefer sticky paint mask; else live multi-selection AABB → Image pixel clip.
@@ -7528,6 +7650,117 @@ impl VadadeeBerryApp {
         self.image_textures.remove(&id);
         self.image_pixel_cache.remove(&id);
         self.status_message = "Paint layer cleared".into();
+    }
+
+    /// Drag circular-symmetry origin (circle + plus). Returns true if event was consumed.
+    fn handle_symmetry_origin_gizmo(
+        &mut self,
+        doc: (f64, f64),
+        pressed: bool,
+        down: bool,
+        released: bool,
+        canvas_origin: Pos2,
+    ) -> bool {
+        if self.tools.raster.sym_divisions < 2 || self.tools.raster.sym_locked {
+            self.tools.raster.sym_dragging_origin = false;
+            return false;
+        }
+        let hit_r_doc = (12.0 / self.viewport.zoom as f64).max(6.0);
+        let origin_doc = self.tools.raster.sym_origin_doc.unwrap_or_else(|| {
+            // Default to active image center if available.
+            if let Some(&id) = self.selection.first().or(self.tools.raster.target.as_ref()) {
+                if let Some(n) = self.project.nodes.get(id) {
+                    if let NodeKind::Image { x, y, width, height, .. } = &n.kind {
+                        return (*x + *width * 0.5, *y + *height * 0.5);
+                    }
+                }
+            }
+            (
+                self.project.document.width * 0.5,
+                self.project.document.height * 0.5,
+            )
+        });
+        if pressed {
+            let d = (doc.0 - origin_doc.0).hypot(doc.1 - origin_doc.1);
+            if d <= hit_r_doc {
+                self.tools.raster.sym_dragging_origin = true;
+                self.tools.raster.sym_origin_doc = Some(doc);
+                return true;
+            }
+        }
+        if self.tools.raster.sym_dragging_origin {
+            if down {
+                self.tools.raster.sym_origin_doc = Some(doc);
+                return true;
+            }
+            if released {
+                self.tools.raster.sym_dragging_origin = false;
+                return true;
+            }
+        }
+        let _ = canvas_origin;
+        false
+    }
+
+    /// Blue radial guide lines + origin handle for circular symmetry.
+    fn draw_circular_symmetry_guides(&self, painter: &egui::Painter, origin: Pos2) {
+        let n = self.tools.raster.sym_divisions.max(1);
+        if n < 2 {
+            return;
+        }
+        let locked = self.tools.raster.sym_locked;
+        let line_a = if locked { 50u8 } else { 160u8 };
+        let color = egui::Color32::from_rgba_unmultiplied(80, 160, 255, line_a);
+        let origin_doc = self.tools.raster.sym_origin_doc.unwrap_or_else(|| {
+            if let Some(&id) = self.selection.first().or(self.tools.raster.target.as_ref()) {
+                if let Some(nd) = self.project.nodes.get(id) {
+                    if let NodeKind::Image { x, y, width, height, .. } = &nd.kind {
+                        return (*x + *width * 0.5, *y + *height * 0.5);
+                    }
+                }
+            }
+            (
+                self.project.document.width * 0.5,
+                self.project.document.height * 0.5,
+            )
+        });
+        let center = self.viewport.doc_to_screen(origin_doc, origin);
+        // Ray length in screen px
+        let ray = 4000.0f32;
+        let offset = self.tools.raster.sym_offset_deg.to_radians() as f32;
+        let step = std::f32::consts::TAU / n as f32;
+        for i in 0..n {
+            let a = offset + step * i as f32;
+            let dir = egui::vec2(a.cos(), a.sin());
+            let p0 = center - dir * ray;
+            let p1 = center + dir * ray;
+            painter.line_segment(
+                [p0, p1],
+                egui::Stroke::new(1.25, color),
+            );
+        }
+        // Origin handle: circle + plus
+        let r = if locked { 7.0 } else { 9.0 };
+        let handle_col = if locked {
+            egui::Color32::from_rgba_unmultiplied(80, 160, 255, 90)
+        } else {
+            egui::Color32::from_rgb(80, 160, 255)
+        };
+        painter.circle_stroke(center, r, egui::Stroke::new(1.5, handle_col));
+        painter.circle_filled(
+            center,
+            2.5,
+            egui::Color32::from_rgba_unmultiplied(80, 160, 255, if locked { 80 } else { 200 }),
+        );
+        let arm = r * 0.65;
+        painter.line_segment(
+            [center - egui::vec2(arm, 0.0), center + egui::vec2(arm, 0.0)],
+            egui::Stroke::new(1.25, handle_col),
+        );
+        painter.line_segment(
+            [center - egui::vec2(0.0, arm), center + egui::vec2(0.0, arm)],
+            egui::Stroke::new(1.25, handle_col),
+        );
     }
 
     /// Sample Image (or canvas) color into Fill swatch while painting (Alt).
@@ -9692,6 +9925,16 @@ fn run_video_decode_thread(
             {
                 self.draw_raster_stroke_overlay(&painter, origin);
             }
+            if matches!(
+                self.tools.active,
+                ToolKind::RasterBrush
+                    | ToolKind::Eraser
+                    | ToolKind::Smudge
+                    | ToolKind::BucketFill
+            ) && self.tools.raster.sym_divisions >= 2
+            {
+                self.draw_circular_symmetry_guides(&painter, origin);
+            }
 
             // Weight flow brush cursor (path sculpt)
             if self.tools.weight_flow.enabled {
@@ -9998,32 +10241,41 @@ fn run_video_decode_thread(
                 );
             }
             ToolKind::RasterBrush | ToolKind::Eraser | ToolKind::Smudge => {
-                let alt = response.ctx.input(|i| i.modifiers.alt);
-                if alt && self.tools.active != ToolKind::Smudge {
-                    // Alt+click / hold: pick color (pro paint workflow).
-                    if primary_pressed || primary_down {
-                        self.raster_pick_color_at(raw_doc);
-                    }
+                // Symmetry origin gizmo drag (when unlocked and divisions ≥ 2).
+                if self.handle_symmetry_origin_gizmo(
+                    raw_doc,
+                    primary_pressed,
+                    primary_down,
+                    primary_released_anywhere,
+                    origin,
+                ) {
+                    // ate the click for painting
                 } else {
-                    let pressure = response.ctx.input(|i| {
-                        for event in &i.events {
-                            if let egui::Event::Touch { force, .. } = event {
-                                return *force;
-                            }
+                    let alt = response.ctx.input(|i| i.modifiers.alt);
+                    if alt && self.tools.active != ToolKind::Smudge {
+                        if primary_pressed || primary_down {
+                            self.raster_pick_color_at(raw_doc);
                         }
-                        None
-                    });
-                    let erase = self.tools.active == ToolKind::Eraser || shift;
-                    // MUST use raw (unsnapped) doc coords — grid snap makes paint look stepped.
-                    self.tool_raster_paint(
-                        raw_doc,
-                        primary_pressed,
-                        primary_down,
-                        primary_released_anywhere,
-                        pressure,
-                        erase,
-                        &response.ctx,
-                    );
+                    } else {
+                        let pressure = response.ctx.input(|i| {
+                            for event in &i.events {
+                                if let egui::Event::Touch { force, .. } = event {
+                                    return *force;
+                                }
+                            }
+                            None
+                        });
+                        let erase = self.tools.active == ToolKind::Eraser || shift;
+                        self.tool_raster_paint(
+                            raw_doc,
+                            primary_pressed,
+                            primary_down,
+                            primary_released_anywhere,
+                            pressure,
+                            erase,
+                            &response.ctx,
+                        );
+                    }
                 }
             }
             ToolKind::BucketFill => {
@@ -19744,8 +19996,10 @@ impl eframe::App for VadadeeBerryApp {
     }
 
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.tick_flood_fill_anim(ctx);
         let painting = self.tools.raster.painting
-            || (self.tools.active == ToolKind::Brush && !self.tools.brush.points.is_empty());
+            || (self.tools.active == ToolKind::Brush && !self.tools.brush.points.is_empty())
+            || self.flood_fill_anim.is_some();
         // While freehand is active, skip non-essential background work so every frame
         // can sample the pointer (smooth strokes need high sample rate, not perfect caches).
         if !painting {
@@ -20840,6 +21094,7 @@ mod tests {
                 on_page_text_newly_created: false,
                 image_textures: std::collections::HashMap::new(),
                 image_pixel_cache: std::collections::HashMap::new(),
+                flood_fill_anim: None,
                 graph_path_textures: std::collections::HashMap::new(),
                 graph_gpu_fx: std::collections::HashMap::new(),
                 graph_base_rgba: std::collections::HashMap::new(),
