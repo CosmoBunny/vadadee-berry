@@ -97,6 +97,72 @@ impl RasterBuffer {
         clip: Option<(i32, i32, i32, i32)>,
         alpha_lock: bool,
     ) {
+        self.stamp_circle_clipped_poly(
+            cx,
+            cy,
+            radius,
+            hardness,
+            color,
+            opacity,
+            erase,
+            clip,
+            alpha_lock,
+            None,
+        );
+    }
+
+    /// Like [`stamp_circle_clipped`] plus optional polygon mask components (pixel space).
+    /// If `poly_components` non-empty **and** `rect_mask` is Some, membership is **OR**
+    /// (union). If only polys, must be inside a poly. If only rect_mask, AABB clip is enough.
+    pub fn stamp_circle_clipped_poly(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        hardness: f32,
+        color: [u8; 4],
+        opacity: f32,
+        erase: bool,
+        clip: Option<(i32, i32, i32, i32)>,
+        alpha_lock: bool,
+        poly_components: Option<&[Vec<(f64, f64)>]>,
+    ) {
+        self.stamp_circle_masked(
+            cx,
+            cy,
+            radius,
+            hardness,
+            color,
+            opacity,
+            erase,
+            clip,
+            None,
+            alpha_lock,
+            poly_components,
+            None,
+            0,
+        );
+    }
+
+    pub fn stamp_circle_masked(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        hardness: f32,
+        color: [u8; 4],
+        opacity: f32,
+        erase: bool,
+        // Coarse loop bounds (union AABB).
+        clip: Option<(i32, i32, i32, i32)>,
+        // Explicit sticky rect mask (for union with poly).
+        rect_mask: Option<(i32, i32, i32, i32)>,
+        alpha_lock: bool,
+        poly_components: Option<&[Vec<(f64, f64)>]>,
+        // Pixel bitmap mask (image space). None = ignore.
+        pixel_mask: Option<&[u8]>,
+        pixel_mask_w: u32,
+    ) {
         let r = radius.max(0.5);
         let hard = hardness.clamp(0.0, 1.0);
         let op = opacity.clamp(0.0, 1.0);
@@ -129,6 +195,46 @@ impl RasterBuffer {
             let dy = y as f32 + 0.5 - cy;
             let dy2 = dy * dy;
             for x in x0..x1 {
+                let px = x as f64 + 0.5;
+                let py = y as f64 + 0.5;
+                let has_poly = poly_components.map(|c| !c.is_empty()).unwrap_or(false);
+                let has_rect = rect_mask.is_some();
+                let has_bitmap = pixel_mask.is_some_and(|m| !m.is_empty() && pixel_mask_w > 0);
+                if has_poly || has_rect || has_bitmap {
+                    let in_poly = has_poly
+                        && poly_components.is_some_and(|comps| {
+                            comps.iter().any(|poly| point_in_polygon(px, py, poly))
+                        });
+                    let in_rect = rect_mask.is_some_and(|(rx0, ry0, rx1, ry1)| {
+                        px >= rx0 as f64 && px < rx1 as f64 && py >= ry0 as f64 && py < ry1 as f64
+                    });
+                    let in_bit = has_bitmap && pixel_mask.is_some_and(|m| {
+                        let ix = x;
+                        let iy = y;
+                        if ix < 0 || iy < 0 {
+                            return false;
+                        }
+                        let ww = pixel_mask_w as usize;
+                        let idx = iy as usize * ww + ix as usize;
+                        m.get(idx).copied().unwrap_or(0) != 0
+                    });
+                    // Any mask channel that exists: OR together (union).
+                    let mut ok = false;
+                    if has_poly {
+                        ok |= in_poly;
+                    }
+                    if has_rect {
+                        ok |= in_rect;
+                    }
+                    if has_bitmap {
+                        ok |= in_bit;
+                    }
+                    // If only geometric masks were empty and only bitmap — use bit.
+                    // If we have masks but none matched, skip.
+                    if !ok {
+                        continue;
+                    }
+                }
                 let dx = x as f32 + 0.5 - cx;
                 let d2 = dx * dx + dy2;
                 if d2 >= r2 {
@@ -476,6 +582,124 @@ pub fn stamps_for_new_sample(
     }
 }
 
+/// Binary dilate for glow expand. `mask` is 0/255, len = w*h.
+///
+/// **Fast path:** expand outward from ON pixels (O(selected × r²)), not O(w×h×r²).
+/// Cap radius at 24 px — larger glows stay cheap via repeated 8-connected pass.
+pub fn dilate_mask(mask: &mut [u8], w: u32, h: u32, radius: i32) {
+    if radius <= 0 || w == 0 || h == 0 || mask.len() < (w * h) as usize {
+        return;
+    }
+    let r = radius.clamp(1, 24);
+    let ww = w as i32;
+    let hh = h as i32;
+    // Collect seeds (selected pixels).
+    let mut seeds = Vec::new();
+    for y in 0..hh {
+        for x in 0..ww {
+            if mask[(y * ww + x) as usize] != 0 {
+                seeds.push((x, y));
+            }
+        }
+    }
+    if seeds.is_empty() {
+        return;
+    }
+    // Dense selection → separable box dilate (O(w×h×r)), still far cheaper than old O(w×h×r²).
+    let total = (w * h) as usize;
+    if seeds.len() > total / 3 {
+        dilate_mask_separable(mask, w, h, r);
+        return;
+    }
+    let mut out = vec![0u8; total];
+    let r2 = r * r;
+    for &(x, y) in &seeds {
+        for dy in -r..=r {
+            let ny = y + dy;
+            if ny < 0 || ny >= hh {
+                continue;
+            }
+            let dy2 = dy * dy;
+            for dx in -r..=r {
+                if dx * dx + dy2 > r2 {
+                    continue;
+                }
+                let nx = x + dx;
+                if nx < 0 || nx >= ww {
+                    continue;
+                }
+                out[(ny * ww + nx) as usize] = 255;
+            }
+        }
+    }
+    mask.copy_from_slice(&out);
+}
+
+/// Separable max-filter dilate for dense masks (horizontal then vertical).
+fn dilate_mask_separable(mask: &mut [u8], w: u32, h: u32, r: i32) {
+    let ww = w as usize;
+    let hh = h as usize;
+    let r = r as usize;
+    let mut tmp = vec![0u8; mask.len()];
+    // Horizontal
+    for y in 0..hh {
+        let row = y * ww;
+        for x in 0..ww {
+            let mut on = false;
+            let x0 = x.saturating_sub(r);
+            let x1 = (x + r).min(ww - 1);
+            for xx in x0..=x1 {
+                if mask[row + xx] != 0 {
+                    on = true;
+                    break;
+                }
+            }
+            if on {
+                tmp[row + x] = 255;
+            }
+        }
+    }
+    // Vertical
+    mask.fill(0);
+    for y in 0..hh {
+        let y0 = y.saturating_sub(r);
+        let y1 = (y + r).min(hh - 1);
+        for x in 0..ww {
+            let mut on = false;
+            for yy in y0..=y1 {
+                if tmp[yy * ww + x] != 0 {
+                    on = true;
+                    break;
+                }
+            }
+            if on {
+                mask[y * ww + x] = 255;
+            }
+        }
+    }
+}
+
+/// Even-odd point-in-polygon (image or doc space).
+pub fn point_in_polygon(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let n = poly.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        let intersect = ((yi > py) != (yj > py))
+            && (px < (xj - xi) * (py - yi) / (yj - yi + 1e-30) + xi);
+        if intersect {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 /// Expand stamp centers with **dihedral / circular** symmetry around `origin`.
 /// `divisions == 1` → no symmetry. `2` ≈ dual axis (like mirror pairs). `offset_rad`
 /// rotates the whole frame.
@@ -690,6 +914,32 @@ mod tests {
         // Right of barrier still empty
         let r = (0 * 8 + 5) * 4;
         assert_eq!(buf.rgba[r + 3], 0);
+    }
+
+    #[test]
+    fn flood_fill_does_not_select_inner_hole() {
+        // Outer ring white (255), center hole black (0) — click outer, hole must stay unfilled.
+        let mut buf = RasterBuffer::new(7, 7);
+        for y in 0..7 {
+            for x in 0..7 {
+                let on_border = x == 0 || y == 0 || x == 6 || y == 6;
+                let i = (y * 7 + x) * 4;
+                if on_border {
+                    buf.rgba[i] = 255;
+                    buf.rgba[i + 1] = 255;
+                    buf.rgba[i + 2] = 255;
+                    buf.rgba[i + 3] = 255;
+                }
+            }
+        }
+        let before = buf.rgba.clone();
+        let mut work = before.clone();
+        flood_fill(&mut work, 7, 7, 0, 0, [1, 2, 3, 255], 0);
+        // Center (3,3) must still match original black/transparent hole.
+        let c = (3 * 7 + 3) * 4;
+        assert_eq!(&work[c..c + 4], &before[c..c + 4], "hole must not be selected");
+        // Border pixel should have changed.
+        assert_ne!(&work[0..4], &before[0..4]);
     }
 
     #[test]

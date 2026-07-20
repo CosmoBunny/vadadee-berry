@@ -68,6 +68,8 @@ pub const ERASER: &str = "󰃢";
 pub const BUCKET: &str = "󰃡";
 /// Smudge / blur finger (nf-md-water).
 pub const SMUDGE: &str = "󰖌";
+/// Raster region select (nf-md-selection-ellipse).
+pub const RASTER_SELECT: &str = "󰒉";
 /// Shader / shading layer (full-page pass; stack-order flexible via raise/lower).
 pub const SHADING: &str = "󰽏";
 /// Live collaboration chat (Nerd Font).

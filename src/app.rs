@@ -6952,7 +6952,25 @@ impl VadadeeBerryApp {
         let prev_px = self.tools.raster.last_px;
         self.tools.raster.last_px = Some((px, py));
         let clip = self.raster_paint_clip_px(id, x, y, width, height, rot, pw, ph);
+        let poly_comps = self.raster_poly_masks_px(x, y, width, height, rot, pw, ph);
+        let sticky_rect = self.tools.raster.sticky_mask_doc;
+        let rect_mask = if let Some((x0, y0, x1, y1)) = sticky_rect {
+            self.doc_aabb_to_image_clip(x, y, width, height, rot, pw, ph, x0, y0, x1, y1)
+        } else {
+            None
+        };
+        // Pixel-accurate mask (eyedrop/magnetic) — only for this Image.
+        let (pix_mask, pix_mw) = self
+            .tools
+            .raster
+            .sticky_pixel_mask
+            .as_ref()
+            .filter(|m| m.node_id == id && m.width == pw && m.height == ph)
+            .map(|m| (Some(m.mask.as_slice()), m.width))
+            .unwrap_or((None, 0));
         let smudge = self.tools.active == ToolKind::Smudge;
+        let alpha_lock = self.tools.raster.alpha_lock && !erase;
+        let smudge_str = self.tools.raster.smudge_strength * press;
         let (ox, oy) = self.raster_sym_origin_px(id, x, y, width, height, rot, pw, ph);
         let divs = self.tools.raster.sym_divisions.max(1);
         let off = self.tools.raster.sym_offset_deg.to_radians();
@@ -6972,9 +6990,28 @@ impl VadadeeBerryApp {
                     } else {
                         (1.0, 0.0)
                     };
-                    let str = self.tools.raster.smudge_strength * press;
                     for (sx, sy) in &all_stamps {
-                        // Rotate direction with symmetry frame for each copy.
+                        if !poly_comps.is_empty() {
+                            let in_poly = poly_comps.iter().any(|poly| {
+                                crate::raster::point_in_polygon(*sx as f64, *sy as f64, poly)
+                            });
+                            if !in_poly {
+                                continue;
+                            }
+                        }
+                        if let Some(m) = pix_mask {
+                            let ix = sx.round() as i32;
+                            let iy = sy.round() as i32;
+                            if ix < 0
+                                || iy < 0
+                                || m.get(iy as usize * pix_mw as usize + ix as usize)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    == 0
+                            {
+                                continue;
+                            }
+                        }
                         let ddx = sx - ox;
                         let ddy = sy - oy;
                         let base_dx = px - ox;
@@ -6982,7 +7019,6 @@ impl VadadeeBerryApp {
                         let d = if base_dx * base_dx + base_dy * base_dy > 1e-6
                             && ddx * ddx + ddy * ddy > 1e-6
                         {
-                            // Approximate: use stroke dir rotated same as tip relative to origin
                             let a0 = base_dy.atan2(base_dx);
                             let a1 = ddy.atan2(ddx);
                             let da = a1 - a0;
@@ -6991,12 +7027,16 @@ impl VadadeeBerryApp {
                         } else {
                             dir
                         };
-                        buf.smudge_circle(*sx, *sy, radius, hardness, str, d, clip);
+                        buf.smudge_circle(*sx, *sy, radius, hardness, smudge_str, d, clip);
                     }
                 } else {
-                    let alpha_lock = self.tools.raster.alpha_lock && !erase;
+                    let poly_ref = if poly_comps.is_empty() {
+                        None
+                    } else {
+                        Some(poly_comps.as_slice())
+                    };
                     for (sx, sy) in all_stamps {
-                        buf.stamp_circle_clipped(
+                        buf.stamp_circle_masked(
                             sx,
                             sy,
                             radius,
@@ -7005,7 +7045,11 @@ impl VadadeeBerryApp {
                             opacity,
                             erase,
                             clip,
+                            rect_mask,
                             alpha_lock,
+                            poly_ref,
+                            pix_mask,
+                            pix_mw,
                         );
                     }
                 }
@@ -7453,7 +7497,7 @@ impl VadadeeBerryApp {
         }
     }
 
-    /// Prefer sticky paint mask; else live multi-selection AABB → Image pixel clip.
+    /// Prefer sticky AABB mask; poly masks use AABB of poly for coarse clip + point-in-poly.
     fn raster_paint_clip_px(
         &self,
         target_id: NodeId,
@@ -7465,6 +7509,23 @@ impl VadadeeBerryApp {
         pw: u32,
         ph: u32,
     ) -> Option<(i32, i32, i32, i32)> {
+        if let Some(poly) = self.tools.raster.sticky_mask_poly.as_ref() {
+            if poly.len() >= 3 {
+                let mut x0 = f64::MAX;
+                let mut y0 = f64::MAX;
+                let mut x1 = f64::MIN;
+                let mut y1 = f64::MIN;
+                for &(px, py) in poly {
+                    x0 = x0.min(px);
+                    y0 = y0.min(py);
+                    x1 = x1.max(px);
+                    y1 = y1.max(py);
+                }
+                return self.doc_aabb_to_image_clip(
+                    img_x, img_y, img_w, img_h, rot, pw, ph, x0, y0, x1, y1,
+                );
+            }
+        }
         if let Some((x0, y0, x1, y1)) = self.tools.raster.sticky_mask_doc {
             return self.doc_aabb_to_image_clip(
                 img_x,
@@ -7481,6 +7542,117 @@ impl VadadeeBerryApp {
             );
         }
         self.raster_selection_clip_px(target_id, img_x, img_y, img_w, img_h, rot, pw, ph)
+    }
+
+    /// All sticky lasso polygons mapped into image pixel space.
+    fn raster_poly_masks_px(
+        &self,
+        img_x: f64,
+        img_y: f64,
+        img_w: f64,
+        img_h: f64,
+        rot: f64,
+        pw: u32,
+        ph: u32,
+    ) -> Vec<Vec<(f64, f64)>> {
+        let mut components: Vec<&[(f64, f64)]> = Vec::new();
+        if let Some(p) = self.tools.raster.sticky_mask_poly.as_ref() {
+            if p.len() >= 3 {
+                components.push(p.as_slice());
+            }
+        }
+        for p in &self.tools.raster.sticky_mask_polys {
+            if p.len() >= 3 {
+                components.push(p.as_slice());
+            }
+        }
+        let mut out = Vec::new();
+        for poly in components {
+            let mut px = Vec::with_capacity(poly.len());
+            for &(dx, dy) in poly {
+                if let Some((u, v)) =
+                    crate::document::image_doc_to_uv(img_x, img_y, img_w, img_h, rot, dx, dy)
+                {
+                    px.push((u * pw as f64, v * ph as f64));
+                }
+            }
+            if px.len() >= 3 {
+                out.push(px);
+            }
+        }
+        out
+    }
+
+    fn raster_poly_mask_px(
+        &self,
+        img_x: f64,
+        img_y: f64,
+        img_w: f64,
+        img_h: f64,
+        rot: f64,
+        pw: u32,
+        ph: u32,
+    ) -> Option<Vec<(f64, f64)>> {
+        // Backward-compatible single poly (first component) for call sites needing one list.
+        self.raster_poly_masks_px(img_x, img_y, img_w, img_h, rot, pw, ph)
+            .into_iter()
+            .next()
+    }
+
+    /// True if pixel is inside sticky rect and/or any sticky poly (OR = union mask).
+    fn raster_pixel_in_sticky_mask_px(
+        &self,
+        px: f64,
+        py: f64,
+        clip: Option<(i32, i32, i32, i32)>,
+        polys: &[Vec<(f64, f64)>],
+    ) -> bool {
+        let has_rect = clip.is_some();
+        let has_poly = !polys.is_empty();
+        if !has_rect && !has_poly {
+            return true; // no sticky mask
+        }
+        let mut ok = false;
+        if let Some((x0, y0, x1, y1)) = clip {
+            // Only treat sticky_mask_doc as sticky when polys empty OR both present for union.
+            // Coarse AABB from poly is always present when poly exists — don't double-count.
+            // Callers pass clip from raster_paint_clip_px which includes poly AABB.
+            // For poly-only, clip is AABB of poly: still need point-in-poly for real clip.
+            if has_poly {
+                // AABB already applied by stamp loop bounds; poly decides membership.
+            } else if px >= x0 as f64 && px < x1 as f64 && py >= y0 as f64 && py < y1 as f64 {
+                ok = true;
+            }
+        }
+        if has_poly {
+            for poly in polys {
+                if crate::raster::point_in_polygon(px, py, poly) {
+                    ok = true;
+                    break;
+                }
+            }
+        } else if has_rect {
+            // handled above
+        }
+        if has_poly && !has_rect {
+            return ok;
+        }
+        if has_rect && !has_poly {
+            return ok;
+        }
+        // Both: OR
+        if has_rect && has_poly {
+            let in_rect = clip
+                .map(|(x0, y0, x1, y1)| {
+                    px >= x0 as f64 && px < x1 as f64 && py >= y0 as f64 && py < y1 as f64
+                })
+                .unwrap_or(false);
+            let in_poly = polys
+                .iter()
+                .any(|p| crate::raster::point_in_polygon(px, py, p));
+            return in_rect || in_poly;
+        }
+        ok
     }
 
     fn doc_aabb_to_image_clip(
@@ -7591,7 +7763,738 @@ impl VadadeeBerryApp {
 
     pub fn raster_clear_sticky_mask(&mut self) {
         self.tools.raster.sticky_mask_doc = None;
+        self.tools.raster.sticky_mask_poly = None;
+        self.tools.raster.sticky_mask_polys.clear();
+        self.tools.raster.sticky_pixel_mask = None;
+        self.tools.raster.mask_tool = crate::tools::PaintMaskTool::Off;
+        self.tools.raster.mask_rect_origin = None;
+        self.tools.raster.mask_drag_current = None;
+        self.tools.raster.mask_lasso_pts.clear();
+        self.tools.raster_select.rect_origin = None;
+        self.tools.raster_select.drag_current = None;
+        self.tools.raster_select.lasso_pts.clear();
         self.status_message = "Paint mask cleared".into();
+    }
+
+    fn raster_apply_rect_mask(&mut self, a: (f64, f64), b: (f64, f64), union: bool) {
+        let x0 = a.0.min(b.0);
+        let y0 = a.1.min(b.1);
+        let x1 = a.0.max(b.0);
+        let y1 = a.1.max(b.1);
+        if (x1 - x0).abs() < 2.0 || (y1 - y0).abs() < 2.0 {
+            return;
+        }
+        if union {
+            if let Some((ox0, oy0, ox1, oy1)) = self.tools.raster.sticky_mask_doc {
+                self.tools.raster.sticky_mask_doc =
+                    Some((x0.min(ox0), y0.min(oy0), x1.max(ox1), y1.max(oy1)));
+            } else {
+                self.tools.raster.sticky_mask_doc = Some((x0, y0, x1, y1));
+            }
+            // keep polys + pixel mask for union OR
+        } else {
+            self.tools.raster.sticky_mask_doc = Some((x0, y0, x1, y1));
+            self.tools.raster.sticky_mask_poly = None;
+            self.tools.raster.sticky_mask_polys.clear();
+            self.tools.raster.sticky_pixel_mask = None;
+        }
+        self.status_message = if union {
+            "Rect mask (union)".into()
+        } else {
+            "Rect mask set".into()
+        };
+    }
+
+    fn raster_apply_poly_mask(&mut self, mut pts: Vec<(f64, f64)>, union: bool) {
+        if pts.len() < 3 {
+            return;
+        }
+        if let Some(first) = pts.first().copied() {
+            let last = *pts.last().unwrap();
+            if (first.0 - last.0).hypot(first.1 - last.1) > 1.0 {
+                pts.push(first);
+            }
+        }
+        if union {
+            if self.tools.raster.sticky_mask_poly.is_none()
+                && self.tools.raster.sticky_mask_polys.is_empty()
+            {
+                self.tools.raster.sticky_mask_poly = Some(pts);
+            } else {
+                self.tools.raster.sticky_mask_polys.push(pts);
+            }
+            // keep sticky_mask_doc + pixel mask for union OR
+        } else {
+            self.tools.raster.sticky_mask_poly = Some(pts);
+            self.tools.raster.sticky_mask_polys.clear();
+            self.tools.raster.sticky_mask_doc = None;
+            self.tools.raster.sticky_pixel_mask = None;
+        }
+        self.status_message = if union {
+            "Lasso mask (union)".into()
+        } else {
+            "Lasso mask set".into()
+        };
+    }
+
+    /// Magnetic / eyedrop: flood similar **connected** pixels → pixel mask (not AABB).
+    /// Holes of a different color inside the seed region are **not** selected.
+    fn raster_select_color_region(
+        &mut self,
+        doc: (f64, f64),
+        ctx: &Context,
+        glow: bool,
+    ) {
+        use crate::tools::StickyPixelMask;
+        let Some(id) = self.selection.first().copied().filter(|&id| {
+            self.project
+                .nodes
+                .get(id)
+                .map_or(false, |n| matches!(n.kind, NodeKind::Image { .. }))
+        }) else {
+            self.status_message = "Select an Image first".into();
+            return;
+        };
+        let snap = self.project.nodes.get(id).and_then(|node| {
+            if let NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                bytes,
+                ..
+            } = &node.kind
+            {
+                Some((
+                    *x,
+                    *y,
+                    *width,
+                    *height,
+                    node.transform.rotation_rad,
+                    bytes.clone(),
+                ))
+            } else {
+                None
+            }
+        });
+        let Some((ix, iy, iw, ih, rot, bytes)) = snap else {
+            return;
+        };
+        self.ensure_image_texture(id, &bytes, ctx);
+        let Some(ci) = self.image_pixel_cache.get(&id) else {
+            return;
+        };
+        let pw = ci.size[0] as u32;
+        let ph = ci.size[1] as u32;
+        let Some((u, v)) =
+            crate::document::image_doc_to_uv(ix, iy, iw, ih, rot, doc.0, doc.1)
+        else {
+            self.status_message = "Click on the Image".into();
+            return;
+        };
+        let sx = (u * pw as f64).floor() as i32;
+        let sy = (v * ph as f64).floor() as i32;
+        let mut raw = Vec::with_capacity(ci.pixels.len() * 4);
+        for p in &ci.pixels {
+            raw.push(p.r());
+            raw.push(p.g());
+            raw.push(p.b());
+            raw.push(p.a());
+        }
+        // Flood only connected matching pixels (tolerance 0 ⇒ exact color, no leak into holes).
+        let mut work = raw.clone();
+        let tol = self.tools.raster_select.tolerance;
+        let n = crate::raster::flood_fill(
+            &mut work,
+            pw,
+            ph,
+            sx,
+            sy,
+            [1, 2, 3, 255],
+            tol,
+        );
+        if n == 0 {
+            self.status_message = "Nothing selected".into();
+            return;
+        }
+        // Build mask only from flood result (not AABB) — hole colors stay unselected.
+        let mut mask = vec![0u8; (pw * ph) as usize];
+        for yy in 0..ph as usize {
+            let row = yy * pw as usize;
+            for xx in 0..pw as usize {
+                let i = (row + xx) * 4;
+                if work[i..i + 4] != raw[i..i + 4] {
+                    mask[row + xx] = 255;
+                }
+            }
+        }
+        // Glow: expand outward from selected pixels only (cheap). Cap px so UI never freezes.
+        if glow {
+            let scale = ((pw as f64 / iw.max(1.0)) + (ph as f64 / ih.max(1.0))) * 0.5;
+            // Doc glow_radius → image pixels, hard-capped (was 64 → multi-second freezes).
+            let glow_px = (self.tools.raster_select.glow_radius as f64 * scale)
+                .ceil()
+                .clamp(0.0, 16.0) as i32;
+            if glow_px > 0 {
+                crate::raster::dilate_mask(&mut mask, pw, ph, glow_px);
+            }
+        }
+        let mut pixel = StickyPixelMask {
+            node_id: id,
+            width: pw,
+            height: ph,
+            mask,
+        };
+        let union = self.tools.raster_select.union_mask;
+        if union {
+            if let Some(existing) = self.tools.raster.sticky_pixel_mask.as_mut() {
+                if existing.node_id == id && existing.width == pw && existing.height == ph {
+                    existing.or_with(&pixel);
+                } else {
+                    *existing = pixel;
+                }
+            } else {
+                self.tools.raster.sticky_pixel_mask = Some(pixel);
+            }
+            // Keep rect/poly for union OR with geometric masks.
+        } else {
+            self.tools.raster.sticky_pixel_mask = Some(pixel);
+            self.tools.raster.sticky_mask_doc = None;
+            self.tools.raster.sticky_mask_poly = None;
+            self.tools.raster.sticky_mask_polys.clear();
+        }
+        let count = self
+            .tools
+            .raster
+            .sticky_pixel_mask
+            .as_ref()
+            .map(|m| m.mask.iter().filter(|&&v| v != 0).count())
+            .unwrap_or(0);
+        self.status_message = if glow {
+            format!("Pixel mask + glow ({count} px, flood {n})")
+        } else {
+            format!("Pixel mask ({count} px, exact flood)")
+        };
+    }
+
+    /// Raster Select tool interaction (only meaningful with Image selected).
+    fn tool_raster_select(
+        &mut self,
+        doc: (f64, f64),
+        pressed: bool,
+        down: bool,
+        released: bool,
+        ctx: &Context,
+    ) {
+        use crate::tools::RasterSelectMode;
+        if !self.selection_is_single_image() {
+            if pressed {
+                self.status_message = "Raster Select: select an Image object first".into();
+            }
+            return;
+        }
+        let union = self.tools.raster_select.union_mask;
+        match self.tools.raster_select.mode {
+            RasterSelectMode::Rect => {
+                if pressed {
+                    self.tools.raster_select.rect_origin = Some(doc);
+                    self.tools.raster_select.drag_current = Some(doc);
+                } else if down && self.tools.raster_select.rect_origin.is_some() {
+                    self.tools.raster_select.drag_current = Some(doc);
+                } else if released {
+                    if let (Some(o), Some(c)) = (
+                        self.tools.raster_select.rect_origin.take(),
+                        self.tools.raster_select.drag_current.take(),
+                    ) {
+                        self.raster_apply_rect_mask(o, c, union);
+                    }
+                }
+            }
+            RasterSelectMode::Lasso => {
+                if pressed {
+                    self.tools.raster_select.lasso_pts.clear();
+                    self.tools.raster_select.lasso_pts.push(doc);
+                    self.tools.raster_select.drag_current = Some(doc);
+                } else if down {
+                    if let Some(last) = self.tools.raster_select.lasso_pts.last().copied() {
+                        if (doc.0 - last.0).hypot(doc.1 - last.1) > 1.5 {
+                            self.tools.raster_select.lasso_pts.push(doc);
+                        }
+                    }
+                    self.tools.raster_select.drag_current = Some(doc);
+                } else if released {
+                    let pts = std::mem::take(&mut self.tools.raster_select.lasso_pts);
+                    self.tools.raster_select.drag_current = None;
+                    self.raster_apply_poly_mask(pts, union);
+                }
+            }
+            RasterSelectMode::Magnetic | RasterSelectMode::Eyedrop => {
+                if pressed {
+                    let glow = self.tools.raster_select.mode == RasterSelectMode::Eyedrop
+                        && self.tools.raster_select.glow_select;
+                    self.raster_select_color_region(doc, ctx, glow);
+                }
+            }
+        }
+    }
+
+    pub fn selection_is_single_image(&self) -> bool {
+        if self.selection.len() != 1 {
+            return false;
+        }
+        self.project
+            .nodes
+            .get(self.selection[0])
+            .map_or(false, |n| matches!(n.kind, NodeKind::Image { .. }))
+    }
+
+    pub fn raster_reset_sym_origin(&mut self) {
+        self.tools.raster.sym_origin_doc = None;
+        self.tools.raster.sym_dragging_origin = false;
+        self.status_message = "Symmetry origin → image center".into();
+    }
+
+    /// Draw rect/lasso mask while `mask_tool` is active. Returns true if event consumed.
+    fn handle_paint_mask_draw(
+        &mut self,
+        doc: (f64, f64),
+        pressed: bool,
+        down: bool,
+        released: bool,
+    ) -> bool {
+        use crate::tools::PaintMaskTool;
+        match self.tools.raster.mask_tool {
+            PaintMaskTool::Off => false,
+            PaintMaskTool::Rect => {
+                if pressed {
+                    self.tools.raster.mask_rect_origin = Some(doc);
+                    self.tools.raster.mask_drag_current = Some(doc);
+                    return true;
+                }
+                if down && self.tools.raster.mask_rect_origin.is_some() {
+                    self.tools.raster.mask_drag_current = Some(doc);
+                    return true;
+                }
+                if released {
+                    if let (Some(o), Some(c)) = (
+                        self.tools.raster.mask_rect_origin.take(),
+                        self.tools.raster.mask_drag_current.take(),
+                    ) {
+                        let x0 = o.0.min(c.0);
+                        let y0 = o.1.min(c.1);
+                        let x1 = o.0.max(c.0);
+                        let y1 = o.1.max(c.1);
+                        if (x1 - x0).abs() > 2.0 && (y1 - y0).abs() > 2.0 {
+                            self.tools.raster.sticky_mask_doc = Some((x0, y0, x1, y1));
+                            self.tools.raster.sticky_mask_poly = None;
+                            self.status_message = "Rect paint mask set".into();
+                        }
+                    }
+                    self.tools.raster.mask_tool = PaintMaskTool::Off;
+                    return true;
+                }
+                self.tools.raster.mask_rect_origin.is_some()
+            }
+            PaintMaskTool::Lasso => {
+                if pressed {
+                    self.tools.raster.mask_lasso_pts.clear();
+                    self.tools.raster.mask_lasso_pts.push(doc);
+                    self.tools.raster.mask_drag_current = Some(doc);
+                    return true;
+                }
+                if down {
+                    if let Some(last) = self.tools.raster.mask_lasso_pts.last().copied() {
+                        let d = (doc.0 - last.0).hypot(doc.1 - last.1);
+                        if d > 1.5 {
+                            self.tools.raster.mask_lasso_pts.push(doc);
+                        }
+                    } else {
+                        self.tools.raster.mask_lasso_pts.push(doc);
+                    }
+                    self.tools.raster.mask_drag_current = Some(doc);
+                    return true;
+                }
+                if released {
+                    let mut pts = std::mem::take(&mut self.tools.raster.mask_lasso_pts);
+                    self.tools.raster.mask_drag_current = None;
+                    if pts.len() >= 3 {
+                        // Close poly
+                        if let Some(first) = pts.first().copied() {
+                            let last = *pts.last().unwrap();
+                            if (first.0 - last.0).hypot(first.1 - last.1) > 1.0 {
+                                pts.push(first);
+                            }
+                        }
+                        self.tools.raster.sticky_mask_poly = Some(pts);
+                        self.tools.raster.sticky_mask_doc = None;
+                        self.status_message = "Lasso paint mask set".into();
+                    }
+                    self.tools.raster.mask_tool = PaintMaskTool::Off;
+                    return true;
+                }
+                !self.tools.raster.mask_lasso_pts.is_empty()
+            }
+        }
+    }
+
+    /// Marching-ants style dashed polyline (screen space).
+    fn draw_dashed_polyline(
+        painter: &egui::Painter,
+        pts: &[Pos2],
+        closed: bool,
+        color_a: egui::Color32,
+        color_b: egui::Color32,
+        phase: f32,
+    ) {
+        if pts.len() < 2 {
+            return;
+        }
+        let dash = 7.0f32;
+        let gap = 5.0f32;
+        let period = dash + gap;
+        let mut segs: Vec<(Pos2, Pos2)> = Vec::new();
+        let n = if closed { pts.len() } else { pts.len() - 1 };
+        for i in 0..n {
+            let a = pts[i];
+            let b = pts[(i + 1) % pts.len()];
+            segs.push((a, b));
+        }
+        let mut dist_along = phase.rem_euclid(period);
+        for (a, b) in segs {
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 0.5 {
+                continue;
+            }
+            let ux = dx / len;
+            let uy = dy / len;
+            let mut t = 0.0f32;
+            while t < len {
+                let in_dash = dist_along < dash;
+                let remain = if in_dash {
+                    dash - dist_along
+                } else {
+                    period - dist_along
+                };
+                let step = remain.min(len - t);
+                if in_dash {
+                    let p0 = Pos2::new(a.x + ux * t, a.y + uy * t);
+                    let p1 = Pos2::new(a.x + ux * (t + step), a.y + uy * (t + step));
+                    // Double stroke: black under / yellow on top for contrast on any bg.
+                    painter.line_segment(
+                        [p0, p1],
+                        egui::Stroke::new(3.0, color_b),
+                    );
+                    painter.line_segment(
+                        [p0, p1],
+                        egui::Stroke::new(1.6, color_a),
+                    );
+                }
+                t += step;
+                dist_along = (dist_along + step).rem_euclid(period);
+            }
+        }
+    }
+
+    fn draw_paint_mask_overlay(&self, painter: &egui::Painter, origin: Pos2) {
+        let phase = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f32() * 14.0)
+                .unwrap_or(0.0)
+        };
+        let yellow = egui::Color32::from_rgb(255, 220, 60);
+        let black = egui::Color32::from_rgb(20, 20, 20);
+        // Yellow shade **only** while Raster Select is active.
+        let shade = self.tools.active == ToolKind::RasterSelect;
+        let fill = egui::Color32::from_rgba_unmultiplied(255, 210, 40, 55);
+
+        // Rect mask — dashed always; shade only on select tool
+        if let Some((x0, y0, x1, y1)) = self.tools.raster.sticky_mask_doc {
+            let p0 = self.viewport.doc_to_screen((x0, y0), origin);
+            let p1 = self.viewport.doc_to_screen((x1, y1), origin);
+            let rect = egui::Rect::from_two_pos(p0, p1);
+            if shade {
+                painter.rect_filled(rect, 0.0, fill);
+            }
+            let corners = [
+                rect.left_top(),
+                rect.right_top(),
+                rect.right_bottom(),
+                rect.left_bottom(),
+            ];
+            Self::draw_dashed_polyline(painter, &corners, true, yellow, black, phase);
+        }
+        // Lasso polys — dashed outline only (shade via soft fill omitted for non-convex)
+        let mut polys: Vec<&[(f64, f64)]> = Vec::new();
+        if let Some(p) = self.tools.raster.sticky_mask_poly.as_ref() {
+            if p.len() >= 2 {
+                polys.push(p.as_slice());
+            }
+        }
+        for p in &self.tools.raster.sticky_mask_polys {
+            if p.len() >= 2 {
+                polys.push(p.as_slice());
+            }
+        }
+        for poly in polys {
+            let pts: Vec<_> = poly
+                .iter()
+                .map(|&p| self.viewport.doc_to_screen(p, origin))
+                .collect();
+            Self::draw_dashed_polyline(painter, &pts, true, yellow, black, phase);
+        }
+        // Pixel mask: dashed boundaries (incl. holes); soft yellow texture only on select tool
+        self.draw_pixel_mask_selection_overlay(painter, origin, phase, yellow, black, shade);
+
+        // In-progress paint-panel rect/lasso mask tools
+        if let (Some(o), Some(c)) = (
+            self.tools.raster.mask_rect_origin,
+            self.tools.raster.mask_drag_current,
+        ) {
+            let p0 = self.viewport.doc_to_screen(o, origin);
+            let p1 = self.viewport.doc_to_screen(c, origin);
+            let rect = egui::Rect::from_two_pos(p0, p1);
+            if shade {
+                painter.rect_filled(rect, 0.0, fill);
+            }
+            let corners = [
+                rect.left_top(),
+                rect.right_top(),
+                rect.right_bottom(),
+                rect.left_bottom(),
+            ];
+            Self::draw_dashed_polyline(painter, &corners, true, yellow, black, phase);
+        }
+        if self.tools.raster.mask_lasso_pts.len() >= 2 {
+            let pts: Vec<_> = self
+                .tools
+                .raster
+                .mask_lasso_pts
+                .iter()
+                .map(|&p| self.viewport.doc_to_screen(p, origin))
+                .collect();
+            Self::draw_dashed_polyline(painter, &pts, false, yellow, black, phase);
+        }
+    }
+
+    /// Pixel mask: **dashed edges including holes**; optional yellow shade only on Raster Select.
+    fn draw_pixel_mask_selection_overlay(
+        &self,
+        painter: &egui::Painter,
+        origin: Pos2,
+        phase: f32,
+        yellow: egui::Color32,
+        black: egui::Color32,
+        shade: bool,
+    ) {
+        let Some(pm) = self.tools.raster.sticky_pixel_mask.as_ref() else {
+            return;
+        };
+        let Some(node) = self.project.nodes.get(pm.node_id) else {
+            return;
+        };
+        let NodeKind::Image {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } = &node.kind
+        else {
+            return;
+        };
+        let rot = node.transform.rotation_rad as f32;
+        let pw = pm.width.max(1);
+        let ph = pm.height.max(1);
+        let is_on = |xx: i32, yy: i32| -> bool {
+            if xx < 0 || yy < 0 || xx >= pw as i32 || yy >= ph as i32 {
+                return false;
+            }
+            pm.mask[yy as usize * pw as usize + xx as usize] != 0
+        };
+
+        // Soft yellow shade via downscaled texture (no per-pixel squares).
+        if shade {
+            const MAX_SIDE: u32 = 256;
+            let scale = (pw.max(ph) as f32 / MAX_SIDE as f32).max(1.0);
+            let tw = ((pw as f32 / scale).ceil() as u32).max(1);
+            let th = ((ph as f32 / scale).ceil() as u32).max(1);
+            let mut rgba = vec![0u8; (tw * th * 4) as usize];
+            for ty in 0..th {
+                for tx in 0..tw {
+                    let ix = ((tx as f32 + 0.5) * scale) as i32;
+                    let iy = ((ty as f32 + 0.5) * scale) as i32;
+                    if is_on(ix.min(pw as i32 - 1), iy.min(ph as i32 - 1)) {
+                        let i = (ty * tw + tx) as usize * 4;
+                        rgba[i] = 255;
+                        rgba[i + 1] = 210;
+                        rgba[i + 2] = 40;
+                        rgba[i + 3] = 70;
+                    }
+                }
+            }
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [tw as usize, th as usize],
+                &rgba,
+            );
+            let tex = painter.ctx().load_texture(
+                "raster_pixel_mask_shade",
+                img,
+                egui::TextureOptions::LINEAR,
+            );
+            let tl = self.viewport.doc_to_screen((*x, *y), origin);
+            let br = self
+                .viewport
+                .doc_to_screen((*x + *width, *y + *height), origin);
+            let rect = egui::Rect::from_two_pos(tl, br);
+            crate::render::paint_image_rotated(
+                painter,
+                tex.id(),
+                rect,
+                rot,
+                1.0,
+            );
+        }
+
+        // Edge segments (includes inner holes): dashed yellow path.
+        // Map pixel corner to screen.
+        let to_screen = |ix: f64, iy: f64| -> Pos2 {
+            let lx = *x + ix / pw as f64 * *width;
+            let ly = *y + iy / ph as f64 * *height;
+            let (dx, dy) = if (rot as f64).abs() < 1e-12 {
+                (lx, ly)
+            } else {
+                let cx = *x + *width * 0.5;
+                let cy = *y + *height * 0.5;
+                let c = (rot as f64).cos();
+                let s = (rot as f64).sin();
+                let rx = lx - cx;
+                let ry = ly - cy;
+                (cx + rx * c - ry * s, cy + rx * s + ry * c)
+            };
+            self.viewport.doc_to_screen((dx, dy), origin)
+        };
+
+        // Subsample scan for large images to keep FPS, but denser than before.
+        let scan = ((pw.max(ph) as usize) / 512).max(1);
+        let mut segs: Vec<(Pos2, Pos2)> = Vec::new();
+        const MAX_SEGS: usize = 6000;
+        'outer: for yy in (0..ph as i32).step_by(scan) {
+            for xx in (0..pw as i32).step_by(scan) {
+                if !is_on(xx, yy) {
+                    continue;
+                }
+                // Top edge of this cell (if above is off)
+                if !is_on(xx, yy - 1) {
+                    segs.push((
+                        to_screen(xx as f64, yy as f64),
+                        to_screen((xx + scan as i32) as f64, yy as f64),
+                    ));
+                }
+                // Left edge
+                if !is_on(xx - 1, yy) {
+                    segs.push((
+                        to_screen(xx as f64, yy as f64),
+                        to_screen(xx as f64, (yy + scan as i32) as f64),
+                    ));
+                }
+                // Right edge of strip
+                if !is_on(xx + scan as i32, yy) {
+                    segs.push((
+                        to_screen((xx + scan as i32) as f64, yy as f64),
+                        to_screen((xx + scan as i32) as f64, (yy + scan as i32) as f64),
+                    ));
+                }
+                // Bottom
+                if !is_on(xx, yy + scan as i32) {
+                    segs.push((
+                        to_screen(xx as f64, (yy + scan as i32) as f64),
+                        to_screen((xx + scan as i32) as f64, (yy + scan as i32) as f64),
+                    ));
+                }
+                if segs.len() >= MAX_SEGS {
+                    break 'outer;
+                }
+            }
+        }
+        // Dash each edge segment (shows outer contour **and** inner holes).
+        let dash = 6.0f32;
+        let gap = 4.0f32;
+        let period = dash + gap;
+        for (i, (a, b)) in segs.iter().enumerate() {
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 0.25 {
+                continue;
+            }
+            let ux = dx / len;
+            let uy = dy / len;
+            let mut t = 0.0f32;
+            let mut dist = (phase + i as f32 * 0.7).rem_euclid(period);
+            while t < len {
+                let in_dash = dist < dash;
+                let remain = if in_dash {
+                    dash - dist
+                } else {
+                    period - dist
+                };
+                let step = remain.min(len - t);
+                if in_dash {
+                    let p0 = Pos2::new(a.x + ux * t, a.y + uy * t);
+                    let p1 = Pos2::new(a.x + ux * (t + step), a.y + uy * (t + step));
+                    painter.line_segment([p0, p1], egui::Stroke::new(2.8, black));
+                    painter.line_segment([p0, p1], egui::Stroke::new(1.5, yellow));
+                }
+                t += step;
+                dist = (dist + step).rem_euclid(period);
+            }
+        }
+    }
+
+    fn draw_raster_select_overlay(&self, painter: &egui::Painter, origin: Pos2) {
+        if self.tools.active != ToolKind::RasterSelect {
+            return;
+        }
+        let phase = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f32() * 14.0)
+                .unwrap_or(0.0)
+        };
+        let yellow = egui::Color32::from_rgb(255, 220, 60);
+        let black = egui::Color32::from_rgb(20, 20, 20);
+        let fill = egui::Color32::from_rgba_unmultiplied(255, 210, 40, 50);
+        if let (Some(o), Some(c)) = (
+            self.tools.raster_select.rect_origin,
+            self.tools.raster_select.drag_current,
+        ) {
+            let p0 = self.viewport.doc_to_screen(o, origin);
+            let p1 = self.viewport.doc_to_screen(c, origin);
+            let rect = egui::Rect::from_two_pos(p0, p1);
+            painter.rect_filled(rect, 0.0, fill);
+            let corners = [
+                rect.left_top(),
+                rect.right_top(),
+                rect.right_bottom(),
+                rect.left_bottom(),
+            ];
+            Self::draw_dashed_polyline(painter, &corners, true, yellow, black, phase);
+        }
+        if self.tools.raster_select.lasso_pts.len() >= 2 {
+            let pts: Vec<_> = self
+                .tools
+                .raster_select
+                .lasso_pts
+                .iter()
+                .map(|&p| self.viewport.doc_to_screen(p, origin))
+                .collect();
+            Self::draw_dashed_polyline(painter, &pts, false, yellow, black, phase);
+        }
     }
 
     /// Fill Image with transparent (clear paint layer) — undoable.
@@ -9931,9 +10834,27 @@ fn run_video_decode_thread(
                     | ToolKind::Eraser
                     | ToolKind::Smudge
                     | ToolKind::BucketFill
-            ) && self.tools.raster.sym_divisions >= 2
-            {
-                self.draw_circular_symmetry_guides(&painter, origin);
+                    | ToolKind::RasterSelect
+            ) {
+                self.draw_paint_mask_overlay(&painter, origin);
+                self.draw_raster_select_overlay(&painter, origin);
+                // Animate marching-ants when any mask is active.
+                let mask_live = self.tools.raster.sticky_mask_doc.is_some()
+                    || self.tools.raster.sticky_mask_poly.is_some()
+                    || !self.tools.raster.sticky_mask_polys.is_empty()
+                    || self.tools.raster.sticky_pixel_mask.is_some()
+                    || self.tools.raster.mask_rect_origin.is_some()
+                    || !self.tools.raster.mask_lasso_pts.is_empty()
+                    || self.tools.raster_select.rect_origin.is_some()
+                    || !self.tools.raster_select.lasso_pts.is_empty();
+                if mask_live {
+                    ui.ctx().request_repaint();
+                }
+                if self.tools.raster.sym_divisions >= 2
+                    && self.tools.active != ToolKind::RasterSelect
+                {
+                    self.draw_circular_symmetry_guides(&painter, origin);
+                }
             }
 
             // Weight flow brush cursor (path sculpt)
@@ -10241,15 +11162,21 @@ fn run_video_decode_thread(
                 );
             }
             ToolKind::RasterBrush | ToolKind::Eraser | ToolKind::Smudge => {
-                // Symmetry origin gizmo drag (when unlocked and divisions ≥ 2).
-                if self.handle_symmetry_origin_gizmo(
+                if self.handle_paint_mask_draw(
+                    raw_doc,
+                    primary_pressed,
+                    primary_down,
+                    primary_released_anywhere,
+                ) {
+                    // Drawing rect/lasso paint mask
+                } else if self.handle_symmetry_origin_gizmo(
                     raw_doc,
                     primary_pressed,
                     primary_down,
                     primary_released_anywhere,
                     origin,
                 ) {
-                    // ate the click for painting
+                    // Symmetry origin drag
                 } else {
                     let alt = response.ctx.input(|i| i.modifiers.alt);
                     if alt && self.tools.active != ToolKind::Smudge {
@@ -10285,6 +11212,15 @@ fn run_video_decode_thread(
                 } else {
                     self.tool_bucket_fill(raw_doc, primary_pressed, &response.ctx);
                 }
+            }
+            ToolKind::RasterSelect => {
+                self.tool_raster_select(
+                    raw_doc,
+                    primary_pressed,
+                    primary_down,
+                    primary_released_anywhere,
+                    &response.ctx,
+                );
             }
 
             ToolKind::Node => self.tool_node(

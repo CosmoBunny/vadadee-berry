@@ -534,7 +534,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Eyedropper,
         ]
     } else {
-        vec![
+        let mut t = vec![
             ToolKind::Select,
             ToolKind::Node,
             ToolKind::Pen,
@@ -552,7 +552,19 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::BucketFill,
             ToolKind::Smudge,
             ToolKind::Eyedropper,
-        ]
+        ];
+        // Raster Select only when a single Image object is selected.
+        if app.selection_is_single_image() {
+            // Insert after Smudge, before Eyedropper
+            if let Some(pos) = t.iter().position(|k| *k == ToolKind::Eyedropper) {
+                t.insert(pos, ToolKind::RasterSelect);
+            } else {
+                t.push(ToolKind::RasterSelect);
+            }
+        } else if app.tools.active == ToolKind::RasterSelect {
+            app.tools.active = ToolKind::Select;
+        }
+        t
     };
     // AV Split + DAW are one-shot actions (not ToolKind) — only when an AV layer is selected.
     let av_action_count = if is_video_or_audio_layer { 2usize } else { 0 };
@@ -592,6 +604,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Eraser => icons::ERASER,
             ToolKind::BucketFill => icons::BUCKET,
             ToolKind::Smudge => icons::SMUDGE,
+            ToolKind::RasterSelect => icons::RASTER_SELECT,
             ToolKind::Eyedropper => icons::EYE_DROPPER,
         }
     };
@@ -614,6 +627,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Eraser => "Eraser (X) — erase Image alpha · Alt=pick",
             ToolKind::BucketFill => "Flood fill (F) — fill contiguous pixels on Image",
             ToolKind::Smudge => "Smudge (U) — smear Image pixels",
+            ToolKind::RasterSelect => "Raster Select (W) — mask on Image only",
             ToolKind::Eyedropper => "Eyedropper (I)",
         }
     };
@@ -6999,6 +7013,101 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         }
     }
 
+    if app.tools.active == ToolKind::RasterSelect {
+        theme::constraint_block(ui, |ui| {
+            let panel_w = ui.available_width().max(120.0);
+            ui.set_max_width(panel_w);
+            ui.label(
+                RichText::new(format!("{} Raster Select", icons::RASTER_SELECT))
+                    .font(nerd_font_id(14.0))
+                    .strong(),
+            );
+            ui.label(
+                RichText::new("Only when an Image is selected · builds paint mask")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(4.0);
+            ui.label(RichText::new("Mode").small().strong());
+            ui.horizontal_wrapped(|ui| {
+                use crate::tools::RasterSelectMode as M;
+                for (m, label) in [
+                    (M::Rect, "Rect"),
+                    (M::Lasso, "Lasso"),
+                    (M::Magnetic, "Magnetic"),
+                    (M::Eyedrop, "Eyedrop"),
+                ] {
+                    if ui
+                        .selectable_label(app.tools.raster_select.mode == m, label)
+                        .clicked()
+                    {
+                        app.tools.raster_select.mode = m;
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut app.tools.raster_select.union_mask,
+                "Union mask (add to existing)",
+            )
+            .on_hover_text("On: new selection merges with current mask. Off: replace mask.");
+            if matches!(
+                app.tools.raster_select.mode,
+                crate::tools::RasterSelectMode::Magnetic | crate::tools::RasterSelectMode::Eyedrop
+            ) {
+                let mut tol = app.tools.raster_select.tolerance as f32;
+                if brush_numeric_row(ui, "Tolerance", &mut tol, 0.0..=128.0, 1.0) {
+                    app.tools.raster_select.tolerance = tol.round().clamp(0.0, 128.0) as u8;
+                }
+            }
+            if app.tools.raster_select.mode == crate::tools::RasterSelectMode::Eyedrop {
+                ui.checkbox(
+                    &mut app.tools.raster_select.glow_select,
+                    "Glow select (expand region)",
+                );
+                if app.tools.raster_select.glow_select {
+                    let mut g = app.tools.raster_select.glow_radius;
+                    // Soft cap — large values used to freeze the app (bad dilate cost).
+                    if brush_numeric_row(ui, "Glow radius", &mut g, 0.0..=24.0, 0.5) {
+                        app.tools.raster_select.glow_radius = g;
+                    }
+                    ui.label(
+                        RichText::new("Expands mask edge only (capped ~16 image px)")
+                            .small()
+                            .color(colors::TEXT_MUTED),
+                    );
+                }
+            }
+            ui.add_space(4.0);
+            let btn_w = (panel_w - 4.0).max(80.0);
+            if ui
+                .add_sized([btn_w, 22.0], egui::Button::new("Clear paint mask"))
+                .clicked()
+            {
+                app.raster_clear_sticky_mask();
+            }
+            ui.label(
+                RichText::new(match app.tools.raster_select.mode {
+                    crate::tools::RasterSelectMode::Rect => "Drag a rectangle on the Image",
+                    crate::tools::RasterSelectMode::Lasso => "Draw freehand around a region",
+                    crate::tools::RasterSelectMode::Magnetic => {
+                        "Click — grow by color (like magic wand)"
+                    }
+                    crate::tools::RasterSelectMode::Eyedrop => {
+                        "Click color region · optional glow expand"
+                    }
+                })
+                .small()
+                .color(colors::TEXT_MUTED),
+            );
+            ui.label(
+                RichText::new("Then use Paint (K) — strokes stay inside the mask")
+                    .small()
+                    .color(colors::TEXT_MUTED),
+            );
+        });
+    }
+
     if matches!(
         app.tools.active,
         ToolKind::RasterBrush | ToolKind::Eraser | ToolKind::BucketFill | ToolKind::Smudge
@@ -7139,11 +7248,34 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     );
                 }
 
-                // Mask / clear — stacked full-width buttons (no horizontal overflow)
+                // Mask tools — stacked full-width (no horizontal overflow)
                 ui.add_space(4.0);
+                ui.label(RichText::new("Paint mask").small().strong());
                 let btn_w = (panel_w - 4.0).max(80.0);
+                ui.horizontal(|ui| {
+                    let rect_on = app.tools.raster.mask_tool
+                        == crate::tools::PaintMaskTool::Rect;
+                    let lasso_on = app.tools.raster.mask_tool
+                        == crate::tools::PaintMaskTool::Lasso;
+                    if ui.selectable_label(rect_on, "Rect").clicked() {
+                        app.tools.raster.mask_tool = if rect_on {
+                            crate::tools::PaintMaskTool::Off
+                        } else {
+                            crate::tools::PaintMaskTool::Rect
+                        };
+                        app.status_message = "Drag on canvas for rect mask".into();
+                    }
+                    if ui.selectable_label(lasso_on, "Lasso").clicked() {
+                        app.tools.raster.mask_tool = if lasso_on {
+                            crate::tools::PaintMaskTool::Off
+                        } else {
+                            crate::tools::PaintMaskTool::Lasso
+                        };
+                        app.status_message = "Draw freehand mask on canvas".into();
+                    }
+                });
                 if ui
-                    .add_sized([btn_w, 22.0], egui::Button::new("Set paint mask"))
+                    .add_sized([btn_w, 22.0], egui::Button::new("Mask from selection"))
                     .on_hover_text("Use current selection AABB as sticky paint mask")
                     .clicked()
                 {
@@ -7156,12 +7288,28 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 {
                     app.raster_clear_sticky_mask();
                 }
-                if app.tools.raster.sticky_mask_doc.is_some() {
+                let mask_status = if app.tools.raster.sticky_mask_poly.is_some() {
+                    "Lasso mask: on"
+                } else if app.tools.raster.sticky_mask_doc.is_some() {
+                    "Rect mask: on"
+                } else if app.tools.raster.mask_tool != crate::tools::PaintMaskTool::Off {
+                    "Draw mask on canvas…"
+                } else {
+                    ""
+                };
+                if !mask_status.is_empty() {
                     ui.label(
-                        RichText::new("Sticky paint mask: on")
+                        RichText::new(mask_status)
                             .small()
                             .color(colors::TEXT_MUTED),
                     );
+                }
+                if ui
+                    .add_sized([btn_w, 22.0], egui::Button::new("Reset sym origin"))
+                    .on_hover_text("Symmetry origin → image center")
+                    .clicked()
+                {
+                    app.raster_reset_sym_origin();
                 }
                 if ui
                     .add_sized([btn_w, 22.0], egui::Button::new("Clear paint layer"))

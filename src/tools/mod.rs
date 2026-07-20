@@ -32,6 +32,8 @@ pub enum ToolKind {
     BucketFill,
     /// Smudge / smear Image pixels.
     Smudge,
+    /// Select region on an Image (rect / lasso / magnetic / color) for paint mask.
+    RasterSelect,
     Eyedropper,
 }
 
@@ -54,6 +56,7 @@ impl ToolKind {
             Self::Eraser => "Eraser",
             Self::BucketFill => "Fill",
             Self::Smudge => "Smudge",
+            Self::RasterSelect => "Raster Select",
             Self::Eyedropper => "Eyedropper",
         }
     }
@@ -72,11 +75,12 @@ impl ToolKind {
             Self::Arc => Some(Key::A),
             Self::Plotter => Some(Key::M),
             Self::Brush => Some(Key::B),
-            // E = Ellipse already; use K (paint) / X eraser / F fill / U smudge.
+            // E = Ellipse already; use K (paint) / X eraser / F fill / U smudge / W raster select.
             Self::RasterBrush => Some(Key::K),
             Self::Eraser => Some(Key::X),
             Self::BucketFill => Some(Key::F),
             Self::Smudge => Some(Key::U),
+            Self::RasterSelect => Some(Key::W),
             Self::Eyedropper => Some(Key::I),
         }
     }
@@ -400,6 +404,94 @@ pub struct SelectSession {
     pub effect_drag_doc_before: Option<crate::document::Document>,
 }
 
+/// How the user is currently drawing a sticky paint mask on the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaintMaskTool {
+    #[default]
+    Off,
+    /// Drag a rectangle → sticky AABB mask.
+    Rect,
+    /// Freehand lasso → sticky polygon mask.
+    Lasso,
+}
+
+/// Sub-mode of [`ToolKind::RasterSelect`] (only when an Image is selected).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RasterSelectMode {
+    #[default]
+    Rect,
+    Lasso,
+    /// Grow from click by color similarity (edge-ish region).
+    Magnetic,
+    /// Select all similar colors (optionally with glow expand).
+    Eyedrop,
+}
+
+#[derive(Debug, Clone)]
+pub struct RasterSelectSession {
+    pub mode: RasterSelectMode,
+    /// Union new selection into existing paint mask (default on).
+    pub union_mask: bool,
+    /// Eyedrop: expand selection by glow radius (doc units / soft expand in px).
+    pub glow_select: bool,
+    /// Glow expand radius in document units (when glow_select).
+    pub glow_radius: f32,
+    /// Magnetic / eyedrop color tolerance 0..128.
+    pub tolerance: u8,
+    /// In-progress rect drag.
+    pub rect_origin: Option<(f64, f64)>,
+    pub drag_current: Option<(f64, f64)>,
+    /// In-progress lasso.
+    pub lasso_pts: Vec<(f64, f64)>,
+}
+
+impl Default for RasterSelectSession {
+    fn default() -> Self {
+        Self {
+            mode: RasterSelectMode::Rect,
+            union_mask: true,
+            glow_select: false,
+            glow_radius: 8.0,
+            tolerance: 28,
+            rect_origin: None,
+            drag_current: None,
+            lasso_pts: Vec::new(),
+        }
+    }
+}
+
+/// Pixel-accurate paint mask (image pixel space) for eyedrop/magnetic select.
+/// Avoids AABB holes: only flood-filled pixels are selected, not the bounding box interior.
+#[derive(Debug, Clone)]
+pub struct StickyPixelMask {
+    pub node_id: crate::document::NodeId,
+    pub width: u32,
+    pub height: u32,
+    /// 0 = outside mask, nonzero = selected. Length = width * height.
+    pub mask: Vec<u8>,
+}
+
+impl StickyPixelMask {
+    pub fn contains(&self, px: i32, py: i32) -> bool {
+        if px < 0 || py < 0 || px >= self.width as i32 || py >= self.height as i32 {
+            return false;
+        }
+        self.mask[py as usize * self.width as usize + px as usize] != 0
+    }
+
+    pub fn or_with(&mut self, other: &StickyPixelMask) {
+        if self.width != other.width || self.height != other.height {
+            *self = other.clone();
+            return;
+        }
+        for (a, b) in self.mask.iter_mut().zip(other.mask.iter()) {
+            if *b != 0 {
+                *a = 255;
+            }
+        }
+    }
+}
+
 /// Raster paint / eraser session (targets `NodeKind::Image` pixels).
 #[derive(Debug, Clone)]
 pub struct RasterSession {
@@ -435,8 +527,22 @@ pub struct RasterSession {
     pub sym_dragging_origin: bool,
     /// Selected brush preset index into [`RasterBrushPreset::ALL`] (for combo UI).
     pub preset_idx: usize,
-    /// Sticky paint mask in **document** space (x0,y0,x1,y1). Survives selection change.
+    /// Sticky paint mask AABB in **document** space (x0,y0,x1,y1).
     pub sticky_mask_doc: Option<(f64, f64, f64, f64)>,
+    /// Sticky freehand mask polygon in **document** space (closed on finish).
+    pub sticky_mask_poly: Option<Vec<(f64, f64)>>,
+    /// Extra polygon components for union mask (lasso pieces).
+    pub sticky_mask_polys: Vec<Vec<(f64, f64)>>,
+    /// Pixel-accurate mask from eyedrop/magnetic (exact flood region, no hole fill).
+    pub sticky_pixel_mask: Option<StickyPixelMask>,
+    /// Active mask drawing tool (rect / lasso) — next canvas drag defines mask.
+    pub mask_tool: PaintMaskTool,
+    /// In-progress rect mask drag origin (doc).
+    pub mask_rect_origin: Option<(f64, f64)>,
+    /// In-progress rect/lasso current point.
+    pub mask_drag_current: Option<(f64, f64)>,
+    /// In-progress lasso polyline (doc).
+    pub mask_lasso_pts: Vec<(f64, f64)>,
     /// Active paint target (Image node).
     pub target: Option<crate::document::NodeId>,
     /// Snapshot of Image.bytes before the stroke (undo).
@@ -485,6 +591,13 @@ impl Default for RasterSession {
             sym_dragging_origin: false,
             preset_idx: 0,
             sticky_mask_doc: None,
+            sticky_mask_poly: None,
+            sticky_mask_polys: Vec::new(),
+            sticky_pixel_mask: None,
+            mask_tool: PaintMaskTool::Off,
+            mask_rect_origin: None,
+            mask_drag_current: None,
+            mask_lasso_pts: Vec::new(),
             target: None,
             before_bytes: None,
             before_w: 0.0,
@@ -590,6 +703,7 @@ pub struct ToolState {
     pub select: SelectSession,
     pub brush: BrushSession,
     pub raster: RasterSession,
+    pub raster_select: RasterSelectSession,
     /// Path weight-flow sculpt (Geometry tab; Select/Node + path only).
     pub weight_flow: WeightFlowBrush,
     pub space_pan: bool,
@@ -681,6 +795,7 @@ impl ToolState {
                 ToolKind::Eraser,
                 ToolKind::BucketFill,
                 ToolKind::Smudge,
+                ToolKind::RasterSelect,
                 ToolKind::Eyedropper,
             ]
         };
