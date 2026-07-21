@@ -162,6 +162,10 @@ pub struct BrushSession {
     pub pixel_cells: u32,
     /// Ctrl+drag line: document point at press (line origin).
     pub pixel_line_anchor: Option<(f64, f64)>,
+    /// Last pointer position in doc space for freehand/erase chaining.
+    /// Must be the cursor, not the stamp center — multi-cell stamps have centers
+    /// offset into a different cell and would drift southeast while held still.
+    pub pixel_last_doc: Option<(f64, f64)>,
     /// Shift+erase: node snapshots before this erase stroke (one undo on release).
     pub pixel_erase_before: Vec<(crate::document::NodeId, crate::document::Node)>,
 }
@@ -202,6 +206,7 @@ impl Default for BrushSession {
             calli_dynamic: false,
             pixel_cells: 1,
             pixel_line_anchor: None,
+            pixel_last_doc: None,
             pixel_erase_before: Vec::new(),
         }
     }
@@ -489,6 +494,16 @@ impl StickyPixelMask {
                 *a = 255;
             }
         }
+    }
+
+    pub fn invert(&mut self) {
+        for v in &mut self.mask {
+            *v = if *v == 0 { 255 } else { 0 };
+        }
+    }
+
+    pub fn count_on(&self) -> usize {
+        self.mask.iter().filter(|&&v| v != 0).count()
     }
 }
 
@@ -975,4 +990,55 @@ pub fn node_bounds_intersects_marquee(node: &Node, marquee: kurbo::Rect) -> bool
     let b = node.bounds();
     let hit = b.intersect(marquee);
     hit.width() > 1e-6 && hit.height() > 1e-6
+}
+
+#[cfg(test)]
+mod pixel_brush_tests {
+    use super::*;
+
+    #[test]
+    fn hold_still_does_not_spawn_extra_stamps() {
+        let gx = 10.0;
+        let gy = 10.0;
+        let doc = (15.0, 15.0); // cell (1,1)
+        // Same from/to (pointer held still) must yield exactly one stamp, any size.
+        for cells in [1u32, 2, 3, 8] {
+            let stamps = pixel_stamps_along(doc, doc, gx, gy, cells);
+            assert_eq!(
+                stamps.len(),
+                1,
+                "cells={cells}: hold-still must not grow the stroke"
+            );
+            let expected = pixel_stamp_at(doc, gx, gy, cells);
+            assert!(
+                (stamps[0].0 - expected.0).abs() < 1e-9
+                    && (stamps[0].1 - expected.1).abs() < 1e-9,
+                "cells={cells}: stamp must match cursor cell"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_cell_stamp_center_is_not_same_cell_as_pointer() {
+        // Documents the bug class: chaining freehand from stamp center would leave
+        // the "from" cell SE of the pointer for size ≥ 2.
+        let gx = 10.0;
+        let gy = 10.0;
+        let doc = (5.0, 5.0); // cell (0,0)
+        let (cx, cy, _, _) = pixel_stamp_at(doc, gx, gy, 2);
+        let ptr_cell = pixel_cell_index(doc, gx, gy);
+        let center_cell = pixel_cell_index((cx, cy), gx, gy);
+        assert_eq!(ptr_cell, (0, 0));
+        assert_ne!(
+            center_cell, ptr_cell,
+            "size-2 stamp center must not be treated as freehand prev pointer"
+        );
+        // Simulating the old bug: from center → to pointer while "held" would
+        // cross into a new stamp cell.
+        let drift = pixel_stamps_along((cx, cy), doc, gx, gy, 2);
+        assert!(
+            drift.len() > 1,
+            "old chain from center would add extra stamps (regression probe)"
+        );
+    }
 }

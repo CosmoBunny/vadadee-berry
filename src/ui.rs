@@ -7079,12 +7079,63 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 }
             }
             ui.add_space(4.0);
-            let btn_w = (panel_w - 4.0).max(80.0);
-            if ui
-                .add_sized([btn_w, 22.0], egui::Button::new("Clear paint mask"))
-                .clicked()
+            // Use columns so row widths never exceed the dock (horizontal + fractions overflowed).
+            ui.columns(2, |cols| {
+                if cols[0]
+                    .add_sized([cols[0].available_width(), 22.0], egui::Button::new("Select all"))
+                    .clicked()
+                {
+                    app.raster_select_all_image(cols[0].ctx());
+                }
+                if cols[1]
+                    .add_sized([cols[1].available_width(), 22.0], egui::Button::new("Deselect"))
+                    .clicked()
+                {
+                    app.raster_clear_sticky_mask();
+                }
+            });
+            ui.columns(3, |cols| {
+                if cols[0]
+                    .add_sized([cols[0].available_width(), 22.0], egui::Button::new("Invert"))
+                    .on_hover_text("Invert mask (holes ↔ selection)")
+                    .clicked()
+                {
+                    app.raster_invert_mask(cols[0].ctx());
+                }
+                if cols[1]
+                    .add_sized([cols[1].available_width(), 22.0], egui::Button::new("Grow"))
+                    .on_hover_text("Expand pixel mask by 2px")
+                    .clicked()
+                {
+                    app.raster_grow_mask(2);
+                }
+                if cols[2]
+                    .add_sized([cols[2].available_width(), 22.0], egui::Button::new("Shrink"))
+                    .on_hover_text("Contract pixel mask by 2px")
+                    .clicked()
+                {
+                    app.raster_shrink_mask(2);
+                }
+            });
+            if let Some(pm) = app.tools.raster.sticky_pixel_mask.as_ref() {
+                ui.label(
+                    RichText::new(format!(
+                        "Mask: {} px ({}×{})",
+                        pm.count_on(),
+                        pm.width,
+                        pm.height
+                    ))
+                    .small()
+                    .color(colors::TEXT_MUTED),
+                );
+            } else if app.tools.raster.sticky_mask_doc.is_some()
+                || app.tools.raster.sticky_mask_poly.is_some()
             {
-                app.raster_clear_sticky_mask();
+                ui.label(
+                    RichText::new("Mask: geometric (rect/lasso)")
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
             }
             ui.label(
                 RichText::new(match app.tools.raster_select.mode {

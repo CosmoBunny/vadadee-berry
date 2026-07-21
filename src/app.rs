@@ -7776,6 +7776,174 @@ impl VadadeeBerryApp {
         self.status_message = "Paint mask cleared".into();
     }
 
+    /// Invert pixel mask (or full image if only geometric mask — builds pixel mask first).
+    pub fn raster_invert_mask(&mut self, ctx: &Context) {
+        if let Some(pm) = self.tools.raster.sticky_pixel_mask.as_mut() {
+            pm.invert();
+            self.status_message = format!("Mask inverted ({} px)", pm.count_on());
+            return;
+        }
+        // No pixel mask: invert rect/poly by rasterizing against image if selected.
+        let Some(id) = self.selection.first().copied().filter(|&id| {
+            self.project
+                .nodes
+                .get(id)
+                .map_or(false, |n| matches!(n.kind, NodeKind::Image { .. }))
+        }) else {
+            self.status_message = "Select an Image to invert mask".into();
+            return;
+        };
+        let snap = self.project.nodes.get(id).and_then(|node| {
+            if let NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                bytes,
+                ..
+            } = &node.kind
+            {
+                Some((
+                    *x,
+                    *y,
+                    *width,
+                    *height,
+                    node.transform.rotation_rad,
+                    bytes.clone(),
+                ))
+            } else {
+                None
+            }
+        });
+        let Some((ix, iy, iw, ih, rot, bytes)) = snap else {
+            return;
+        };
+        self.ensure_image_texture(id, &bytes, ctx);
+        let Some(ci) = self.image_pixel_cache.get(&id) else {
+            self.status_message = "No image pixels to invert".into();
+            return;
+        };
+        let pw = ci.size[0] as u32;
+        let ph = ci.size[1] as u32;
+        let mut mask = vec![0u8; (pw * ph) as usize];
+        // Rasterize current geometric mask into bitmap, then invert.
+        let polys = self.raster_poly_masks_px(ix, iy, iw, ih, rot, pw, ph);
+        let rect = self.tools.raster.sticky_mask_doc.and_then(|(x0, y0, x1, y1)| {
+            self.doc_aabb_to_image_clip(ix, iy, iw, ih, rot, pw, ph, x0, y0, x1, y1)
+        });
+        let has_geo = rect.is_some() || !polys.is_empty();
+        if !has_geo {
+            // Invert empty → select all
+            mask.fill(255);
+        } else {
+            for yy in 0..ph as i32 {
+                for xx in 0..pw as i32 {
+                    let px = xx as f64 + 0.5;
+                    let py = yy as f64 + 0.5;
+                    let in_rect = rect.is_some_and(|(x0, y0, x1, y1)| {
+                        px >= x0 as f64 && px < x1 as f64 && py >= y0 as f64 && py < y1 as f64
+                    });
+                    let in_poly = polys
+                        .iter()
+                        .any(|p| crate::raster::point_in_polygon(px, py, p));
+                    let on = if rect.is_some() && !polys.is_empty() {
+                        in_rect || in_poly
+                    } else if !polys.is_empty() {
+                        in_poly
+                    } else {
+                        in_rect
+                    };
+                    if on {
+                        mask[yy as usize * pw as usize + xx as usize] = 255;
+                    }
+                }
+            }
+            for v in &mut mask {
+                *v = if *v == 0 { 255 } else { 0 };
+            }
+        }
+        self.tools.raster.sticky_pixel_mask = Some(crate::tools::StickyPixelMask {
+            node_id: id,
+            width: pw,
+            height: ph,
+            mask,
+        });
+        // Clear geometric so pixel mask is the source of truth after invert.
+        self.tools.raster.sticky_mask_doc = None;
+        self.tools.raster.sticky_mask_poly = None;
+        self.tools.raster.sticky_mask_polys.clear();
+        let n = self
+            .tools
+            .raster
+            .sticky_pixel_mask
+            .as_ref()
+            .map(|m| m.count_on())
+            .unwrap_or(0);
+        self.status_message = format!("Mask inverted ({n} px)");
+    }
+
+    pub fn raster_grow_mask(&mut self, px: i32) {
+        let Some(pm) = self.tools.raster.sticky_pixel_mask.as_mut() else {
+            self.status_message = "Grow needs a pixel mask (use Eyedrop/Magnetic first)".into();
+            return;
+        };
+        let r = px.clamp(1, 16);
+        crate::raster::dilate_mask(&mut pm.mask, pm.width, pm.height, r);
+        self.status_message = format!("Mask grown +{r}px ({} px)", pm.count_on());
+    }
+
+    pub fn raster_shrink_mask(&mut self, px: i32) {
+        let Some(pm) = self.tools.raster.sticky_pixel_mask.as_mut() else {
+            self.status_message = "Shrink needs a pixel mask (use Eyedrop/Magnetic first)".into();
+            return;
+        };
+        let r = px.clamp(1, 16);
+        // Shrink = invert, dilate, invert
+        pm.invert();
+        crate::raster::dilate_mask(&mut pm.mask, pm.width, pm.height, r);
+        pm.invert();
+        self.status_message = format!("Mask shrunk −{r}px ({} px)", pm.count_on());
+    }
+
+    pub fn raster_select_all_image(&mut self, ctx: &Context) {
+        let Some(id) = self.selection.first().copied().filter(|&id| {
+            self.project
+                .nodes
+                .get(id)
+                .map_or(false, |n| matches!(n.kind, NodeKind::Image { .. }))
+        }) else {
+            self.status_message = "Select an Image first".into();
+            return;
+        };
+        let bytes = self.project.nodes.get(id).and_then(|n| {
+            if let NodeKind::Image { bytes, .. } = &n.kind {
+                Some(bytes.clone())
+            } else {
+                None
+            }
+        });
+        let Some(bytes) = bytes else {
+            return;
+        };
+        self.ensure_image_texture(id, &bytes, ctx);
+        let Some(ci) = self.image_pixel_cache.get(&id) else {
+            return;
+        };
+        let pw = ci.size[0] as u32;
+        let ph = ci.size[1] as u32;
+        let mask = vec![255u8; (pw * ph) as usize];
+        self.tools.raster.sticky_pixel_mask = Some(crate::tools::StickyPixelMask {
+            node_id: id,
+            width: pw,
+            height: ph,
+            mask,
+        });
+        self.tools.raster.sticky_mask_doc = None;
+        self.tools.raster.sticky_mask_poly = None;
+        self.tools.raster.sticky_mask_polys.clear();
+        self.status_message = format!("Selected all ({}×{})", pw, ph);
+    }
+
     fn raster_apply_rect_mask(&mut self, a: (f64, f64), b: (f64, f64), union: bool) {
         let x0 = a.0.min(b.0);
         let y0 = a.1.min(b.1);
@@ -10991,6 +11159,7 @@ fn run_video_decode_thread(
 
         if response.ctx.input(|i| i.multi_touch().is_some()) {
             self.tools.brush.points.clear();
+            self.tools.brush.pixel_last_doc = None;
             return;
         }
         if let Some(editor_rect) = self.text_editor_rect {
@@ -17073,6 +17242,7 @@ fn run_video_decode_thread(
         if pressed {
             self.tools.brush.points.clear();
             self.tools.brush.pixel_line_anchor = None;
+            self.tools.brush.pixel_last_doc = None;
             self.tools.brush.pixel_erase_before.clear();
             if erase {
                 // Snapshot nodes we may patch for one undo on release.
@@ -17086,6 +17256,7 @@ fn run_video_decode_thread(
                     self.tools.brush.pixel_cells,
                 );
                 self.tools.brush.points.push(([cx, cy], time, w as f32));
+                self.tools.brush.pixel_last_doc = Some(doc);
                 if line_mode {
                     self.tools.brush.pixel_line_anchor = Some(doc);
                 }
@@ -17123,16 +17294,12 @@ fn run_video_decode_thread(
                 }
             } else if pixel {
                 // Freehand: fill every cell along the segment (no gaps when moving fast).
+                // Chain from last *pointer* position, not stamp center — multi-cell
+                // stamps sit offset SE of the cursor and would crawl diagonally on hold.
                 let gx = self.viewport.step_x();
                 let gy = self.viewport.step_y();
                 let cells = self.tools.brush.pixel_cells;
-                let prev_doc = self
-                    .tools
-                    .brush
-                    .points
-                    .last()
-                    .map(|&(p, _, _)| (p[0], p[1]))
-                    .unwrap_or(doc);
+                let prev_doc = self.tools.brush.pixel_last_doc.unwrap_or(doc);
                 let stamps =
                     crate::tools::pixel_stamps_along(prev_doc, doc, gx, gy, cells);
                 for (cx, cy, w, _h) in stamps {
@@ -17143,6 +17310,7 @@ fn run_video_decode_thread(
                         self.tools.brush.points.push(([cx, cy], time, w as f32));
                     }
                 }
+                self.tools.brush.pixel_last_doc = Some(doc);
             } else if let Some(&(prev_pos, prev_time, prev_w)) = self.tools.brush.points.last() {
                 let size = self.tools.brush.size;
                 let heavy = self.tools.brush.heavy;
@@ -17240,6 +17408,7 @@ fn run_video_decode_thread(
                 self.pixel_erase_commit();
                 self.tools.brush.points.clear();
                 self.tools.brush.pixel_line_anchor = None;
+                self.tools.brush.pixel_last_doc = None;
                 return;
             }
 
@@ -17311,6 +17480,7 @@ fn run_video_decode_thread(
             }
             self.tools.brush.points.clear();
             self.tools.brush.pixel_line_anchor = None;
+            self.tools.brush.pixel_last_doc = None;
         }
     }
 
@@ -17340,12 +17510,14 @@ fn run_video_decode_thread(
         let gx = self.viewport.step_x();
         let gy = self.viewport.step_y();
         let cells = self.tools.brush.pixel_cells;
-        let stamps = if let Some(&(p, _, _)) = self.tools.brush.points.last() {
-            crate::tools::pixel_stamps_along((p[0], p[1]), doc, gx, gy, cells)
+        // Chain from last pointer, not stamp center (same hold-still SE drift bug).
+        let stamps = if let Some(prev) = self.tools.brush.pixel_last_doc {
+            crate::tools::pixel_stamps_along(prev, doc, gx, gy, cells)
         } else {
             let (cx, cy, w, h) = crate::tools::pixel_stamp_at(doc, gx, gy, cells);
             vec![(cx, cy, w, h)]
         };
+        self.tools.brush.pixel_last_doc = Some(doc);
         // Track for red erase preview.
         for (cx, cy, w, _h) in &stamps {
             let dup = self.tools.brush.points.iter().any(|&(p, _, _)| {
