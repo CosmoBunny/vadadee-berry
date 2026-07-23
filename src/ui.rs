@@ -1,4 +1,4 @@
-use egui::{scroll_area::ScrollBarVisibility, Context, FontFamily, FontId, Rect, RichText, ScrollArea, Ui};
+use egui::{scroll_area::ScrollBarVisibility, Context, Rect, RichText, ScrollArea, Ui};
 
 use crate::animation::action_bar_overlay_rect;
 use crate::app::{AudioExtractStatus, KeyframeTrack, VadadeeBerryApp};
@@ -8623,9 +8623,12 @@ pub fn show_on_page_text_editor(
 
     let ctx = ui.ctx().clone();
     app.fonts.ensure_loaded(&ctx, &font_family);
-    let font = FontId::new(
+    // Never use unbound FontFamily::Name — epaint panics. Falls back for 1 frame
+    // while set_fonts rebuilds (e.g. double-click into Nerd Font text).
+    let font = crate::fonts::FontRegistry::font_id(
+        &ctx,
+        &font_family,
         (font_size * app.viewport.zoom).max(8.0),
-        FontFamily::Name(font_family.as_str().into()),
     );
 
     let mut focus_resp = None;

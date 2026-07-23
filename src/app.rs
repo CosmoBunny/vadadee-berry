@@ -9836,8 +9836,16 @@ fn run_video_decode_thread(
             let ctx = ui.ctx().clone();
             for id in &order {
                 if let Some(node) = self.project.nodes.get(*id) {
-                    if let NodeKind::Text { style, .. } = &node.kind {
-                        self.fonts.ensure_loaded(&ctx, &style.font_family);
+                    match &node.kind {
+                        NodeKind::Text { style, .. } => {
+                            self.fonts.ensure_loaded(&ctx, &style.font_family);
+                        }
+                        NodeKind::FlowchartNode {
+                            label_font_family, ..
+                        } => {
+                            self.fonts.ensure_loaded(&ctx, label_font_family);
+                        }
+                        _ => {}
                     }
                 }
             }

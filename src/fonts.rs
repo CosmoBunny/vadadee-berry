@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
-use egui::{Context, FontData, FontFamily};
+use egui::{Context, FontData, FontDefinitions, FontFamily, FontId};
 use fontdb::{Database, Family, Query};
 
 use crate::icons;
@@ -12,6 +12,10 @@ pub struct FontRegistry {
     families: Vec<String>,
     loaded: HashSet<String>,
     db: Database,
+    /// Accumulates font definitions across multiple `ensure_loaded` calls in the same
+    /// frame. egui applies `set_fonts` asynchronously; cloning *active* defs between
+    /// successive loads would drop earlier families and leave `FontFamily::Name` unbound.
+    staged: Option<FontDefinitions>,
 }
 
 impl FontRegistry {
@@ -31,6 +35,7 @@ impl FontRegistry {
             families,
             loaded: HashSet::new(),
             db,
+            staged: None,
         }
     }
 
@@ -48,6 +53,7 @@ impl FontRegistry {
     }
 
     pub fn query_face_bytes(&self, family: &str, bold: bool, italic: bool) -> Option<Vec<u8>> {
+        let family = sanitize_svg_font_family(family);
         let weight = if bold {
             fontdb::Weight::BOLD
         } else {
@@ -59,7 +65,7 @@ impl FontRegistry {
             fontdb::Style::Normal
         };
         let query = Query {
-            families: &[Family::Name(family)],
+            families: &[Family::Name(&family)],
             weight,
             stretch: fontdb::Stretch::Normal,
             style,
@@ -69,38 +75,119 @@ impl FontRegistry {
             .with_face_data(id, |data, _| data.to_vec())
     }
 
+    fn family_bound_in(defs: &FontDefinitions, fam: &FontFamily) -> bool {
+        defs.families
+            .get(fam)
+            .map(|list| !list.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn family_bound_active(ctx: &Context, fam: &FontFamily) -> bool {
+        ctx.fonts(|f| Self::family_bound_in(f.definitions(), fam))
+    }
+
+    /// Ensure `family` is registered with egui so `FontFamily::Name` never panics.
+    /// Safe to call every frame; merges multiple loads in one frame without clobbering.
     pub fn ensure_loaded(&mut self, ctx: &Context, family: &str) {
-        if self.loaded.contains(family) {
+        let key = sanitize_svg_font_family(family);
+        if key.is_empty() {
             return;
         }
+        let fam = FontFamily::Name(key.as_str().into());
+
+        // Fully applied in the active font atlas.
+        if Self::family_bound_active(ctx, &fam) {
+            self.loaded.insert(key);
+            // Staged is obsolete once active has the family; drop to pick up fresh base later.
+            if let Some(staged) = self.staged.as_ref() {
+                if Self::family_bound_in(staged, &fam) {
+                    // Keep staged until all pending families apply — only clear when
+                    // every staged Name family is also active (cheap: clear if active
+                    // definitions equal-or-superset for our tracked keys).
+                }
+            }
+            return;
+        }
+
+        // Merge into same-frame staged defs (never re-clone active mid-batch).
+        let mut defs = self
+            .staged
+            .take()
+            .unwrap_or_else(|| ctx.fonts(|f| f.definitions().clone()));
+
+        if Self::family_bound_in(&defs, &fam) {
+            // Already staged this frame but not active yet — re-apply and wait.
+            ctx.set_fonts(defs.clone());
+            self.staged = Some(defs);
+            self.loaded.insert(key);
+            ctx.request_repaint();
+            return;
+        }
+
         let query = Query {
-            families: &[Family::Name(family)],
+            families: &[Family::Name(key.as_str())],
             weight: fontdb::Weight::NORMAL,
             stretch: fontdb::Stretch::Normal,
             style: fontdb::Style::Normal,
         };
-        
-        let key = family.to_string();
-        let mut defs = ctx.fonts(|f| f.definitions().clone());
-        
+
         if let Some(id) = self.db.query(&query) {
             if let Some(bytes) = self.db.with_face_data(id, |data, _| data.to_vec()) {
-                defs.font_data.insert(key.clone(), FontData::from_owned(bytes).into());
-                defs.families
-                    .entry(FontFamily::Name(key.clone().into()))
-                    .or_default()
-                    .push(key.clone());
-                ctx.set_fonts(defs);
+                let data_key = key.clone();
+                defs.font_data
+                    .insert(data_key.clone(), FontData::from_owned(bytes).into());
+                defs.families.entry(fam.clone()).or_default().push(data_key);
+                ctx.set_fonts(defs.clone());
+                self.staged = Some(defs);
                 self.loaded.insert(key);
+                ctx.request_repaint();
                 return;
             }
         }
-        
-        // Fallback: Bind the font family name to egui's default proportional fonts list so it never crashes.
-        let fallback_fonts = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-        defs.families.insert(FontFamily::Name(key.clone().into()), fallback_fonts);
-        ctx.set_fonts(defs);
+
+        // Fallback: bind name to proportional stack so layout never panics.
+        let fallback_fonts = defs
+            .families
+            .get(&FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default();
+        if fallback_fonts.is_empty() {
+            // Absolute last resort — still bind something non-empty if possible.
+            if let Some((name, _)) = defs.font_data.iter().next() {
+                defs.families
+                    .insert(fam, vec![name.clone()]);
+            } else {
+                // Leave unbound only if there is literally no font data; callers use
+                // `resolved_family` which falls back to Proportional.
+                self.staged = Some(defs);
+                return;
+            }
+        } else {
+            defs.families.insert(fam, fallback_fonts);
+        }
+        ctx.set_fonts(defs.clone());
+        self.staged = Some(defs);
         self.loaded.insert(key);
+        ctx.request_repaint();
+    }
+
+    /// `FontFamily` safe for immediate egui layout. Uses `Name` only when active;
+    /// otherwise Proportional (one frame after ensure_loaded until fonts rebuild).
+    pub fn resolved_family(ctx: &Context, family: &str) -> FontFamily {
+        let key = sanitize_svg_font_family(family);
+        if key.is_empty() {
+            return FontFamily::Proportional;
+        }
+        let fam = FontFamily::Name(key.as_str().into());
+        if Self::family_bound_active(ctx, &fam) {
+            fam
+        } else {
+            FontFamily::Proportional
+        }
+    }
+
+    pub fn font_id(ctx: &Context, family: &str, size: f32) -> FontId {
+        FontId::new(size.max(1.0), Self::resolved_family(ctx, family))
     }
 }
 
@@ -131,6 +218,11 @@ fn register_nerd_font_aliases(db: &mut Database) {
         icons::FONT_NAME,
         "DaddyTimeMono Nerd Font",
         "DaddyTimeMonoNerdFont",
+        // Common system Nerd Font family names (canvas text may reference these)
+        "CaskaydiaCove Nerd Font",
+        "CaskaydiaCove NF",
+        "Cascadia Code",
+        "Cascadia Mono",
     ];
 
     for alias in ALIASES {
@@ -164,4 +256,17 @@ pub fn usvg_options() -> usvg::Options<'static> {
     opt.fontdb = USVG_FONTDB.get_or_init(build_usvg_fontdb).clone();
     opt.font_family = DEFAULT_FONT.to_string();
     opt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_quotes() {
+        assert_eq!(
+            sanitize_svg_font_family("  \"CaskaydiaCove Nerd Font\"  "),
+            "CaskaydiaCove Nerd Font"
+        );
+    }
 }

@@ -2121,8 +2121,11 @@ pub fn draw_node(
             {
                 if !label.is_empty() {
                     let size = (*label_font_size as f32 * viewport.zoom).max(6.0);
-                    let family = egui::FontFamily::Name(label_font_family.as_str().into());
-                    let font_id = egui::FontId::new(size, family);
+                    let font_id = crate::fonts::FontRegistry::font_id(
+                        painter.ctx(),
+                        label_font_family,
+                        size,
+                    );
                     let align2 = match label_align {
                         crate::document::TextAlign::Left => egui::Align2::LEFT_CENTER,
                         crate::document::TextAlign::Center => egui::Align2::CENTER_CENTER,
@@ -4196,12 +4199,10 @@ pub fn draw_pen_preview(
     }
 }
 
-fn text_font_id(style: &TextStyle, zoom: f32) -> FontId {
+fn text_font_id(style: &TextStyle, zoom: f32, ctx: &egui::Context) -> FontId {
     let size = (style.font_size * zoom).max(6.0);
-    FontId::new(
-        size,
-        FontFamily::Name(style.font_family.as_str().into()),
-    )
+    // Safe even if ensure_loaded has not yet applied this frame.
+    crate::fonts::FontRegistry::font_id(ctx, &style.font_family, size)
 }
 
 /// Paint a textured rect, rotating vertices about `rect.center()` (document/export pivot).
@@ -4300,7 +4301,7 @@ fn draw_text_node(
     }
     let pos = viewport.doc_to_screen((x, y), origin);
     let fill_color = sample_fill_at(fill, opacity, 0.5, 0.5);
-    let font_id = text_font_id(style, viewport.zoom);
+    let font_id = text_font_id(style, viewport.zoom, painter.ctx());
     let layout_text = style.layout_lines().join("\n");
     let wrap_px = style
         .wrap_width()
