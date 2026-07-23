@@ -391,6 +391,9 @@ pub struct VadadeeBerryApp {
     pub export_image_format: io::ExportImageFormat,
     /// When true, raster export uses selection bounds; otherwise full document.
     pub export_image_selection_only: bool,
+    /// Target DPI for raster export / PNG clipboard (document uses 96 CSS px/in).
+    /// scale = dpi / 96. Higher DPI matches zoomed preview sharpness.
+    pub export_dpi: f32,
     pub eyedropper_holding: bool,
     pub eyedropper_releasing: bool,
     pub eyedropper_t: f32,
@@ -1069,6 +1072,7 @@ impl VadadeeBerryApp {
             pending_export_image: false,
             export_image_format: io::ExportImageFormat::Png,
             export_image_selection_only: false,
+            export_dpi: 96.0,
             eyedropper_holding: false,
             eyedropper_releasing: false,
             eyedropper_t: 0.0,
@@ -3709,12 +3713,22 @@ impl VadadeeBerryApp {
         let Some(bounds) = bounds else {
             return Err("Could not compute object bounds".into());
         };
+        // Pad strokes like clipboard/export so thin outlines are not clipped.
+        let mut pad = 0.5_f64;
+        for id in node_ids {
+            if let Some(node) = self.project.nodes.get(*id) {
+                if node.style.stroke.style.is_visible() && node.style.stroke.width > 0.0 {
+                    pad = pad.max(node.style.stroke.width as f64 * 0.5 + 0.5);
+                }
+            }
+        }
+        let bounds = bounds.inflate(pad, pad);
         crate::io::export_selection_raster(
             &self.project,
             node_ids,
             bounds,
             crate::io::ExportImageFormat::Png,
-            1.0,
+            self.export_raster_scale(),
             out_path,
         )
         .map_err(|e| format!("Rasterize object failed: {e}"))
@@ -4206,6 +4220,35 @@ impl VadadeeBerryApp {
         union_rect
     }
 
+    /// Selection bounds expanded by half stroke width so raster export/clipboard
+    /// does not clip strokes (geometry bounds alone omit stroke extent).
+    pub fn selection_bounds_for_raster(&self) -> Option<kurbo::Rect> {
+        let mut r = self.selection_bounds()?;
+        let mut pad = 0.5_f64; // subpixel AA fringe
+        for id in &self.selection {
+            let Some(node) = self.project.nodes.get(*id) else {
+                continue;
+            };
+            if node.style.stroke.style.is_visible() && node.style.stroke.width > 0.0 {
+                pad = pad.max(node.style.stroke.width as f64 * 0.5 + 0.5);
+            }
+        }
+        r = r.inflate(pad, pad);
+        // Degenerate thin selection: ensure non-zero export viewBox.
+        if r.width() < 1e-3 {
+            r = kurbo::Rect::new(r.x0 - 0.5, r.y0, r.x1 + 0.5, r.y1);
+        }
+        if r.height() < 1e-3 {
+            r = kurbo::Rect::new(r.x0, r.y0 - 0.5, r.x1, r.y1 + 0.5);
+        }
+        Some(r)
+    }
+
+    /// Raster scale relative to document (96 CSS px = 1 inch).
+    pub fn export_raster_scale(&self) -> f32 {
+        (self.export_dpi / 96.0).clamp(0.25, 16.0)
+    }
+
     pub fn resize_to_selection(&mut self) {
         let Some(bounds) = self.selection_bounds() else {
             return;
@@ -4241,7 +4284,7 @@ impl VadadeeBerryApp {
     }
 
     pub fn copy_selection_as_png(&mut self, dpi_scale: f32) {
-        let Some(bounds) = self.selection_bounds() else {
+        let Some(bounds) = self.selection_bounds_for_raster() else {
             self.status_message = "Copy PNG failed: no object selected".into();
             return;
         };
@@ -4252,7 +4295,7 @@ impl VadadeeBerryApp {
             self.status_message = "Copy PNG failed: rasterization error".into();
             return;
         };
-        
+
         // 3. Set image to system clipboard
         #[cfg(not(target_os = "android"))]
         {
@@ -4266,7 +4309,13 @@ impl VadadeeBerryApp {
                     if let Err(e) = cb.set_image(img) {
                         self.status_message = format!("Clipboard copy failed: {e}");
                     } else {
-                        self.status_message = format!("Copied selection as PNG ({}x{}) to clipboard", w, h);
+                        self.status_message = format!(
+                            "Copied selection PNG {}×{} @ {:.0} DPI (scale {:.2}×)",
+                            w,
+                            h,
+                            self.export_dpi,
+                            dpi_scale
+                        );
                     }
                 }
                 Err(e) => {
@@ -5349,9 +5398,10 @@ impl VadadeeBerryApp {
                 self.pending_export_image = false;
                 let fmt = self.export_image_format;
                 let ext = fmt.extension();
-                let scale = 1.0f32;
+                let scale = self.export_raster_scale();
+                let dpi = self.export_dpi;
                 if self.export_image_selection_only {
-                    let Some(bounds) = self.selection_bounds() else {
+                    let Some(bounds) = self.selection_bounds_for_raster() else {
                         self.status_message = "Export image: nothing selected".into();
                         return;
                     };
@@ -5368,7 +5418,14 @@ impl VadadeeBerryApp {
                             scale,
                             &path,
                         ) {
-                            Ok(()) => self.status_message = format!("Exported {}", path.display()),
+                            Ok(()) => {
+                                self.status_message = format!(
+                                    "Exported {} @ {:.0} DPI (scale {:.2}×)",
+                                    path.display(),
+                                    dpi,
+                                    scale
+                                )
+                            }
                             Err(e) => self.status_message = format!("Export failed: {e}"),
                         }
                     }
@@ -5378,7 +5435,14 @@ impl VadadeeBerryApp {
                     .save_file()
                 {
                     match io::export_document_raster(&self.project, fmt, scale, &path) {
-                        Ok(()) => self.status_message = format!("Exported {}", path.display()),
+                        Ok(()) => {
+                            self.status_message = format!(
+                                "Exported {} @ {:.0} DPI (scale {:.2}×)",
+                                path.display(),
+                                dpi,
+                                scale
+                            )
+                        }
                         Err(e) => self.status_message = format!("Export failed: {e}"),
                     }
                 }
@@ -5584,7 +5648,8 @@ impl VadadeeBerryApp {
 
         if want_copy_png && !self.selection.is_empty() {
             log::info!("CLIPBOARD: detected copy PNG shortcut");
-            self.copy_selection_as_png(ctx.pixels_per_point());
+            // Use export DPI (not display pixels_per_point) so clipboard matches Export tab.
+            self.copy_selection_as_png(self.export_raster_scale());
             ctx.request_repaint();
             return false;
         }
@@ -16660,7 +16725,7 @@ fn run_video_decode_thread(
                 let node = match kind {
                     ToolKind::Rectangle => {
                         let (x, y, w, h) = tools::normalize_rect(origin, current);
-                        if w <= 2.0 || h <= 2.0 {
+                        if !tools::shape_size_ok(w, h) {
                             return;
                         }
                         if is_flowchart {
@@ -16697,7 +16762,7 @@ fn run_video_decode_thread(
                     ToolKind::Circle => {
                         let (x, y, w, h) = tools::normalize_rect(origin, current);
                         let side = w.min(h);
-                        if side <= 2.0 {
+                        if !tools::shape_side_ok(side) {
                             return;
                         }
                         let cx = x + w / 2.0;
@@ -16709,7 +16774,7 @@ fn run_video_decode_thread(
                     }
                     ToolKind::Ellipse => {
                         let (x, y, w, h) = tools::normalize_rect(origin, current);
-                        if w <= 2.0 || h <= 2.0 {
+                        if !tools::shape_size_ok(w, h) {
                             return;
                         }
                         self.styled_shape_node(Node::ellipse(
@@ -16723,7 +16788,7 @@ fn run_video_decode_thread(
                     ToolKind::Polygon => {
                         let (x, y, w, h) = tools::normalize_rect(origin, current);
                         let side = w.min(h);
-                        if side <= 2.0 {
+                        if !tools::shape_side_ok(side) {
                             return;
                         }
                         let cx = x + w / 2.0;
@@ -16739,7 +16804,7 @@ fn run_video_decode_thread(
                     ToolKind::Line => {
                         let dx = current.0 - origin.0;
                         let dy = current.1 - origin.1;
-                        if dx.hypot(dy) <= 2.0 {
+                        if !tools::shape_side_ok(dx.hypot(dy)) {
                             return;
                         }
                         let mut stroke = self.build_ui_stroke();
@@ -16806,7 +16871,7 @@ fn run_video_decode_thread(
                     ToolKind::Arc => {
                         let (x, y, w, h) = tools::normalize_rect(origin, current);
                         let side = w.min(h);
-                        if side <= 2.0 {
+                        if !tools::shape_side_ok(side) {
                             return;
                         }
                         let cx = x + w / 2.0;
@@ -16827,7 +16892,7 @@ fn run_video_decode_thread(
                     }
                     ToolKind::Plotter => {
                         let (x, y, w, h) = tools::normalize_rect(origin, current);
-                        if w <= 2.0 || h <= 2.0 {
+                        if !tools::shape_size_ok(w, h) {
                             return;
                         }
                         self.styled_shape_node(Node::plotter(x, y, w, h, self.build_ui_fill()))
@@ -22267,6 +22332,7 @@ mod tests {
                 pending_export_image: false,
                 export_image_format: io::ExportImageFormat::Png,
                 export_image_selection_only: false,
+                export_dpi: 96.0,
                 eyedropper_holding: false,
                 eyedropper_releasing: false,
                 eyedropper_t: 0.0,

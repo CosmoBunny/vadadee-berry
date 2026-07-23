@@ -986,6 +986,21 @@ pub fn marquee_is_drag(origin: (f64, f64), current: (f64, f64)) -> bool {
     (origin.0 - current.0).abs() > 1.5 || (origin.1 - current.1).abs() > 1.5
 }
 
+/// Minimum size for drag-created shapes (document units / CSS px).
+/// Was 2.0 (~0.5 mm), which dropped thin bars and ~1 mm edges after snap.
+/// Allow anything above a tiny epsilon so 1 mm (≈3.78 px @ 96 DPI) and thinner work.
+pub const MIN_SHAPE_DOC: f64 = 1e-3;
+
+#[inline]
+pub fn shape_size_ok(w: f64, h: f64) -> bool {
+    w > MIN_SHAPE_DOC && h > MIN_SHAPE_DOC
+}
+
+#[inline]
+pub fn shape_side_ok(side: f64) -> bool {
+    side > MIN_SHAPE_DOC
+}
+
 pub fn node_bounds_intersects_marquee(node: &Node, marquee: kurbo::Rect) -> bool {
     let b = node.bounds();
     let hit = b.intersect(marquee);
