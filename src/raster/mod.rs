@@ -163,16 +163,57 @@ impl RasterBuffer {
         pixel_mask: Option<&[u8]>,
         pixel_mask_w: u32,
     ) {
+        self.stamp_tip_masked(
+            cx,
+            cy,
+            radius,
+            hardness,
+            color,
+            opacity,
+            erase,
+            clip,
+            rect_mask,
+            alpha_lock,
+            poly_components,
+            pixel_mask,
+            pixel_mask_w,
+            1.0,
+            0.0,
+        );
+    }
+
+    /// Soft/hard tip with optional elliptical aspect (0.2..=1) and rotation (radians).
+    pub fn stamp_tip_masked(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        hardness: f32,
+        color: [u8; 4],
+        opacity: f32,
+        erase: bool,
+        clip: Option<(i32, i32, i32, i32)>,
+        rect_mask: Option<(i32, i32, i32, i32)>,
+        alpha_lock: bool,
+        poly_components: Option<&[Vec<(f64, f64)>]>,
+        pixel_mask: Option<&[u8]>,
+        pixel_mask_w: u32,
+        aspect: f32,
+        angle_rad: f32,
+    ) {
         let r = radius.max(0.5);
         let hard = hardness.clamp(0.0, 1.0);
         let op = opacity.clamp(0.0, 1.0);
         if op <= 1e-6 {
             return;
         }
-        let mut x0 = (cx - r - 1.0).floor().max(0.0) as i32;
-        let mut y0 = (cy - r - 1.0).floor().max(0.0) as i32;
-        let mut x1 = ((cx + r + 1.0).ceil() as i32).min(self.width as i32);
-        let mut y1 = ((cy + r + 1.0).ceil() as i32).min(self.height as i32);
+        let aspect = aspect.clamp(0.15, 1.0);
+        // Bounding radius for rotated ellipse.
+        let pad = r * 1.05;
+        let mut x0 = (cx - pad - 1.0).floor().max(0.0) as i32;
+        let mut y0 = (cy - pad - 1.0).floor().max(0.0) as i32;
+        let mut x1 = ((cx + pad + 1.0).ceil() as i32).min(self.width as i32);
+        let mut y1 = ((cy + pad + 1.0).ceil() as i32).min(self.height as i32);
         if let Some((cx0, cy0, cx1, cy1)) = clip {
             x0 = x0.max(cx0);
             y0 = y0.max(cy0);
@@ -182,18 +223,17 @@ impl RasterBuffer {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
-        let r2 = r * r;
         let hard_r = hard * r;
-        let hard_r2 = hard_r * hard_r;
         let soft_span = (r - hard_r).max(1e-3);
         let w = self.width as usize;
-        // Fast hard brush: no soft falloff, integer-ish alpha.
-        let fully_hard = hard >= 0.999 && op >= 0.999;
+        // Fast hard circle only (ellipse / soft always use falloff path).
+        let fully_hard = hard >= 0.999 && op >= 0.999 && aspect >= 0.999 && angle_rad.abs() < 1e-4;
+        let (cos_a, sin_a) = (angle_rad.cos(), angle_rad.sin());
+        let inv_aspect = 1.0 / aspect;
 
         for y in y0..y1 {
             let row = y as usize * w;
-            let dy = y as f32 + 0.5 - cy;
-            let dy2 = dy * dy;
+            let dy0 = y as f32 + 0.5 - cy;
             for x in x0..x1 {
                 let px = x as f64 + 0.5;
                 let py = y as f64 + 0.5;
@@ -235,20 +275,26 @@ impl RasterBuffer {
                         continue;
                     }
                 }
-                let dx = x as f32 + 0.5 - cx;
-                let d2 = dx * dx + dy2;
+                let dx0 = x as f32 + 0.5 - cx;
+                // Rotate into tip frame, then scale Y by 1/aspect for elliptical tip.
+                let lx = dx0 * cos_a + dy0 * sin_a;
+                let ly = (-dx0 * sin_a + dy0 * cos_a) * inv_aspect;
+                let d2 = lx * lx + ly * ly;
+                let r2 = r * r;
                 if d2 >= r2 {
                     continue;
                 }
                 let a = if fully_hard {
                     1.0
-                } else if d2 <= hard_r2 {
-                    op
                 } else {
                     let d = d2.sqrt();
-                    let t = ((d - hard_r) / soft_span).clamp(0.0, 1.0);
-                    let t = t * t * (3.0 - 2.0 * t);
-                    op * (1.0 - t)
+                    if d <= hard_r {
+                        op
+                    } else {
+                        let t = ((d - hard_r) / soft_span).clamp(0.0, 1.0);
+                        let t = t * t * (3.0 - 2.0 * t);
+                        op * (1.0 - t)
+                    }
                 };
                 if a <= 1e-6 {
                     continue;
@@ -410,6 +456,16 @@ impl RasterBuffer {
             }
         }
     }
+}
+
+/// Cheap deterministic [0,1) noise for brush jitter (no external RNG dependency).
+#[inline]
+pub fn brush_unit_noise(seed: u32) -> f32 {
+    let mut x = seed.wrapping_mul(0x9E37_79B9).wrapping_add(0x85EB_CA6B);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    (x as f32) * (1.0 / (u32::MAX as f32))
 }
 
 /// Walk from `from` → `to` placing stamp centers every `spacing` pixels (continuous pen).

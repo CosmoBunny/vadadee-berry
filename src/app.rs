@@ -6883,6 +6883,447 @@ impl VadadeeBerryApp {
         Some(format!("Target: {px} · doc {:.0}×{:.0}", width, height))
     }
 
+    /// Cut current paint mask into a floating transform layer.
+    pub fn raster_float_selection(&mut self, ctx: &Context) {
+        if self.tools.raster.floating.is_some() {
+            self.status_message = "Already floating — Apply or Cancel first".into();
+            return;
+        }
+        let id = self
+            .selection
+            .first()
+            .copied()
+            .or(self.tools.raster.target)
+            .filter(|&id| {
+                self.project
+                    .nodes
+                    .get(id)
+                    .map_or(false, |n| matches!(n.kind, NodeKind::Image { .. }))
+            });
+        let Some(id) = id else {
+            self.status_message = "Select an Image to float selection".into();
+            return;
+        };
+        // Build or use pixel mask covering the selection.
+        let has_pixel = self
+            .tools
+            .raster
+            .sticky_pixel_mask
+            .as_ref()
+            .is_some_and(|m| m.node_id == id);
+        if !has_pixel
+            && self.tools.raster.sticky_mask_doc.is_none()
+            && self.tools.raster.sticky_mask_poly.is_none()
+            && self.tools.raster.sticky_mask_polys.is_empty()
+        {
+            self.status_message = "Make a mask first (Raster Select / Paint mask)".into();
+            return;
+        }
+        let snap = self.project.nodes.get(id).and_then(|node| {
+            if let NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                bytes,
+                ..
+            } = &node.kind
+            {
+                Some((
+                    *x,
+                    *y,
+                    *width,
+                    *height,
+                    node.transform.rotation_rad,
+                    bytes.clone(),
+                ))
+            } else {
+                None
+            }
+        });
+        let Some((ix, iy, iw, ih, irot, before_png)) = snap else {
+            return;
+        };
+        self.ensure_image_texture(id, &before_png, ctx);
+        let Some(ci) = self.image_pixel_cache.get(&id) else {
+            self.status_message = "No image pixels".into();
+            return;
+        };
+        let pw = ci.size[0] as u32;
+        let ph = ci.size[1] as u32;
+        // Ensure pixel mask: rasterize geometric if needed.
+        if !has_pixel {
+            let mut mask = vec![0u8; (pw * ph) as usize];
+            let polys = self.raster_poly_masks_px(ix, iy, iw, ih, irot, pw, ph);
+            let rect = self.tools.raster.sticky_mask_doc.and_then(|(x0, y0, x1, y1)| {
+                self.doc_aabb_to_image_clip(ix, iy, iw, ih, irot, pw, ph, x0, y0, x1, y1)
+            });
+            for yy in 0..ph as i32 {
+                for xx in 0..pw as i32 {
+                    let px = xx as f64 + 0.5;
+                    let py = yy as f64 + 0.5;
+                    let in_rect = rect.is_some_and(|(a, b, c, d)| {
+                        px >= a as f64 && px < c as f64 && py >= b as f64 && py < d as f64
+                    });
+                    let in_poly = polys
+                        .iter()
+                        .any(|p| crate::raster::point_in_polygon(px, py, p));
+                    let on = if rect.is_some() && !polys.is_empty() {
+                        in_rect || in_poly
+                    } else if !polys.is_empty() {
+                        in_poly
+                    } else {
+                        in_rect
+                    };
+                    if on {
+                        mask[yy as usize * pw as usize + xx as usize] = 255;
+                    }
+                }
+            }
+            self.tools.raster.sticky_pixel_mask = Some(crate::tools::StickyPixelMask {
+                node_id: id,
+                width: pw,
+                height: ph,
+                mask,
+            });
+        }
+        let pm = self.tools.raster.sticky_pixel_mask.as_ref().unwrap();
+        // BBox of mask on pixels.
+        let mut min_x = pw as i32;
+        let mut min_y = ph as i32;
+        let mut max_x = -1i32;
+        let mut max_y = -1i32;
+        for y in 0..ph as i32 {
+            for x in 0..pw as i32 {
+                if pm.mask[y as usize * pw as usize + x as usize] != 0 {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        if max_x < min_x {
+            self.status_message = "Mask is empty".into();
+            return;
+        }
+        let bw = (max_x - min_x + 1) as u32;
+        let bh = (max_y - min_y + 1) as u32;
+        let mut cut = vec![0u8; (bw * bh * 4) as usize];
+        let mut hole = crate::raster::RasterBuffer {
+            width: pw,
+            height: ph,
+            rgba: {
+                let mut raw = Vec::with_capacity(ci.pixels.len() * 4);
+                for p in &ci.pixels {
+                    raw.push(p.r());
+                    raw.push(p.g());
+                    raw.push(p.b());
+                    raw.push(p.a());
+                }
+                raw
+            },
+        };
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let mi = y as usize * pw as usize + x as usize;
+                if pm.mask[mi] == 0 {
+                    continue;
+                }
+                let si = mi * 4;
+                let di = ((y - min_y) as u32 * bw + (x - min_x) as u32) as usize * 4;
+                cut[di..di + 4].copy_from_slice(&hole.rgba[si..si + 4]);
+                // Clear hole
+                hole.rgba[si] = 0;
+                hole.rgba[si + 1] = 0;
+                hole.rgba[si + 2] = 0;
+                hole.rgba[si + 3] = 0;
+            }
+        }
+        let Some(hole_png) = hole.encode_png() else {
+            self.status_message = "Float encode failed".into();
+            return;
+        };
+        // Write hole into document image (preview base).
+        {
+            let Some(before_node) = self.project.nodes.get(id).cloned() else {
+                return;
+            };
+            let mut after = before_node.clone();
+            if let NodeKind::Image { bytes, .. } = &mut after.kind {
+                *bytes = hole_png.clone();
+            }
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchNode {
+                    id,
+                    before: before_node,
+                    after,
+                },
+            );
+            self.sync_image_texture_from_rgba(id, pw, ph, &hole.rgba, ctx);
+        }
+        self.tools.raster.floating = Some(crate::tools::FloatingPixels {
+            node_id: id,
+            bbox_x: min_x,
+            bbox_y: min_y,
+            width: bw,
+            height: bh,
+            rgba: cut,
+            hole_png,
+            before_png,
+            dx: 0.0,
+            dy: 0.0,
+            scale: 1.0,
+            rot_deg: 0.0,
+            dragging: false,
+            drag_last_px: None,
+        });
+        self.tools.raster.target = Some(id);
+        self.raster_refresh_float_preview(ctx);
+        self.status_message = format!("Floating {bw}×{bh} — drag to move, Apply when done");
+    }
+
+    /// Composite hole + transformed float into the image texture (live preview).
+    pub fn raster_refresh_float_preview(&mut self, ctx: &Context) {
+        let Some(fl) = self.tools.raster.floating.clone() else {
+            return;
+        };
+        let Some(hole) = crate::raster::RasterBuffer::from_png_bytes(&fl.hole_png) else {
+            return;
+        };
+        let mut out = hole;
+        self.composite_float_into(&mut out, &fl);
+        self.sync_image_texture_from_rgba(fl.node_id, out.width, out.height, &out.rgba, ctx);
+        if let Some(node) = self.project.nodes.get_mut(fl.node_id) {
+            if let NodeKind::Image { bytes, .. } = &mut node.kind {
+                if let Some(png) = out.encode_png() {
+                    *bytes = png;
+                }
+            }
+        }
+    }
+
+    fn composite_float_into(
+        &self,
+        dest: &mut crate::raster::RasterBuffer,
+        fl: &crate::tools::FloatingPixels,
+    ) {
+        let sc = fl.scale.clamp(0.05, 8.0);
+        let ang = fl.rot_deg.to_radians();
+        let (c, s) = (ang.cos(), ang.sin());
+        let cx = fl.width as f32 * 0.5;
+        let cy = fl.height as f32 * 0.5;
+        // Destination center of the float
+        let dest_cx = fl.bbox_x as f32 + cx + fl.dx;
+        let dest_cy = fl.bbox_y as f32 + cy + fl.dy;
+        // Inverse map each dest pixel near the transformed AABB
+        let max_r = (fl.width.max(fl.height) as f32) * sc * 0.75 + 2.0;
+        let x0 = (dest_cx - max_r).floor().max(0.0) as i32;
+        let y0 = (dest_cy - max_r).floor().max(0.0) as i32;
+        let x1 = ((dest_cx + max_r).ceil() as i32).min(dest.width as i32);
+        let y1 = ((dest_cy + max_r).ceil() as i32).min(dest.height as i32);
+        let fw = fl.width as i32;
+        let fh = fl.height as i32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let dx = x as f32 + 0.5 - dest_cx;
+                let dy = y as f32 + 0.5 - dest_cy;
+                // inverse rotate+scale
+                let lx = (dx * c + dy * s) / sc + cx;
+                let ly = (-dx * s + dy * c) / sc + cy;
+                let ix = lx.floor() as i32;
+                let iy = ly.floor() as i32;
+                if ix < 0 || iy < 0 || ix >= fw || iy >= fh {
+                    continue;
+                }
+                let si = (iy as u32 * fl.width + ix as u32) as usize * 4;
+                let sa = fl.rgba[si + 3];
+                if sa == 0 {
+                    continue;
+                }
+                let di = (y as u32 * dest.width + x as u32) as usize * 4;
+                // Source-over
+                let a = sa as f32 / 255.0;
+                let inv = 1.0 - a;
+                dest.rgba[di] =
+                    (fl.rgba[si] as f32 * a + dest.rgba[di] as f32 * inv).round() as u8;
+                dest.rgba[di + 1] =
+                    (fl.rgba[si + 1] as f32 * a + dest.rgba[di + 1] as f32 * inv).round() as u8;
+                dest.rgba[di + 2] =
+                    (fl.rgba[si + 2] as f32 * a + dest.rgba[di + 2] as f32 * inv).round() as u8;
+                dest.rgba[di + 3] = (sa as f32 + dest.rgba[di + 3] as f32 * inv)
+                    .round()
+                    .min(255.0) as u8;
+            }
+        }
+    }
+
+    pub fn raster_apply_float(&mut self, ctx: &Context) {
+        let Some(fl) = self.tools.raster.floating.take() else {
+            self.status_message = "Nothing floating".into();
+            return;
+        };
+        // Final composite is already in the node from last preview refresh.
+        // Record undo as pre-float image → current so one Undo restores the hole cut.
+        let current = self
+            .project
+            .nodes
+            .get(fl.node_id)
+            .and_then(|n| match &n.kind {
+                NodeKind::Image { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            });
+        let Some(cur) = current else {
+            return;
+        };
+        if let Some(before_node) = self.project.nodes.get(fl.node_id).cloned() {
+            let mut before = before_node.clone();
+            if let NodeKind::Image { bytes, .. } = &mut before.kind {
+                *bytes = fl.before_png;
+            }
+            let mut after = before_node;
+            if let NodeKind::Image { bytes, .. } = &mut after.kind {
+                *bytes = cur.clone();
+            }
+            self.history.push(
+                &mut self.project,
+                ProjectEdit::PatchNode {
+                    id: fl.node_id,
+                    before,
+                    after,
+                },
+            );
+        }
+        self.ensure_image_texture(fl.node_id, &cur, ctx);
+        self.tools.raster.live_rgba = None;
+        self.status_message = "Float applied".into();
+    }
+
+    pub fn raster_cancel_float(&mut self, ctx: &Context) {
+        let Some(fl) = self.tools.raster.floating.take() else {
+            return;
+        };
+        let Some(before_node) = self.project.nodes.get(fl.node_id).cloned() else {
+            return;
+        };
+        let mut after = before_node.clone();
+        if let NodeKind::Image { bytes, .. } = &mut after.kind {
+            *bytes = fl.before_png.clone();
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchNode {
+                id: fl.node_id,
+                before: before_node,
+                after,
+            },
+        );
+        self.ensure_image_texture(fl.node_id, &fl.before_png, ctx);
+        self.image_textures.remove(&fl.node_id);
+        self.ensure_image_texture(fl.node_id, &fl.before_png, ctx);
+        self.status_message = "Float cancelled".into();
+    }
+
+    pub fn raster_nudge_float(&mut self, ctx: &Context, dx: f32, dy: f32) {
+        if let Some(fl) = self.tools.raster.floating.as_mut() {
+            fl.dx += dx;
+            fl.dy += dy;
+        } else {
+            return;
+        }
+        self.raster_refresh_float_preview(ctx);
+    }
+
+    pub fn raster_scale_float(&mut self, ctx: &Context, factor: f32) {
+        if let Some(fl) = self.tools.raster.floating.as_mut() {
+            fl.scale = (fl.scale * factor).clamp(0.05, 8.0);
+        } else {
+            return;
+        }
+        self.raster_refresh_float_preview(ctx);
+    }
+
+    pub fn raster_rotate_float(&mut self, ctx: &Context, deg: f32) {
+        if let Some(fl) = self.tools.raster.floating.as_mut() {
+            fl.rot_deg = (fl.rot_deg + deg).rem_euclid(360.0);
+        } else {
+            return;
+        }
+        self.raster_refresh_float_preview(ctx);
+    }
+
+    /// Drag floating selection in image-pixel space (doc pointer → px delta).
+    pub fn raster_float_pointer(
+        &mut self,
+        doc: (f64, f64),
+        pressed: bool,
+        down: bool,
+        released: bool,
+        ctx: &Context,
+    ) -> bool {
+        let Some(id) = self.tools.raster.floating.as_ref().map(|f| f.node_id) else {
+            return false;
+        };
+        let meta = self.project.nodes.get(id).and_then(|node| {
+            if let NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } = &node.kind
+            {
+                Some((*x, *y, *width, *height, node.transform.rotation_rad))
+            } else {
+                None
+            }
+        });
+        let Some((x, y, w, h, rot)) = meta else {
+            return false;
+        };
+        let (pw, ph) = self
+            .image_pixel_cache
+            .get(&id)
+            .map(|c| (c.size[0] as u32, c.size[1] as u32))
+            .unwrap_or((1, 1));
+        let (px, py) = if let Some((u, v)) =
+            crate::document::image_doc_to_uv(x, y, w, h, rot, doc.0, doc.1)
+        {
+            ((u * pw as f64) as f32, (v * ph as f64) as f32)
+        } else {
+            return true; // still consume while floating
+        };
+        if pressed {
+            if let Some(fl) = self.tools.raster.floating.as_mut() {
+                fl.dragging = true;
+                fl.drag_last_px = Some((px, py));
+            }
+        } else if down {
+            let mut dirty = false;
+            if let Some(fl) = self.tools.raster.floating.as_mut() {
+                if fl.dragging {
+                    if let Some((lx, ly)) = fl.drag_last_px {
+                        fl.dx += px - lx;
+                        fl.dy += py - ly;
+                        dirty = true;
+                    }
+                    fl.drag_last_px = Some((px, py));
+                }
+            }
+            if dirty {
+                self.raster_refresh_float_preview(ctx);
+            }
+        }
+        if released {
+            if let Some(fl) = self.tools.raster.floating.as_mut() {
+                fl.dragging = false;
+                fl.drag_last_px = None;
+            }
+        }
+        true
+    }
+
     /// Ensure a paint target Image exists; create a transparent full-page image if needed.
     fn ensure_raster_paint_target(&mut self, ctx: &Context) -> Option<NodeId> {
         // Prefer selected Image.
@@ -7083,16 +7524,23 @@ impl VadadeeBerryApp {
         }
 
         // Incremental bake like Krita/CSP: stamp only the *new* segment into live_rgba.
-        let radius = crate::raster::doc_size_to_pixel_radius(
+        let base_radius = crate::raster::doc_size_to_pixel_radius(
             self.tools.raster.size * press,
             width,
             height,
             pw,
             ph,
         );
-        let spacing = (radius * self.tools.raster.spacing.max(0.04)).max(0.25);
+        let spacing = (base_radius * self.tools.raster.spacing.max(0.04)).max(0.25);
         let hardness = self.tools.raster.hardness;
-        let opacity = self.tools.raster.opacity * if erase { 1.0 } else { press };
+        let flow = self.tools.raster.flow.clamp(0.0, 1.0);
+        let opacity = self.tools.raster.opacity
+            * flow
+            * if erase {
+                1.0
+            } else {
+                press
+            };
         let color = self.raster_paint_rgba();
         let force = force_first || self.tools.raster.sample_hist.len() <= 1;
         let (stamps, carry) = crate::raster::stamps_for_new_sample(
@@ -7129,6 +7577,11 @@ impl VadadeeBerryApp {
         let off = self.tools.raster.sym_offset_deg.to_radians();
         let all_stamps =
             crate::raster::expand_circular_symmetry(&stamps, (ox, oy), divs, off);
+        let scatter = self.tools.raster.scatter.clamp(0.0, 1.0);
+        let size_jit = self.tools.raster.size_jitter.clamp(0.0, 1.0);
+        let aspect = self.tools.raster.aspect.clamp(0.15, 1.0);
+        let base_angle = self.tools.raster.angle_deg.to_radians();
+        let ang_jit = self.tools.raster.angle_jitter.clamp(0.0, 1.0);
 
         if !all_stamps.is_empty() {
             if let Some(rgba) = self.tools.raster.live_rgba.as_mut() {
@@ -7180,7 +7633,7 @@ impl VadadeeBerryApp {
                         } else {
                             dir
                         };
-                        buf.smudge_circle(*sx, *sy, radius, hardness, smudge_str, d, clip);
+                        buf.smudge_circle(*sx, *sy, base_radius, hardness, smudge_str, d, clip);
                     }
                 } else {
                     let poly_ref = if poly_comps.is_empty() {
@@ -7188,11 +7641,23 @@ impl VadadeeBerryApp {
                     } else {
                         Some(poly_comps.as_slice())
                     };
-                    for (sx, sy) in all_stamps {
-                        buf.stamp_circle_masked(
-                            sx,
-                            sy,
-                            radius,
+                    for (i, (sx, sy)) in all_stamps.iter().enumerate() {
+                        let seed = (i as u32)
+                            .wrapping_mul(0xA24B_AED5)
+                            .wrapping_add((sx.to_bits()) ^ (sy.to_bits() << 1));
+                        let n0 = crate::raster::brush_unit_noise(seed);
+                        let n1 = crate::raster::brush_unit_noise(seed.wrapping_add(1));
+                        let n2 = crate::raster::brush_unit_noise(seed.wrapping_add(2));
+                        let n3 = crate::raster::brush_unit_noise(seed.wrapping_add(3));
+                        let jx = (n0 * 2.0 - 1.0) * scatter * base_radius;
+                        let jy = (n1 * 2.0 - 1.0) * scatter * base_radius;
+                        let r_mul = 1.0 + (n2 * 2.0 - 1.0) * size_jit;
+                        let tip_r = (base_radius * r_mul).max(0.5);
+                        let ang = base_angle + (n3 * 2.0 - 1.0) * ang_jit * std::f32::consts::PI;
+                        buf.stamp_tip_masked(
+                            sx + jx,
+                            sy + jy,
+                            tip_r,
                             hardness,
                             color,
                             opacity,
@@ -7203,6 +7668,8 @@ impl VadadeeBerryApp {
                             poly_ref,
                             pix_mask,
                             pix_mw,
+                            aspect,
+                            ang,
                         );
                     }
                 }
@@ -11492,7 +11959,15 @@ fn run_video_decode_thread(
                 );
             }
             ToolKind::RasterBrush | ToolKind::Eraser | ToolKind::Smudge => {
-                if self.handle_paint_mask_draw(
+                if self.tools.raster.floating.is_some() {
+                    self.raster_float_pointer(
+                        raw_doc,
+                        primary_pressed,
+                        primary_down,
+                        primary_released_anywhere,
+                        &response.ctx,
+                    );
+                } else if self.handle_paint_mask_draw(
                     raw_doc,
                     primary_pressed,
                     primary_down,
@@ -11544,13 +12019,23 @@ fn run_video_decode_thread(
                 }
             }
             ToolKind::RasterSelect => {
-                self.tool_raster_select(
-                    raw_doc,
-                    primary_pressed,
-                    primary_down,
-                    primary_released_anywhere,
-                    &response.ctx,
-                );
+                if self.tools.raster.floating.is_some() {
+                    self.raster_float_pointer(
+                        raw_doc,
+                        primary_pressed,
+                        primary_down,
+                        primary_released_anywhere,
+                        &response.ctx,
+                    );
+                } else {
+                    self.tool_raster_select(
+                        raw_doc,
+                        primary_pressed,
+                        primary_down,
+                        primary_released_anywhere,
+                        &response.ctx,
+                    );
+                }
             }
 
             ToolKind::Node => self.tool_node(

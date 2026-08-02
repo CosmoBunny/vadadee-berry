@@ -29,3 +29,6 @@ app/src/main/jniLibs/**/*.so
 scratch/
 .deps/
 *.deb
+
+# Explicit (non-root) for tools that match bare names
+target/

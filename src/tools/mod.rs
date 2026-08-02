@@ -507,6 +507,31 @@ impl StickyPixelMask {
     }
 }
 
+/// Cut/float pixels from a paint mask — move / scale / rotate before re-commit.
+#[derive(Debug, Clone)]
+pub struct FloatingPixels {
+    pub node_id: crate::document::NodeId,
+    /// Bounding box of the cut in **image pixel** space at cut time.
+    pub bbox_x: i32,
+    pub bbox_y: i32,
+    pub width: u32,
+    pub height: u32,
+    /// RGBA of the cut region (transparent outside the mask).
+    pub rgba: Vec<u8>,
+    /// Image PNG after hole was cut (base for live preview).
+    pub hole_png: Vec<u8>,
+    /// Full image PNG before cut (cancel restore).
+    pub before_png: Vec<u8>,
+    /// Transform applied to the float (relative to bbox origin).
+    pub dx: f32,
+    pub dy: f32,
+    pub scale: f32,
+    pub rot_deg: f32,
+    /// UI: dragging the float on canvas.
+    pub dragging: bool,
+    pub drag_last_px: Option<(f32, f32)>,
+}
+
 /// Raster paint / eraser session (targets `NodeKind::Image` pixels).
 #[derive(Debug, Clone)]
 pub struct RasterSession {
@@ -514,8 +539,20 @@ pub struct RasterSession {
     pub size: f32,
     /// 0 = fully soft, 1 = hard edge.
     pub hardness: f32,
-    /// 0..1 stamp opacity / flow.
+    /// 0..1 stamp opacity (max alpha of a full-opacity stamp).
     pub opacity: f32,
+    /// 0..1 flow — multiplies opacity per stamp (build-up independent of spacing).
+    pub flow: f32,
+    /// 0..1 position scatter as fraction of brush radius.
+    pub scatter: f32,
+    /// 0..1 random size variation (fraction of radius).
+    pub size_jitter: f32,
+    /// Base tip angle in degrees (elliptical stretch axis).
+    pub angle_deg: f32,
+    /// 0..1 random angle variation (degrees × 180).
+    pub angle_jitter: f32,
+    /// Ellipse aspect 0.2..1.0 (1 = circle). Minor axis = radius * aspect.
+    pub aspect: f32,
     /// Stamp spacing as fraction of radius (0.05..1.0). Lower = denser continuous stroke.
     pub spacing: f32,
     /// Streamline / stabilizer 0..1 (CSP-style pull). 0 = raw pointer, 1 = strong lag.
@@ -583,6 +620,8 @@ pub struct RasterSession {
     pub tex_dirty: bool,
     /// `ctx.input.time` of last GPU upload (throttle mid-stroke).
     pub last_tex_upload: f64,
+    /// Floating selection (cut pixels) being transformed.
+    pub floating: Option<FloatingPixels>,
 }
 
 impl Default for RasterSession {
@@ -591,6 +630,12 @@ impl Default for RasterSession {
             size: 24.0,
             hardness: 0.85,
             opacity: 1.0,
+            flow: 1.0,
+            scatter: 0.0,
+            size_jitter: 0.0,
+            angle_deg: 0.0,
+            angle_jitter: 0.0,
+            aspect: 1.0,
             // Dense stamps for continuous freehand.
             spacing: 0.08,
             stabilizer: 0.35,
@@ -629,6 +674,7 @@ impl Default for RasterSession {
             live_rgba: None,
             tex_dirty: false,
             last_tex_upload: 0.0,
+            floating: None,
         }
     }
 }
@@ -640,8 +686,12 @@ pub struct RasterBrushPreset {
     pub size: f32,
     pub hardness: f32,
     pub opacity: f32,
+    pub flow: f32,
     pub spacing: f32,
     pub stabilizer: f32,
+    pub scatter: f32,
+    pub size_jitter: f32,
+    pub aspect: f32,
 }
 
 impl RasterBrushPreset {
@@ -651,48 +701,84 @@ impl RasterBrushPreset {
             size: 28.0,
             hardness: 0.15,
             opacity: 0.9,
+            flow: 1.0,
             spacing: 0.1,
             stabilizer: 0.35,
+            scatter: 0.0,
+            size_jitter: 0.0,
+            aspect: 1.0,
         },
         RasterBrushPreset {
             name: "Hard Round",
             size: 20.0,
             hardness: 1.0,
             opacity: 1.0,
+            flow: 1.0,
             spacing: 0.12,
             stabilizer: 0.15,
+            scatter: 0.0,
+            size_jitter: 0.0,
+            aspect: 1.0,
         },
         RasterBrushPreset {
             name: "Ink Pen",
             size: 5.0,
             hardness: 0.95,
             opacity: 1.0,
+            flow: 1.0,
             spacing: 0.08,
             stabilizer: 0.55,
+            scatter: 0.0,
+            size_jitter: 0.0,
+            aspect: 1.0,
         },
         RasterBrushPreset {
             name: "Airbrush",
             size: 48.0,
             hardness: 0.0,
             opacity: 0.35,
+            flow: 0.45,
             spacing: 0.14,
             stabilizer: 0.25,
+            scatter: 0.08,
+            size_jitter: 0.1,
+            aspect: 1.0,
         },
         RasterBrushPreset {
             name: "Marker",
             size: 36.0,
             hardness: 0.75,
             opacity: 0.85,
+            flow: 0.9,
             spacing: 0.1,
             stabilizer: 0.3,
+            scatter: 0.0,
+            size_jitter: 0.0,
+            aspect: 0.55,
         },
         RasterBrushPreset {
             name: "Sketch",
             size: 3.0,
             hardness: 0.6,
             opacity: 0.75,
+            flow: 0.85,
             spacing: 0.1,
             stabilizer: 0.2,
+            scatter: 0.05,
+            size_jitter: 0.15,
+            aspect: 1.0,
+        },
+        RasterBrushPreset {
+            name: "Spray",
+            size: 40.0,
+            hardness: 0.2,
+            opacity: 0.55,
+            flow: 0.35,
+            spacing: 0.22,
+            stabilizer: 0.1,
+            scatter: 0.55,
+            size_jitter: 0.4,
+            aspect: 1.0,
         },
     ];
 
@@ -700,8 +786,12 @@ impl RasterBrushPreset {
         s.size = self.size;
         s.hardness = self.hardness;
         s.opacity = self.opacity;
+        s.flow = self.flow;
         s.spacing = self.spacing;
         s.stabilizer = self.stabilizer;
+        s.scatter = self.scatter;
+        s.size_jitter = self.size_jitter;
+        s.aspect = self.aspect;
     }
 
     pub fn index_of_name(name: &str) -> Option<usize> {

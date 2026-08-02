@@ -1,0 +1,12 @@
+# Rust / build (do not index or ship to cloud agents)
+/target/
+target/
+**/target/
+/app/build/
+.gradle/
+**/build/
+/dist/
+*.so
+*.apk
+*.aab
+_snap_*.png
