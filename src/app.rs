@@ -4635,85 +4635,91 @@ impl VadadeeBerryApp {
         log::info!("CLIPBOARD: cut {} objects", names.len());
     }
 
-    fn image_paste_doc_center(&self) -> (f64, f64) {
-        if let Some((cx, cy)) = self.cursor_doc {
-            return (cx, cy);
+    /// Document point under the pointer if it lies in the current canvas view; else view center.
+    fn paste_anchor_doc(&self) -> (f64, f64) {
+        if let Some(c) = self.cursor_doc {
+            if self.doc_point_in_view(c) {
+                return c;
+            }
         }
+        self.view_center_doc()
+    }
+
+    fn view_center_doc(&self) -> (f64, f64) {
         if let (Some(rect), origin) = (self.canvas_screen_rect, self.canvas_origin) {
-            let center_screen = rect.center();
-            return tools::doc_point_from_screen(
-                center_screen,
-                origin,
-                self.viewport.pan,
-                self.viewport.zoom,
-            );
+            return self.viewport.screen_to_doc(rect.center(), origin);
         }
-        (180.0, 120.0)
+        (
+            self.project.document.width * 0.5,
+            self.project.document.height * 0.5,
+        )
+    }
+
+    /// Whether a document point is inside the visible canvas (with a small margin).
+    fn doc_point_in_view(&self, doc: (f64, f64)) -> bool {
+        let Some(rect) = self.canvas_screen_rect else {
+            return true;
+        };
+        let screen = self.viewport.doc_to_screen(doc, self.canvas_origin);
+        rect.expand(-4.0).contains(screen)
+    }
+
+    /// Small SE nudge in **document** units that stays ~constant on screen (~18 px).
+    /// Avoids fixed-doc offsets that jump off-screen when zoomed in, or vanish when zoomed out.
+    fn nearby_nudge_doc(&self) -> (f64, f64) {
+        let z = self.viewport.zoom.max(0.05) as f64;
+        let screen_px = 18.0_f64;
+        let mut d = (screen_px / z).clamp(1.0, 64.0);
+        if self.viewport.snap_grid {
+            let gx = self.viewport.step_x().max(0.5);
+            let gy = self.viewport.step_y().max(0.5);
+            // Prefer one grid step when that step is still “nearby” on screen.
+            let step = gx.min(gy);
+            let step_screen = step * z;
+            if step_screen >= 4.0 && step_screen <= 80.0 {
+                d = step;
+            } else {
+                // Snap nudge length to grid without taking multi-step leaps.
+                d = ((d / step).round().max(1.0) * step).min(64.0);
+            }
+            return (d, d * gy / gx);
+        }
+        (d, d)
+    }
+
+    fn image_paste_doc_center(&self) -> (f64, f64) {
+        self.paste_anchor_doc()
     }
 
     fn object_paste_offset(&self) -> (f64, f64) {
-        /// Offset so the first object's position lands on a grid cell (no “half-step gap”).
+        let (nudge_x, nudge_y) = self.nearby_nudge_doc();
         let snap_offset = |dx: f64, dy: f64, origin: (f64, f64)| -> (f64, f64) {
             if !self.viewport.snap_grid {
                 return (dx, dy);
             }
-            let g = self.viewport.grid_step as f64;
-            if g <= 0.0 {
-                return (dx, dy);
-            }
-            let tx = ((origin.0 + dx) / g).round() * g;
-            let ty = ((origin.1 + dy) / g).round() * g;
+            let gx = self.viewport.step_x().max(0.5);
+            let gy = self.viewport.step_y().max(0.5);
+            let tx = ((origin.0 + dx) / gx).round() * gx;
+            let ty = ((origin.1 + dy) / gy).round() * gy;
             (tx - origin.0, ty - origin.1)
         };
 
-        if let Some((cx, cy)) = self.cursor_doc {
-            if let Some(first) = self.clipboard.first() {
-                let b = first.bounds();
-                let (fx, fy) = (b.x0, b.y0);
-                // Nudge one grid step so paste is not on top of the original.
-                let g = if self.viewport.snap_grid {
-                    self.viewport.grid_step as f64
-                } else {
-                    16.0
-                };
-                let raw = (cx - fx + g, cy - fy + g);
-                return snap_offset(raw.0, raw.1, (fx, fy));
+        // Prefer a small nudge from the **clipboard** geometry so paste stays next to
+        // the source when the source is still in view; otherwise drop at view center.
+        if let Some(first) = self.clipboard.first() {
+            let b = first.bounds();
+            let (fx, fy) = (b.x0, b.y0);
+            let src_center = ((b.x0 + b.x1) * 0.5, (b.y0 + b.y1) * 0.5);
+            if self.doc_point_in_view(src_center) {
+                // Source visible: offset by zoom-aware nudge only (not jump to far cursor).
+                return snap_offset(nudge_x, nudge_y, (fx, fy));
             }
-            let g = if self.viewport.snap_grid {
-                self.viewport.grid_step as f64
-            } else {
-                24.0
-            };
-            return (g, g);
+            // Source off-screen: place top-left near view anchor so paste lands in view.
+            let (ax, ay) = self.paste_anchor_doc();
+            let raw = (ax - fx + nudge_x * 0.25, ay - fy + nudge_y * 0.25);
+            return snap_offset(raw.0, raw.1, (fx, fy));
         }
-        if let (Some(rect), origin) = (self.canvas_screen_rect, self.canvas_origin) {
-            let center_screen = rect.center();
-            let (cx, cy) =
-                tools::doc_point_from_screen(center_screen, origin, self.viewport.pan, self.viewport.zoom);
-            if let Some(first) = self.clipboard.first() {
-                let b = first.bounds();
-                let (fx, fy) = (b.x0, b.y0);
-                let g = if self.viewport.snap_grid {
-                    self.viewport.grid_step as f64
-                } else {
-                    16.0
-                };
-                let raw = (cx - fx + g, cy - fy + g);
-                return snap_offset(raw.0, raw.1, (fx, fy));
-            }
-            let g = if self.viewport.snap_grid {
-                self.viewport.grid_step as f64
-            } else {
-                24.0
-            };
-            return (g, g);
-        }
-        let g = if self.viewport.snap_grid {
-            self.viewport.grid_step as f64
-        } else {
-            24.0
-        };
-        (g, g)
+        (nudge_x, nudge_y)
     }
 
     fn begin_system_image_paste(&mut self) {
@@ -5046,12 +5052,24 @@ impl VadadeeBerryApp {
     }
 
     pub fn duplicate_selection(&mut self) {
+        let (dx, dy) = self.nearby_nudge_doc();
+        let (dx, dy) = if self.viewport.snap_grid {
+            let gx = self.viewport.step_x().max(0.5);
+            let gy = self.viewport.step_y().max(0.5);
+            // Snap delta so duplicates land on grid without large jumps.
+            (
+                (dx / gx).round().max(1.0) * gx,
+                (dy / gy).round().max(1.0) * gy,
+            )
+        } else {
+            (dx, dy)
+        };
         let copies: Vec<Node> = self
             .selection
             .iter()
             .filter_map(|id| self.project.nodes.get(*id).cloned())
             .map(|mut n| {
-                n.translate(24.0, 24.0);
+                n.translate(dx, dy);
                 n.duplicate()
             })
             .collect();

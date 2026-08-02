@@ -2147,32 +2147,17 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 }
             });
     });
+    // Compact DPI control only (no preset chips — they overflow the dock).
     ui.horizontal(|ui| {
-        ui.label("DPI:");
+        ui.label("DPI");
         ui.add(
             egui::DragValue::new(&mut app.export_dpi)
                 .range(72.0..=600.0)
                 .speed(1.0)
-                .suffix(" dpi"),
+                .fixed_decimals(0),
         )
         .on_hover_text(
-            "Raster resolution for Export image and Ctrl+Shift+C clipboard.\n\
-             Document is 96 CSS px/inch — 96 = 1:1, 192 = 2×, 300 = print-ish.\n\
-             Zoomed canvas preview can look sharper than 96 DPI export; raise DPI to match.",
-        );
-        for (label, dpi) in [("96", 96.0), ("150", 150.0), ("300", 300.0)] {
-            if ui
-                .selectable_label((app.export_dpi - dpi).abs() < 0.5, label)
-                .clicked()
-            {
-                app.export_dpi = dpi;
-            }
-        }
-        let scale = app.export_raster_scale();
-        ui.label(
-            RichText::new(format!("×{scale:.2}"))
-                .small()
-                .color(colors::TEXT_MUTED),
+            "Raster DPI for Export image and Ctrl+Shift+C (96 = 1 doc px per pixel).",
         );
     });
     ui.checkbox(
