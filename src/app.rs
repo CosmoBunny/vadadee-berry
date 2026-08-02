@@ -6803,6 +6803,86 @@ impl VadadeeBerryApp {
         ]
     }
 
+    /// Cap paint buffer long edge so live brush stays interactive.
+    const MAX_PAINT_EDGE: f64 = 1536.0;
+
+    fn paint_buffer_dims(doc_w: f64, doc_h: f64) -> (u32, u32) {
+        let doc_w = doc_w.max(1.0);
+        let doc_h = doc_h.max(1.0);
+        let long = doc_w.max(doc_h);
+        let scale = if long > Self::MAX_PAINT_EDGE {
+            Self::MAX_PAINT_EDGE / long
+        } else {
+            1.0
+        };
+        let pw = (doc_w * scale).round().clamp(1.0, Self::MAX_PAINT_EDGE) as u32;
+        let ph = (doc_h * scale).round().clamp(1.0, Self::MAX_PAINT_EDGE) as u32;
+        (pw, ph)
+    }
+
+    /// Always create a new transparent Image paint surface and select it.
+    /// `region` is document-space placement; `None` = full page (0,0,page).
+    pub fn raster_new_paint_layer(
+        &mut self,
+        ctx: &Context,
+        region: Option<(f64, f64, f64, f64)>,
+    ) -> Option<NodeId> {
+        let (x, y, doc_w, doc_h) = region.unwrap_or((
+            0.0,
+            0.0,
+            self.project.document.width.max(1.0),
+            self.project.document.height.max(1.0),
+        ));
+        let doc_w = doc_w.max(1.0);
+        let doc_h = doc_h.max(1.0);
+        let (pw, ph) = Self::paint_buffer_dims(doc_w, doc_h);
+        let bytes = crate::raster::RasterBuffer::transparent_png(pw, ph)?;
+        let mut node = self.styled_shape_node(Node::image(x, y, doc_w, doc_h, bytes));
+        node.name = "Paint Layer".into();
+        let id = node.id;
+        self.insert_node(node);
+        self.selection = vec![id];
+        self.tools.raster.target = Some(id);
+        self.tools.raster.live_rgba = None;
+        // Clear sticky masks — they belong to the previous image.
+        self.tools.raster.sticky_mask_doc = None;
+        self.tools.raster.sticky_mask_poly = None;
+        self.tools.raster.sticky_mask_polys.clear();
+        self.tools.raster.sticky_pixel_mask = None;
+        let bytes = self.project.nodes.get(id).and_then(|n| match &n.kind {
+            NodeKind::Image { bytes, .. } => Some(bytes.clone()),
+            _ => None,
+        })?;
+        self.ensure_image_texture(id, &bytes, ctx);
+        self.status_message = format!("New paint layer {pw}×{ph}px");
+        Some(id)
+    }
+
+    /// New transparent layer matching selected object(s) bounds (or page if nothing selected).
+    pub fn raster_new_paint_layer_from_selection(&mut self, ctx: &Context) -> Option<NodeId> {
+        let region = self.selection_bounds().map(|b| {
+            let w = b.width().max(1.0);
+            let h = b.height().max(1.0);
+            (b.x0, b.y0, w, h)
+        });
+        self.raster_new_paint_layer(ctx, region)
+    }
+
+    /// Status line for paint panel: pixel buffer + doc size of selected Image.
+    pub fn raster_paint_target_info(&self) -> Option<String> {
+        let &id = self.selection.first()?;
+        let node = self.project.nodes.get(id)?;
+        let NodeKind::Image { width, height, .. } = &node.kind else {
+            return None;
+        };
+        let px = self
+            .image_pixel_cache
+            .get(&id)
+            .map(|c| format!("{}×{}px", c.size[0], c.size[1]))
+            .unwrap_or_else(|| "…".into());
+        Some(format!("Target: {px} · doc {:.0}×{:.0}", width, height))
+    }
+
     /// Ensure a paint target Image exists; create a transparent full-page image if needed.
     fn ensure_raster_paint_target(&mut self, ctx: &Context) -> Option<NodeId> {
         // Prefer selected Image.
@@ -6813,39 +6893,29 @@ impl VadadeeBerryApp {
             });
             if let Some(bytes) = bytes_opt {
                 self.ensure_image_texture(id, &bytes, ctx);
+                self.tools.raster.target = Some(id);
                 return Some(id);
             }
         }
-        // Create new transparent paint surface (cap pixel size for interactive brush FPS).
-        let doc_w = self.project.document.width.max(1.0);
-        let doc_h = self.project.document.height.max(1.0);
-        // Prefer ≤1536 on the long edge so live paint stays interactive on typical pages.
-        const MAX_PAINT_EDGE: f64 = 1536.0;
-        let long = doc_w.max(doc_h);
-        let scale = if long > MAX_PAINT_EDGE {
-            MAX_PAINT_EDGE / long
-        } else {
-            1.0
-        };
-        let pw = (doc_w * scale).round().clamp(1.0, MAX_PAINT_EDGE) as u32;
-        let ph = (doc_h * scale).round().clamp(1.0, MAX_PAINT_EDGE) as u32;
-        let bytes = crate::raster::RasterBuffer::transparent_png(pw, ph)?;
-        // Image is still placed at full document size; pixels are lower-res paint buffer.
-        let node = self.styled_shape_node(Node::image(0.0, 0.0, doc_w, doc_h, bytes));
-        let id = node.id;
-        self.insert_node(node);
-        self.selection = vec![id];
-        let bytes = self
-            .project
-            .nodes
-            .get(id)
-            .and_then(|n| match &n.kind {
-                NodeKind::Image { bytes, .. } => Some(bytes.clone()),
-                _ => None,
-            })?;
-        self.ensure_image_texture(id, &bytes, ctx);
-        self.status_message = format!("New paint layer {pw}×{ph}px");
-        Some(id)
+        // Prefer last paint target if still an Image.
+        if let Some(id) = self.tools.raster.target {
+            if self
+                .project
+                .nodes
+                .get(id)
+                .map_or(false, |n| matches!(n.kind, NodeKind::Image { .. }))
+            {
+                let bytes = self.project.nodes.get(id).and_then(|n| match &n.kind {
+                    NodeKind::Image { bytes, .. } => Some(bytes.clone()),
+                    _ => None,
+                })?;
+                self.ensure_image_texture(id, &bytes, ctx);
+                self.selection = vec![id];
+                return Some(id);
+            }
+        }
+        // Create new transparent full-page paint surface.
+        self.raster_new_paint_layer(ctx, None)
     }
 
     fn tool_raster_paint(

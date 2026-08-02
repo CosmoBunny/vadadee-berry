@@ -7199,6 +7199,39 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     .color(colors::TEXT_MUTED),
             );
             ui.add_space(4.0);
+            // Explicit paint-layer setup (always new Image — does not reuse selection).
+            let btn_w_layer = (panel_w - 4.0).max(80.0);
+            if ui
+                .add_sized(
+                    [btn_w_layer, 22.0],
+                    egui::Button::new("New paint layer (page)"),
+                )
+                .on_hover_text("Transparent Image covering the full page, selected for paint")
+                .clicked()
+            {
+                app.raster_new_paint_layer(ui.ctx(), None);
+            }
+            if ui
+                .add_sized(
+                    [btn_w_layer, 22.0],
+                    egui::Button::new("New layer from selection"),
+                )
+                .on_hover_text(
+                    "Transparent Image matching selection bounds (or full page if empty)",
+                )
+                .clicked()
+            {
+                app.raster_new_paint_layer_from_selection(ui.ctx());
+            }
+            // Show active paint target size when an Image is selected.
+            if let Some(info) = app.raster_paint_target_info() {
+                ui.label(
+                    RichText::new(info)
+                        .small()
+                        .color(colors::TEXT_MUTED),
+                );
+            }
+            ui.add_space(4.0);
 
             if app.tools.active == ToolKind::BucketFill {
                 let mut tol = app.tools.raster.fill_tolerance as f32;
