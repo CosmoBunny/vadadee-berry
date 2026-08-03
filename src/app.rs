@@ -1452,16 +1452,39 @@ impl VadadeeBerryApp {
         }
         #[cfg(not(target_os = "android"))]
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Images", &["png", "jpg", "jpeg"])
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
             .pick_file()
         {
             if let Ok(bytes) = std::fs::read(&path) {
-                // Place near view "center" (rough, user can drag)
-                let cx = 200.0;
-                let cy = 150.0;
-                let w = 320.0;
-                let h = 240.0;
-                self.insert_image(cx - w / 2.0, cy - h / 2.0, w, h, bytes);
+                // Natural pixel aspect — never force a fixed box (was 320×240 → squeeze).
+                let (iw, ih) = image::load_from_memory(&bytes)
+                    .map(|img| (img.width().max(1), img.height().max(1)))
+                    .unwrap_or((320, 240));
+                let page_w = self.project.document.width.max(1.0);
+                let page_h = self.project.document.height.max(1.0);
+                // Fit inside ~70% of page, preserve aspect ratio.
+                let max_w = page_w * 0.70;
+                let max_h = page_h * 0.70;
+                let tw = iw as f64;
+                let th = ih as f64;
+                let (w, h) = if (max_w / tw) <= (max_h / th) {
+                    let w = max_w.min(tw); // don't upscale tiny images past native px
+                    let h = th * (w / tw);
+                    (w.max(1.0), h.max(1.0))
+                } else {
+                    let h = max_h.min(th);
+                    let w = tw * (h / th);
+                    (w.max(1.0), h.max(1.0))
+                };
+                // Prefer native pixel size when it already fits on the page.
+                let (w, h) = if tw <= max_w && th <= max_h {
+                    (tw, th)
+                } else {
+                    (w, h)
+                };
+                let cx = page_w * 0.5;
+                let cy = page_h * 0.5;
+                self.insert_image(cx - w * 0.5, cy - h * 0.5, w, h, bytes);
             }
         }
     }
@@ -6951,17 +6974,48 @@ impl VadadeeBerryApp {
         };
         let pw = ci.size[0] as u32;
         let ph = ci.size[1] as u32;
-        // Ensure pixel mask: rasterize geometric if needed.
+        // Ensure pixel mask: rasterize geometric into a **region** buffer only.
         if !has_pixel {
-            let mut mask = vec![0u8; (pw * ph) as usize];
             let polys = self.raster_poly_masks_px(ix, iy, iw, ih, irot, pw, ph);
             let rect = self.tools.raster.sticky_mask_doc.and_then(|(x0, y0, x1, y1)| {
                 self.doc_aabb_to_image_clip(ix, iy, iw, ih, irot, pw, ph, x0, y0, x1, y1)
             });
-            for yy in 0..ph as i32 {
-                for xx in 0..pw as i32 {
-                    let px = xx as f64 + 0.5;
-                    let py = yy as f64 + 0.5;
+            // Tight scan bounds from rect + poly AABB (never full frame).
+            let mut rx0 = pw as i32;
+            let mut ry0 = ph as i32;
+            let mut rx1 = 0i32;
+            let mut ry1 = 0i32;
+            if let Some((a, b, c, d)) = rect {
+                rx0 = rx0.min(a);
+                ry0 = ry0.min(b);
+                rx1 = rx1.max(c);
+                ry1 = ry1.max(d);
+            }
+            for poly in &polys {
+                for &(px, py) in poly {
+                    rx0 = rx0.min(px.floor() as i32);
+                    ry0 = ry0.min(py.floor() as i32);
+                    rx1 = rx1.max(px.ceil() as i32 + 1);
+                    ry1 = ry1.max(py.ceil() as i32 + 1);
+                }
+            }
+            rx0 = rx0.clamp(0, pw as i32);
+            ry0 = ry0.clamp(0, ph as i32);
+            rx1 = rx1.clamp(0, pw as i32);
+            ry1 = ry1.clamp(0, ph as i32);
+            if rx1 <= rx0 || ry1 <= ry0 {
+                self.status_message = "Mask is empty".into();
+                return;
+            }
+            let rw = (rx1 - rx0) as u32;
+            let rh = (ry1 - ry0) as u32;
+            let mut mask = vec![0u8; (rw * rh) as usize];
+            for yy in 0..rh as i32 {
+                for xx in 0..rw as i32 {
+                    let gx = rx0 + xx;
+                    let gy = ry0 + yy;
+                    let px = gx as f64 + 0.5;
+                    let py = gy as f64 + 0.5;
                     let in_rect = rect.is_some_and(|(a, b, c, d)| {
                         px >= a as f64 && px < c as f64 && py >= b as f64 && py < d as f64
                     });
@@ -6976,37 +7030,24 @@ impl VadadeeBerryApp {
                         in_rect
                     };
                     if on {
-                        mask[yy as usize * pw as usize + xx as usize] = 255;
+                        mask[yy as usize * rw as usize + xx as usize] = 255;
                     }
                 }
             }
-            self.tools.raster.sticky_pixel_mask = Some(crate::tools::StickyPixelMask {
-                node_id: id,
-                width: pw,
-                height: ph,
-                mask,
-            });
+            self.tools.raster.sticky_pixel_mask = Some(crate::tools::StickyPixelMask::from_region(
+                id, pw, ph, rx0, ry0, rw, rh, mask,
+            ));
+            // Keep geometric for paint clip OR; float uses pixel mask as source of truth.
         }
         let pm = self.tools.raster.sticky_pixel_mask.as_ref().unwrap();
-        // BBox of mask on pixels.
-        let mut min_x = pw as i32;
-        let mut min_y = ph as i32;
-        let mut max_x = -1i32;
-        let mut max_y = -1i32;
-        for y in 0..ph as i32 {
-            for x in 0..pw as i32 {
-                if pm.mask[y as usize * pw as usize + x as usize] != 0 {
-                    min_x = min_x.min(x);
-                    min_y = min_y.min(y);
-                    max_x = max_x.max(x);
-                    max_y = max_y.max(y);
-                }
-            }
-        }
-        if max_x < min_x {
-            self.status_message = "Mask is empty".into();
+        if pm.node_id != id || pm.full_w != pw || pm.full_h != ph {
+            self.status_message = "Mask does not match selected Image".into();
             return;
         }
+        let Some((min_x, min_y, max_x, max_y)) = pm.on_bbox() else {
+            self.status_message = "Mask is empty".into();
+            return;
+        };
         let bw = (max_x - min_x + 1) as u32;
         let bh = (max_y - min_y + 1) as u32;
         let mut cut = vec![0u8; (bw * bh * 4) as usize];
@@ -7026,11 +7067,10 @@ impl VadadeeBerryApp {
         };
         for y in min_y..=max_y {
             for x in min_x..=max_x {
-                let mi = y as usize * pw as usize + x as usize;
-                if pm.mask[mi] == 0 {
+                if !pm.contains(x, y) {
                     continue;
                 }
-                let si = mi * 4;
+                let si = (y as usize * pw as usize + x as usize) * 4;
                 let di = ((y - min_y) as u32 * bw + (x - min_x) as u32) as usize * 4;
                 cut[di..di + 4].copy_from_slice(&hole.rgba[si..si + 4]);
                 // Clear hole
@@ -7560,15 +7600,13 @@ impl VadadeeBerryApp {
         } else {
             None
         };
-        // Pixel-accurate mask (eyedrop/magnetic) — only for this Image.
-        let (pix_mask, pix_mw) = self
+        // Pixel-accurate region mask (eyedrop/magnetic/lasso float) — image space.
+        let pix_mask = self
             .tools
             .raster
             .sticky_pixel_mask
             .as_ref()
-            .filter(|m| m.node_id == id && m.width == pw && m.height == ph)
-            .map(|m| (Some(m.mask.as_slice()), m.width))
-            .unwrap_or((None, 0));
+            .filter(|m| m.node_id == id && m.full_w == pw && m.full_h == ph);
         let smudge = self.tools.active == ToolKind::Smudge;
         let alpha_lock = self.tools.raster.alpha_lock && !erase;
         let smudge_str = self.tools.raster.smudge_strength * press;
@@ -7606,15 +7644,7 @@ impl VadadeeBerryApp {
                             }
                         }
                         if let Some(m) = pix_mask {
-                            let ix = sx.round() as i32;
-                            let iy = sy.round() as i32;
-                            if ix < 0
-                                || iy < 0
-                                || m.get(iy as usize * pix_mw as usize + ix as usize)
-                                    .copied()
-                                    .unwrap_or(0)
-                                    == 0
-                            {
+                            if !m.contains(sx.round() as i32, sy.round() as i32) {
                                 continue;
                             }
                         }
@@ -7654,6 +7684,9 @@ impl VadadeeBerryApp {
                         let r_mul = 1.0 + (n2 * 2.0 - 1.0) * size_jit;
                         let tip_r = (base_radius * r_mul).max(0.5);
                         let ang = base_angle + (n3 * 2.0 - 1.0) * ang_jit * std::f32::consts::PI;
+                        let pix_region = pix_mask.map(|m| {
+                            (m.ox, m.oy, m.width, m.height, m.mask.as_slice())
+                        });
                         buf.stamp_tip_masked(
                             sx + jx,
                             sy + jy,
@@ -7666,8 +7699,7 @@ impl VadadeeBerryApp {
                             rect_mask,
                             alpha_lock,
                             poly_ref,
-                            pix_mask,
-                            pix_mw,
+                            pix_region,
                             aspect,
                             ang,
                         );
@@ -8445,50 +8477,89 @@ impl VadadeeBerryApp {
         };
         let pw = ci.size[0] as u32;
         let ph = ci.size[1] as u32;
-        let mut mask = vec![0u8; (pw * ph) as usize];
-        // Rasterize current geometric mask into bitmap, then invert.
+        // Rasterize geometric mask into a region buffer, then invert **within that region**.
         let polys = self.raster_poly_masks_px(ix, iy, iw, ih, rot, pw, ph);
         let rect = self.tools.raster.sticky_mask_doc.and_then(|(x0, y0, x1, y1)| {
             self.doc_aabb_to_image_clip(ix, iy, iw, ih, rot, pw, ph, x0, y0, x1, y1)
         });
         let has_geo = rect.is_some() || !polys.is_empty();
         if !has_geo {
-            // Invert empty → select all
-            mask.fill(255);
-        } else {
-            for yy in 0..ph as i32 {
-                for xx in 0..pw as i32 {
-                    let px = xx as f64 + 0.5;
-                    let py = yy as f64 + 0.5;
-                    let in_rect = rect.is_some_and(|(x0, y0, x1, y1)| {
-                        px >= x0 as f64 && px < x1 as f64 && py >= y0 as f64 && py < y1 as f64
-                    });
-                    let in_poly = polys
-                        .iter()
-                        .any(|p| crate::raster::point_in_polygon(px, py, p));
-                    let on = if rect.is_some() && !polys.is_empty() {
-                        in_rect || in_poly
-                    } else if !polys.is_empty() {
-                        in_poly
-                    } else {
-                        in_rect
-                    };
-                    if on {
-                        mask[yy as usize * pw as usize + xx as usize] = 255;
-                    }
+            // No mask → select all via geometric full image (no multi-megabyte bitmap).
+            if let Some(node) = self.project.nodes.get(id) {
+                if let NodeKind::Image {
+                    x, y, width, height, ..
+                } = &node.kind
+                {
+                    self.tools.raster.sticky_mask_doc =
+                        Some((*x, *y, *x + *width, *y + *height));
+                    self.tools.raster.sticky_pixel_mask = None;
+                    self.status_message =
+                        format!("Selected all (geometric {}×{})", pw, ph);
+                    return;
                 }
             }
-            for v in &mut mask {
-                *v = if *v == 0 { 255 } else { 0 };
+            self.status_message = "Nothing to invert".into();
+            return;
+        }
+        let mut rx0 = pw as i32;
+        let mut ry0 = ph as i32;
+        let mut rx1 = 0i32;
+        let mut ry1 = 0i32;
+        if let Some((a, b, c, d)) = rect {
+            rx0 = rx0.min(a);
+            ry0 = ry0.min(b);
+            rx1 = rx1.max(c);
+            ry1 = ry1.max(d);
+        }
+        for poly in &polys {
+            for &(px, py) in poly {
+                rx0 = rx0.min(px.floor() as i32);
+                ry0 = ry0.min(py.floor() as i32);
+                rx1 = rx1.max(px.ceil() as i32 + 1);
+                ry1 = ry1.max(py.ceil() as i32 + 1);
             }
         }
-        self.tools.raster.sticky_pixel_mask = Some(crate::tools::StickyPixelMask {
-            node_id: id,
-            width: pw,
-            height: ph,
-            mask,
-        });
-        // Clear geometric so pixel mask is the source of truth after invert.
+        rx0 = rx0.clamp(0, pw as i32);
+        ry0 = ry0.clamp(0, ph as i32);
+        rx1 = rx1.clamp(0, pw as i32);
+        ry1 = ry1.clamp(0, ph as i32);
+        if rx1 <= rx0 || ry1 <= ry0 {
+            self.status_message = "Mask is empty".into();
+            return;
+        }
+        let rw = (rx1 - rx0) as u32;
+        let rh = (ry1 - ry0) as u32;
+        let mut mask = vec![0u8; (rw * rh) as usize];
+        for yy in 0..rh as i32 {
+            for xx in 0..rw as i32 {
+                let gx = rx0 + xx;
+                let gy = ry0 + yy;
+                let px = gx as f64 + 0.5;
+                let py = gy as f64 + 0.5;
+                let in_rect = rect.is_some_and(|(x0, y0, x1, y1)| {
+                    px >= x0 as f64 && px < x1 as f64 && py >= y0 as f64 && py < y1 as f64
+                });
+                let in_poly = polys
+                    .iter()
+                    .any(|p| crate::raster::point_in_polygon(px, py, p));
+                let on = if rect.is_some() && !polys.is_empty() {
+                    in_rect || in_poly
+                } else if !polys.is_empty() {
+                    in_poly
+                } else {
+                    in_rect
+                };
+                if on {
+                    mask[yy as usize * rw as usize + xx as usize] = 255;
+                }
+            }
+        }
+        for v in &mut mask {
+            *v = if *v == 0 { 255 } else { 0 };
+        }
+        self.tools.raster.sticky_pixel_mask = Some(crate::tools::StickyPixelMask::from_region(
+            id, pw, ph, rx0, ry0, rw, rh, mask,
+        ));
         self.tools.raster.sticky_mask_doc = None;
         self.tools.raster.sticky_mask_poly = None;
         self.tools.raster.sticky_mask_polys.clear();
@@ -8499,7 +8570,7 @@ impl VadadeeBerryApp {
             .as_ref()
             .map(|m| m.count_on())
             .unwrap_or(0);
-        self.status_message = format!("Mask inverted ({n} px)");
+        self.status_message = format!("Mask inverted ({n} px, region {rw}×{rh})");
     }
 
     pub fn raster_grow_mask(&mut self, px: i32) {
@@ -8508,8 +8579,15 @@ impl VadadeeBerryApp {
             return;
         };
         let r = px.clamp(1, 16);
+        pm.pad_region(r);
         crate::raster::dilate_mask(&mut pm.mask, pm.width, pm.height, r);
-        self.status_message = format!("Mask grown +{r}px ({} px)", pm.count_on());
+        pm.compact(1);
+        self.status_message = format!(
+            "Mask grown +{r}px ({} px, region {}×{})",
+            pm.count_on(),
+            pm.width,
+            pm.height
+        );
     }
 
     pub fn raster_shrink_mask(&mut self, px: i32) {
@@ -8518,11 +8596,17 @@ impl VadadeeBerryApp {
             return;
         };
         let r = px.clamp(1, 16);
-        // Shrink = invert, dilate, invert
+        // Shrink = invert region, dilate, invert
         pm.invert();
         crate::raster::dilate_mask(&mut pm.mask, pm.width, pm.height, r);
         pm.invert();
-        self.status_message = format!("Mask shrunk −{r}px ({} px)", pm.count_on());
+        pm.compact(1);
+        self.status_message = format!(
+            "Mask shrunk −{r}px ({} px, region {}×{})",
+            pm.count_on(),
+            pm.width,
+            pm.height
+        );
     }
 
     pub fn raster_select_all_image(&mut self, ctx: &Context) {
@@ -8535,33 +8619,26 @@ impl VadadeeBerryApp {
             self.status_message = "Select an Image first".into();
             return;
         };
-        let bytes = self.project.nodes.get(id).and_then(|n| {
-            if let NodeKind::Image { bytes, .. } = &n.kind {
-                Some(bytes.clone())
+        let _ = ctx;
+        // Geometric full-image mask — no multi-megabyte pixel buffer.
+        let snap = self.project.nodes.get(id).and_then(|n| {
+            if let NodeKind::Image {
+                x, y, width, height, ..
+            } = &n.kind
+            {
+                Some((*x, *y, *width, *height))
             } else {
                 None
             }
         });
-        let Some(bytes) = bytes else {
+        let Some((x, y, w, h)) = snap else {
             return;
         };
-        self.ensure_image_texture(id, &bytes, ctx);
-        let Some(ci) = self.image_pixel_cache.get(&id) else {
-            return;
-        };
-        let pw = ci.size[0] as u32;
-        let ph = ci.size[1] as u32;
-        let mask = vec![255u8; (pw * ph) as usize];
-        self.tools.raster.sticky_pixel_mask = Some(crate::tools::StickyPixelMask {
-            node_id: id,
-            width: pw,
-            height: ph,
-            mask,
-        });
-        self.tools.raster.sticky_mask_doc = None;
+        self.tools.raster.sticky_mask_doc = Some((x, y, x + w, y + h));
+        self.tools.raster.sticky_pixel_mask = None;
         self.tools.raster.sticky_mask_poly = None;
         self.tools.raster.sticky_mask_polys.clear();
-        self.status_message = format!("Selected all ({}×{})", pw, ph);
+        self.status_message = format!("Selected all (geometric {w:.0}×{h:.0} doc)");
     }
 
     fn raster_apply_rect_mask(&mut self, a: (f64, f64), b: (f64, f64), union: bool) {
@@ -8705,38 +8782,42 @@ impl VadadeeBerryApp {
             self.status_message = "Nothing selected".into();
             return;
         }
-        // Build mask only from flood result (not AABB) — hole colors stay unselected.
-        let mut mask = vec![0u8; (pw * ph) as usize];
+        // Build full-frame mask only temporarily, then crop to tight region buffer.
+        let mut full_mask = vec![0u8; (pw * ph) as usize];
         for yy in 0..ph as usize {
             let row = yy * pw as usize;
             for xx in 0..pw as usize {
                 let i = (row + xx) * 4;
                 if work[i..i + 4] != raw[i..i + 4] {
-                    mask[row + xx] = 255;
+                    full_mask[row + xx] = 255;
                 }
             }
         }
-        // Glow: expand outward from selected pixels only (cheap). Cap px so UI never freezes.
+        // Glow: expand outward. Cap px so UI never freezes.
+        let mut glow_px = 0i32;
         if glow {
             let scale = ((pw as f64 / iw.max(1.0)) + (ph as f64 / ih.max(1.0))) * 0.5;
-            // Doc glow_radius → image pixels, hard-capped (was 64 → multi-second freezes).
-            let glow_px = (self.tools.raster_select.glow_radius as f64 * scale)
+            glow_px = (self.tools.raster_select.glow_radius as f64 * scale)
                 .ceil()
                 .clamp(0.0, 16.0) as i32;
             if glow_px > 0 {
-                crate::raster::dilate_mask(&mut mask, pw, ph, glow_px);
+                crate::raster::dilate_mask(&mut full_mask, pw, ph, glow_px);
             }
         }
-        let mut pixel = StickyPixelMask {
-            node_id: id,
-            width: pw,
-            height: ph,
-            mask,
+        let Some(pixel) =
+            StickyPixelMask::from_full_frame(id, pw, ph, &full_mask, glow_px.max(1))
+        else {
+            self.status_message = "Nothing selected".into();
+            return;
         };
+        drop(full_mask);
         let union = self.tools.raster_select.union_mask;
         if union {
             if let Some(existing) = self.tools.raster.sticky_pixel_mask.as_mut() {
-                if existing.node_id == id && existing.width == pw && existing.height == ph {
+                if existing.node_id == id
+                    && existing.full_w == pw
+                    && existing.full_h == ph
+                {
                     existing.or_with(&pixel);
                 } else {
                     *existing = pixel;
@@ -8744,24 +8825,23 @@ impl VadadeeBerryApp {
             } else {
                 self.tools.raster.sticky_pixel_mask = Some(pixel);
             }
-            // Keep rect/poly for union OR with geometric masks.
         } else {
             self.tools.raster.sticky_pixel_mask = Some(pixel);
             self.tools.raster.sticky_mask_doc = None;
             self.tools.raster.sticky_mask_poly = None;
             self.tools.raster.sticky_mask_polys.clear();
         }
-        let count = self
+        let (count, rw, rh) = self
             .tools
             .raster
             .sticky_pixel_mask
             .as_ref()
-            .map(|m| m.mask.iter().filter(|&&v| v != 0).count())
-            .unwrap_or(0);
+            .map(|m| (m.count_on(), m.width, m.height))
+            .unwrap_or((0, 0, 0));
         self.status_message = if glow {
-            format!("Pixel mask + glow ({count} px, flood {n})")
+            format!("Pixel mask + glow ({count} px, region {rw}×{rh}, flood {n})")
         } else {
-            format!("Pixel mask ({count} px, exact flood)")
+            format!("Pixel mask ({count} px, region {rw}×{rh}, flood {n})")
         };
     }
 
@@ -8805,7 +8885,8 @@ impl VadadeeBerryApp {
                     self.tools.raster_select.drag_current = Some(doc);
                 } else if down {
                     if let Some(last) = self.tools.raster_select.lasso_pts.last().copied() {
-                        if (doc.0 - last.0).hypot(doc.1 - last.1) > 1.5 {
+                        // Larger step = fewer vertices (big images stay smooth while drawing).
+                        if (doc.0 - last.0).hypot(doc.1 - last.1) > 3.0 {
                             self.tools.raster_select.lasso_pts.push(doc);
                         }
                     }
@@ -8893,7 +8974,7 @@ impl VadadeeBerryApp {
                 if down {
                     if let Some(last) = self.tools.raster.mask_lasso_pts.last().copied() {
                         let d = (doc.0 - last.0).hypot(doc.1 - last.1);
-                        if d > 1.5 {
+                        if d > 3.0 {
                             self.tools.raster.mask_lasso_pts.push(doc);
                         }
                     } else {
@@ -9095,27 +9176,30 @@ impl VadadeeBerryApp {
             return;
         };
         let rot = node.transform.rotation_rad as f32;
-        let pw = pm.width.max(1);
-        let ph = pm.height.max(1);
-        let is_on = |xx: i32, yy: i32| -> bool {
-            if xx < 0 || yy < 0 || xx >= pw as i32 || yy >= ph as i32 {
+        let full_w = pm.full_w.max(1);
+        let full_h = pm.full_h.max(1);
+        let rw = pm.width.max(1);
+        let rh = pm.height.max(1);
+        // Region-local on-test.
+        let is_on_local = |lx: i32, ly: i32| -> bool {
+            if lx < 0 || ly < 0 || lx >= rw as i32 || ly >= rh as i32 {
                 return false;
             }
-            pm.mask[yy as usize * pw as usize + xx as usize] != 0
+            pm.mask[ly as usize * rw as usize + lx as usize] != 0
         };
 
-        // Soft yellow shade via downscaled texture (no per-pixel squares).
-        if shade {
+        // Soft yellow shade via downscaled **region** texture only.
+        if shade && rw > 0 && rh > 0 {
             const MAX_SIDE: u32 = 256;
-            let scale = (pw.max(ph) as f32 / MAX_SIDE as f32).max(1.0);
-            let tw = ((pw as f32 / scale).ceil() as u32).max(1);
-            let th = ((ph as f32 / scale).ceil() as u32).max(1);
+            let scale = (rw.max(rh) as f32 / MAX_SIDE as f32).max(1.0);
+            let tw = ((rw as f32 / scale).ceil() as u32).max(1);
+            let th = ((rh as f32 / scale).ceil() as u32).max(1);
             let mut rgba = vec![0u8; (tw * th * 4) as usize];
             for ty in 0..th {
                 for tx in 0..tw {
-                    let ix = ((tx as f32 + 0.5) * scale) as i32;
-                    let iy = ((ty as f32 + 0.5) * scale) as i32;
-                    if is_on(ix.min(pw as i32 - 1), iy.min(ph as i32 - 1)) {
+                    let lx = ((tx as f32 + 0.5) * scale) as i32;
+                    let ly = ((ty as f32 + 0.5) * scale) as i32;
+                    if is_on_local(lx.min(rw as i32 - 1), ly.min(rh as i32 - 1)) {
                         let i = (ty * tw + tx) as usize * 4;
                         rgba[i] = 255;
                         rgba[i + 1] = 210;
@@ -9133,25 +9217,39 @@ impl VadadeeBerryApp {
                 img,
                 egui::TextureOptions::LINEAR,
             );
-            let tl = self.viewport.doc_to_screen((*x, *y), origin);
-            let br = self
-                .viewport
-                .doc_to_screen((*x + *width, *y + *height), origin);
+            // Map region AABB (full image px) → document → screen.
+            let u0 = pm.ox as f64 / full_w as f64;
+            let v0 = pm.oy as f64 / full_h as f64;
+            let u1 = (pm.ox as f64 + rw as f64) / full_w as f64;
+            let v1 = (pm.oy as f64 + rh as f64) / full_h as f64;
+            let map_uv = |u: f64, v: f64| -> (f64, f64) {
+                let lx = *x + u * *width;
+                let ly = *y + v * *height;
+                if (rot as f64).abs() < 1e-12 {
+                    (lx, ly)
+                } else {
+                    let cx = *x + *width * 0.5;
+                    let cy = *y + *height * 0.5;
+                    let c = (rot as f64).cos();
+                    let s = (rot as f64).sin();
+                    let rx = lx - cx;
+                    let ry = ly - cy;
+                    (cx + rx * c - ry * s, cy + rx * s + ry * c)
+                }
+            };
+            let (dx0, dy0) = map_uv(u0, v0);
+            let (dx1, dy1) = map_uv(u1, v1);
+            let tl = self.viewport.doc_to_screen((dx0, dy0), origin);
+            let br = self.viewport.doc_to_screen((dx1, dy1), origin);
             let rect = egui::Rect::from_two_pos(tl, br);
-            crate::render::paint_image_rotated(
-                painter,
-                tex.id(),
-                rect,
-                rot,
-                1.0,
-            );
+            crate::render::paint_image_rotated(painter, tex.id(), rect, 0.0, 1.0);
         }
 
         // Edge segments (includes inner holes): dashed yellow path.
-        // Map pixel corner to screen.
+        // Map full-image pixel corner → screen.
         let to_screen = |ix: f64, iy: f64| -> Pos2 {
-            let lx = *x + ix / pw as f64 * *width;
-            let ly = *y + iy / ph as f64 * *height;
+            let lx = *x + ix / full_w as f64 * *width;
+            let ly = *y + iy / full_h as f64 * *height;
             let (dx, dy) = if (rot as f64).abs() < 1e-12 {
                 (lx, ly)
             } else {
@@ -9166,41 +9264,40 @@ impl VadadeeBerryApp {
             self.viewport.doc_to_screen((dx, dy), origin)
         };
 
-        // Subsample scan for large images to keep FPS, but denser than before.
-        let scan = ((pw.max(ph) as usize) / 512).max(1);
+        // Scan only the region buffer (not full frame).
+        let scan = ((rw.max(rh) as usize) / 512).max(1);
         let mut segs: Vec<(Pos2, Pos2)> = Vec::new();
-        const MAX_SEGS: usize = 6000;
-        'outer: for yy in (0..ph as i32).step_by(scan) {
-            for xx in (0..pw as i32).step_by(scan) {
-                if !is_on(xx, yy) {
+        const MAX_SEGS: usize = 4000;
+        'outer: for ly in (0..rh as i32).step_by(scan) {
+            for lx in (0..rw as i32).step_by(scan) {
+                if !is_on_local(lx, ly) {
                     continue;
                 }
-                // Top edge of this cell (if above is off)
-                if !is_on(xx, yy - 1) {
+                let gx = pm.ox + lx;
+                let gy = pm.oy + ly;
+                let step = scan as i32;
+                if !is_on_local(lx, ly - 1) {
                     segs.push((
-                        to_screen(xx as f64, yy as f64),
-                        to_screen((xx + scan as i32) as f64, yy as f64),
+                        to_screen(gx as f64, gy as f64),
+                        to_screen((gx + step) as f64, gy as f64),
                     ));
                 }
-                // Left edge
-                if !is_on(xx - 1, yy) {
+                if !is_on_local(lx - 1, ly) {
                     segs.push((
-                        to_screen(xx as f64, yy as f64),
-                        to_screen(xx as f64, (yy + scan as i32) as f64),
+                        to_screen(gx as f64, gy as f64),
+                        to_screen(gx as f64, (gy + step) as f64),
                     ));
                 }
-                // Right edge of strip
-                if !is_on(xx + scan as i32, yy) {
+                if !is_on_local(lx + step, ly) {
                     segs.push((
-                        to_screen((xx + scan as i32) as f64, yy as f64),
-                        to_screen((xx + scan as i32) as f64, (yy + scan as i32) as f64),
+                        to_screen((gx + step) as f64, gy as f64),
+                        to_screen((gx + step) as f64, (gy + step) as f64),
                     ));
                 }
-                // Bottom
-                if !is_on(xx, yy + scan as i32) {
+                if !is_on_local(lx, ly + step) {
                     segs.push((
-                        to_screen(xx as f64, (yy + scan as i32) as f64),
-                        to_screen((xx + scan as i32) as f64, (yy + scan as i32) as f64),
+                        to_screen(gx as f64, (gy + step) as f64),
+                        to_screen((gx + step) as f64, (gy + step) as f64),
                     ));
                 }
                 if segs.len() >= MAX_SEGS {
@@ -9563,6 +9660,35 @@ impl VadadeeBerryApp {
 
     pub fn graph_path_texture_id(&self, key: &str) -> Option<egui::TextureId> {
         self.graph_path_textures.get(key).map(|t| t.id())
+    }
+
+    /// Texture pixel size for node-editor previews (aspect-fit).
+    pub fn graph_path_texture_size(&self, key: &str) -> Option<[usize; 2]> {
+        self.graph_path_textures.get(key).map(|t| t.size())
+    }
+
+    /// Upload a CV bake-cache RGBA (see [`crate::cv::global_cv_cache`]) for node previews.
+    pub fn ensure_graph_bake_texture(
+        &mut self,
+        key: &str,
+        ctx: &Context,
+    ) -> Option<egui::TextureId> {
+        if let Some(t) = self.graph_path_textures.get(key) {
+            return Some(t.id());
+        }
+        let rgba = crate::cv::global_cv_cache().get_rgba_image(key)?;
+        let (w, h) = rgba.dimensions();
+        let pixels = rgba.into_raw();
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+        let handle = ctx.load_texture(
+            format!("vadadee-berry-graph-bake-{}", key.chars().take(48).collect::<String>()),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        let id = handle.id();
+        self.graph_path_textures.insert(key.to_string(), handle);
+        Some(id)
     }
 
     pub fn image_texture_id(&self, id: NodeId) -> Option<egui::TextureId> {
@@ -10538,6 +10664,8 @@ fn run_video_decode_thread(
             }
 
             // Warm Node Editor Output Object textures (include blur bake when not playing).
+            // Also upload CV bake-cache keys so paint can stay on `&self`.
+            let mut graph_bake_keys: Vec<String> = Vec::new();
             let graph_evals: Vec<(String, crate::document::GraphOutputEval)> = self
                 .project
                 .document
@@ -10551,10 +10679,17 @@ fn run_video_decode_thread(
                         crate::document::GraphImageSource::FilePath(p) => {
                             Some((p.clone(), eval))
                         }
+                        crate::document::GraphImageSource::BakedCache { key } => {
+                            graph_bake_keys.push(key.clone());
+                            None
+                        }
                         _ => None,
                     }
                 })
                 .collect();
+            for key in &graph_bake_keys {
+                let _ = self.ensure_graph_bake_texture(key, &ctx);
+            }
             // While extract is busy, only show cached frames (no new libav seeks).
             for (path, eval) in &graph_evals {
                 if eval.video_time_sec.is_some() && self.ne_audio_extract_busy(path) {
@@ -10568,7 +10703,7 @@ fn run_video_decode_thread(
                 }
                 let _ = self.ensure_graph_fx_texture(path, eval, &ctx);
             }
-            // Fit still-default proxies to natural image size (once).
+            // Fit still-default proxies to natural image size (once) — keep aspect ratio.
             {
                 let page_w = self.project.document.width;
                 let page_h = self.project.document.height;
@@ -10582,18 +10717,18 @@ fn run_video_decode_thread(
                     .filter_map(|(i, l)| {
                         let g = l.node_graph.as_ref()?;
                         let eval = g.resolve_output_image();
-                        let path = match &eval.image {
-                            crate::document::GraphImageSource::FilePath(p) => p.as_str(),
+                        let size = match &eval.image {
+                            crate::document::GraphImageSource::FilePath(p) => self
+                                .graph_fx_paint_tex(p, &eval)
+                                .map(|(_, s)| s)
+                                .or_else(|| {
+                                    self.graph_path_textures.get(p).map(|t| t.size())
+                                })?,
+                            crate::document::GraphImageSource::BakedCache { key } => {
+                                self.graph_path_textures.get(key).map(|t| t.size())?
+                            }
                             _ => return None,
                         };
-                        let size = self
-                            .graph_fx_paint_tex(path, &eval)
-                            .map(|(_, s)| s)
-                            .or_else(|| {
-                                self.graph_path_textures
-                                    .get(path)
-                                    .map(|t| t.size())
-                            })?;
                         Some((i, size[0] as u32, size[1] as u32))
                     })
                     .collect();
@@ -10957,6 +11092,61 @@ fn run_video_decode_thread(
                                                 );
                                             }
                                         }
+                                    }
+                                }
+                                crate::document::GraphImageSource::BakedCache { key } => {
+                                    // Spatial FX bake (CV materialize). Warmed via ensure_graph_bake_texture.
+                                    if let Some(tex_id) = self.graph_path_texture_id(key) {
+                                        let (dx, dy, w, h, rot_rad) = layer.ne_output_paint_geom(
+                                            &self.project.nodes,
+                                            &eval,
+                                        );
+                                        let mut layer_opacity = layer
+                                            .ne_output_proxy
+                                            .and_then(|pid| self.project.nodes.get(pid))
+                                            .map(|n| n.get_opacity())
+                                            .unwrap_or(1.0);
+                                        if let Some(pid) = layer.ne_output_proxy {
+                                            if let Some(track) =
+                                                self.project.anim_timeline.nodes.get(&pid)
+                                            {
+                                                if let Some(o) = track
+                                                    .opacity
+                                                    .interpolate(self.anim_current_frame)
+                                                {
+                                                    layer_opacity = o as f32;
+                                                }
+                                            }
+                                        }
+                                        let tl = self.viewport.doc_to_screen((dx, dy), origin);
+                                        let br = self.viewport.doc_to_screen(
+                                            (dx + w, dy + h),
+                                            origin,
+                                        );
+                                        let rect = egui::Rect::from_min_max(tl, br);
+                                        let mirror = eval.geo_mirror.round() as i32;
+                                        let mul = layer_opacity.clamp(0.0, 1.0);
+                                        let rgb_mul = if eval.only_brightness_fx() {
+                                            (eval.brightness as f32).clamp(0.0, 8.0)
+                                        } else {
+                                            1.0
+                                        };
+                                        let uv = if eval.has_zoom() {
+                                            eval.zoom_uv_rect()
+                                        } else {
+                                            (0.0, 0.0, 1.0, 1.0)
+                                        };
+                                        paint_rotated_image_mirrored_tint_uv(
+                                            &painter,
+                                            tex_id,
+                                            rect,
+                                            rot_rad as f32,
+                                            mul,
+                                            rgb_mul,
+                                            mirror & 1 != 0,
+                                            mirror & 2 != 0,
+                                            uv,
+                                        );
                                     }
                                 }
                                 crate::document::GraphImageSource::FilePath(path) => {
@@ -19176,6 +19366,9 @@ fn run_video_decode_thread(
                     crate::document::GraphImageSource::Empty => {
                         serde_json::json!({ "type": "empty" })
                     }
+                    crate::document::GraphImageSource::BakedCache { key } => {
+                        serde_json::json!({ "type": "baked_cache", "key": key })
+                    }
                     crate::document::GraphImageSource::FilePath(p) => {
                         serde_json::json!({ "type": "file", "path": p })
                     }
@@ -21751,6 +21944,13 @@ impl eframe::App for VadadeeBerryApp {
 
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.tick_flood_fill_anim(ctx);
+        // CV background jobs (face / privacy / chroma) finished → refresh previews.
+        if crate::cv::take_dirty() {
+            ctx.request_repaint();
+        } else if crate::cv::jobs::is_pending_any() {
+            // Keep ticking lightly while a job is in flight.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         let painting = self.tools.raster.painting
             || (self.tools.active == ToolKind::Brush && !self.tools.brush.points.is_empty())
             || self.flood_fill_anim.is_some();

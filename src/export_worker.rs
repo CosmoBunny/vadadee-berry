@@ -519,44 +519,53 @@ impl<'a> ExportSession<'a> {
             let _ = time_secs;
         }
 
-        // NE FilePath: bake with session caches + sticky last-key reuse.
-        let ne_layers: Vec<(uuid::Uuid, String, crate::document::GraphOutputEval)> = self
-            .project
-            .document
-            .layers
-            .iter()
-            .filter(|l| l.visible && l.is_renderer && l.kind == crate::document::LayerKind::NodeEditor)
-            .filter_map(|l| {
-                let g = l.node_graph.as_ref()?;
-                let eval = g.resolve_output_image();
-                match &eval.image {
-                    crate::document::GraphImageSource::FilePath(p) => {
-                        Some((l.id, p.clone(), eval))
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
+        // NE FilePath / CV bake: session caches + sticky last-key reuse.
+        // Sync CV so face/privacy finish before bake (live path is async).
+        let ne_layers: Vec<(uuid::Uuid, crate::document::GraphOutputEval)> =
+            crate::cv::jobs::with_sync_cv(|| {
+                self.project
+                    .document
+                    .layers
+                    .iter()
+                    .filter(|l| {
+                        l.visible && l.is_renderer && l.kind == crate::document::LayerKind::NodeEditor
+                    })
+                    .filter_map(|l| {
+                        let g = l.node_graph.as_ref()?;
+                        let eval = g.resolve_output_image();
+                        match &eval.image {
+                            crate::document::GraphImageSource::FilePath(_)
+                            | crate::document::GraphImageSource::BakedCache { .. } => {
+                                Some((l.id, eval))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect()
+            });
 
         let blur_step = self.ne_blur_step();
-        for (layer_id, path, eval) in ne_layers {
+        for (layer_id, eval) in ne_layers {
             let mut q = eval.quantized_for_cache(true);
             let step = blur_step.max(0.25) as f64;
             q.blur_px = ((q.blur_px / step).round() * step).clamp(0.0, 64.0);
-            let fx_key = format!("{}|ms{max_side}|s{step}", q.fx_cache_key(&path));
+            let path_tag = eval.source_file_path().unwrap_or("bake");
+            let fx_key = format!("{}|ms{max_side}|s{step}", q.fx_cache_key(path_tag));
 
             if self.last_ne_bake_key.as_ref() != Some(&fx_key) {
                 // Do **not** grow base/fx HashMaps across timed video frames — each
                 // key is unique (|t0.000, |t0.033, …) and was blowing RSS to multi‑GB.
                 // Sticky last_ne_bake_rgba is enough for the current frame.
-                let baked = crate::document::bake_graph_output_rgba(
-                    &path,
-                    &eval,
-                    max_side,
-                    blur_step,
-                    None,
-                    None,
-                )?;
+                // Force CV jobs (face/privacy) to run sync so export is complete.
+                let baked = crate::cv::jobs::with_sync_cv(|| {
+                    crate::document::bake_graph_eval_rgba(
+                        &eval,
+                        max_side,
+                        blur_step,
+                        None,
+                        None,
+                    )
+                })?;
                 self.last_ne_bake_key = Some(fx_key);
                 self.last_ne_bake_rgba = Some(baked);
                 // Drop any leftover maps from older code paths / still bakes.
@@ -660,24 +669,23 @@ impl<'a> ExportSession<'a> {
         }
     }
 
-    /// Bake/upload NE FilePath FX texture for a layer; reuses when FX key unchanged.
+    /// Bake/upload NE FilePath / CV bake FX texture for a layer; reuses when FX key unchanged.
     fn ensure_ne_fx_texture(
         &mut self,
         layer_id: uuid::Uuid,
-        path: &str,
         eval: &crate::document::GraphOutputEval,
         max_side: u32,
     ) -> Option<egui::TextureHandle> {
         let q = eval.quantized_for_cache(true);
-        let fx_key = format!("{}|ms{max_side}", q.fx_cache_key(path));
+        let path_tag = eval.source_file_path().unwrap_or("bake");
+        let fx_key = format!("{}|ms{max_side}", q.fx_cache_key(path_tag));
         if self.ne_tex_fx_key.get(&layer_id) == Some(&fx_key) {
             // Texture is stored under synthetic node id = layer_id for NE Output.
             if let Some(t) = self.image_textures.get(&layer_id) {
                 return Some(t.clone());
             }
         }
-        let rgba = crate::document::bake_graph_output_rgba(
-            path,
+        let rgba = crate::document::bake_graph_eval_rgba(
             eval,
             max_side,
             self.ne_blur_step(),
@@ -1713,9 +1721,9 @@ impl<'a> ExportSession<'a> {
             self.image_textures.insert(*layer_id, handle);
         }
 
-        // Pre-bake NE FilePath textures (cached by FX key).
+        // Pre-bake NE FilePath / CV bake textures (cached by FX key).
         let max_side = self.ne_bake_max_side(width, height);
-        let ne_jobs: Vec<(uuid::Uuid, String, crate::document::GraphOutputEval)> = self
+        let ne_jobs: Vec<(uuid::Uuid, crate::document::GraphOutputEval)> = self
             .project
             .document
             .layers
@@ -1725,15 +1733,16 @@ impl<'a> ExportSession<'a> {
                 let g = l.node_graph.as_ref()?;
                 let eval = g.resolve_output_image();
                 match &eval.image {
-                    crate::document::GraphImageSource::FilePath(p) => {
-                        Some((l.id, p.clone(), eval))
+                    crate::document::GraphImageSource::FilePath(_)
+                    | crate::document::GraphImageSource::BakedCache { .. } => {
+                        Some((l.id, eval))
                     }
                     _ => None,
                 }
             })
             .collect();
-        for (lid, path, eval) in &ne_jobs {
-            let _ = self.ensure_ne_fx_texture(*lid, path, eval, max_side);
+        for (lid, eval) in &ne_jobs {
+            let _ = self.ensure_ne_fx_texture(*lid, eval, max_side);
         }
 
         // P6c: hide AppObject sources that feed NE Output (match canvas).
@@ -1911,6 +1920,62 @@ impl<'a> ExportSession<'a> {
                                                 &image_textures,
                                             );
                                         }
+                                    }
+                                }
+                                crate::document::GraphImageSource::BakedCache { .. } => {
+                                    // Same as FilePath: texture pre-baked into image_textures[layer.id].
+                                    if let Some(tex) = image_textures.get(&layer.id) {
+                                        let (tw, th) = (
+                                            tex.size()[0] as f64,
+                                            tex.size()[1] as f64,
+                                        );
+                                        let (dx, dy, mut w, mut h, rot_rad) = layer
+                                            .ne_output_paint_geom(
+                                                &self.project.nodes,
+                                                &eval,
+                                            );
+                                        let def_w = layer.width as f64;
+                                        let def_h = layer.height as f64;
+                                        let near_default = (w - def_w).abs() < 2.0
+                                            && (h - def_h).abs() < 2.0;
+                                        let near_a4 = (w
+                                            - crate::document::A4_WIDTH_PX)
+                                            .abs()
+                                            < 2.0
+                                            && (h - crate::document::A4_HEIGHT_PX)
+                                                .abs()
+                                                < 2.0;
+                                        if near_default || near_a4 {
+                                            let page_w =
+                                                self.project.document.width.max(1.0);
+                                            let page_h =
+                                                self.project.document.height.max(1.0);
+                                            let mut nw = tw;
+                                            let mut nh = th;
+                                            if nw > page_w || nh > page_h {
+                                                let s = (page_w / nw)
+                                                    .min(page_h / nh);
+                                                nw *= s;
+                                                nh *= s;
+                                            }
+                                            w = nw.max(1.0);
+                                            h = nh.max(1.0);
+                                        }
+                                        let tl = viewport
+                                            .doc_to_screen((dx, dy), origin);
+                                        let br = viewport.doc_to_screen(
+                                            (dx + w, dy + h),
+                                            origin,
+                                        );
+                                        let rect =
+                                            egui::Rect::from_min_max(tl, br);
+                                        paint_rotated_image(
+                                            &painter,
+                                            tex.id(),
+                                            rect,
+                                            rot_rad as f32,
+                                            1.0,
+                                        );
                                     }
                                 }
                                 crate::document::GraphImageSource::FilePath(_path) => {

@@ -24,6 +24,14 @@ pub enum PortType {
     Color,
     /// Compound position (2 reals).
     Position,
+    /// Single-channel matte / alpha (CV analyze → spatial effects).
+    Mask,
+    /// Labeled boxes/polygons for one time sample (privacy, detect).
+    Regions,
+    /// Motion track sample (center / bbox over time).
+    Track,
+    /// Composited multi-image union stream (Union Image 2/3/5/7 nodes).
+    UnionImage,
 }
 
 impl PortType {
@@ -37,6 +45,10 @@ impl PortType {
             Self::Real => "Real",
             Self::Color => "Color",
             Self::Position => "Position",
+            Self::Mask => "Mask",
+            Self::Regions => "Regions",
+            Self::Track => "Track",
+            Self::UnionImage => "Union",
         }
     }
 
@@ -46,9 +58,17 @@ impl PortType {
             (a, b) if a == b => true,
             // Video can feed image-effect chains (treat as image stream).
             (Self::RawVideo, Self::RawImage) => true,
+            // Union result can drive image sinks (Output Object, effects).
+            (Self::UnionImage, Self::RawImage) => true,
+            // Track is its own type; use Track Motion `x`/`y` Real outs for Geo/Zoom.
             // Color/Position can feed Real only via expanded child ports later; not as whole.
             _ => false,
         }
+    }
+
+    /// Port types introduced for CV analyze / spatial FX (node editor).
+    pub fn is_cv_structured(self) -> bool {
+        matches!(self, Self::Mask | Self::Regions | Self::Track)
     }
 }
 
@@ -148,6 +168,28 @@ pub enum GraphNodeKind {
         #[serde(default = "default_viz_gain")]
         gain: f64,
     },
+    /// HSV green-screen style key → Mask + keyed Image (materializing).
+    ChromaKey,
+    /// Multiply image alpha by Mask (materializing).
+    ApplyMask,
+    /// Blur where Mask is low / background (materializing).
+    BackgroundBlur,
+    /// Manual privacy box (normalized x,y,w,h) → Regions.
+    RegionsFromManual,
+    /// Blur / pixelate ROIs from Regions (materializing).
+    PrivacyBlur,
+    /// Face detect → Regions (stub until OpenCV/plugin; emits empty list).
+    DetectFace,
+    /// Motion track from seed position (template match). Outputs Track + x/y/conf.
+    TrackMotion,
+    /// Union Image 2: 1× Image + optional Union in → Union out.
+    UnionImage2,
+    /// Union Image 3: 2× Image + optional Union in → Union out.
+    UnionImage3,
+    /// Union Image 5: 4× Image + optional Union in → Union out.
+    UnionImage5,
+    /// Union Image 7: 6× Image + optional Union in → Union out.
+    UnionImage7,
 
     // --- Geometry ---
     GeoSize,
@@ -182,6 +224,51 @@ fn default_expr_xyz() -> String {
 fn default_viz_gain() -> f64 {
     1.0
 }
+
+/// Build ports for Union Image N: `(N-1)` image inputs + optional `union` in + `out` union.
+fn union_image_ports(image_slots: usize) -> Vec<PortDef> {
+    use PortDir::*;
+    use PortType::*;
+    let mut v = Vec::with_capacity(image_slots + 2);
+    for i in 0..image_slots {
+        v.push(PortDef {
+            id: format!("img{i}"),
+            name: format!("Image {}", i + 1),
+            ty: RawImage,
+            dir: Input,
+        });
+    }
+    v.push(PortDef {
+        id: "union".into(),
+        name: "Union".into(),
+        ty: UnionImage,
+        dir: Input,
+    });
+    v.push(PortDef {
+        id: "out".into(),
+        name: "Union".into(),
+        ty: UnionImage,
+        dir: Output,
+    });
+    v
+}
+
+impl GraphNodeKind {
+    /// How many plain image inputs on a Union Image node (2→1, 3→2, 5→4, 7→6).
+    pub fn union_image_slot_count(&self) -> Option<usize> {
+        match self {
+            Self::UnionImage2 => Some(1),
+            Self::UnionImage3 => Some(2),
+            Self::UnionImage5 => Some(4),
+            Self::UnionImage7 => Some(6),
+            _ => None,
+        }
+    }
+
+    pub fn is_union_image(&self) -> bool {
+        self.union_image_slot_count().is_some()
+    }
+}
 fn default_mouse_time_threshold() -> f64 {
     // Wider window = smoother shakiness envelope while still tracking tremor.
     0.20
@@ -214,7 +301,18 @@ impl GraphNodeKind {
             | Self::Zoom
             | Self::Equalizer
             | Self::Speed
-            | Self::Visualizer { .. } => "Effect",
+            | Self::Visualizer { .. }
+            | Self::ApplyMask
+            | Self::BackgroundBlur
+            | Self::PrivacyBlur => "Effect",
+            Self::ChromaKey
+            | Self::RegionsFromManual
+            | Self::DetectFace
+            | Self::TrackMotion => "Analyze",
+            Self::UnionImage2
+            | Self::UnionImage3
+            | Self::UnionImage5
+            | Self::UnionImage7 => "Composite",
             Self::GeoSize
             | Self::GeoPlacement
             | Self::GeoRotate
@@ -252,6 +350,17 @@ impl GraphNodeKind {
             Self::Equalizer => "Equalizer",
             Self::Speed => "Speed",
             Self::Visualizer { .. } => "Visualizer",
+            Self::ChromaKey => "Chroma Key",
+            Self::ApplyMask => "Apply Mask",
+            Self::BackgroundBlur => "Background Blur",
+            Self::RegionsFromManual => "Manual Region",
+            Self::PrivacyBlur => "Privacy Blur",
+            Self::DetectFace => "Detect Face",
+            Self::TrackMotion => "Track Motion",
+            Self::UnionImage2 => "Union Image 2",
+            Self::UnionImage3 => "Union Image 3",
+            Self::UnionImage5 => "Union Image 5",
+            Self::UnionImage7 => "Union Image 7",
             Self::GeoSize => "Size",
             Self::GeoPlacement => "Placement",
             Self::GeoRotate => "Rotate",
@@ -733,6 +842,241 @@ impl GraphNodeKind {
                     dir: Output,
                 },
             ],
+            Self::ChromaKey => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "key_r".into(),
+                    name: "Key R".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "key_g".into(),
+                    name: "Key G".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "key_b".into(),
+                    name: "Key B".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "tol".into(),
+                    name: "Tolerance".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "soft".into(),
+                    name: "Soft".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "mask".into(),
+                    name: "Mask".into(),
+                    ty: Mask,
+                    dir: Output,
+                },
+            ],
+            Self::ApplyMask => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "mask".into(),
+                    name: "Mask".into(),
+                    ty: Mask,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "invert".into(),
+                    name: "Invert".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+            ],
+            Self::BackgroundBlur => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "mask".into(),
+                    name: "Mask".into(),
+                    ty: Mask,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "amount".into(),
+                    name: "Radius".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+            ],
+            Self::RegionsFromManual => vec![
+                PortDef {
+                    id: "x".into(),
+                    name: "X".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "y".into(),
+                    name: "Y".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "w".into(),
+                    name: "W".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "h".into(),
+                    name: "H".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Regions".into(),
+                    ty: Regions,
+                    dir: Output,
+                },
+            ],
+            Self::DetectFace => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Regions".into(),
+                    ty: Regions,
+                    dir: Output,
+                },
+            ],
+            Self::PrivacyBlur => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "regions".into(),
+                    name: "Regions".into(),
+                    ty: Regions,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "strength".into(),
+                    name: "Strength".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "pad".into(),
+                    name: "Pad".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "mode".into(),
+                    name: "Mode".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+            ],
+            Self::UnionImage2 => union_image_ports(1),
+            Self::UnionImage3 => union_image_ports(2),
+            Self::UnionImage5 => union_image_ports(4),
+            Self::UnionImage7 => union_image_ports(6),
+            Self::TrackMotion => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Scene".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                /// Reference views of the object — from Union Image (many crops → one position).
+                PortDef {
+                    id: "targets".into(),
+                    name: "Targets".into(),
+                    ty: UnionImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "thresh".into(),
+                    name: "Thresh".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Track".into(),
+                    ty: Track,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "x".into(),
+                    name: "X".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "y".into(),
+                    name: "Y".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+                PortDef {
+                    id: "conf".into(),
+                    name: "Conf".into(),
+                    ty: Real,
+                    dir: Output,
+                },
+            ],
             // Geometry transforms operate on an image stream and take Real/Position controls.
             Self::GeoSize => vec![
                 PortDef {
@@ -1037,8 +1381,34 @@ pub enum GraphImageSource {
     AppObjects(Vec<Uuid>),
     /// Filesystem path (ObjectImage / ObjectVideo).
     FilePath(String),
+    /// Materialized RGBA in [`crate::cv::global_cv_cache`] (spatial FX / analyze bake).
+    /// Key from [`crate::cv::CvAnalyzeContext::cache_key`].
+    BakedCache {
+        key: String,
+    },
     /// Nothing connected or unresolved.
     Empty,
+}
+
+impl GraphImageSource {
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    /// Filesystem path when this source is path-backed (not bake cache / app objects).
+    pub fn file_path(&self) -> Option<&str> {
+        match self {
+            Self::FilePath(p) if !p.trim().is_empty() => Some(p.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn baked_key(&self) -> Option<&str> {
+        match self {
+            Self::BakedCache { key } => Some(key.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// Sound source resolved from Output Object `sound` input (P5).
@@ -1125,6 +1495,8 @@ pub struct GraphOutputEval {
     pub zoom_cy: f64,
     /// Whether any effect nodes were traversed.
     pub effects_on_path: bool,
+    /// True when a materializing CV / spatial node contributed a bake (PR1 plumbing).
+    pub materialized: bool,
 }
 
 impl Default for GraphOutputEval {
@@ -1148,6 +1520,7 @@ impl Default for GraphOutputEval {
             zoom_cx: 0.5,
             zoom_cy: 0.5,
             effects_on_path: false,
+            materialized: false,
         }
     }
 }
@@ -1187,14 +1560,56 @@ impl GraphOutputEval {
             .video_time_sec
             .map(|t| format!("|t{t:.3}"))
             .unwrap_or_default();
+        let bake = match &self.image {
+            GraphImageSource::BakedCache { key } => format!("|bake:{key}"),
+            _ => String::new(),
+        };
         format!(
-            "{path}{t}|b{:.3}|c{:.3}|s{:.3}|h{:.2}|bl{:.2}",
+            "{path}{t}{bake}|b{:.3}|c{:.3}|s{:.3}|h{:.2}|bl{:.2}",
             self.brightness,
             self.contrast,
             self.saturation,
             self.hue_shift,
             self.blur_px,
         )
+    }
+
+    /// Media path for path-backed sources (None for Empty / AppObjects / pure bake).
+    pub fn source_file_path(&self) -> Option<&str> {
+        self.image.file_path()
+    }
+
+    /// Build a CV analyze context from this eval + materialize node identity.
+    ///
+    /// Uses media path + snapped `video_time_sec` so preview scrubbing and export
+    /// share the same [`crate::cv::CvCache`] keys when params match.
+    pub fn cv_analyze_context(
+        &self,
+        job: crate::cv::CvJob,
+        node_id: Uuid,
+        params_hash: u64,
+        width: u32,
+        height: u32,
+    ) -> crate::cv::CvAnalyzeContext {
+        crate::cv::analyze_context_for_media(
+            job,
+            self.source_file_path().unwrap_or(""),
+            self.video_time_sec,
+            node_id,
+            params_hash,
+            width,
+            height,
+        )
+    }
+
+    /// Point the image source at a CV bake key and mark the chain as materialized.
+    /// Upstream path/time are preserved on this eval for cache keying; callers may
+    /// clear scalar FX if they were already applied into the bake.
+    pub fn with_baked_cache(mut self, key: String) -> Self {
+        self.image = GraphImageSource::BakedCache { key };
+        self.materialized = true;
+        self.effects_on_path = true;
+        self
     }
 
     /// UV rect for paint-time zoom (0..1). Identity when zoom ≤ 1.
@@ -1297,6 +1712,51 @@ pub fn load_graph_media_rgba(
             image::RgbaImage::from_raw(w, h, rgba)
         }
     }
+}
+
+/// Load RGBA for a resolved graph image source (path media or CV bake cache).
+pub fn load_graph_source_rgba(
+    source: &GraphImageSource,
+    video_time_sec: Option<f64>,
+    fps: f32,
+) -> Option<image::RgbaImage> {
+    match source {
+        GraphImageSource::FilePath(path) => load_graph_media_rgba(path, video_time_sec, fps),
+        GraphImageSource::BakedCache { key } => crate::cv::global_cv_cache().get_rgba_image(key),
+        GraphImageSource::AppObjects(_) | GraphImageSource::Empty => None,
+    }
+}
+
+/// Load RGBA for a full [`GraphOutputEval`] image source (respects bake keys + media time).
+pub fn load_graph_eval_rgba(eval: &GraphOutputEval, fps: f32) -> Option<image::RgbaImage> {
+    load_graph_source_rgba(&eval.image, eval.video_time_sec, fps)
+}
+
+/// Decode/load + apply folded scalar FX and zoom into a concrete RGBA buffer.
+/// Used by materializing CV nodes (chroma / mask / bg blur).
+pub fn materialize_eval_rgba(eval: &GraphOutputEval, fps: f32) -> Option<image::RgbaImage> {
+    let mut img = load_graph_eval_rgba(eval, fps)?;
+    if eval.needs_pixel_fx() {
+        apply_graph_image_fx(&mut img, eval);
+    }
+    if eval.has_zoom() {
+        apply_zoom_crop_export(&mut img, eval);
+    }
+    Some(img)
+}
+
+/// After spatial bake: point at cache key and clear pixel FX already folded into the bake.
+pub fn eval_after_spatial_bake(mut eval: GraphOutputEval, bake_key: String) -> GraphOutputEval {
+    eval = eval.with_baked_cache(bake_key);
+    eval.brightness = 1.0;
+    eval.contrast = 1.0;
+    eval.saturation = 1.0;
+    eval.hue_shift = 0.0;
+    eval.blur_px = 0.0;
+    eval.zoom = 1.0;
+    eval.zoom_cx = 0.5;
+    eval.zoom_cy = 0.5;
+    eval
 }
 
 /// Continuous preview blur for animation: downsample→upsample scales with radius
@@ -1455,6 +1915,34 @@ pub fn export_fast_blur_rgba(img: &mut image::RgbaImage, blur_px: f32) {
     }
     let small = image::imageops::resize(img, nw, nh, image::imageops::FilterType::Triangle);
     *img = image::imageops::resize(&small, w, h, image::imageops::FilterType::Triangle);
+}
+
+/// Bake any resolved Output Object image (path media or CV bake cache) for export.
+pub fn bake_graph_eval_rgba(
+    eval: &GraphOutputEval,
+    max_side: u32,
+    blur_step: f32,
+    base_cache: Option<&mut std::collections::HashMap<String, image::RgbaImage>>,
+    fx_cache: Option<&mut std::collections::HashMap<String, image::RgbaImage>>,
+) -> Option<image::RgbaImage> {
+    match &eval.image {
+        GraphImageSource::FilePath(path) => {
+            bake_graph_output_rgba(path, eval, max_side, blur_step, base_cache, fx_cache)
+        }
+        GraphImageSource::BakedCache { key } => {
+            let max_side = max_side.max(64).min(4096);
+            let mut img = crate::cv::global_cv_cache().get_rgba_image(key)?;
+            // Spatial bake already folded pixel FX; still allow residual blur if set.
+            if eval.blur_px > 0.01 {
+                let mut q = eval.quantized_for_cache(true);
+                let step = blur_step.max(0.25) as f64;
+                q.blur_px = ((q.blur_px / step).round() * step).clamp(0.0, 64.0);
+                apply_graph_image_fx(&mut img, &q);
+            }
+            Some(downscale_rgba_max_side(&img, max_side))
+        }
+        GraphImageSource::AppObjects(_) | GraphImageSource::Empty => None,
+    }
 }
 
 /// Decode + downscale + apply FX for Output Object FilePath (export / software path).
@@ -1833,6 +2321,18 @@ pub struct NodeGraph {
     /// Port-scoped Real outputs (Mouse Encoder x/y/shakiness/event, etc.).
     #[serde(skip)]
     pub last_real_port_values: std::collections::HashMap<(Uuid, String), f64>,
+    /// Last CV cache keys resolved per node (mask / regions / track / bake). Not persisted.
+    #[serde(skip)]
+    pub last_cv_keys: std::collections::HashMap<Uuid, NodeCvKeys>,
+}
+
+/// Per-node CV result keys from the last resolve/analyze pass (runtime only).
+#[derive(Debug, Clone, Default)]
+pub struct NodeCvKeys {
+    pub mask: Option<String>,
+    pub regions: Option<String>,
+    pub track: Option<String>,
+    pub bake: Option<String>,
 }
 
 impl Default for NodeGraph {
@@ -1852,12 +2352,421 @@ impl NodeGraph {
             root_error: None,
             last_real_values: std::collections::HashMap::new(),
             last_real_port_values: std::collections::HashMap::new(),
+            last_cv_keys: std::collections::HashMap::new(),
         };
         // Seed with an Output Object so the layer has a clear sink.
         let out = GraphNode::new(GraphNodeKind::OutputObject, 280.0, 120.0);
         g.output_node_id = Some(out.id);
         g.nodes.insert(out.id, out);
         g
+    }
+
+    /// Record CV cache keys produced by `node_id` (analyze / materialize).
+    pub fn set_cv_keys(&mut self, node_id: Uuid, keys: NodeCvKeys) {
+        self.last_cv_keys.insert(node_id, keys);
+    }
+
+    pub fn cv_keys(&self, node_id: Uuid) -> Option<&NodeCvKeys> {
+        self.last_cv_keys.get(&node_id)
+    }
+
+    /// Look up a mask for `node_id` from the process CV cache via [`Self::last_cv_keys`].
+    pub fn cached_mask_for_node(&self, node_id: Uuid) -> Option<crate::cv::CvMask> {
+        let key = self.cv_keys(node_id)?.mask.as_ref()?;
+        crate::cv::global_cv_cache()
+            .get(key)
+            .and_then(|v| v.as_mask().cloned())
+    }
+
+    pub fn cached_regions_for_node(&self, node_id: Uuid) -> Option<Vec<crate::cv::CvRegion>> {
+        let key = self.cv_keys(node_id)?.regions.as_ref()?;
+        crate::cv::global_cv_cache()
+            .get(key)
+            .and_then(|v| v.as_regions().map(|r| r.to_vec()))
+    }
+
+    pub fn cached_track_for_node(&self, node_id: Uuid) -> Option<crate::cv::CvTrackSample> {
+        let key = self.cv_keys(node_id)?.track.as_ref()?;
+        crate::cv::global_cv_cache()
+            .get(key)
+            .and_then(|v| v.as_track().cloned())
+    }
+
+    /// Resolve a Mask port chain into a concrete matte (computes ChromaKey if needed).
+    pub fn resolve_mask_input(&self, to_node: Uuid, to_port: &str, depth: usize) -> Option<crate::cv::CvMask> {
+        if depth > 32 {
+            return None;
+        }
+        let src_id = self.input_source_node(to_node, to_port)?;
+        let node = self.nodes.get(&src_id)?;
+        match &node.kind {
+            GraphNodeKind::ChromaKey => {
+                let (_bake, mask_key) = self.materialize_chroma_key(src_id, depth + 1)?;
+                crate::cv::global_cv_cache()
+                    .get(&mask_key)
+                    .and_then(|v| v.as_mask().cloned())
+            }
+            _ => {
+                // Future: mask pass-through / MaskFromRegions.
+                None
+            }
+        }
+    }
+
+    /// Resolve a Regions port (manual box, face detect stub, …).
+    pub fn resolve_regions_input(
+        &self,
+        to_node: Uuid,
+        to_port: &str,
+        depth: usize,
+    ) -> Option<Vec<crate::cv::CvRegion>> {
+        if depth > 32 {
+            return None;
+        }
+        let src_id = self.input_source_node(to_node, to_port)?;
+        self.regions_for_node(src_id, depth + 1)
+    }
+
+    pub fn regions_for_node(&self, node_id: Uuid, depth: usize) -> Option<Vec<crate::cv::CvRegion>> {
+        if depth > 32 {
+            return None;
+        }
+        let node = self.nodes.get(&node_id)?;
+        match &node.kind {
+            GraphNodeKind::RegionsFromManual => {
+                let x = self
+                    .real_input_source(node_id, "x")
+                    .and_then(|id| self.last_real_out(id))
+                    .unwrap_or(0.25);
+                let y = self
+                    .real_input_source(node_id, "y")
+                    .and_then(|id| self.last_real_out(id))
+                    .unwrap_or(0.25);
+                let w = self
+                    .real_input_source(node_id, "w")
+                    .and_then(|id| self.last_real_out(id))
+                    .unwrap_or(0.5);
+                let h = self
+                    .real_input_source(node_id, "h")
+                    .and_then(|id| self.last_real_out(id))
+                    .unwrap_or(0.5);
+                let region = crate::cv::CvRegion {
+                    label: "manual".into(),
+                    x: x as f32,
+                    y: y as f32,
+                    w: w as f32,
+                    h: h as f32,
+                    confidence: 1.0,
+                    track_id: None,
+                }
+                .clamp_norm();
+                let params = crate::cv::hash_params_f64(&[x, y, w, h]);
+                let key = format!(
+                    "cv|regions|manual|n{}|p{:x}",
+                    node_id.as_simple(),
+                    params
+                );
+                crate::cv::global_cv_cache().insert(
+                    key,
+                    crate::cv::CvCacheValue::Regions(vec![region.clone()]),
+                );
+                Some(vec![region])
+            }
+            GraphNodeKind::DetectFace => {
+                let inner = self.resolve_image_chain(node_id, "in", depth);
+                if matches!(inner.image, GraphImageSource::Empty) {
+                    return Some(vec![]);
+                }
+                let path = inner.source_file_path().unwrap_or("").to_string();
+                let t = inner
+                    .video_time_sec
+                    .map(|t| format!("t{:.3}", t))
+                    .unwrap_or_else(|| "still".into());
+                let key = format!(
+                    "cv|regions|face|{}|{}|n{}|ms{}|b{}",
+                    path,
+                    t,
+                    node_id.as_simple(),
+                    crate::cv::FACE_MAX_SIDE,
+                    crate::cv::face_backend().as_u8()
+                );
+                // Live path: never block UI — schedule if missing.
+                let inner_job = inner.clone();
+                let nid = node_id;
+                match crate::cv::get_or_schedule(key.clone(), Some(nid), move || {
+                    let img = materialize_eval_rgba(&inner_job, 30.0)
+                        .unwrap_or_else(|| image::RgbaImage::new(1, 1));
+                    let small = downscale_rgba_max_side(&img, crate::cv::FACE_MAX_SIDE);
+                    let regions = crate::cv::detect_faces_auto(&small);
+                    crate::cv::CvCacheValue::Regions(regions)
+                }) {
+                    crate::cv::JobOutcome::Ready(v) => {
+                        Some(v.as_regions().map(|r| r.to_vec()).unwrap_or_default())
+                    }
+                    crate::cv::JobOutcome::Pending => {
+                        // Sticky: reuse last good face regions while re-detecting.
+                        if let Some(prev) = crate::cv::last_good_key(nid) {
+                            if let Some(v) = crate::cv::global_cv_cache().get(&prev) {
+                                if let Some(regs) = v.as_regions() {
+                                    return Some(regs.to_vec());
+                                }
+                            }
+                        }
+                        // First time: empty (privacy will show black until first bake).
+                        Some(vec![])
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn materialize_privacy_blur(&self, node_id: Uuid, depth: usize) -> Option<String> {
+        let inner = self.resolve_image_chain(node_id, "in", depth);
+        if matches!(inner.image, GraphImageSource::Empty) {
+            return None;
+        }
+        let regions = self
+            .resolve_regions_input(node_id, "regions", depth)
+            .unwrap_or_default();
+        let mut strength = self
+            .real_input_source(node_id, "strength")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(12.0);
+        // Value nodes are often 0..1 — map into a useful pixel radius (~0..24).
+        if strength > 0.0 && strength <= 1.0 {
+            strength *= 24.0;
+        }
+        let strength = strength.clamp(0.0, 64.0);
+        let pad = self
+            .real_input_source(node_id, "pad")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.02)
+            .clamp(0.0, 0.5);
+        let mode = self
+            .real_input_source(node_id, "mode")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.0)
+            .round() as i32;
+        let reg_hash = crate::cv::hash_params_bytes(
+            &regions
+                .iter()
+                .flat_map(|r| {
+                    [
+                        r.x.to_bits().to_le_bytes(),
+                        r.y.to_bits().to_le_bytes(),
+                        r.w.to_bits().to_le_bytes(),
+                        r.h.to_bits().to_le_bytes(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        );
+        let params = crate::cv::hash_params_f64(&[strength, pad, mode as f64, reg_hash as f64]);
+        let ctx = inner.cv_analyze_context(
+            crate::cv::CvJob::PRIVACY,
+            node_id,
+            params,
+            0,
+            0,
+        );
+        // Include preview max-side so full-res export can use a different key later.
+        let bake_key = format!("{}|ms{}", ctx.cache_key(), crate::cv::PREVIEW_MAX_SIDE);
+        let regions_job = regions.clone();
+        let strength_f = strength as f32;
+        let pad_f = pad as f32;
+        let inner_job = inner.clone();
+        let outcome = crate::cv::get_or_schedule(bake_key.clone(), Some(node_id), move || {
+            let img = materialize_eval_rgba(&inner_job, 30.0)
+                .unwrap_or_else(|| image::RgbaImage::new(1, 1));
+            let small = downscale_rgba_max_side(&img, crate::cv::PREVIEW_MAX_SIDE);
+            // Scale strength with downscale so blur looks similar on proxy.
+            let scale = (small.width().max(small.height()) as f32
+                / img.width().max(img.height()).max(1) as f32)
+                .clamp(0.15, 1.0);
+            let out = crate::cv::privacy_blur_rgba(
+                &small,
+                &regions_job,
+                strength_f * scale,
+                pad_f,
+                mode,
+                "",
+            );
+            crate::cv::rgba_to_cache_value(&out)
+        });
+        // First bake → black placeholder; param change → keep previous bake until ready.
+        Some(crate::cv::preview_bake_key(node_id, &bake_key, &outcome))
+    }
+
+    fn chroma_params(&self, node_id: Uuid) -> (f64, f64, f64, f64, f64) {
+        // Default pure green screen.
+        let r = self
+            .real_input_source(node_id, "key_r")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.0);
+        let g = self
+            .real_input_source(node_id, "key_g")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(1.0);
+        let b = self
+            .real_input_source(node_id, "key_b")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.0);
+        let tol = self
+            .real_input_source(node_id, "tol")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(40.0);
+        let soft = self
+            .real_input_source(node_id, "soft")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(15.0);
+        (r, g, b, tol, soft)
+    }
+
+    /// Run chroma (or hit cache). Returns `(bake_key, mask_key)`.
+    fn materialize_chroma_key(&self, node_id: Uuid, depth: usize) -> Option<(String, String)> {
+        let inner = self.resolve_image_chain(node_id, "in", depth);
+        if matches!(inner.image, GraphImageSource::Empty) {
+            return None;
+        }
+        let (kr, kg, kb, tol, soft) = self.chroma_params(node_id);
+        let params = crate::cv::hash_params_f64(&[kr, kg, kb, tol, soft]);
+        // Size unknown until load — use 0x0 stamp; path+time+params still unique.
+        let ctx = inner.cv_analyze_context(crate::cv::CvJob::CHROMA, node_id, params, 0, 0);
+        let bake_key = format!("{}|rgba", ctx.cache_key());
+        let mask_key = format!("{}|mask", ctx.cache_key());
+        let cache = crate::cv::global_cv_cache();
+        if cache.contains(&bake_key) && cache.contains(&mask_key) {
+            return Some((bake_key, mask_key));
+        }
+        let img = materialize_eval_rgba(&inner, 30.0)?;
+        let (keyed, mask) = crate::cv::chroma_key_rgba(
+            &img,
+            kr as f32,
+            kg as f32,
+            kb as f32,
+            tol as f32,
+            soft as f32,
+        );
+        cache.insert(mask_key.clone(), crate::cv::CvCacheValue::Mask(mask));
+        cache.insert(bake_key.clone(), crate::cv::rgba_to_cache_value(&keyed));
+        Some((bake_key, mask_key))
+    }
+
+    fn materialize_apply_mask(&self, node_id: Uuid, depth: usize) -> Option<String> {
+        let inner = self.resolve_image_chain(node_id, "in", depth);
+        if matches!(inner.image, GraphImageSource::Empty) {
+            return None;
+        }
+        let invert = self
+            .real_input_source(node_id, "invert")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.0)
+            > 0.5;
+        let mask = self
+            .resolve_mask_input(node_id, "mask", depth)
+            .unwrap_or_else(|| crate::cv::CvMask::solid(1, 1, 255));
+        let mask_hash = crate::cv::hash_params_bytes(
+            &mask
+                .data
+                .iter()
+                .step_by((mask.data.len() / 64).max(1))
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        let params = crate::cv::hash_params_f64(&[if invert { 1.0 } else { 0.0 }, mask_hash as f64]);
+        let ctx = inner.cv_analyze_context(crate::cv::CvJob::MATTE, node_id, params, mask.width, mask.height);
+        let bake_key = ctx.cache_key();
+        let cache = crate::cv::global_cv_cache();
+        if cache.contains(&bake_key) {
+            return Some(bake_key);
+        }
+        let mut img = materialize_eval_rgba(&inner, 30.0)?;
+        crate::cv::apply_mask_rgba(&mut img, &mask, invert);
+        cache.insert(bake_key.clone(), crate::cv::rgba_to_cache_value(&img));
+        Some(bake_key)
+    }
+
+    fn materialize_background_blur(&self, node_id: Uuid, depth: usize) -> Option<String> {
+        let inner = self.resolve_image_chain(node_id, "in", depth);
+        if matches!(inner.image, GraphImageSource::Empty) {
+            return None;
+        }
+        let amount = self
+            .real_input_source(node_id, "amount")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(12.0)
+            .clamp(0.0, 64.0);
+        let mask = self
+            .resolve_mask_input(node_id, "mask", depth)
+            .unwrap_or_else(|| crate::cv::CvMask::solid(1, 1, 255));
+        let mask_hash = crate::cv::hash_params_bytes(
+            &mask
+                .data
+                .iter()
+                .step_by((mask.data.len() / 64).max(1))
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        let params = crate::cv::hash_params_f64(&[amount, mask_hash as f64]);
+        let ctx =
+            inner.cv_analyze_context(crate::cv::CvJob::BG_BLUR, node_id, params, mask.width, mask.height);
+        let bake_key = ctx.cache_key();
+        let cache = crate::cv::global_cv_cache();
+        if cache.contains(&bake_key) {
+            return Some(bake_key);
+        }
+        let img = materialize_eval_rgba(&inner, 30.0)?;
+        let out = crate::cv::background_blur_rgba(&img, &mask, amount as f32);
+        cache.insert(bake_key.clone(), crate::cv::rgba_to_cache_value(&out));
+        Some(bake_key)
+    }
+
+    fn resolve_spatial_effect(&self, node_id: Uuid, depth: usize) -> GraphOutputEval {
+        let Some(node) = self.nodes.get(&node_id) else {
+            return GraphOutputEval::default();
+        };
+        match &node.kind {
+            GraphNodeKind::ChromaKey => {
+                let inner = self.resolve_image_chain(node_id, "in", depth);
+                if let Some((bake, _mask)) = self.materialize_chroma_key(node_id, depth) {
+                    return eval_after_spatial_bake(inner, bake);
+                }
+                let mut inner = inner;
+                inner.effects_on_path = true;
+                inner
+            }
+            GraphNodeKind::ApplyMask => {
+                let inner = self.resolve_image_chain(node_id, "in", depth);
+                if let Some(bake) = self.materialize_apply_mask(node_id, depth) {
+                    return eval_after_spatial_bake(inner, bake);
+                }
+                let mut inner = inner;
+                inner.effects_on_path = true;
+                inner
+            }
+            GraphNodeKind::BackgroundBlur => {
+                let inner = self.resolve_image_chain(node_id, "in", depth);
+                if let Some(bake) = self.materialize_background_blur(node_id, depth) {
+                    return eval_after_spatial_bake(inner, bake);
+                }
+                let mut inner = inner;
+                inner.effects_on_path = true;
+                inner
+            }
+            GraphNodeKind::PrivacyBlur => {
+                let inner = self.resolve_image_chain(node_id, "in", depth);
+                if let Some(bake) = self.materialize_privacy_blur(node_id, depth) {
+                    return eval_after_spatial_bake(inner, bake);
+                }
+                let mut inner = inner;
+                inner.effects_on_path = true;
+                inner
+            }
+            _ => GraphOutputEval::default(),
+        }
     }
 
     pub fn add_node(&mut self, kind: GraphNodeKind, x: f32, y: f32) -> Uuid {
@@ -1961,12 +2870,48 @@ impl NodeGraph {
                 to_ty.label()
             ));
         }
+        // Cycle guard: if `to` can already reach `from`, adding from→to loops the graph
+        // (Union Image chains otherwise recurse forever and blow memory/CPU).
+        if self.node_can_reach(to_node, from_node) {
+            return Err("Would create a cycle".into());
+        }
         // One link per input port.
         self.links
             .retain(|l| !(l.to_node == to_node && l.to_port == to_port));
         self.links
             .push(GraphLink::new(from_node, from_port, to_node, to_port));
         Ok(())
+    }
+
+    /// BFS: can we reach `goal` starting from `start` following existing links?
+    fn node_can_reach(&self, start: Uuid, goal: Uuid) -> bool {
+        use std::collections::{HashSet, VecDeque};
+        if start == goal {
+            return true;
+        }
+        let mut seen = HashSet::new();
+        let mut q = VecDeque::new();
+        q.push_back(start);
+        seen.insert(start);
+        let mut guard = 0usize;
+        while let Some(cur) = q.pop_front() {
+            guard += 1;
+            if guard > 10_000 {
+                return true; // fail closed: treat as cycle if graph is huge/broken
+            }
+            for link in &self.links {
+                if link.from_node != cur {
+                    continue;
+                }
+                if link.to_node == goal {
+                    return true;
+                }
+                if seen.insert(link.to_node) {
+                    q.push_back(link.to_node);
+                }
+            }
+        }
+        false
     }
 
     /// Drop links that reference missing app objects; set root_error if Output is affected.
@@ -2248,6 +3193,12 @@ impl NodeGraph {
             GraphNodeKind::OutputObject => {
                 return self.resolve_image_chain(node_id, "image", 0);
             }
+            GraphNodeKind::UnionImage2
+            | GraphNodeKind::UnionImage3
+            | GraphNodeKind::UnionImage5
+            | GraphNodeKind::UnionImage7 => {
+                return self.resolve_union_as_image(node_id, 0);
+            }
             _ => {}
         }
         // Effect / geometry: apply this node on top of its primary image input.
@@ -2278,6 +3229,10 @@ impl NodeGraph {
                 // resolve_image_chain looks at *input* of to_node — so invent call from ports.
                 self.resolve_effect_as_root(node_id)
             }
+            GraphNodeKind::ChromaKey
+            | GraphNodeKind::ApplyMask
+            | GraphNodeKind::BackgroundBlur
+            | GraphNodeKind::PrivacyBlur => self.resolve_spatial_effect(node_id, 0),
             GraphNodeKind::GeoAdd => {
                 let mut inner = self.resolve_image_chain(node_id, "a", 0);
                 if matches!(inner.image, GraphImageSource::Empty) {
@@ -2332,6 +3287,10 @@ impl NodeGraph {
                 inner.effects_on_path = true;
                 inner
             }
+            GraphNodeKind::ChromaKey
+            | GraphNodeKind::ApplyMask
+            | GraphNodeKind::BackgroundBlur
+            | GraphNodeKind::PrivacyBlur => self.resolve_spatial_effect(node_id, 0),
             GraphNodeKind::Zoom => {
                 let (cx, cy) = self.resolve_position_input(node_id, "pos", 0.5, 0.5);
                 let z = self
@@ -2427,8 +3386,12 @@ impl NodeGraph {
     /// Whether this node has image/video input and/or output ports (for preview).
     pub fn image_port_dirs(kind: &GraphNodeKind) -> (bool, bool) {
         let ports = kind.ports();
-        let is_vis =
-            |ty: PortType| matches!(ty, PortType::RawImage | PortType::RawVideo);
+        let is_vis = |ty: PortType| {
+            matches!(
+                ty,
+                PortType::RawImage | PortType::RawVideo | PortType::UnionImage
+            )
+        };
         let has_in = ports
             .iter()
             .any(|p| p.dir == PortDir::Input && is_vis(p.ty));
@@ -2436,6 +3399,112 @@ impl NodeGraph {
             .iter()
             .any(|p| p.dir == PortDir::Output && is_vis(p.ty));
         (has_in, has_out)
+    }
+
+    /// Collect individual member images from a Union Image node (and nested unions).
+    /// Cycle-safe: revisiting a node yields no extra images (no infinite queue).
+    pub fn collect_union_member_images(
+        &self,
+        node_id: Uuid,
+        visited: &mut std::collections::HashSet<Uuid>,
+        depth: usize,
+        fps: f32,
+    ) -> Vec<image::RgbaImage> {
+        if depth > 32 || !visited.insert(node_id) {
+            return Vec::new();
+        }
+        let Some(node) = self.nodes.get(&node_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Some(n_slots) = node.kind.union_image_slot_count() {
+            for i in 0..n_slots {
+                let port = format!("img{i}");
+                let ev = self.resolve_image_chain(node_id, &port, depth + 1);
+                if matches!(ev.image, GraphImageSource::Empty) {
+                    continue;
+                }
+                if let Some(img) = materialize_eval_rgba(&ev, fps) {
+                    out.push(img);
+                }
+            }
+            // Nested union (optional)
+            if let Some(src) = self.input_source_node(node_id, "union") {
+                out.extend(self.collect_union_member_images(src, visited, depth + 1, fps));
+            }
+        } else {
+            // Allow a plain image node wired into a union pin only via union type —
+            // if someone resolves a non-union, try single materialize.
+            let ev = self.resolve_node_image_out(node_id);
+            if let Some(img) = materialize_eval_rgba(&ev, fps) {
+                out.push(img);
+            }
+        }
+        out
+    }
+
+    /// Alpha-over composite of layers (first = bottom). Empty → 1×1 transparent.
+    pub fn composite_images_over(layers: &[image::RgbaImage]) -> image::RgbaImage {
+        if layers.is_empty() {
+            return image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        }
+        let w = layers.iter().map(|i| i.width()).max().unwrap_or(1).max(1);
+        let h = layers.iter().map(|i| i.height()).max().unwrap_or(1).max(1);
+        let mut out = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
+        for layer in layers {
+            let lw = layer.width();
+            let lh = layer.height();
+            // Top-left align (simple stack)
+            for y in 0..lh.min(h) {
+                for x in 0..lw.min(w) {
+                    let src = layer.get_pixel(x, y).0;
+                    let dst = out.get_pixel(x, y).0;
+                    let sa = src[3] as f32 / 255.0;
+                    let da = dst[3] as f32 / 255.0;
+                    let out_a = sa + da * (1.0 - sa);
+                    let blend = |s: u8, d: u8| -> u8 {
+                        if out_a < 1e-6 {
+                            0
+                        } else {
+                            let v = (s as f32 * sa + d as f32 * da * (1.0 - sa)) / out_a;
+                            v.round().clamp(0.0, 255.0) as u8
+                        }
+                    };
+                    out.put_pixel(
+                        x,
+                        y,
+                        image::Rgba([
+                            blend(src[0], dst[0]),
+                            blend(src[1], dst[1]),
+                            blend(src[2], dst[2]),
+                            (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
+                        ]),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Materialize a Union Image node to a single baked RGBA (for preview / image sinks).
+    fn resolve_union_as_image(&self, node_id: Uuid, depth: usize) -> GraphOutputEval {
+        let mut visited = std::collections::HashSet::new();
+        let members = self.collect_union_member_images(node_id, &mut visited, depth, 30.0);
+        if members.is_empty() {
+            return GraphOutputEval::default();
+        }
+        let composite = Self::composite_images_over(&members);
+        let mut h = crate::cv::hash_params_f64(&[
+            members.len() as f64,
+            composite.width() as f64,
+            composite.height() as f64,
+        ]);
+        for (i, m) in members.iter().enumerate().take(8) {
+            h ^= crate::cv::hash_params_f64(&[i as f64, m.width() as f64, m.height() as f64]);
+        }
+        let key = format!("cv|union|n{}|p{:x}", node_id.as_simple(), h);
+        crate::cv::global_cv_cache().insert(key.clone(), crate::cv::rgba_to_cache_value(&composite));
+        GraphOutputEval::default().with_baked_cache(key)
     }
 
     fn resolve_image_chain(&self, to_node: Uuid, to_port: &str, depth: usize) -> GraphOutputEval {
@@ -2450,6 +3519,12 @@ impl NodeGraph {
             return out;
         };
         match &node.kind {
+            GraphNodeKind::UnionImage2
+            | GraphNodeKind::UnionImage3
+            | GraphNodeKind::UnionImage5
+            | GraphNodeKind::UnionImage7 => {
+                return self.resolve_union_as_image(src_id, depth + 1);
+            }
             GraphNodeKind::ObjectFromApp { node_ids } => {
                 out.image = GraphImageSource::AppObjects(node_ids.clone());
             }
@@ -2522,6 +3597,12 @@ impl NodeGraph {
                 inner.blur_px += amount.max(0.0).min(128.0);
                 inner.effects_on_path = true;
                 return inner;
+            }
+            GraphNodeKind::ChromaKey
+            | GraphNodeKind::ApplyMask
+            | GraphNodeKind::BackgroundBlur
+            | GraphNodeKind::PrivacyBlur => {
+                return self.resolve_spatial_effect(src_id, depth + 1);
             }
             GraphNodeKind::Speed => {
                 let factor = self
@@ -3010,6 +4091,61 @@ impl NodeGraph {
                     // Primary = shakiness (useful default for single-wire demos).
                     Ok(enc.shakiness)
                 }
+                GraphNodeKind::TrackMotion => {
+                    // Union Image targets (many ref crops) → single x/y; hold last if missing.
+                    let thresh = self
+                        .real_input_source(id, "thresh")
+                        .and_then(|src| values.get(&src).copied())
+                        .unwrap_or(0.45)
+                        .clamp(0.15, 0.95);
+                    let scene_eval = self.resolve_image_chain(id, "in", 0);
+                    let path = scene_eval.source_file_path().unwrap_or("");
+                    let t_media = scene_eval.video_time_sec.unwrap_or(time_sec);
+                    let media_key = format!(
+                        "{}|t{:.3}",
+                        path,
+                        ((t_media * 1000.0).floor() / 1000.0).max(0.0)
+                    );
+                    // Expand Union chain → individual target images (cycle-safe).
+                    let mut targets: Vec<image::RgbaImage> = Vec::new();
+                    if let Some(union_src) = self.input_source_node(id, "targets") {
+                        let mut visited = std::collections::HashSet::new();
+                        targets = self.collect_union_member_images(
+                            union_src,
+                            &mut visited,
+                            0,
+                            fps as f32,
+                        );
+                        for t in &mut targets {
+                            *t = downscale_rgba_max_side(t, 128);
+                        }
+                    }
+                    let (cx, cy, conf) =
+                        if let Some(scene) = materialize_eval_rgba(&scene_eval, fps as f32) {
+                            let sample = crate::cv::track::track_targets(
+                                id,
+                                &scene,
+                                &targets,
+                                thresh as f32,
+                                &media_key,
+                                t_media,
+                            );
+                            let tkey = format!("cv|track|n{}|{}", id.as_simple(), media_key);
+                            crate::cv::global_cv_cache()
+                                .insert(tkey, crate::cv::CvCacheValue::Track(sample.clone()));
+                            (
+                                sample.cx as f64,
+                                sample.cy as f64,
+                                sample.confidence as f64,
+                            )
+                        } else {
+                            (0.5, 0.5, 0.0)
+                        };
+                    port_buf.insert((id, "x".into()), cx);
+                    port_buf.insert((id, "y".into()), cy);
+                    port_buf.insert((id, "conf".into()), conf);
+                    Ok(conf)
+                }
                 GraphNodeKind::ParamReal { param_id } => {
                     let v = self
                         .parameters
@@ -3098,6 +4234,17 @@ impl NodeGraph {
             Equalizer,
             Speed,
             Visualizer { gain: 1.0 },
+            ChromaKey,
+            ApplyMask,
+            BackgroundBlur,
+            RegionsFromManual,
+            PrivacyBlur,
+            DetectFace,
+            TrackMotion,
+            UnionImage2,
+            UnionImage3,
+            UnionImage5,
+            UnionImage7,
             VideoPlayer,
             SepticPlayer,
             MouseEncoder {
@@ -3137,6 +4284,17 @@ impl NodeGraph {
             },
             Frame,
             Time,
+            ChromaKey,
+            ApplyMask,
+            BackgroundBlur,
+            RegionsFromManual,
+            PrivacyBlur,
+            DetectFace,
+            TrackMotion,
+            UnionImage2,
+            UnionImage3,
+            UnionImage5,
+            UnionImage7,
             ObjectImage {
                 path: String::new(),
             },
@@ -3434,6 +4592,7 @@ mod tests {
             root_error: None,
             last_real_values: Default::default(),
             last_real_port_values: Default::default(),
+            last_cv_keys: Default::default(),
         };
         let v = g.add_node(GraphNodeKind::Value { value: 3.5 }, 0.0, 0.0);
         let f = g.add_node(GraphNodeKind::Frame, 0.0, 0.0);
@@ -3455,6 +4614,7 @@ mod tests {
             root_error: None,
             last_real_values: Default::default(),
             last_real_port_values: Default::default(),
+            last_cv_keys: Default::default(),
         };
         let v = g.add_node(GraphNodeKind::Value { value: 10.0 }, 0.0, 0.0);
         let e = g.add_node(
@@ -3501,6 +4661,7 @@ mod tests {
             root_error: None,
             last_real_values: Default::default(),
             last_real_port_values: Default::default(),
+            last_cv_keys: Default::default(),
         };
         let e1 = g.add_node(
             GraphNodeKind::ExprX {
@@ -3545,6 +4706,7 @@ mod tests {
             root_error: None,
             last_real_values: Default::default(),
             last_real_port_values: Default::default(),
+            last_cv_keys: Default::default(),
         };
         let pid = g.parameters[0].id;
         let n = g.add_node(GraphNodeKind::ParamReal { param_id: pid }, 0.0, 0.0);
@@ -3563,6 +4725,7 @@ mod tests {
             root_error: None,
             last_real_values: Default::default(),
             last_real_port_values: Default::default(),
+            last_cv_keys: Default::default(),
         };
         let f = g.add_node(GraphNodeKind::Frame, 0.0, 0.0);
         let e = g.add_node(
@@ -3598,6 +4761,7 @@ mod tests {
             root_error: None,
             last_real_values: Default::default(),
             last_real_port_values: Default::default(),
+            last_cv_keys: Default::default(),
         };
         let e = g.add_node(
             GraphNodeKind::ExprX {
@@ -3749,6 +4913,7 @@ mod tests {
             root_error: None,
             last_real_values: Default::default(),
             last_real_port_values: Default::default(),
+            last_cv_keys: Default::default(),
         };
         let audio = g.add_node(
             GraphNodeKind::ObjectAudio {
@@ -3889,6 +5054,367 @@ mod tests {
         g.remove_node(nid);
         assert!(g.parameters.iter().all(|p| p.id != pid2));
         let _ = pid;
+    }
+
+    #[test]
+    fn chroma_key_materializes_mask_and_bake() {
+        // 2×2: green | red / green | blue
+        let mut img = image::RgbaImage::new(2, 2);
+        img.put_pixel(0, 0, image::Rgba([0, 255, 0, 255]));
+        img.put_pixel(1, 0, image::Rgba([255, 0, 0, 255]));
+        img.put_pixel(0, 1, image::Rgba([0, 220, 0, 255]));
+        img.put_pixel(1, 1, image::Rgba([0, 0, 255, 255]));
+        let path = std::env::temp_dir().join("vadadee_chroma_pr2.png");
+        img.save(&path).unwrap();
+        let path_s = path.to_string_lossy().into_owned();
+
+        let mut g = NodeGraph::new_empty();
+        let out_id = g.output_node_id.expect("seed");
+        let img_n = g.add_node(
+            GraphNodeKind::ObjectImage {
+                path: path_s.clone(),
+            },
+            0.0,
+            0.0,
+        );
+        let chroma = g.add_node(GraphNodeKind::ChromaKey, 120.0, 0.0);
+        let soft0 = g.add_node(GraphNodeKind::Value { value: 0.0 }, 120.0, 60.0);
+        g.try_add_link(img_n, "out", chroma, "in").unwrap();
+        g.try_add_link(soft0, "out", chroma, "soft").unwrap(); // no feather bleed on 2×2
+        g.try_add_link(chroma, "out", out_id, "image").unwrap();
+        g.eval_reals(0, 30.0);
+
+        let ev = g.resolve_output_image();
+        assert!(
+            matches!(ev.image, GraphImageSource::BakedCache { .. }),
+            "expected baked cache, got {:?}",
+            ev.image
+        );
+        let rgba = load_graph_eval_rgba(&ev, 30.0).expect("baked rgba");
+        // Green pixels should be transparent-ish
+        assert!(
+            rgba.get_pixel(0, 0).0[3] < 40,
+            "green alpha={}",
+            rgba.get_pixel(0, 0).0[3]
+        );
+        assert!(rgba.get_pixel(1, 0).0[3] > 200);
+
+        // Mask port consumers
+        let apply = g.add_node(GraphNodeKind::ApplyMask, 240.0, 0.0);
+        g.try_add_link(img_n, "out", apply, "in").unwrap();
+        g.try_add_link(chroma, "mask", apply, "mask").unwrap();
+        let mask = g.resolve_mask_input(apply, "mask", 0).expect("mask");
+        assert_eq!(mask.width, 2);
+        assert!(mask.data[0] < 40);
+        assert!(mask.data[1] > 200);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn background_blur_node_bakes() {
+        let mut img = image::RgbaImage::new(8, 8);
+        for px in img.pixels_mut() {
+            *px = image::Rgba([0, 0, 0, 255]);
+        }
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        for y in 2..6 {
+            for x in 2..6 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let path = std::env::temp_dir().join("vadadee_bgblur_pr2.png");
+        img.save(&path).unwrap();
+
+        let mut g = NodeGraph::new_empty();
+        let out_id = g.output_node_id.expect("seed");
+        let img_n = g.add_node(
+            GraphNodeKind::ObjectImage {
+                path: path.to_string_lossy().into_owned(),
+            },
+            0.0,
+            0.0,
+        );
+        let chroma = g.add_node(GraphNodeKind::ChromaKey, 100.0, 0.0);
+        // Key black? Use green defaults won't punch black. Use solid mask via chroma on green none.
+        // Instead: BackgroundBlur with no mask → solid keep mask → almost identity with amount.
+        let bg = g.add_node(GraphNodeKind::BackgroundBlur, 200.0, 0.0);
+        g.try_add_link(img_n, "out", bg, "in").unwrap();
+        // optional amount
+        let amt = g.add_node(GraphNodeKind::Value { value: 6.0 }, 200.0, 80.0);
+        g.try_add_link(amt, "out", bg, "amount").unwrap();
+        g.try_add_link(bg, "out", out_id, "image").unwrap();
+        let _ = chroma;
+        g.eval_reals(0, 30.0);
+
+        let ev = g.resolve_output_image();
+        assert!(matches!(ev.image, GraphImageSource::BakedCache { .. }));
+        let _ = load_graph_eval_rgba(&ev, 30.0).expect("bg blur bake");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn privacy_blur_with_manual_region() {
+        let mut img = image::RgbaImage::new(32, 32);
+        for px in img.pixels_mut() {
+            *px = image::Rgba([180, 180, 180, 255]);
+        }
+        for y in 0..10 {
+            for x in 0..10 {
+                img.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
+            }
+        }
+        let path = std::env::temp_dir().join("vadadee_privacy_pr3.png");
+        img.save(&path).unwrap();
+
+        let mut g = NodeGraph::new_empty();
+        let out_id = g.output_node_id.expect("seed");
+        let img_n = g.add_node(
+            GraphNodeKind::ObjectImage {
+                path: path.to_string_lossy().into_owned(),
+            },
+            0.0,
+            0.0,
+        );
+        let reg = g.add_node(GraphNodeKind::RegionsFromManual, 80.0, 0.0);
+        let x = g.add_node(GraphNodeKind::Value { value: 0.0 }, 80.0, 40.0);
+        let y = g.add_node(GraphNodeKind::Value { value: 0.0 }, 80.0, 70.0);
+        let w = g.add_node(GraphNodeKind::Value { value: 0.35 }, 80.0, 100.0);
+        let h = g.add_node(GraphNodeKind::Value { value: 0.35 }, 80.0, 130.0);
+        g.try_add_link(x, "out", reg, "x").unwrap();
+        g.try_add_link(y, "out", reg, "y").unwrap();
+        g.try_add_link(w, "out", reg, "w").unwrap();
+        g.try_add_link(h, "out", reg, "h").unwrap();
+
+        let privb = g.add_node(GraphNodeKind::PrivacyBlur, 200.0, 0.0);
+        let str = g.add_node(GraphNodeKind::Value { value: 8.0 }, 200.0, 60.0);
+        g.try_add_link(img_n, "out", privb, "in").unwrap();
+        g.try_add_link(reg, "out", privb, "regions").unwrap();
+        g.try_add_link(str, "out", privb, "strength").unwrap();
+        g.try_add_link(privb, "out", out_id, "image").unwrap();
+        g.eval_reals(0, 30.0);
+
+        let regions = g.regions_for_node(reg, 0).expect("manual regions");
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].label, "manual");
+
+        let ev = crate::cv::jobs::with_sync_cv(|| g.resolve_output_image());
+        assert!(
+            matches!(ev.image, GraphImageSource::BakedCache { .. }),
+            "expected bake, got {:?}",
+            ev.image
+        );
+        let out = load_graph_eval_rgba(&ev, 30.0).expect("privacy bake");
+        let p = out.get_pixel(2, 2).0;
+        assert!(p[0] < 255 || p[1] > 0, "ROI should be blurred, got {:?}", p);
+        let o = out.get_pixel(30, 30).0;
+        assert_eq!(o[0], 180, "outside ROI unchanged");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn detect_face_empty_source() {
+        let mut g = NodeGraph::new_empty();
+        let img_n = g.add_node(
+            GraphNodeKind::ObjectImage {
+                path: String::new(),
+            },
+            0.0,
+            0.0,
+        );
+        let det = g.add_node(GraphNodeKind::DetectFace, 100.0, 0.0);
+        g.try_add_link(img_n, "out", det, "in").unwrap();
+        let regs = g.regions_for_node(det, 0).expect("empty image");
+        assert!(regs.is_empty());
+    }
+
+    #[test]
+    fn detect_face_finds_skin_blob() {
+        // Synthetic skin-colored oval on gray — should yield a face region.
+        let mut img = image::RgbaImage::new(64, 64);
+        for px in img.pixels_mut() {
+            *px = image::Rgba([40, 40, 40, 255]);
+        }
+        for y in 12..40 {
+            for x in 18..46 {
+                let dx = x as f32 - 32.0;
+                let dy = y as f32 - 26.0;
+                if (dx * dx) / (12.0 * 12.0) + (dy * dy) / (14.0 * 14.0) <= 1.0 {
+                    img.put_pixel(x, y, image::Rgba([200, 150, 120, 255]));
+                }
+            }
+        }
+        let path = std::env::temp_dir().join("vadadee_face_pr3.png");
+        img.save(&path).unwrap();
+        // Native path (OpenCV may also run when feature on; either is fine).
+        let regs = crate::cv::detect_faces_auto(&img);
+        // Skin blob should register on native; OpenCV Haar often misses pure synthetic.
+        let native = crate::cv::detect_face_regions(&img);
+        assert!(
+            !regs.is_empty() || !native.is_empty(),
+            "expected face-ish region from auto or native"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cv_async_schedule_does_not_block() {
+        let key = format!("cv|test|async|{}", uuid::Uuid::new_v4());
+        let outcome = crate::cv::get_or_schedule(key.clone(), None, || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            crate::cv::CvCacheValue::Regions(vec![])
+        });
+        assert!(matches!(outcome, crate::cv::JobOutcome::Pending));
+        // Wait for worker
+        for _ in 0..50 {
+            if crate::cv::global_cv_cache().contains(&key) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(crate::cv::global_cv_cache().contains(&key));
+        let _ = crate::cv::take_dirty();
+    }
+
+    #[test]
+    fn track_motion_takes_union_targets() {
+        let ports = GraphNodeKind::TrackMotion.ports();
+        assert!(ports
+            .iter()
+            .any(|p| p.id == "targets" && p.ty == PortType::UnionImage));
+        assert!(!ports.iter().any(|p| p.id.starts_with("target0")));
+        assert!(ports.iter().any(|p| p.id == "x" && p.dir == PortDir::Output));
+    }
+
+    #[test]
+    fn union_image_slots_and_cycle_guard() {
+        assert_eq!(GraphNodeKind::UnionImage2.union_image_slot_count(), Some(1));
+        assert_eq!(GraphNodeKind::UnionImage3.union_image_slot_count(), Some(2));
+        assert_eq!(GraphNodeKind::UnionImage5.union_image_slot_count(), Some(4));
+        assert_eq!(GraphNodeKind::UnionImage7.union_image_slot_count(), Some(6));
+
+        let mut g = NodeGraph::new_empty();
+        let a = g.add_node(GraphNodeKind::UnionImage3, 0.0, 0.0);
+        let b = g.add_node(GraphNodeKind::UnionImage3, 100.0, 0.0);
+        g.try_add_link(a, "out", b, "union").unwrap();
+        // Self is blocked
+        assert!(g.try_add_link(a, "out", a, "union").is_err());
+        // Cycle a→b→a blocked
+        assert!(g.try_add_link(b, "out", a, "union").is_err());
+    }
+
+    #[test]
+    fn collect_union_members_cycle_safe() {
+        let mut g = NodeGraph::new_empty();
+        let u = g.add_node(GraphNodeKind::UnionImage2, 0.0, 0.0);
+        // No images wired — empty members, no hang
+        let mut visited = std::collections::HashSet::new();
+        let m = g.collect_union_member_images(u, &mut visited, 0, 30.0);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn port_type_cv_connect_rules() {
+        assert!(PortType::can_connect(PortType::Mask, PortType::Mask));
+        assert!(PortType::can_connect(PortType::Regions, PortType::Regions));
+        assert!(PortType::can_connect(PortType::Track, PortType::Track));
+        assert!(!PortType::can_connect(PortType::Mask, PortType::RawImage));
+        assert!(!PortType::can_connect(PortType::Track, PortType::Position));
+        assert!(!PortType::can_connect(PortType::Regions, PortType::Mask));
+        assert!(PortType::Mask.is_cv_structured());
+        assert!(PortType::Regions.is_cv_structured());
+        assert!(PortType::Track.is_cv_structured());
+        assert!(!PortType::RawImage.is_cv_structured());
+        assert_eq!(PortType::Mask.label(), "Mask");
+        assert_eq!(PortType::Regions.label(), "Regions");
+        assert_eq!(PortType::Track.label(), "Track");
+    }
+
+    #[test]
+    fn cv_analyze_context_from_eval_uses_media_time() {
+        let mut eval = GraphOutputEval {
+            image: GraphImageSource::FilePath("/media/clip.mp4".into()),
+            video_time_sec: Some(2.501),
+            ..Default::default()
+        };
+        let id = Uuid::nil();
+        let ctx = eval.cv_analyze_context(crate::cv::CvJob::CHROMA, id, 0x11, 320, 240);
+        let key = ctx.cache_key();
+        assert!(key.contains("chroma"));
+        assert!(key.contains("/media/clip.mp4"));
+        assert!(key.contains("t2501"));
+        assert!(key.contains("320x240"));
+
+        // Materialize → bake source; path still available for keying via source_file_path only when FilePath.
+        eval = eval.with_baked_cache(key.clone());
+        assert!(eval.materialized);
+        assert!(matches!(eval.image, GraphImageSource::BakedCache { .. }));
+        assert_eq!(eval.image.baked_key(), Some(key.as_str()));
+        assert!(eval.source_file_path().is_none());
+    }
+
+    #[test]
+    fn load_graph_source_baked_cache_roundtrip() {
+        let key = "cv|test|bake|roundtrip";
+        let pixels = vec![10u8, 20, 30, 255, 40, 50, 60, 255];
+        crate::cv::global_cv_cache().insert(
+            key,
+            crate::cv::CvCacheValue::Rgba {
+                width: 2,
+                height: 1,
+                data: std::sync::Arc::new(pixels.clone()),
+            },
+        );
+        let img = load_graph_source_rgba(
+            &GraphImageSource::BakedCache {
+                key: key.into(),
+            },
+            None,
+            30.0,
+        )
+        .expect("baked rgba");
+        assert_eq!(img.dimensions(), (2, 1));
+        assert_eq!(img.into_raw(), pixels);
+    }
+
+    #[test]
+    fn node_graph_cv_keys_side_table() {
+        let mut g = NodeGraph::new_empty();
+        let nid = g.add_node(
+            GraphNodeKind::ObjectImage {
+                path: String::new(),
+            },
+            0.0,
+            0.0,
+        );
+        let mask_key = "cv|mask|demo".to_string();
+        let m = crate::cv::CvMask::solid(4, 4, 200);
+        crate::cv::global_cv_cache().insert(mask_key.clone(), crate::cv::CvCacheValue::Mask(m));
+        g.set_cv_keys(
+            nid,
+            NodeCvKeys {
+                mask: Some(mask_key),
+                regions: None,
+                track: None,
+                bake: None,
+            },
+        );
+        let got = g.cached_mask_for_node(nid).expect("mask");
+        assert_eq!(got.width, 4);
+        assert_eq!(got.height, 4);
+        assert_eq!(got.data[0], 200);
+    }
+
+    #[test]
+    fn fx_cache_key_includes_bake() {
+        let eval = GraphOutputEval {
+            image: GraphImageSource::BakedCache {
+                key: "cv|k".into(),
+            },
+            brightness: 1.0,
+            ..Default::default()
+        };
+        let k = eval.fx_cache_key("/unused.png");
+        assert!(k.contains("bake:cv|k"));
     }
 
     #[test]

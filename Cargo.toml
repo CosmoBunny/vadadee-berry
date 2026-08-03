@@ -56,6 +56,21 @@ rodio = { version = "0.22.2", default-features = false, features = ["playback", 
 symphonia = { version = "0.5.5", default-features = false, features = ["aac", "flac", "isomp4", "mkv", "mp3", "vorbis", "wav"] }
 hound = "3.5.1"
 rayon = "1.10"
+
+# OpenCV face detect (default). Needs system libopencv + clang/libclang for bindgen.
+# Disable: cargo run --no-default-features
+# Runtime: Haar cascade if found, else pure-Rust skin-tone face ROI.
+[features]
+default = ["opencv"]
+opencv = ["dep:opencv"]
+
+[dependencies.opencv]
+version = "0.93"
+optional = true
+default-features = false
+# clang-runtime: load libclang dynamically (avoids bindgen "not loaded on this thread").
+features = ["imgproc", "objdetect", "clang-runtime"]
+
 # ── Host (non-Android) shared deps ────────────────────────────────────────────
 [target.'cfg(not(target_os = "android"))'.dependencies]
 env_logger = "0.11.8"

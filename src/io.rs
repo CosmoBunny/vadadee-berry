@@ -1238,10 +1238,13 @@ pub fn composite_export_frame(
                 // P6c: software path for NE Output (GPU export uses export_worker caches).
                 if let Some(g) = &layer.node_graph {
                     let eval = g.resolve_output_image();
-                    if let crate::document::GraphImageSource::FilePath(path) = &eval.image {
+                    if matches!(
+                        eval.image,
+                        crate::document::GraphImageSource::FilePath(_)
+                            | crate::document::GraphImageSource::BakedCache { .. }
+                    ) {
                         let max_side = pixel_w.max(pixel_h).clamp(256, 2048);
-                        if let Some(rgba) = crate::document::bake_graph_output_rgba(
-                            path,
+                        if let Some(rgba) = crate::document::bake_graph_eval_rgba(
                             &eval,
                             max_side.min(512),
                             1.0,

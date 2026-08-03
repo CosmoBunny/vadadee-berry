@@ -236,6 +236,72 @@ If FFmpeg is not found the editor still runs; video import/export is silently di
 
 ---
 
+## OpenCV (node editor CV — face detect, etc.)
+
+Face detection and related CV nodes prefer **system OpenCV** (Haar cascade) when the
+`opencv` Cargo feature is enabled (this is the **default**). If OpenCV is missing at
+build time or the cascade cannot load at runtime, the app falls back to a pure-Rust
+skin-tone face ROI detector.
+
+### Install build dependencies
+
+**Debian / Ubuntu**
+
+```bash
+sudo apt install libopencv-dev clang libclang-dev
+# Haar cascades (usually pulled in with libopencv-dev):
+#   /usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml
+```
+
+If bindgen fails with `a libclang shared library is not loaded`, point it at LLVM:
+
+```bash
+export LIBCLANG_PATH=/usr/lib/llvm-18/lib   # adjust version (llvm-17, llvm-18, …)
+export LD_LIBRARY_PATH="$LIBCLANG_PATH:${LD_LIBRARY_PATH:-}"
+```
+
+**Fedora**
+
+```bash
+sudo dnf install opencv-devel clang clang-devel
+```
+
+**macOS (Homebrew)**
+
+```bash
+brew install opencv llvm
+export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+export DYLD_LIBRARY_PATH="$LIBCLANG_PATH:${DYLD_LIBRARY_PATH:-}"
+```
+
+**Windows**
+
+Install OpenCV and set `OPENCV_INCLUDE_PATHS` / `OPENCV_LINK_PATHS` (or use vcpkg) per
+[opencv-rust](https://github.com/twistedfall/opencv-rust) docs. Install LLVM and set
+`LIBCLANG_PATH` to the directory containing `libclang.dll`.
+
+### Build
+
+```bash
+# Default includes --features opencv
+cargo run --bin vadadee-berry
+
+# Without OpenCV (native CV only)
+cargo run --bin vadadee-berry --no-default-features
+```
+
+### Runtime notes
+
+- First Privacy Blur / face preview shows a **black** placeholder until the first bake finishes (async; UI does not freeze).
+- Changing strength, image, or regions **keeps the previous** preview until the new bake is ready.
+- Export forces CV to complete synchronously so frames are final.
+- **Settings › Computer vision** chooses face detect backend:
+  - **Auto** — OpenCV Haar when available, else native
+  - **OpenCV Haar** — force OpenCV (falls back if cascade missing)
+  - **Native (fast)** — pure-Rust skin ROI (usually faster for live preview)
+
+---
+
 ## MCP server
 
 The `vadadee-mcp-stdio` binary exposes the editor over the Model Context Protocol

@@ -25,6 +25,7 @@ pub mod raster;
 pub mod path_physics;
 pub mod ui;
 pub mod video_decode;
+pub mod cv;
 pub mod export_worker;
 pub mod export_audio;
 pub mod recorder;

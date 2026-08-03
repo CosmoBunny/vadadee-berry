@@ -1,7 +1,4 @@
-# Local PipeWire headers (extracted from distro -dev debs) for pipewire-rs build.
-# Runtime still uses system libpipewire-0.3.so.
+# Help opencv-rust bindgen find libclang (Debian/Ubuntu LLVM packages).
+# Override in your environment if needed: export LIBCLANG_PATH=...
 [env]
-PKG_CONFIG_PATH = { value = ".deps/pipewire/usr/lib/x86_64-linux-gnu/pkgconfig", relative = true, force = true }
-
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-L", "native=.deps/pipewire/usr/lib/x86_64-linux-gnu"]
+LIBCLANG_PATH = { value = "/usr/lib/llvm-18/lib", force = false }

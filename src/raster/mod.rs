@@ -140,7 +140,6 @@ impl RasterBuffer {
             alpha_lock,
             poly_components,
             None,
-            0,
         );
     }
 
@@ -159,9 +158,8 @@ impl RasterBuffer {
         rect_mask: Option<(i32, i32, i32, i32)>,
         alpha_lock: bool,
         poly_components: Option<&[Vec<(f64, f64)>]>,
-        // Pixel bitmap mask (image space). None = ignore.
-        pixel_mask: Option<&[u8]>,
-        pixel_mask_w: u32,
+        // Region pixel mask: (ox, oy, width, height, mask).
+        pixel_region: Option<(i32, i32, u32, u32, &[u8])>,
     ) {
         self.stamp_tip_masked(
             cx,
@@ -175,8 +173,7 @@ impl RasterBuffer {
             rect_mask,
             alpha_lock,
             poly_components,
-            pixel_mask,
-            pixel_mask_w,
+            pixel_region,
             1.0,
             0.0,
         );
@@ -196,8 +193,8 @@ impl RasterBuffer {
         rect_mask: Option<(i32, i32, i32, i32)>,
         alpha_lock: bool,
         poly_components: Option<&[Vec<(f64, f64)>]>,
-        pixel_mask: Option<&[u8]>,
-        pixel_mask_w: u32,
+        // Region pixel mask: (ox, oy, width, height, mask) in full image coords.
+        pixel_region: Option<(i32, i32, u32, u32, &[u8])>,
         aspect: f32,
         angle_rad: f32,
     ) {
@@ -239,7 +236,9 @@ impl RasterBuffer {
                 let py = y as f64 + 0.5;
                 let has_poly = poly_components.map(|c| !c.is_empty()).unwrap_or(false);
                 let has_rect = rect_mask.is_some();
-                let has_bitmap = pixel_mask.is_some_and(|m| !m.is_empty() && pixel_mask_w > 0);
+                let has_bitmap = pixel_region.is_some_and(|(_, _, w, h, m)| {
+                    w > 0 && h > 0 && !m.is_empty()
+                });
                 if has_poly || has_rect || has_bitmap {
                     let in_poly = has_poly
                         && poly_components.is_some_and(|comps| {
@@ -248,16 +247,18 @@ impl RasterBuffer {
                     let in_rect = rect_mask.is_some_and(|(rx0, ry0, rx1, ry1)| {
                         px >= rx0 as f64 && px < rx1 as f64 && py >= ry0 as f64 && py < ry1 as f64
                     });
-                    let in_bit = has_bitmap && pixel_mask.is_some_and(|m| {
-                        let ix = x;
-                        let iy = y;
-                        if ix < 0 || iy < 0 {
-                            return false;
-                        }
-                        let ww = pixel_mask_w as usize;
-                        let idx = iy as usize * ww + ix as usize;
-                        m.get(idx).copied().unwrap_or(0) != 0
-                    });
+                    let in_bit = has_bitmap
+                        && pixel_region.is_some_and(|(ox, oy, mw, mh, m)| {
+                            let lx = x - ox;
+                            let ly = y - oy;
+                            if lx < 0 || ly < 0 || lx >= mw as i32 || ly >= mh as i32 {
+                                return false;
+                            }
+                            m.get(ly as usize * mw as usize + lx as usize)
+                                .copied()
+                                .unwrap_or(0)
+                                != 0
+                        });
                     // Any mask channel that exists: OR together (union).
                     let mut ok = false;
                     if has_poly {
@@ -269,8 +270,6 @@ impl RasterBuffer {
                     if has_bitmap {
                         ok |= in_bit;
                     }
-                    // If only geometric masks were empty and only bitmap — use bit.
-                    // If we have masks but none matched, skip.
                     if !ok {
                         continue;
                     }

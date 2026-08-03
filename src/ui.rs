@@ -384,6 +384,78 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         }
                     });
                 });
+                ui.menu_button("Settings", |ui| {
+                    ui.label(
+                        RichText::new("Computer vision (face detect)")
+                            .small()
+                            .weak(),
+                    );
+                    let mut backend = crate::cv::face_backend();
+                    let opencv_ok = crate::cv::opencv_face::opencv_available();
+                    ui.add_enabled_ui(true, |ui| {
+                        if ui
+                            .radio_value(
+                                &mut backend,
+                                crate::cv::CvFaceBackend::Auto,
+                                "Auto (OpenCV → native)",
+                            )
+                            .on_hover_text(
+                                "Use OpenCV Haar when built/linked; otherwise native skin ROI.",
+                            )
+                            .changed()
+                        {
+                            crate::cv::set_face_backend(backend);
+                            app.status_message =
+                                format!("CV face backend: {}", backend.label()).into();
+                        }
+                        let r = ui
+                            .add_enabled(
+                                cfg!(feature = "opencv"),
+                                egui::RadioButton::new(
+                                    backend == crate::cv::CvFaceBackend::OpenCv,
+                                    if opencv_ok {
+                                        "OpenCV Haar"
+                                    } else {
+                                        "OpenCV Haar (cascade not found)"
+                                    },
+                                ),
+                            )
+                            .on_hover_text(
+                                "Force OpenCV. Rebuild with default features if disabled. Needs system OpenCV + cascade XML.",
+                            );
+                        if r.clicked() && cfg!(feature = "opencv") {
+                            backend = crate::cv::CvFaceBackend::OpenCv;
+                            crate::cv::set_face_backend(backend);
+                            app.status_message =
+                                format!("CV face backend: {}", backend.label()).into();
+                        }
+                        if ui
+                            .radio_value(
+                                &mut backend,
+                                crate::cv::CvFaceBackend::Native,
+                                "Native (fast)",
+                            )
+                            .on_hover_text(
+                                "Pure-Rust skin-tone face ROI — usually faster for live preview.",
+                            )
+                            .changed()
+                        {
+                            crate::cv::set_face_backend(backend);
+                            app.status_message =
+                                format!("CV face backend: {}", backend.label()).into();
+                        }
+                    });
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!(
+                            "Active: {} · OpenCV cascade: {}",
+                            crate::cv::face_backend().label(),
+                            if opencv_ok { "yes" } else { "no" }
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                });
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut app.viewport.show_grid, "Show grid lines")
                         .on_hover_text("Draw document grid on the page (View › grid step / cols×rows)");
@@ -5569,6 +5641,9 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     let eval = g.resolve_output_image();
                     out_img = match &eval.image {
                         crate::document::GraphImageSource::Empty => "image: —".into(),
+                        crate::document::GraphImageSource::BakedCache { .. } => {
+                            "image: (baked CV)".into()
+                        }
                         crate::document::GraphImageSource::FilePath(p) => {
                             let name = std::path::Path::new(p)
                                 .file_name()
@@ -5971,6 +6046,9 @@ fn ne_output_proxy_inspector(
         let g = layer.node_graph.as_ref();
         let eval = g.map(|g| g.resolve_output_image());
         let img_line = match eval.as_ref().map(|e| &e.image) {
+            Some(crate::document::GraphImageSource::BakedCache { .. }) => {
+                "Image: (baked CV)".into()
+            }
             Some(crate::document::GraphImageSource::FilePath(p)) => {
                 let name = std::path::Path::new(p)
                     .file_name()
@@ -7078,9 +7156,14 @@ fn paint_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     });
     if let Some(pm) = app.tools.raster.sticky_pixel_mask.as_ref() {
         ui.label(
-            RichText::new(format!("Mask: {} px", pm.count_on()))
-                .small()
-                .color(colors::TEXT_MUTED),
+            RichText::new(format!(
+                "Mask: {} px · region {}×{}",
+                pm.count_on(),
+                pm.width,
+                pm.height
+            ))
+            .small()
+            .color(colors::TEXT_MUTED),
         );
     } else if app.tools.raster.sticky_mask_doc.is_some()
         || app.tools.raster.sticky_mask_poly.is_some()
@@ -7401,10 +7484,12 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             if let Some(pm) = app.tools.raster.sticky_pixel_mask.as_ref() {
                 ui.label(
                     RichText::new(format!(
-                        "Mask: {} px ({}×{})",
+                        "Mask: {} px · region {}×{} @({},{})",
                         pm.count_on(),
                         pm.width,
-                        pm.height
+                        pm.height,
+                        pm.ox,
+                        pm.oy
                     ))
                     .small()
                     .color(colors::TEXT_MUTED),

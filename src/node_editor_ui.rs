@@ -27,6 +27,10 @@ fn port_type_color(ty: PortType) -> Color32 {
         PortType::Real => Color32::from_rgb(240, 200, 80),      // gold
         PortType::Color => Color32::from_rgb(255, 120, 160),    // pink
         PortType::Position => Color32::from_rgb(120, 220, 180), // mint
+        PortType::Mask => Color32::from_rgb(180, 180, 200),     // silver-gray
+        PortType::Regions => Color32::from_rgb(255, 100, 200),  // magenta
+        PortType::Track => Color32::from_rgb(100, 200, 120),    // green
+        PortType::UnionImage => Color32::from_rgb(160, 120, 255), // violet
     }
 }
 
@@ -36,6 +40,20 @@ fn node_width(n: &crate::document::GraphNode) -> f32 {
     // ~7.2px per glyph at base 11pt; padding for trash chip + margins.
     let w = 36.0 + title.chars().count() as f32 * 7.4;
     w.clamp(NODE_W_MIN, NODE_W_MAX)
+}
+
+/// Fit `tex_w × tex_h` inside `outer` preserving aspect (letterbox; no stretch).
+fn aspect_fit_rect(outer: Rect, tex_w: f32, tex_h: f32) -> Rect {
+    let tw = tex_w.max(1.0);
+    let th = tex_h.max(1.0);
+    let ow = outer.width().max(1.0);
+    let oh = outer.height().max(1.0);
+    let scale = (ow / tw).min(oh / th);
+    let w = tw * scale;
+    let h = th * scale;
+    let x = outer.center().x - w * 0.5;
+    let y = outer.center().y - h * 0.5;
+    Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -723,6 +741,104 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
                 .clicked()
             {
                 spawn = Some(GraphNodeKind::Visualizer { gain: 1.0 });
+                ui.close();
+            }
+            if ui
+                .button("Apply Mask")
+                .on_hover_text("Image + Mask → alpha matte")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::ApplyMask);
+                ui.close();
+            }
+            if ui
+                .button("Background Blur")
+                .on_hover_text("Image + Mask + Radius → blur where mask is low")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::BackgroundBlur);
+                ui.close();
+            }
+            if ui
+                .button("Privacy Blur")
+                .on_hover_text(
+                    "Image + Regions + Strength/Pad/Mode(0=blur,1=pixel). Strength 0..1 → px×24; or raw px >1.",
+                )
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::PrivacyBlur);
+                ui.close();
+            }
+        });
+        ui.menu_button("Analyze ▾", |ui| {
+            if ui
+                .button("Chroma Key")
+                .on_hover_text("Image + key RGB + tol/soft → Mask + keyed Image (green screen)")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::ChromaKey);
+                ui.close();
+            }
+            if ui
+                .button("Manual Region")
+                .on_hover_text("X/Y/W/H (0..1) → Regions box labeled manual")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::RegionsFromManual);
+                ui.close();
+            }
+            if ui
+                .button("Detect Face")
+                .on_hover_text(
+                    "Image → Regions. OpenCV Haar when available, else native skin ROI. Async (no UI freeze).",
+                )
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::DetectFace);
+                ui.close();
+            }
+            if ui
+                .button("Track Motion")
+                .on_hover_text(
+                    "Scene + Targets (Union Image of object crops) → single X/Y/Conf. Holds last pos if missing.",
+                )
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::TrackMotion);
+                ui.close();
+            }
+        });
+        ui.menu_button("Composite ▾", |ui| {
+            if ui
+                .button("Union Image 2")
+                .on_hover_text("1× Image + optional Union in → Union out")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::UnionImage2);
+                ui.close();
+            }
+            if ui
+                .button("Union Image 3")
+                .on_hover_text("2× Image + optional Union in → Union out")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::UnionImage3);
+                ui.close();
+            }
+            if ui
+                .button("Union Image 5")
+                .on_hover_text("4× Image + optional Union in → Union out")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::UnionImage5);
+                ui.close();
+            }
+            if ui
+                .button("Union Image 7")
+                .on_hover_text("6× Image + optional Union in → Union out")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::UnionImage7);
                 ui.close();
             }
         });
@@ -1566,6 +1682,9 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                             });
                         if let Some(eval) = preview_eval {
                             let tid = match &eval.image {
+                                crate::document::GraphImageSource::BakedCache { key } => {
+                                    app.ensure_graph_bake_texture(key, ui.ctx())
+                                }
                                 crate::document::GraphImageSource::FilePath(path) => {
                                     let _ = app.ensure_graph_path_texture_at(
                                         path,
@@ -1585,7 +1704,28 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                                     egui::pos2(0.0, 0.0),
                                     egui::pos2(1.0, 1.0),
                                 );
-                                painter.image(tid, img_rect, uv, Color32::WHITE);
+                                // Preserve texture aspect inside the node card (no height/width squeeze).
+                                let (tw, th) = match &eval.image {
+                                    crate::document::GraphImageSource::FilePath(path) => {
+                                        let key = eval.media_cache_key(path);
+                                        app.graph_path_texture_size(&key)
+                                            .or_else(|| app.graph_path_texture_size(path))
+                                            .map(|s| (s[0] as f32, s[1] as f32))
+                                            .unwrap_or((img_rect.width(), img_rect.height()))
+                                    }
+                                    crate::document::GraphImageSource::BakedCache { key } => app
+                                        .graph_path_texture_size(key)
+                                        .map(|s| (s[0] as f32, s[1] as f32))
+                                        .unwrap_or((img_rect.width(), img_rect.height())),
+                                    _ => (img_rect.width(), img_rect.height()),
+                                };
+                                let fit = aspect_fit_rect(img_rect, tw, th);
+                                painter.rect_filled(
+                                    img_rect,
+                                    2.0,
+                                    Color32::from_rgb(24, 26, 32),
+                                );
+                                painter.image(tid, fit, uv, Color32::WHITE);
                             } else {
                                 painter.text(
                                     img_rect.center(),

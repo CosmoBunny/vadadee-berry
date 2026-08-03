@@ -465,45 +465,307 @@ impl Default for RasterSelectSession {
     }
 }
 
-/// Pixel-accurate paint mask (image pixel space) for eyedrop/magnetic select.
-/// Avoids AABB holes: only flood-filled pixels are selected, not the bounding box interior.
+/// Pixel-accurate paint mask for eyedrop/magnetic/lasso float.
+///
+/// Stored as a **region buffer**: only the tight bounding box of selected
+/// pixels (plus padding), not a full-frame 3060×4080 mask. Coordinates are
+/// still in full image pixel space via `ox`/`oy`.
 #[derive(Debug, Clone)]
 pub struct StickyPixelMask {
     pub node_id: crate::document::NodeId,
+    /// Full image size (for bounds checks / matching the paint target).
+    pub full_w: u32,
+    pub full_h: u32,
+    /// Region origin in full image pixel space.
+    pub ox: i32,
+    pub oy: i32,
+    /// Region size — `mask.len() == width * height`.
     pub width: u32,
     pub height: u32,
-    /// 0 = outside mask, nonzero = selected. Length = width * height.
+    /// 0 = outside mask, nonzero = selected (region-local).
     pub mask: Vec<u8>,
 }
 
 impl StickyPixelMask {
-    pub fn contains(&self, px: i32, py: i32) -> bool {
-        if px < 0 || py < 0 || px >= self.width as i32 || py >= self.height as i32 {
-            return false;
+    /// Build a region buffer from a full-frame mask (tight bbox of nonzero pixels).
+    /// Returns `None` if the mask is empty.
+    pub fn from_full_frame(
+        node_id: crate::document::NodeId,
+        full_w: u32,
+        full_h: u32,
+        full_mask: &[u8],
+        pad: i32,
+    ) -> Option<Self> {
+        if full_w == 0 || full_h == 0 || full_mask.len() < (full_w * full_h) as usize {
+            return None;
         }
-        self.mask[py as usize * self.width as usize + px as usize] != 0
+        let mut min_x = full_w as i32;
+        let mut min_y = full_h as i32;
+        let mut max_x = -1i32;
+        let mut max_y = -1i32;
+        for y in 0..full_h as i32 {
+            let row = y as usize * full_w as usize;
+            for x in 0..full_w as i32 {
+                if full_mask[row + x as usize] != 0 {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        if max_x < min_x {
+            return None;
+        }
+        let pad = pad.max(0);
+        let ox = (min_x - pad).max(0);
+        let oy = (min_y - pad).max(0);
+        let x1 = (max_x + 1 + pad).min(full_w as i32);
+        let y1 = (max_y + 1 + pad).min(full_h as i32);
+        let rw = (x1 - ox) as u32;
+        let rh = (y1 - oy) as u32;
+        let mut mask = vec![0u8; (rw * rh) as usize];
+        for y in 0..rh as i32 {
+            let src_y = oy + y;
+            let src_row = src_y as usize * full_w as usize;
+            let dst_row = y as usize * rw as usize;
+            for x in 0..rw as i32 {
+                let src_x = ox + x;
+                mask[dst_row + x as usize] = full_mask[src_row + src_x as usize];
+            }
+        }
+        Some(Self {
+            node_id,
+            full_w,
+            full_h,
+            ox,
+            oy,
+            width: rw,
+            height: rh,
+            mask,
+        })
     }
 
+    /// Region buffer already covering `[ox,oy)..[ox+w, oy+h)` in full image space.
+    pub fn from_region(
+        node_id: crate::document::NodeId,
+        full_w: u32,
+        full_h: u32,
+        ox: i32,
+        oy: i32,
+        width: u32,
+        height: u32,
+        mask: Vec<u8>,
+    ) -> Self {
+        debug_assert_eq!(mask.len(), (width * height) as usize);
+        Self {
+            node_id,
+            full_w,
+            full_h,
+            ox,
+            oy,
+            width,
+            height,
+            mask,
+        }
+    }
+
+    #[inline]
+    pub fn contains(&self, px: i32, py: i32) -> bool {
+        let lx = px - self.ox;
+        let ly = py - self.oy;
+        if lx < 0 || ly < 0 || lx >= self.width as i32 || ly >= self.height as i32 {
+            return false;
+        }
+        self.mask[ly as usize * self.width as usize + lx as usize] != 0
+    }
+
+    /// Union another region into this one (expands bbox if needed).
     pub fn or_with(&mut self, other: &StickyPixelMask) {
-        if self.width != other.width || self.height != other.height {
+        if self.node_id != other.node_id
+            || self.full_w != other.full_w
+            || self.full_h != other.full_h
+        {
             *self = other.clone();
             return;
         }
-        for (a, b) in self.mask.iter_mut().zip(other.mask.iter()) {
-            if *b != 0 {
-                *a = 255;
+        let nx0 = self.ox.min(other.ox);
+        let ny0 = self.oy.min(other.oy);
+        let nx1 = (self.ox + self.width as i32).max(other.ox + other.width as i32);
+        let ny1 = (self.oy + self.height as i32).max(other.oy + other.height as i32);
+        let nw = (nx1 - nx0) as u32;
+        let nh = (ny1 - ny0) as u32;
+        if nw == self.width
+            && nh == self.height
+            && nx0 == self.ox
+            && ny0 == self.oy
+            && other.ox >= self.ox
+            && other.oy >= self.oy
+            && other.ox + other.width as i32 <= self.ox + self.width as i32
+            && other.oy + other.height as i32 <= self.oy + self.height as i32
+        {
+            // other fully inside self — OR in place
+            for y in 0..other.height as i32 {
+                let sy = (other.oy - self.oy + y) as usize;
+                let src_row = y as usize * other.width as usize;
+                let dst_row = sy * self.width as usize;
+                for x in 0..other.width as i32 {
+                    let sx = (other.ox - self.ox + x) as usize;
+                    if other.mask[src_row + x as usize] != 0 {
+                        self.mask[dst_row + sx] = 255;
+                    }
+                }
+            }
+            return;
+        }
+        let mut new_mask = vec![0u8; (nw * nh) as usize];
+        // Copy self
+        for y in 0..self.height as i32 {
+            let dy = (self.oy - ny0 + y) as usize;
+            let src_row = y as usize * self.width as usize;
+            let dst_row = dy * nw as usize;
+            for x in 0..self.width as i32 {
+                let dx = (self.ox - nx0 + x) as usize;
+                new_mask[dst_row + dx] = self.mask[src_row + x as usize];
             }
         }
+        // OR other
+        for y in 0..other.height as i32 {
+            let dy = (other.oy - ny0 + y) as usize;
+            let src_row = y as usize * other.width as usize;
+            let dst_row = dy * nw as usize;
+            for x in 0..other.width as i32 {
+                let dx = (other.ox - nx0 + x) as usize;
+                if other.mask[src_row + x as usize] != 0 {
+                    new_mask[dst_row + dx] = 255;
+                }
+            }
+        }
+        self.ox = nx0;
+        self.oy = ny0;
+        self.width = nw;
+        self.height = nh;
+        self.mask = new_mask;
     }
 
+    /// Invert only within the current region buffer (outside region stays unselected).
     pub fn invert(&mut self) {
         for v in &mut self.mask {
             *v = if *v == 0 { 255 } else { 0 };
         }
     }
 
+    /// Expand region by `pad` pixels (clamped to full image), filling new border with 0.
+    /// Used before dilate so growth isn't clipped by the region edge.
+    pub fn pad_region(&mut self, pad: i32) {
+        let pad = pad.max(0);
+        if pad == 0 {
+            return;
+        }
+        let nx0 = (self.ox - pad).max(0);
+        let ny0 = (self.oy - pad).max(0);
+        let nx1 = (self.ox + self.width as i32 + pad).min(self.full_w as i32);
+        let ny1 = (self.oy + self.height as i32 + pad).min(self.full_h as i32);
+        let nw = (nx1 - nx0) as u32;
+        let nh = (ny1 - ny0) as u32;
+        if nw == self.width && nh == self.height && nx0 == self.ox && ny0 == self.oy {
+            return;
+        }
+        let mut new_mask = vec![0u8; (nw * nh) as usize];
+        for y in 0..self.height as i32 {
+            let dy = (self.oy - ny0 + y) as usize;
+            let src_row = y as usize * self.width as usize;
+            let dst_row = dy * nw as usize;
+            for x in 0..self.width as i32 {
+                let dx = (self.ox - nx0 + x) as usize;
+                new_mask[dst_row + dx] = self.mask[src_row + x as usize];
+            }
+        }
+        self.ox = nx0;
+        self.oy = ny0;
+        self.width = nw;
+        self.height = nh;
+        self.mask = new_mask;
+    }
+
+    /// Tight-crop after operations that may leave empty borders.
+    pub fn compact(&mut self, pad: i32) {
+        let mut min_x = self.width as i32;
+        let mut min_y = self.height as i32;
+        let mut max_x = -1i32;
+        let mut max_y = -1i32;
+        for y in 0..self.height as i32 {
+            let row = y as usize * self.width as usize;
+            for x in 0..self.width as i32 {
+                if self.mask[row + x as usize] != 0 {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        if max_x < min_x {
+            self.mask.clear();
+            self.width = 0;
+            self.height = 0;
+            return;
+        }
+        let pad = pad.max(0);
+        let lx0 = (min_x - pad).max(0);
+        let ly0 = (min_y - pad).max(0);
+        let lx1 = (max_x + 1 + pad).min(self.width as i32);
+        let ly1 = (max_y + 1 + pad).min(self.height as i32);
+        if lx0 == 0 && ly0 == 0 && lx1 == self.width as i32 && ly1 == self.height as i32 {
+            return;
+        }
+        let nw = (lx1 - lx0) as u32;
+        let nh = (ly1 - ly0) as u32;
+        let mut new_mask = vec![0u8; (nw * nh) as usize];
+        for y in 0..nh as i32 {
+            let src_row = (ly0 + y) as usize * self.width as usize;
+            let dst_row = y as usize * nw as usize;
+            for x in 0..nw as i32 {
+                new_mask[dst_row + x as usize] = self.mask[src_row + (lx0 + x) as usize];
+            }
+        }
+        self.ox += lx0;
+        self.oy += ly0;
+        self.width = nw;
+        self.height = nh;
+        self.mask = new_mask;
+    }
+
     pub fn count_on(&self) -> usize {
         self.mask.iter().filter(|&&v| v != 0).count()
+    }
+
+    /// Inclusive pixel AABB of on-pixels in full image coords, or None if empty.
+    pub fn on_bbox(&self) -> Option<(i32, i32, i32, i32)> {
+        let mut min_x = self.width as i32;
+        let mut min_y = self.height as i32;
+        let mut max_x = -1i32;
+        let mut max_y = -1i32;
+        for y in 0..self.height as i32 {
+            let row = y as usize * self.width as usize;
+            for x in 0..self.width as i32 {
+                if self.mask[row + x as usize] != 0 {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        if max_x < min_x {
+            return None;
+        }
+        Some((
+            self.ox + min_x,
+            self.oy + min_y,
+            self.ox + max_x,
+            self.oy + max_y,
+        ))
     }
 }
 
