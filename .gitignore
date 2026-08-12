@@ -32,3 +32,6 @@ scratch/
 
 # Explicit (non-root) for tools that match bare names
 target/
+
+# Local Grok folder
+.grok/
