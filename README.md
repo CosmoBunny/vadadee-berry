@@ -146,6 +146,14 @@ The studio tile is the desktop window / launcher icon.
 Grok workflow (optional): copy `packaging/desktop-release.rhai` to
 `.grok/workflows/desktop-release.rhai` and run `/workflow desktop-release`.
 
+### GitHub Actions (downloadable builds)
+
+Workflow: [`.github/workflows/desktop-release.yml`](.github/workflows/desktop-release.yml)
+
+- **Manual:** Actions → *Desktop release* → Run workflow  
+- **Tag:** push `v*` (e.g. `v0.1.0`) → builds Linux / Windows / macOS, uploads artifacts, attaches them to the GitHub Release for download  
+- Default CI build uses `--no-default-features` (no OpenCV); enable OpenCV from the workflow dispatch inputs if needed  
+
 ---
 
 ### macOS
