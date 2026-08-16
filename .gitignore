@@ -24,6 +24,11 @@ app/src/main/jniLibs/**/*.so
 # Distribution artifacts
 /dist/
 
+# Desktop download drop (archives only; keep README/.gitkeep)
+/release/*
+!/release/README.md
+!/release/.gitkeep
+
 # Local agent/session caches & scratch
 .cache/
 scratch/

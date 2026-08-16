@@ -42,6 +42,20 @@ use app::VadadeeBerryApp;
 /// Must match `eframe::NativeOptions::multisampling` — shading WGSL pipelines use the same MSAA count as egui.
 pub const VIEWPORT_MSAA_SAMPLES: u32 = 4;
 
+/// Studio mark from `assets/logo.svg` (left 100×100 tile). Used as the window/taskbar icon.
+#[cfg(not(target_os = "android"))]
+fn app_icon() -> egui::IconData {
+    let image = image::load_from_memory(include_bytes!("../assets/icon_studio.png"))
+        .expect("assets/icon_studio.png")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
+}
+
 fn native_options() -> eframe::NativeOptions {
     #[cfg(target_os = "android")]
     {
@@ -59,7 +73,8 @@ fn native_options() -> eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1400.0, 900.0])
                 .with_min_inner_size([800.0, 500.0])
-                .with_title("Vadadee Berry — vector editor"),
+                .with_title("Vadadee Berry — vector editor")
+                .with_icon(app_icon()),
             multisampling: VIEWPORT_MSAA_SAMPLES as u16,
             ..Default::default()
         }

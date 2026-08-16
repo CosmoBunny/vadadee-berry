@@ -1,5 +1,9 @@
 # Vadadee Berry
 
+<p align="center">
+  <img src="assets/logo.svg" alt="Vadadee Berry — studio (left) and MCP (right)" width="200" height="100" />
+</p>
+
 A creative tool built in Rust with egui and wgpu. It combines a vector graphics
 editor, a video/audio timeline, a shader compositor, image editing, flowchart
 diagramming, and a music sequencer — all in a single native application with a
@@ -117,6 +121,30 @@ Build and run:
 cargo build --release --bin vadadee-berry
 ./target/release/vadadee-berry
 ```
+
+### Desktop download package (Linux / host)
+
+Build release binaries, bundle them with logos, and copy an archive into
+`release/` for user download:
+
+```bash
+./packaging/make_desktop_release.sh
+# optional:
+#   ./packaging/make_desktop_release.sh --no-default-features   # no OpenCV
+#   ./packaging/make_desktop_release.sh --bins studio
+#   OPENCV=0 ./packaging/make_desktop_release.sh
+```
+
+Output:
+
+- `dist/desktop/vadadee-berry-<ver>-<os>-<arch>/` — unpacked bundle  
+- `release/vadadee-berry-<ver>-<os>-<arch>.tar.gz` — downloadable archive (+ `.sha256`)
+
+Logos live in `assets/logo.svg` (200×100): left tile = **studio**, right tile = **MCP**.
+The studio tile is the desktop window / launcher icon.
+
+Grok workflow (optional): copy `packaging/desktop-release.rhai` to
+`.grok/workflows/desktop-release.rhai` and run `/workflow desktop-release`.
 
 ---
 

@@ -78,7 +78,14 @@ cp "$SCRIPT_DIR/Info.plist" "$RELEASE_DIR/Contents/Info.plist"
 echo -n "APPL????" > "$RELEASE_DIR/Contents/PkgInfo"
 
 # ── Generate .icns ─────────────────────────────────────────────────────────────
-ICON_SRC="$ROOT/vadadee_berry_icon.png"
+# Studio tile from assets/logo.svg (left 100×100), preferred high-res source:
+ICON_SRC="$ROOT/assets/icon_studio_1024.png"
+if [[ ! -f "$ICON_SRC" ]]; then
+  ICON_SRC="$ROOT/assets/vadadee_berry_icon.png"
+fi
+if [[ ! -f "$ICON_SRC" ]]; then
+  ICON_SRC="$ROOT/assets/icon_studio.png"
+fi
 ICNS_OUT="$RELEASE_DIR/Contents/Resources/AppIcon.icns"
 
 if [[ -f "$ICON_SRC" ]]; then
