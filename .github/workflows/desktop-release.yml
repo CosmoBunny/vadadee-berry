@@ -54,6 +54,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # libclang-dev alone is not enough for bindgen: the shared lib lives under
+          # /usr/lib/llvm-*/lib and must be pointed at via LIBCLANG_PATH (pipewire/libspa-sys).
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             pkg-config \
@@ -65,11 +67,28 @@ jobs:
             libwayland-dev \
             libasound2-dev \
             libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            clang \
             libclang-dev \
-            clang
+            llvm-dev
           if [ "${{ github.event_name == 'workflow_dispatch' && inputs.with_opencv || false }}" = "true" ]; then
             sudo apt-get install -y --no-install-recommends libopencv-dev
           fi
+          # Prefer llvm-config; fall back to the usual Ubuntu path.
+          if command -v llvm-config >/dev/null 2>&1; then
+            echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+          elif [ -d /usr/lib/llvm-14/lib ]; then
+            echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> "$GITHUB_ENV"
+          else
+            # last resort: first libclang.so* we can find
+            CLANG_SO="$(find /usr/lib -name 'libclang.so*' 2>/dev/null | head -1 || true)"
+            if [ -n "$CLANG_SO" ]; then
+              echo "LIBCLANG_PATH=$(dirname "$CLANG_SO")" >> "$GITHUB_ENV"
+            fi
+          fi
+          echo "LIBCLANG_PATH will be: ${LIBCLANG_PATH:-'(set in GITHUB_ENV for next steps)'}"
+          # Show what we wrote (next steps pick it up from GITHUB_ENV)
+          grep LIBCLANG_PATH "$GITHUB_ENV" || true
 
       - name: Install macOS system deps
         if: runner.os == 'macOS'
