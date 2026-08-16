@@ -151,8 +151,9 @@ Grok workflow (optional): copy `packaging/desktop-release.rhai` to
 Workflow: [`.github/workflows/desktop-release.yml`](.github/workflows/desktop-release.yml)
 
 - **Manual:** Actions → *Desktop release* → Run workflow  
-- **Tag:** push `v*` (e.g. `v0.1.0`) → builds Linux / Windows / macOS, uploads artifacts, attaches them to the GitHub Release for download  
+- **Tag:** push `v*` (e.g. `v0.1.0`) → builds Linux (Ubuntu 24.04) / Windows / macOS, uploads artifacts, attaches them to the GitHub Release for download  
 - Default CI build uses `--no-default-features` (no OpenCV); enable OpenCV from the workflow dispatch inputs if needed  
+- Linux CI uses **Ubuntu 24.04** because PipeWire/`libspa` 0.8 needs SPA headers newer than Ubuntu 22.04’s
 
 ---
 

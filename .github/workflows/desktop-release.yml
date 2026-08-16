@@ -42,16 +42,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Ubuntu 22.04 ships LLVM 14; pipewire's libspa-sys needs bindgen + libclang.
-          - os: ubuntu-22.04
+          # Ubuntu 24.04: PipeWire/SPA headers new enough for pipewire-rs 0.8 / libspa 0.8.
+          # (22.04's SPA lacks spa_video_info_raw.flags → libspa fails to compile.)
+          - os: ubuntu-24.04
             platform: linux
-            libclang_path: /usr/lib/llvm-14/lib
           - os: windows-latest
             platform: windows
-            libclang_path: ""
           - os: macos-14
             platform: macos
-            libclang_path: ""
 
     steps:
       - name: Checkout
@@ -62,6 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
+          # Noble: clang/llvm default to 18; pipewire 1.x headers match pipewire-rs 0.8.
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             pkg-config \
@@ -74,22 +73,38 @@ jobs:
             libasound2-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
-            clang-14 \
-            libclang-14-dev \
-            libclang1-14 \
-            llvm-14 \
-            llvm-14-dev
+            clang \
+            libclang-dev \
+            llvm-dev
           if [ "${{ github.event_name == 'workflow_dispatch' && inputs.with_opencv || false }}" = "true" ]; then
             sudo apt-get install -y --no-install-recommends libopencv-dev
           fi
 
-          # Prove libclang is on disk where we expect it (bindgen / libspa-sys).
-          echo "=== libclang search ==="
-          ls -la /usr/lib/llvm-14/lib/libclang* || true
-          find /usr/lib -name 'libclang.so*' 2>/dev/null | head -20 || true
-          test -e /usr/lib/llvm-14/lib/libclang.so.1 \
-            || test -e /usr/lib/llvm-14/lib/libclang.so \
-            || { echo "ERROR: libclang shared library missing under /usr/lib/llvm-14/lib"; exit 1; }
+          # Resolve libclang for bindgen (pipewire → libspa-sys).
+          if command -v llvm-config >/dev/null 2>&1; then
+            LIBCLANG_PATH="$(llvm-config --libdir)"
+          else
+            LIBCLANG_PATH="$(find /usr/lib -type d -path '*/llvm-*/lib' 2>/dev/null | sort -V | tail -1)"
+          fi
+          if [ -z "${LIBCLANG_PATH:-}" ] || [ ! -d "$LIBCLANG_PATH" ]; then
+            echo "ERROR: could not locate LLVM libdir for LIBCLANG_PATH"
+            find /usr/lib -name 'libclang.so*' 2>/dev/null | head -20 || true
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$LIBCLANG_PATH" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$LIBCLANG_PATH"
+          ls -la "$LIBCLANG_PATH"/libclang* || true
+          # bindgen often wants an unversioned libclang.so
+          if [ ! -e "$LIBCLANG_PATH/libclang.so" ]; then
+            SO="$(ls "$LIBCLANG_PATH"/libclang.so.* 2>/dev/null | head -1 || true)"
+            if [ -n "$SO" ]; then
+              sudo ln -sfn "$(basename "$SO")" "$LIBCLANG_PATH/libclang.so"
+            fi
+          fi
+          test -e "$LIBCLANG_PATH/libclang.so" -o -e "$LIBCLANG_PATH/libclang.so.1" \
+            || { echo "ERROR: libclang shared library still missing"; exit 1; }
+          pkg-config --modversion libspa-0.2
+          pkg-config --modversion libpipewire-0.3
 
       - name: Install macOS system deps
         if: runner.os == 'macOS'
@@ -128,23 +143,17 @@ jobs:
 
       - name: Build, bundle, copy to release/
         shell: bash
-        env:
-          # Set here (not only GITHUB_ENV) so cargo/bindgen always see it on Linux.
-          LIBCLANG_PATH: ${{ matrix.libclang_path }}
         run: |
           set -euo pipefail
 
           if [ "${{ runner.os }}" = "Linux" ]; then
-            # Empty matrix value would clear LIBCLANG_PATH; force known path.
-            export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-14/lib}"
-            echo "LIBCLANG_PATH=$LIBCLANG_PATH"
-            ls -la "$LIBCLANG_PATH"/libclang* || true
-            # Some bindgen versions want a plain libclang.so symlink.
-            if [ ! -e "$LIBCLANG_PATH/libclang.so" ] && [ -e "$LIBCLANG_PATH/libclang.so.1" ]; then
-              sudo ln -sf libclang.so.1 "$LIBCLANG_PATH/libclang.so"
+            # From Install Linux system deps (GITHUB_ENV).
+            if [ -z "${LIBCLANG_PATH:-}" ]; then
+              LIBCLANG_PATH="$(llvm-config --libdir 2>/dev/null || true)"
             fi
-            # Also export for any nested process that only reads GITHUB_ENV-style vars.
-            echo "LIBCLANG_PATH=$LIBCLANG_PATH" >> "$GITHUB_ENV"
+            export LIBCLANG_PATH
+            echo "LIBCLANG_PATH=${LIBCLANG_PATH:-unset}"
+            test -n "${LIBCLANG_PATH:-}" || { echo "ERROR: LIBCLANG_PATH empty"; exit 1; }
           fi
 
           chmod +x packaging/make_desktop_release.sh
@@ -152,7 +161,6 @@ jobs:
           if [ "${{ steps.flags.outputs.with_opencv }}" != "true" ]; then
             EXTRA+=(--no-default-features)
           fi
-          # Expand EXTRA safely under set -u when empty.
           if [ ${#EXTRA[@]} -gt 0 ]; then
             ./packaging/make_desktop_release.sh --bins "${{ steps.flags.outputs.bins }}" "${EXTRA[@]}"
           else
