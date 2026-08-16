@@ -1,6 +1,9 @@
 # Build desktop release binaries, bundle them, and publish downloadable archives.
 # Artifacts land under release/ (via packaging/make_desktop_release.sh) and are
 # uploaded for download. On version tags (v*), they are attached to a GitHub Release.
+#
+# IMPORTANT: "Re-run failed jobs" reuses the same commit. After workflow fixes,
+# start a NEW run (Actions → Desktop release → Run workflow) on latest main.
 name: Desktop release
 
 on:
@@ -39,12 +42,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Ubuntu 22.04 ships LLVM 14; pipewire's libspa-sys needs bindgen + libclang.
           - os: ubuntu-22.04
             platform: linux
+            libclang_path: /usr/lib/llvm-14/lib
           - os: windows-latest
             platform: windows
+            libclang_path: ""
           - os: macos-14
             platform: macos
+            libclang_path: ""
 
     steps:
       - name: Checkout
@@ -53,9 +60,8 @@ jobs:
       - name: Install Linux system deps
         if: runner.os == 'Linux'
         run: |
+          set -euo pipefail
           sudo apt-get update
-          # libclang-dev alone is not enough for bindgen: the shared lib lives under
-          # /usr/lib/llvm-*/lib and must be pointed at via LIBCLANG_PATH (pipewire/libspa-sys).
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             pkg-config \
@@ -68,32 +74,27 @@ jobs:
             libasound2-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
-            clang \
-            libclang-dev \
-            llvm-dev
+            clang-14 \
+            libclang-14-dev \
+            libclang1-14 \
+            llvm-14 \
+            llvm-14-dev
           if [ "${{ github.event_name == 'workflow_dispatch' && inputs.with_opencv || false }}" = "true" ]; then
             sudo apt-get install -y --no-install-recommends libopencv-dev
           fi
-          # Prefer llvm-config; fall back to the usual Ubuntu path.
-          if command -v llvm-config >/dev/null 2>&1; then
-            echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
-          elif [ -d /usr/lib/llvm-14/lib ]; then
-            echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> "$GITHUB_ENV"
-          else
-            # last resort: first libclang.so* we can find
-            CLANG_SO="$(find /usr/lib -name 'libclang.so*' 2>/dev/null | head -1 || true)"
-            if [ -n "$CLANG_SO" ]; then
-              echo "LIBCLANG_PATH=$(dirname "$CLANG_SO")" >> "$GITHUB_ENV"
-            fi
-          fi
-          echo "LIBCLANG_PATH will be: ${LIBCLANG_PATH:-'(set in GITHUB_ENV for next steps)'}"
-          # Show what we wrote (next steps pick it up from GITHUB_ENV)
-          grep LIBCLANG_PATH "$GITHUB_ENV" || true
+
+          # Prove libclang is on disk where we expect it (bindgen / libspa-sys).
+          echo "=== libclang search ==="
+          ls -la /usr/lib/llvm-14/lib/libclang* || true
+          find /usr/lib -name 'libclang.so*' 2>/dev/null | head -20 || true
+          test -e /usr/lib/llvm-14/lib/libclang.so.1 \
+            || test -e /usr/lib/llvm-14/lib/libclang.so \
+            || { echo "ERROR: libclang shared library missing under /usr/lib/llvm-14/lib"; exit 1; }
 
       - name: Install macOS system deps
         if: runner.os == 'macOS'
         run: |
-          # Xcode CLT is preinstalled on GitHub runners.
+          set -euo pipefail
           if [ "${{ github.event_name == 'workflow_dispatch' && inputs.with_opencv || false }}" = "true" ]; then
             brew install opencv llvm
             echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
@@ -112,6 +113,7 @@ jobs:
         id: flags
         shell: bash
         run: |
+          set -euo pipefail
           BINS="all"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             BINS="${{ inputs.bins }}"
@@ -126,14 +128,36 @@ jobs:
 
       - name: Build, bundle, copy to release/
         shell: bash
+        env:
+          # Set here (not only GITHUB_ENV) so cargo/bindgen always see it on Linux.
+          LIBCLANG_PATH: ${{ matrix.libclang_path }}
         run: |
           set -euo pipefail
+
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            # Empty matrix value would clear LIBCLANG_PATH; force known path.
+            export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-14/lib}"
+            echo "LIBCLANG_PATH=$LIBCLANG_PATH"
+            ls -la "$LIBCLANG_PATH"/libclang* || true
+            # Some bindgen versions want a plain libclang.so symlink.
+            if [ ! -e "$LIBCLANG_PATH/libclang.so" ] && [ -e "$LIBCLANG_PATH/libclang.so.1" ]; then
+              sudo ln -sf libclang.so.1 "$LIBCLANG_PATH/libclang.so"
+            fi
+            # Also export for any nested process that only reads GITHUB_ENV-style vars.
+            echo "LIBCLANG_PATH=$LIBCLANG_PATH" >> "$GITHUB_ENV"
+          fi
+
           chmod +x packaging/make_desktop_release.sh
           EXTRA=()
           if [ "${{ steps.flags.outputs.with_opencv }}" != "true" ]; then
             EXTRA+=(--no-default-features)
           fi
-          ./packaging/make_desktop_release.sh --bins "${{ steps.flags.outputs.bins }}" "${EXTRA[@]+"${EXTRA[@]}"}"
+          # Expand EXTRA safely under set -u when empty.
+          if [ ${#EXTRA[@]} -gt 0 ]; then
+            ./packaging/make_desktop_release.sh --bins "${{ steps.flags.outputs.bins }}" "${EXTRA[@]}"
+          else
+            ./packaging/make_desktop_release.sh --bins "${{ steps.flags.outputs.bins }}"
+          fi
           echo "---- release/ ----"
           ls -lah release/
 
@@ -148,7 +172,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # Attach packaged archives to a GitHub Release so users can download them.
   publish:
     name: Publish GitHub Release assets
     needs: desktop
