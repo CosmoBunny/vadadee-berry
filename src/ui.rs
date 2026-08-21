@@ -565,6 +565,120 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         });
 }
 
+/// Minimal markdown → [`egui::text::LayoutJob`] for toolbar tips.
+/// Supports: `**bold**`, `` `code` ``, soft newlines, word wrap (markdown-lint style).
+fn toolbar_tip_layout_job(md: &str, max_width: f32) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+
+    let body = TextFormat {
+        font_id: egui::FontId::proportional(13.0),
+        color: colors::TEXT,
+        ..Default::default()
+    };
+    // Title / **bold** — slightly larger + stronger color (no separate bold face required).
+    let bold = TextFormat {
+        font_id: egui::FontId::proportional(13.5),
+        color: colors::TEXT,
+        extra_letter_spacing: 0.15,
+        ..Default::default()
+    };
+    let code = TextFormat {
+        font_id: egui::FontId::monospace(12.5),
+        color: colors::ACCENT,
+        background: colors::BG_ELEVATED,
+        expand_bg: 2.0,
+        ..Default::default()
+    };
+    let muted = TextFormat {
+        font_id: egui::FontId::proportional(12.5),
+        color: colors::TEXT_MUTED,
+        ..Default::default()
+    };
+
+    let mut job = LayoutJob {
+        wrap: egui::text::TextWrapping {
+            max_width: max_width.max(40.0),
+            max_rows: usize::MAX,
+            break_anywhere: false, // word-by-word
+            overflow_character: Some('…'),
+        },
+        halign: egui::Align::LEFT,
+        justify: false,
+        first_row_min_height: 0.0,
+        round_output_to_gui: true,
+        ..LayoutJob::default()
+    };
+
+    // First non-empty line = title; further lines = muted body.
+    let mut first_content = true;
+    for (li, line) in md.lines().enumerate() {
+        if li > 0 {
+            job.append("\n", 0.0, body.clone());
+        }
+        let is_title_line = first_content && !line.trim().is_empty();
+        if is_title_line {
+            first_content = false;
+        }
+        let default_fmt = if is_title_line {
+            bold.clone()
+        } else {
+            muted.clone()
+        };
+
+        let mut rest = line;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("**") {
+                if let Some(end) = after.find("**") {
+                    let (inner, tail) = after.split_at(end);
+                    job.append(inner, 0.0, bold.clone());
+                    rest = &tail[2..];
+                    continue;
+                }
+            }
+            if let Some(after) = rest.strip_prefix('`') {
+                if let Some(end) = after.find('`') {
+                    let (inner, tail) = after.split_at(end);
+                    job.append(inner, 0.0, code.clone());
+                    rest = &tail[1..];
+                    continue;
+                }
+            }
+            let next_star = rest.find("**").unwrap_or(rest.len());
+            let next_tick = rest.find('`').unwrap_or(rest.len());
+            let cut = next_star.min(next_tick).max(1).min(rest.len());
+            job.append(&rest[..cut], 0.0, default_fmt.clone());
+            rest = &rest[cut..];
+        }
+    }
+    job
+}
+
+/// Hover tip next to the floating toolbar: markdown-style, word wrap, max width 2× toolbar.
+fn show_toolbar_hover_tip(
+    ui: &mut Ui,
+    id: impl std::hash::Hash,
+    md: &str,
+    max_width: f32,
+) {
+    // Never inherit the button-slot width (that was wrapping mid-word: "Eras\\ner (\\nX)").
+    let max_width = max_width.max(160.0);
+    let parent_id = ui.make_persistent_id(id);
+    egui::Tooltip::always_open(
+        ui.ctx().clone(),
+        ui.layer_id(),
+        parent_id,
+        egui::PopupAnchor::Pointer,
+    )
+    .width(max_width)
+    .gap(8.0)
+    .show(|ui| {
+        ui.set_max_width(max_width);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        let job = toolbar_tip_layout_job(md, max_width - 12.0);
+        ui.add(egui::Label::new(job).wrap().selectable(false));
+    });
+}
+
 fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     let alpha = app.ui_anim.toolbar_alpha();
     let inset = theme::overlay_work_rect(work);
@@ -652,6 +766,9 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     let expanded_inner_w = 3.0 * btn_size + 2.0 * spacing;
     let expanded_inner_h =
         expanded_rows as f32 * btn_size + (expanded_rows.saturating_sub(1) as f32) * spacing;
+    // Hover tips: max width = double the expanded toolbar card width.
+    let toolbar_card_w = expanded_inner_w + 2.0 * margin_x;
+    let tip_max_w = toolbar_card_w * 2.0;
 
     // Use egui's built-in bool animator for smooth transitions
     let expand_t = ctx.animate_bool(egui::Id::new("toolbar_expanded_anim"), app.toolbar_expanded);
@@ -688,26 +805,35 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
         }
     };
 
+    // Markdown tips: first line title, `code` = shortcut, rest muted body.
     let get_tool_tip = |tool: ToolKind| -> &'static str {
         match tool {
-            ToolKind::Select => "Select (V)",
-            ToolKind::Node => "Edit nodes (N)",
-            ToolKind::Pen => "Pen (P)",
-            ToolKind::Rectangle => "Rectangle (R)",
-            ToolKind::Circle => "Circle (C)",
-            ToolKind::Ellipse => "Ellipse (E)",
-            ToolKind::Line => "Line (L)",
-            ToolKind::Polygon => "Polygon (G)",
-            ToolKind::Arc => "Arc / Chord (A)",
-            ToolKind::Plotter => "Plotter f(x)/f(y) (M)",
-            ToolKind::Text => "Text (T)",
-            ToolKind::Brush => "Brush (B)",
-            ToolKind::RasterBrush => "Raster paint (K) — paints Image pixels · Alt=pick",
-            ToolKind::Eraser => "Eraser (X) — erase Image alpha · Alt=pick",
-            ToolKind::BucketFill => "Flood fill (F) — fill contiguous pixels on Image",
-            ToolKind::Smudge => "Smudge (U) — smear Image pixels",
-            ToolKind::RasterSelect => "Raster Select (W) — mask on Image only",
-            ToolKind::Eyedropper => "Eyedropper (I)",
+            ToolKind::Select => "**Select** (`V`)",
+            ToolKind::Node => "**Edit nodes** (`N`)",
+            ToolKind::Pen => "**Pen** (`P`)",
+            ToolKind::Rectangle => "**Rectangle** (`R`)",
+            ToolKind::Circle => "**Circle** (`C`)",
+            ToolKind::Ellipse => "**Ellipse** (`E`)",
+            ToolKind::Line => "**Line** (`L`)",
+            ToolKind::Polygon => "**Polygon** (`G`)",
+            ToolKind::Arc => "**Arc / Chord** (`A`)",
+            ToolKind::Plotter => "**Plotter** (`M`)\nf(x) / f(y) curves",
+            ToolKind::Text => "**Text** (`T`)",
+            ToolKind::Brush => "**Brush** (`B`)",
+            ToolKind::RasterBrush => {
+                "**Raster paint** (`K`)\npaints Image pixels · `Alt` = pick color"
+            }
+            ToolKind::Eraser => {
+                "**Eraser** (`X`)\nerase Image alpha · `Alt` = pick color"
+            }
+            ToolKind::BucketFill => {
+                "**Flood fill** (`F`)\nfill contiguous pixels on Image"
+            }
+            ToolKind::Smudge => "**Smudge** (`U`)\nsmear Image pixels",
+            ToolKind::RasterSelect => {
+                "**Raster Select** (`W`)\nmask on Image only"
+            }
+            ToolKind::Eyedropper => "**Eyedropper** (`I`)",
         }
     };
 
@@ -853,11 +979,9 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                     colors::TEXT.gamma_multiply(button_alpha),
                 );
 
-                // Draw simple tooltip on desktop
+                // Desktop hover tip — word-wrap, max width 2× toolbar.
                 if hovered && !is_android {
-                    egui::show_tooltip::<()>(ui.ctx(), ui.layer_id(), ui.make_persistent_id("tool_tip"), |ui| {
-                        ui.label(get_tool_tip(tool));
-                    });
+                    show_toolbar_hover_tip(ui, "tool_tip", get_tool_tip(tool), tip_max_w);
                 }
             }
         }
@@ -865,8 +989,16 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
         // AV-only one-shot actions: Split + DAW (only when AV layer is selected).
         if is_video_or_audio_layer && expand_t > 0.01 {
             let av_actions: [(&str, &str, &str); 2] = [
-                (icons::SPLIT, "Split", "Split/cut clip at playhead"),
-                (icons::MUSIC, "DAW", "Create 1s DAW node on DAW layer (double-click opens piano)"),
+                (
+                    icons::SPLIT,
+                    "Split",
+                    "**Split**\ncut clip at playhead",
+                ),
+                (
+                    icons::MUSIC,
+                    "DAW",
+                    "**DAW**\ncreate 1s DAW node on DAW layer\ndouble-click opens piano",
+                ),
             ];
             for (i, (icon, _label, tip)) in av_actions.iter().enumerate() {
                 let (gx, gy) = get_grid_pos(tools.len() + i);
@@ -905,14 +1037,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                     colors::TEXT.gamma_multiply(button_alpha),
                 );
                 if hovered && !is_android {
-                    egui::show_tooltip::<()>(
-                        ui.ctx(),
-                        ui.layer_id(),
-                        ui.make_persistent_id(("av_action_tip", i)),
-                        |ui| {
-                            ui.label(*tip);
-                        },
-                    );
+                    show_toolbar_hover_tip(ui, ("av_action_tip", i), tip, tip_max_w);
                 }
             }
         }
@@ -998,11 +1123,15 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     theme::show_overlay_area(ctx, "float_collab_rail", collab_rect, alpha, |ui| {
         let origin = ui.max_rect().min;
         let collab_buttons: [(&str, crate::left_dock::LeftDockPanel, &str); 2] = [
-            (icons::CHAT, crate::left_dock::LeftDockPanel::Chat, "Live chat"),
+            (
+                icons::CHAT,
+                crate::left_dock::LeftDockPanel::Chat,
+                "**Live chat**",
+            ),
             (
                 icons::COLLAB,
                 crate::left_dock::LeftDockPanel::Collab,
-                "Collaboration settings",
+                "**Collaboration**\nsettings & peers",
             ),
         ];
         for (i, (icon, panel, tip)) in collab_buttons.iter().enumerate() {
@@ -1038,14 +1167,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                 colors::TEXT.gamma_multiply(alpha),
             );
             if is_hovered && !is_android {
-                egui::show_tooltip::<()>(
-                    ui.ctx(),
-                    ui.layer_id(),
-                    ui.make_persistent_id(("collab_tip", *panel as u8)),
-                    |ui| {
-                        ui.label(*tip);
-                    },
-                );
+                show_toolbar_hover_tip(ui, ("collab_tip", *panel as u8), tip, tip_max_w);
             }
             let collab_resp = ui.interact(
                 button_screen_rect,
@@ -1074,12 +1196,13 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Pen | ToolKind::Brush => {
                 promote_action_tab(app, ActionTab::ColorStroke);
             }
+            // Raster tools: Geometry tab first (size/placement); Paint is opt-in via strip.
             ToolKind::RasterBrush
             | ToolKind::Eraser
             | ToolKind::BucketFill
             | ToolKind::Smudge
             | ToolKind::RasterSelect => {
-                promote_action_tab(app, ActionTab::Paint);
+                promote_action_tab(app, ActionTab::Geometry);
             }
             _ => {}
         }
