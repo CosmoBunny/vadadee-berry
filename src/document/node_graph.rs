@@ -4678,7 +4678,14 @@ mod tests {
             0.0,
         );
         g.try_add_link(e1, "out", e2, "x").unwrap();
-        g.try_add_link(e2, "out", e1, "x").unwrap();
+        // Edit-time guard must refuse to close the loop (Union image chains
+        // would otherwise recurse forever).
+        let err = g.try_add_link(e2, "out", e1, "x").unwrap_err();
+        assert!(err.contains("cycle"), "guard must name the cycle: {err}");
+        // A cyclic graph arriving through another path (legacy file, undo
+        // restore bypassing the guard) must still evaluate safely and mark
+        // the error instead of hanging or crashing.
+        g.links.push(GraphLink::new(e2, "out", e1, "x"));
         g.eval_reals(0, 30.0);
         assert!(g.root_error.as_ref().is_some_and(|e| e.contains("cycle")));
     }

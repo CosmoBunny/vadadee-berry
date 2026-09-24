@@ -420,6 +420,120 @@ pub fn choose_joke(
     msgs[j_idx].to_string()
 }
 
+/// System-status HUD shown during video export (stats + rotating jokes).
+///
+/// Split out of `VideoExportState`: export settings/progress own the render,
+/// this owns the unrelated "how is the machine suffering" panel. Lives on
+/// `App` directly so UI can read it without going through export state.
+#[derive(Debug)]
+pub struct SystemHud {
+    pub stats: SysStats,
+    pub last_stats_update: std::time::Instant,
+    pub last_joke_update: std::time::Instant,
+    pub joke_rules: Vec<JokeRule>,
+    pub current_joke: String,
+    /// Cycles through jokes sequentially instead of random.
+    pub joke_cycle: usize,
+}
+
+impl Default for SystemHud {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SystemHud {
+    pub fn new() -> Self {
+        let mut rules = Vec::new();
+        if let Ok(content) = std::fs::read_to_string("jokes_export.txt") {
+            rules = parse_jokes(&content);
+        }
+        if rules.is_empty() {
+            rules = parse_jokes(
+                // ── Platform-independent jokes (no prefix) ──────────────────
+                "[CPU 80..]\nYour CPU is working harder than a developer on a deadline.\n\
+                 [CPU 80..]\nThe CPU is so hot, you could fry an egg on it.\n\
+                 [CPU 80..]\nCPU became BBQ. Just cook food there and save the gas bill.\n\
+                 [CPU ..2]\nCPU usage is basically 0%... did the export even start?\n\
+                 [SEC_PER_FRAME 1..]\nAt this speed, a flipbook would be faster.\n\
+                 [SEC_PER_FRAME 0.1..=1]\n1-10 fps? Your PC is giving every frame a hug.\n\
+                 [RAM 16..]\nRAM eating competition — and your laptop/desktop is winning gold.\n\
+                 [RAM ..4]\nWhere is the RAM? Are you exporting on a potato?\n\
+                 [CPU_TEMP 80..]\nTemperature warning: things are getting spicy in there.\n\
+                 [CPU_TEMP 80..]\nYour CPU temp is higher than my motivation on Monday.\n\
+                 \
+                 # ── Desktop-only jokes ──────────────────────────────────────
+                 [DESKTOP CPU 80..]\nYour PC sounds like a jet engine. Ready for takeoff?\n\
+                 [DESKTOP CPU ..2]\nDid you accidentally place your laptop/desktop in Antarctica?\n\
+                 [DESKTOP SEC_PER_FRAME 1..]\nEven my grandma\'s old PC could export this faster.\n\
+                 [DESKTOP RAM ..4]\nBro, you\'re exporting video with less RAM than a smart fridge.\n\
+                 [DESKTOP RAM 32..]\nThat\'s a lot of RAM. Your PC could run the whole country.\n\
+                 \
+                 # ── Mobile-only jokes ───────────────────────────────────────
+                 [MOBILE CPU 80..]\nYour phone is hotter than the sun right now. Poor little guy.\n\
+                 [MOBILE CPU 80..]\nPhone CPU on max load — hope you\'re not using the camera too.\n\
+                 [MOBILE CPU ..2]\nCPU at 0% on mobile? The app might be asleep at the wheel.\n\
+                 [MOBILE SEC_PER_FRAME 1..]\nExporting video on a phone? Brave soul. Truly brave.\n\
+                 [MOBILE SEC_PER_FRAME 2..]\nMaybe send the project to a PC... just a friendly suggestion.\n\
+                 [MOBILE RAM ..4]\nYour phone is basically begging you to close some apps.\n\
+                 [MOBILE RAM 8..]\nWow, 8 GB RAM on a phone. Overkill, but we love it.\n\
+                 [MOBILE CPU_TEMP 45..]\nPhone getting warm... your pocket is a sauna now.\n\
+                 \
+                 # ── Fallback (DEFAULT applies everywhere) ───────────────────
+                 [DEFAULT]\nStill rendering... go touch some grass.\n\
+                 [DEFAULT]\nExporting... perfect time to hydrate.\n\
+                 [DEFAULT]\nPatience is a virtue. You\'re basically a saint right now.\n\
+                 [DEFAULT]\nStill going... you\'ve earned a snack break."
+            );
+        }
+
+        Self {
+            stats: SysStats::new(),
+            last_stats_update: std::time::Instant::now(),
+            last_joke_update: std::time::Instant::now(),
+            joke_rules: rules,
+            current_joke: "Still exporting... Go grab a coffee, or maybe grow a tree.".to_string(),
+            joke_cycle: 0,
+        }
+    }
+
+    fn pick_joke(&mut self, sec_per_frame: f32) {
+        let is_mobile = cfg!(target_os = "android");
+        self.current_joke = choose_joke(
+            &self.joke_rules,
+            self.stats.cpu_usage,
+            self.stats.ram_sys_used_gb,
+            sec_per_frame,
+            self.stats.cpu_temp,
+            is_mobile,
+            self.joke_cycle,
+        );
+    }
+
+    /// Reset timers, take a fresh stats sample and pick the first joke.
+    pub fn reset_for_export(&mut self, sec_per_frame: f32) {
+        self.last_joke_update = std::time::Instant::now();
+        self.last_stats_update = std::time::Instant::now();
+        self.stats.update();
+        self.joke_cycle = 0;
+        self.pick_joke(sec_per_frame);
+    }
+
+    /// 1s stats cadence + 10s joke rotation. Called from export polling.
+    pub fn poll(&mut self, sec_per_frame: f32) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_stats_update) >= std::time::Duration::from_secs(1) {
+            self.stats.update();
+            self.last_stats_update = now;
+        }
+        if now.duration_since(self.last_joke_update) >= std::time::Duration::from_secs(10) {
+            self.joke_cycle = self.joke_cycle.wrapping_add(1);
+            self.pick_joke(sec_per_frame);
+            self.last_joke_update = now;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

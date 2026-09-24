@@ -1,6 +1,6 @@
 [package]
 name = "vadadee-berry"
-version = "0.1.0"
+version = "0.0.2"
 edition = "2024"
 description = "Creative tool combining vector graphics, video timeline, shaders, image editing, flowcharts and music sequencer — GPU-accelerated, built with egui and wgpu"
 authors = ["CosmoBunny", "ANGSUDO"]

@@ -5,7 +5,7 @@ use kramaframe::prelude::{KeyFrameFunction, KeyList};
 use kramaframe::{BTclasslist, BTframelist, KramaFrame};
 
 use crate::tools::ToolKind;
-use crate::ui::ActionTab;
+use crate::action_tab::ActionTab;
 
 const ID: u32 = 0;
 

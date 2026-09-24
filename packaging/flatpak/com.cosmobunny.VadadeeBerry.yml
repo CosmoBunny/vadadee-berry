@@ -1,0 +1,35 @@
+app-id: com.cosmobunny.VadadeeBerry
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: vadadee-berry
+finish-args:
+  # Display + GPU.
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # An editor must open/save user projects anywhere; portals cover
+  # picker flows, home access covers save-as + recent files.
+  - --filesystem=home
+  # Audio playback/monitoring.
+  - --socket=pulseaudio
+modules:
+  - name: vadadee-berry
+    buildsystem: simple
+    sources:
+      # Staged by packaging/flatpak/build_flatpak.sh into
+      # dist/flatpak/stage (binary + shared .desktop + shared icon tree).
+      # flatpak-builder copies a dir source's CONTENTS into the build dir,
+      # so build-commands below reference them at top level.
+      - type: dir
+        path: ../../dist/flatpak/stage
+    build-commands:
+      - install -Dm755 bin/vadadee-berry /app/bin/vadadee-berry
+      - install -Dm644 com.cosmobunny.VadadeeBerry.desktop /app/share/applications/com.cosmobunny.VadadeeBerry.desktop
+      - install -Dm644 com.cosmobunny.VadadeeBerry.metainfo.xml /app/share/metainfo/com.cosmobunny.VadadeeBerry.metainfo.xml
+      - |
+        for s in 16 32 48 64 128 256 512; do
+          install -Dm644 "icons/hicolor/${s}x${s}/apps/com.cosmobunny.VadadeeBerry.png" \
+            "/app/share/icons/hicolor/${s}x${s}/apps/com.cosmobunny.VadadeeBerry.png"
+        done

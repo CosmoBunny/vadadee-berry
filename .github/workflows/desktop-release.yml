@@ -2,6 +2,12 @@
 # Artifacts land under release/ (via packaging/make_desktop_release.sh) and are
 # uploaded for download. On version tags (v*), they are attached to a GitHub Release.
 #
+# Release policy (explicit — see Cargo.toml [features], default = ["opencv"]):
+# official tag releases intentionally use the MINIMAL feature set
+# (--no-default-features, no OpenCV). OpenCV builds are opt-in via manual
+# dispatch only, where the runner actually provisions system OpenCV.
+# Do not assume v1.x artifacts contain the default feature build.
+#
 # IMPORTANT: "Re-run failed jobs" reuses the same commit. After workflow fixes,
 # start a NEW run (Actions → Desktop release → Run workflow) on latest main.
 name: Desktop release
@@ -18,14 +24,12 @@ on:
           - mcp
         default: all
       with_opencv:
-        description: "Enable OpenCV feature (slower; needs system OpenCV)"
+        description: "Enable OpenCV feature (slower; needs system OpenCV; Linux/macOS CI only)"
         type: boolean
         default: false
   push:
     tags:
       - "v*"
-  release:
-    types: [published]
 
 permissions:
   contents: write
@@ -135,11 +139,23 @@ jobs:
           fi
           echo "bins=$BINS" >> "$GITHUB_OUTPUT"
 
+          # Trigger → feature matrix (explicit):
+          #   manual dispatch, checkbox false → minimal (--no-default-features)
+          #   manual dispatch, checkbox true  → default features (OpenCV)
+          #   tag push v*                     → minimal (--no-default-features)
           WITH_OPENCV="false"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.with_opencv }}" = "true" ]; then
             WITH_OPENCV="true"
           fi
           echo "with_opencv=$WITH_OPENCV" >> "$GITHUB_OUTPUT"
+          # Windows CI does not provision system OpenCV: fail early with a
+          # clear message instead of a late bindgen compile error.
+          if [ "$WITH_OPENCV" = "true" ] && [ "${{ runner.os }}" = "Windows" ]; then
+            echo "ERROR: OpenCV builds are not configured for Windows CI yet."
+            echo "Run with with_opencv=false, or provision OpenCV (vcpkg/Chocolatey)"
+            echo "plus OpenCV_DIR/PKG_CONFIG_PATH first."
+            exit 1
+          fi
 
       - name: Build, bundle, copy to release/
         shell: bash
@@ -169,6 +185,66 @@ jobs:
           echo "---- release/ ----"
           ls -lah release/
 
+      # Linux distribution formats live here — never in the shared dependency
+      # block above, and never expected from Windows/macOS jobs.
+      - name: Install Flatpak tooling (Linux only)
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder desktop-file-utils appstream
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install -y --user flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+
+      - name: Build Linux AppImage
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          chmod +x packaging/linux/appimage/build_appimage.sh
+          ./packaging/linux/appimage/build_appimage.sh
+          ls -lah release/*.AppImage
+
+      - name: Build Linux Flatpak bundle
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          chmod +x packaging/flatpak/build_flatpak.sh
+          ./packaging/flatpak/build_flatpak.sh
+          ls -lah release/*.flatpak
+
+      - name: Build Linux .deb
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          chmod +x packaging/linux/build_deb.sh
+          ./packaging/linux/build_deb.sh
+          ls -lah release/*.deb
+
+      - name: Install-test Linux .deb
+        if: matrix.platform == 'linux'
+        run: |
+          set -euo pipefail
+          sudo dpkg -i release/vadadee-berry_*.deb || sudo apt-get install -f -y
+          test -x /usr/bin/vadadee-berry
+          missing="$(ldd /usr/bin/vadadee-berry | grep 'not found' || true)"
+          test -z "$missing" || { echo "ERROR: missing runtime libs:$missing"; exit 1; }
+          echo "deb install-test OK"
+
+      - name: Build Windows installer
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          .\packaging\windows\build_installer.ps1
+          Get-ChildItem release\*-setup.exe
+
+      - name: Build macOS DMG
+        if: matrix.platform == 'macos'
+        run: |
+          set -euo pipefail
+          chmod +x packaging/macos/make_macos_installer.sh
+          ./packaging/macos/make_macos_installer.sh --arch aarch64 --bin-dir target/release
+          ls -lah release/*.dmg
+
       - name: Upload release archives (workflow artifact)
         uses: actions/upload-artifact@v4
         with:
@@ -176,6 +252,11 @@ jobs:
           path: |
             release/*.tar.gz
             release/*.zip
+            release/*.AppImage
+            release/*.flatpak
+            release/*.deb
+            release/*.dmg
+            release/*-setup.exe
             release/*.sha256
           if-no-files-found: error
           retention-days: 30
@@ -183,14 +264,14 @@ jobs:
   publish:
     name: Publish GitHub Release assets
     needs: desktop
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Download all platform artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: vadadee-berry-desktop-*
+          pattern: vadadee-berry-*
           merge-multiple: true
 
       - name: List downloadable files
@@ -202,6 +283,11 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.zip
+            artifacts/*.AppImage
+            artifacts/*.flatpak
+            artifacts/*.deb
+            artifacts/*.dmg
+            artifacts/*-setup.exe
             artifacts/*.sha256
           fail_on_unmatched_files: false
           generate_release_notes: true

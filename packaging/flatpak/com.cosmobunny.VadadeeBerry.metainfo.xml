@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.cosmobunny.VadadeeBerry</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>Vadadee Berry</name>
+  <summary>Vector, video and design editor</summary>
+  <developer>
+    <name>Cosmobunny</name>
+  </developer>
+  <url type="homepage">https://github.com/CosmoBunny/vadadee-berry</url>
+  <content_rating type="oars-1.1" />
+  <description>
+    <p>
+      Vadadee Berry is a vector, video and design editor: draw and edit
+      vector artwork, animate it on a timeline, and export stills and video
+      through one authoritative render pipeline.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.cosmobunny.VadadeeBerry.desktop</launchable>
+  <provides>
+    <binary>vadadee-berry</binary>
+  </provides>
+  <categories>
+    <category>Graphics</category>
+    <category>Video</category>
+  </categories>
+</component>

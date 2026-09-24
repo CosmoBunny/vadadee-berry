@@ -1,7 +1,11 @@
 use egui::{scroll_area::ScrollBarVisibility, Context, Rect, RichText, ScrollArea, Ui};
 
+pub mod mobile;
+
 use crate::animation::action_bar_overlay_rect;
-use crate::app::{AudioExtractStatus, KeyframeTrack, VadadeeBerryApp};
+use crate::app::VadadeeBerryApp;
+use crate::audio_extract::AudioExtractStatus;
+use crate::document::KeyframeTrack;
 use crate::document::{
     compute_whole_object_bounds, compute_tiling_whole_bounds, compute_circular_whole_bounds, default_loft_gap_for_node, find_effect_for_pair, ArcJoin, FillKind, GeometryProfile, LineCap,
     LineJoin, NodeKind, OnPathMode, StrokePaintOrder, TextStyle,
@@ -16,127 +20,39 @@ use crate::io;
 use crate::theme::{self, colors};
 use crate::tools::ToolKind;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ActionTab {
-    Export,
-    #[default]
-    Layer,
-    ColorStroke,
-    Objects,
-    Geometry,
-    /// Raster paint layers, masks, float transform, brush engine.
-    Paint,
-    PathMagic,
-    Animation,
-    /// Graph parameters for Node Editor layers (animatable).
-    Parameter,
+use crate::action_tab::ActionTab;
+
+/// Tab label in the action bar (video layer → "Color" only; audio hides this tab).
+fn action_tab_strip_label(tab: ActionTab, app: &crate::app::VadadeeBerryApp) -> String {
+    if tab == ActionTab::ColorStroke {
+        if let Some(crate::document::LayerKind::AV) = app.selected_layer_kind() {
+            return "Color".into();
+        }
+    }
+    tab.label().to_string()
 }
 
-impl ActionTab {
-    /// Wire slug for collaboration UI sync.
-    pub fn collab_slug(self) -> &'static str {
-        match self {
-            Self::Export => "export",
-            Self::Layer => "layer",
-            Self::ColorStroke => "color_stroke",
-            Self::Objects => "objects",
-            Self::Geometry => "geometry",
-            Self::Paint => "paint",
-            Self::PathMagic => "path_magic",
-            Self::Animation => "animation",
-            Self::Parameter => "parameter",
+fn action_tab_visible_in_strip(tab: ActionTab, app: &crate::app::VadadeeBerryApp) -> bool {
+    if tab == ActionTab::ColorStroke {
+        if let Some(crate::document::LayerKind::AV) = app.selected_layer_kind() {
+            return true; // AV acts like Video for color (merged from Audio/Video)
         }
     }
-
-    pub fn from_collab_slug(s: &str) -> Option<Self> {
-        match s {
-            "export" => Some(Self::Export),
-            "layer" => Some(Self::Layer),
-            "color_stroke" => Some(Self::ColorStroke),
-            "objects" => Some(Self::Objects),
-            "geometry" => Some(Self::Geometry),
-            "paint" => Some(Self::Paint),
-            "path_magic" => Some(Self::PathMagic),
-            "animation" => Some(Self::Animation),
-            "parameter" => Some(Self::Parameter),
-            _ => None,
+    if tab == ActionTab::Parameter {
+        // Active Node Editor layer is enough (do not require layer id in selection).
+        if app
+            .project
+            .document
+            .active_layer()
+            .is_some_and(|l| l.kind == crate::document::LayerKind::NodeEditor)
+        {
+            return true;
         }
+        return app
+            .selected_layer_kind()
+            .is_some_and(|k| k == crate::document::LayerKind::NodeEditor);
     }
-
-    pub fn all_tabs() -> Vec<Self> {
-        vec![
-            Self::Export,
-            Self::Layer,
-            Self::ColorStroke,
-            Self::Objects,
-            Self::Geometry,
-            Self::Paint,
-            Self::PathMagic,
-            Self::Animation,
-            Self::Parameter,
-        ]
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Export => "Export",
-            Self::Layer => "Layer",
-            Self::ColorStroke => "Color & stroke",
-            Self::Objects => "Objects",
-            Self::Geometry => "Geometry",
-            Self::Paint => "Paint",
-            Self::PathMagic => "Path magic",
-            Self::Animation => "Animation",
-            Self::Parameter => "Parameter",
-        }
-    }
-
-    /// Tab label in the action bar (video layer → "Color" only; audio hides this tab).
-    fn strip_label(self, app: &crate::app::VadadeeBerryApp) -> String {
-        if self == Self::ColorStroke {
-            if let Some(crate::document::LayerKind::AV) = app.selected_layer_kind() {
-                return "Color".into();
-            }
-        }
-        self.label().to_string()
-    }
-
-    fn visible_in_strip(self, app: &crate::app::VadadeeBerryApp) -> bool {
-        if self == Self::ColorStroke {
-            if let Some(crate::document::LayerKind::AV) = app.selected_layer_kind() {
-                return true; // AV acts like Video for color (merged from Audio/Video)
-            }
-        }
-        if self == Self::Parameter {
-            // Active Node Editor layer is enough (do not require layer id in selection).
-            if app
-                .project
-                .document
-                .active_layer()
-                .is_some_and(|l| l.kind == crate::document::LayerKind::NodeEditor)
-            {
-                return true;
-            }
-            return app
-                .selected_layer_kind()
-                .is_some_and(|k| k == crate::document::LayerKind::NodeEditor);
-        }
-        true
-    }
-
-    fn icon(self) -> &'static str {
-        match self {
-            Self::Export => "⤓",
-            Self::Layer => icons::LAYER,
-            Self::ColorStroke => icons::COLOR,
-            Self::Objects => icons::OBJECT,
-            Self::Geometry => icons::RECT,
-            Self::Paint => icons::RASTER_BRUSH,
-            Self::PathMagic => icons::PATH_MAGIC,
-            Self::Animation => "",
-            Self::Parameter => icons::PARAMETER,
-        }
-    }
+    true
 }
 
 /// Coarse coordinate steps for the status bar so tiny mouse jitter does not restart
@@ -155,12 +71,56 @@ fn status_coords_text(cursor_doc: Option<(f64, f64)>) -> String {
 /// All chrome must use `show_inside(ui)` on eframe 0.34's root [`Ui`].
 /// `Panel::show(ctx)` does not lay out with `run_ui` and bars will not appear.
 pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
-    menubar(app, ui);
+    let doc_label = format!(
+        "{} · {:.0}×{:.0}",
+        app.project.document.title, app.project.document.width, app.project.document.height
+    );
+    for intent in menubar(
+        MenuView {
+            alpha: app.ui_anim.menubar_alpha(),
+            history: &app.history,
+            selection_empty: app.selection.is_empty(),
+            status: &mut app.status_message,
+            viewport: &mut app.viewport,
+            dock: &mut app.left_dock,
+            pixel_art_mode: &mut app.pixel_art_mode,
+            pixel_cell_size: &mut app.pixel_cell_size,
+            gpu_shading: &mut app.gpu_shading,
+            raster_cache: &mut app.enable_layer_raster_cache,
+            action_bar_open: &mut app.action_bar_open,
+            timeline_w: &mut app.timeline_container_w,
+            video_editor_w: &mut app.video_editor_container_w,
+            snap_magnet: &mut app.snap_magnet,
+            doc_label,
+        },
+        ui,
+    ) {
+        match intent {
+            MenuIntent::NewDocument => app.new_document(),
+            MenuIntent::OpenProject => app.request_open_project(),
+            MenuIntent::OpenSvg => app.request_open_svg(),
+            MenuIntent::ImportImage => app.request_import_image(),
+            MenuIntent::SaveProject => app.request_save_project(),
+            MenuIntent::ExportSvg => app.request_export_svg(),
+            MenuIntent::Undo => app.do_undo(),
+            MenuIntent::Redo => app.do_redo(),
+            MenuIntent::Cut => app.cut_selection(),
+            MenuIntent::Copy => app.copy_selection(),
+            MenuIntent::Paste => app.paste_clipboard(false),
+            MenuIntent::DeleteSelection => app.delete_selection_public(),
+            MenuIntent::Group => app.group_selection(),
+            MenuIntent::Ungroup => app.ungroup_selection(),
+            MenuIntent::Duplicate => app.duplicate_selection(),
+            MenuIntent::NudgeZ(d) => app.nudge_z_order(d),
+            MenuIntent::FlipHorizontal => app.flip_selection(true),
+            MenuIntent::FlipVertical => app.flip_selection(false),
+        }
+    }
 
     let action_text = app.derive_action_status(ui.ctx());
     if VadadeeBerryApp::is_ephemeral_status_event(&app.status_message) {
         // Flash the event (Pasted, Pen cancelled, Undo, etc.) then settle to Idle (or live action).
-        app.status_message.clear();
+         app.status_message.clear();
     }
     let msg_width = theme::measure_status_label(ui, &action_text);
     let tool_width = theme::measure_status_label(ui, app.tools.active.label());
@@ -188,13 +148,48 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     app.ui_anim.advance_video_editor_slide(ui.ctx());
     app.ui_anim.advance_left_dock_slide(ui.ctx());
     app.ui_anim.tick(ui.ctx());
-    video_export_progress_window(app, ui.ctx());
-    shader_editor_window(app, ui.ctx());
-    object_rename_dialog(app, ui.ctx());
+    if video_export_progress_window(&mut app.video_export, &app.system_hud, ui.ctx()) {
+        app.cancel_video_export();
+    }
+    shader_editor_window(&mut app.show_shader_editor_window, &mut app.project, ui.ctx());
+    object_rename_dialog(&mut app.object_rename_dialog, &mut app.project, &mut app.history, ui.ctx());
     plotter_formula_dialog(app, ui.ctx());
-    daw_piano_dialog(app, ui.ctx());
-    crate::node_editor_ui::show_node_editor_dialog(app, ui.ctx());
-    hit_pick_menu_overlay(app, ui.ctx());
+    daw_piano_dialog(
+        &mut app.piano_roll_clip,
+        &mut app.project,
+        &mut app.piano_tool,
+        app.playback.fps,
+        &mut app.piano_zoom,
+        &mut app.piano_scroll_offset,
+        &mut app.piano_pitch_scroll,
+        ui.ctx(),
+    );
+    // Clone the status map handle so the probe closure owns it (no app borrow).
+    let audio_status = app.audio_extract_status.clone();
+    let audio_busy = |path: &str| {
+        audio_status
+            .lock()
+            .ok()
+            .and_then(|m| m.get(path).map(|s| s.is_extracting()))
+            .unwrap_or(false)
+    };
+    crate::node_editor_ui::show_node_editor_dialog(
+        &mut crate::node_editor_ui::NodeEditorView {
+            state: &mut app.node_editor_ui,
+            project: &mut app.project,
+            selection: &mut app.selection,
+                                status: &mut app.status_message,
+            frame: app.playback.frame,
+            fps: app.playback.fps,
+            textures: &mut app.graph_preview_textures,
+            image_textures: &app.image_textures,
+            audio_extract_busy: &audio_busy,
+        },
+        ui.ctx(),
+    );
+    if let Some(id) = hit_pick_menu_overlay(&mut app.hit_pick_menu, &app.project, ui.ctx()) {
+        app.select_from_hit_picker(id);
+    }
     status_bar_layout_reserve(ui);
 
     let canvas_alpha = app.ui_anim.canvas_alpha();
@@ -207,14 +202,66 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             app.tick_live_collaboration_after_canvas(ui.ctx());
             app.tools.handle_shortcuts(ui);
             let ctx = ui.ctx().clone();
-            floating_toolbar(app, &ctx, canvas_work);
+            floating_toolbar(
+                ToolbarView {
+                    alpha: app.ui_anim.toolbar_alpha(),
+                    tool_state: &mut app.tools,
+                    active_layer_kind: app
+                        .project
+                        .document
+                        .active_layer()
+                        .map(|l| l.kind),
+                    raster_select_offered: crate::selection::selection_is_single_image(
+                        &app.project,
+                        &app.selection,
+                    ),
+                    expanded: &mut app.toolbar_expanded,
+                    drag_active: &mut app.toolbar_drag_active,
+                    outer_rect: &mut app.toolbar_outer_rect,
+                    polygon_sides: app.polygon_sides,
+                    fill_stops: &mut app.ui_fill_stops,
+                    stroke_stops: &mut app.ui_stroke_stops,
+                    stroke_width: &mut app.ui_stroke_width,
+                    dock_active: app.left_dock.active,
+                },
+                &ctx,
+                canvas_work,
+            )
+            .into_iter()
+            .for_each(|intent| match intent {
+                ToolbarIntent::ToggleDockPanel(panel) => app.left_dock.toggle(panel),
+                ToolbarIntent::PromoteTab(tab) => app.promote_action_tab(tab),
+                ToolbarIntent::SplitAvClip => app.split_active_av_clip_at_playhead(),
+                ToolbarIntent::CreateDawClip => app.create_daw_clip_at_playhead(),
+                ToolbarIntent::ApplyStrokeFill => {
+                    app.apply_fill_to_selection();
+                    app.apply_stroke_to_selection();
+                }
+            });
             floating_action_bar(app, &ctx, canvas_work);
             floating_timeline_window(app, &ctx, floater_work);
             floating_video_editor(app, &ctx, floater_work);
-            crate::left_dock::show(app, &ctx, canvas_work);
+            // Desktop-only preview state; the dock takes `None` on Android.
+            #[cfg(not(target_os = "android"))]
+            let preview = Some(&mut app.mcp_preview);
+            #[cfg(target_os = "android")]
+            let preview: Option<&mut crate::left_dock::McpPreviewState> = None;
+            if let Some((fx, fy)) = crate::left_dock::show(
+                crate::left_dock::DockFrameView {
+                    anim: &app.ui_anim,
+                    dock: &mut app.left_dock,
+                    collab: &mut app.collab,
+                    preview,
+                },
+                &ctx,
+                canvas_work,
+                app.toolbar_outer_rect.map(|r| r.max.x),
+            ) {
+                app.focus_viewport_on_peer(fx, fy);
+            }
         });
 
-    crate::left_dock::show_chat_toasts(app, ui.ctx());
+    crate::left_dock::show_chat_toasts(&mut app.left_dock, ui.ctx());
     status_bar_overlay(app, ui.ctx());
 
     let ctx = ui.ctx();
@@ -233,8 +280,66 @@ fn menubar_action_toggle(ui: &mut Ui, icon: &str, tip: &str) -> egui::Response {
     .on_hover_text(tip)
 }
 
-fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
-    let alpha = app.ui_anim.menubar_alpha();
+/// Menubar actions for the caller to execute (file/edit/object ops).
+pub enum MenuIntent {
+    NewDocument,
+    OpenProject,
+    OpenSvg,
+    ImportImage,
+    SaveProject,
+    ExportSvg,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    DeleteSelection,
+    Group,
+    Ungroup,
+    Duplicate,
+    NudgeZ(isize),
+    FlipHorizontal,
+    FlipVertical,
+}
+
+/// Narrow view-model for the menubar: the only app state it may touch.
+pub struct MenuView<'a> {
+    pub alpha: f32,
+    pub history: &'a crate::history::History,
+    pub selection_empty: bool,
+    pub status: &'a mut String,
+    pub viewport: &'a mut crate::canvas::Viewport,
+    pub dock: &'a mut crate::left_dock::LeftDockState,
+    pub pixel_art_mode: &'a mut bool,
+    pub pixel_cell_size: &'a mut f32,
+    pub gpu_shading: &'a mut bool,
+    pub raster_cache: &'a mut bool,
+    pub action_bar_open: &'a mut bool,
+    pub timeline_w: &'a mut f32,
+    pub video_editor_w: &'a mut f32,
+    pub snap_magnet: &'a mut bool,
+    pub doc_label: String,
+}
+
+fn menubar(view: MenuView<'_>, ui: &mut Ui) -> Vec<MenuIntent> {
+    let mut intents = Vec::new();
+    let MenuView {
+        alpha,
+        history,
+        selection_empty,
+        status,
+        viewport,
+        dock,
+        pixel_art_mode,
+        pixel_cell_size,
+        gpu_shading,
+        raster_cache,
+        action_bar_open,
+        timeline_w,
+        video_editor_w,
+        snap_magnet,
+        doc_label,
+    } = view;
     egui::Panel::top("menubar")
         .frame(theme::bar_frame(alpha))
         .exact_size(32.0)
@@ -250,74 +355,74 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 .ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New A4 page   Ctrl+N").clicked() {
-                        app.new_document();
+                        intents.push(MenuIntent::NewDocument);
                         ui.close();
                     }
                     if ui.button("Open project…   Ctrl+O").clicked() {
-                        app.request_open_project();
+                        intents.push(MenuIntent::OpenProject);
                         ui.close();
                     }
                     if ui.button("Open SVG…").clicked() {
-                        app.request_open_svg();
+                        intents.push(MenuIntent::OpenSvg);
                         ui.close();
                     }
                     if ui.button("Import Image…").clicked() {
-                        app.request_import_image();
+                        intents.push(MenuIntent::ImportImage);
                         ui.close();
                     }
                     if ui.button("Save project   Ctrl+S").clicked() {
-                        app.request_save_project();
+                        intents.push(MenuIntent::SaveProject);
                         ui.close();
                     }
                     if ui.button("Live collaboration…").clicked() {
-                        app.left_dock.toggle(crate::left_dock::LeftDockPanel::Collab);
+                        dock.toggle(crate::left_dock::LeftDockPanel::Collab);
                         ui.close();
                     }
                     if ui.button("Export SVG…").clicked() {
-                        app.request_export_svg();
+                        intents.push(MenuIntent::ExportSvg);
                         ui.close();
                     }
                 });
                 ui.menu_button("Edit", |ui| {
                     if ui
-                        .add_enabled(app.history.can_undo(), egui::Button::new("Undo   Ctrl+Z"))
+                        .add_enabled(history.can_undo(), egui::Button::new("Undo   Ctrl+Z"))
                         .clicked()
                     {
-                        app.do_undo();
+                        intents.push(MenuIntent::Undo);
                         ui.close();
                     }
                     if ui
                         .add_enabled(
-                            app.history.can_redo(),
+                            history.can_redo(),
                             egui::Button::new("Redo   Ctrl+Shift+Z"),
                         )
                         .clicked()
                     {
-                        app.do_redo();
+                        intents.push(MenuIntent::Redo);
                         ui.close();
                     }
                     ui.separator();
                     if ui
-                        .add_enabled(!app.selection.is_empty(), egui::Button::new("Cut   Ctrl+X"))
+                        .add_enabled(!selection_empty, egui::Button::new("Cut   Ctrl+X"))
                         .clicked()
                     {
-                        app.cut_selection();
+                        intents.push(MenuIntent::Cut);
                         ui.close();
                     }
                     if ui
-                        .add_enabled(!app.selection.is_empty(), egui::Button::new("Copy   Ctrl+C"))
+                        .add_enabled(!selection_empty, egui::Button::new("Copy   Ctrl+C"))
                         .clicked()
                     {
-                        app.copy_selection();
+                        intents.push(MenuIntent::Copy);
                         ui.close();
                     }
                     if ui.button("Paste   Ctrl+V").clicked() {
-                        app.paste_clipboard(false);
+                        intents.push(MenuIntent::Paste);
                         ui.close();
                     }
                     ui.separator();
                     if ui.button("Delete   Del").clicked() {
-                        app.delete_selection_public();
+                        intents.push(MenuIntent::DeleteSelection);
                         ui.close();
                     }
                 });
@@ -329,7 +434,7 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         .on_hover_text("Group selection — children move/rotate with parent")
                         .clicked()
                     {
-                        app.group_selection();
+                        intents.push(MenuIntent::Group);
                         ui.close();
                     }
                     if ui
@@ -340,12 +445,12 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         .on_hover_text("Dissolve selected group(s)")
                         .clicked()
                     {
-                        app.ungroup_selection();
+                        intents.push(MenuIntent::Ungroup);
                         ui.close();
                     }
                     ui.separator();
                     if ui.button("Duplicate   Ctrl+D").clicked() {
-                        app.duplicate_selection();
+                        intents.push(MenuIntent::Duplicate);
                         ui.close();
                     }
                     if ui
@@ -353,7 +458,7 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         .on_hover_text("Raise vs video/audio layers, or within image layer")
                         .clicked()
                     {
-                        app.nudge_z_order(1);
+                        intents.push(MenuIntent::NudgeZ(1));
                         ui.close();
                     }
                     if ui
@@ -361,7 +466,7 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         .on_hover_text("Lower vs video/audio layers, or within image layer")
                         .clicked()
                     {
-                        app.nudge_z_order(-1);
+                        intents.push(MenuIntent::NudgeZ(-1));
                         ui.close();
                     }
                     ui.separator();
@@ -371,7 +476,7 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             .on_hover_text("Ctrl+Shift+H")
                             .clicked()
                         {
-                            app.flip_selection(true);
+                            intents.push(MenuIntent::FlipHorizontal);
                             ui.close();
                         }
                         if ui
@@ -379,7 +484,7 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             .on_hover_text("Ctrl+Shift+V")
                             .clicked()
                         {
-                            app.flip_selection(false);
+                            intents.push(MenuIntent::FlipVertical);
                             ui.close();
                         }
                     });
@@ -405,7 +510,7 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             .changed()
                         {
                             crate::cv::set_face_backend(backend);
-                            app.status_message =
+                             *status  =
                                 format!("CV face backend: {}", backend.label()).into();
                         }
                         let r = ui
@@ -426,7 +531,7 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         if r.clicked() && cfg!(feature = "opencv") {
                             backend = crate::cv::CvFaceBackend::OpenCv;
                             crate::cv::set_face_backend(backend);
-                            app.status_message =
+                             *status  =
                                 format!("CV face backend: {}", backend.label()).into();
                         }
                         if ui
@@ -441,7 +546,7 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             .changed()
                         {
                             crate::cv::set_face_backend(backend);
-                            app.status_message =
+                             *status  =
                                 format!("CV face backend: {}", backend.label()).into();
                         }
                     });
@@ -457,17 +562,17 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     );
                 });
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut app.viewport.show_grid, "Show grid lines")
+                    ui.checkbox(&mut viewport.show_grid, "Show grid lines")
                         .on_hover_text("Draw document grid on the page (View › grid step / cols×rows)");
-                    ui.checkbox(&mut app.viewport.snap_grid, "Snap to grid");
-                    ui.checkbox(&mut app.snap_magnet, "Magnetic snap");
+                    ui.checkbox(&mut viewport.snap_grid, "Snap to grid");
+                    ui.checkbox(snap_magnet, "Magnetic snap");
                     ui.separator();
                     ui.label(RichText::new("Static grid (page divisions)").small().weak());
                     // DragValue = label you drag + click to type (no slider track).
                     // Menu stays open via MenuBar CloseOnClickOutside.
                     ui.horizontal(|ui| {
                         ui.label("Cols");
-                        let mut c = app.viewport.grid_cols;
+                        let mut c = viewport.grid_cols;
                         ui.add(
                             egui::DragValue::new(&mut c)
                                 .range(0..=128u32)
@@ -477,10 +582,10 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         .on_hover_text(
                             "Drag left/right to change. Click and type, then Enter. 0 = free step (px).",
                         );
-                        app.viewport.grid_cols = c;
+                        viewport.grid_cols = c;
                         ui.add_space(8.0);
                         ui.label("Rows");
-                        let mut r = app.viewport.grid_rows;
+                        let mut r = viewport.grid_rows;
                         ui.add(
                             egui::DragValue::new(&mut r)
                                 .range(0..=128u32)
@@ -490,13 +595,13 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         .on_hover_text(
                             "Drag left/right to change. Click and type, then Enter. 0 = free step (px).",
                         );
-                        app.viewport.grid_rows = r;
+                        viewport.grid_rows = r;
                     });
-                    if app.viewport.grid_cols == 0 && app.viewport.grid_rows == 0 {
+                    if viewport.grid_cols == 0 && viewport.grid_rows == 0 {
                         ui.horizontal(|ui| {
                             ui.label("Grid step");
                             ui.add(
-                                egui::DragValue::new(&mut app.viewport.grid_step)
+                                egui::DragValue::new(&mut viewport.grid_step)
                                     .range(4.0..=200.0)
                                     .speed(0.4)
                                     .suffix(" px")
@@ -505,19 +610,19 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             .on_hover_text("Drag or click to type (document units).");
                         });
                     }
-                    ui.checkbox(&mut app.pixel_art_mode, "Pixel art mode");
-                    if app.pixel_art_mode {
-                        ui.add(egui::Slider::new(&mut app.pixel_cell_size, 0.5..=10.0).text("Cell size"));
+                    ui.checkbox(pixel_art_mode, "Pixel art mode");
+                    if *pixel_art_mode {
+                        ui.add(egui::Slider::new(pixel_cell_size, 0.5..=10.0).text("Cell size"));
                     }
                     ui.separator();
-                    ui.checkbox(&mut app.gpu_shading, "GPU shading (WGSL)")
+                    ui.checkbox(gpu_shading, "GPU shading (WGSL)")
                         .on_hover_text(
                             "Compile and run shading layer WGSL on the GPU. \
                              Edits to the WGSL source apply after recompile (toggle pass or restart).",
                         );
                     if ui
                         .checkbox(
-                            &mut app.enable_layer_raster_cache,
+                            raster_cache,
                             "Layer raster cache",
                         )
                         .on_hover_text(
@@ -525,44 +630,40 @@ fn menubar(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                              Best for many rectangles; leave off when text looks shifted or blurry.",
                         )
                         .changed()
-                        && !app.enable_layer_raster_cache
+                        && !*raster_cache
                     {
-                        app.status_message =
+                        *status =
                             "Layer raster cache disabled — drawing vectors directly.".into();
                     }
                     if ui.button("Zoom 100%").clicked() {
-                        app.viewport.zoom = 1.0;
+                        viewport.zoom = 1.0;
                     }
                     if ui.button("Fit A4 page").clicked() {
-                        app.viewport.zoom = 0.85;
-                        app.viewport.pan = egui::vec2(48.0, 48.0);
+                        viewport.zoom = 0.85;
+                        viewport.pan = egui::vec2(48.0, 48.0);
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (icon, tip) = if app.action_bar_open {
+                    let (icon, tip) = if *action_bar_open {
                         (icons::ACTION_HIDE, "Hide action bar")
                     } else {
                         (icons::ACTION_SHOW, "Show action bar")
                     };
                     if menubar_action_toggle(ui, icon, tip).clicked() {
-                        app.action_bar_open = !app.action_bar_open;
+                        *action_bar_open = !*action_bar_open;
                         // reset stored sizes so panels expand/contract with available space
-                        app.timeline_container_w = 0.0;
-                        app.video_editor_container_w = 0.0;
+                        *timeline_w = 0.0;
+                        *video_editor_w = 0.0;
                     }
                     ui.label(
-                        RichText::new(format!(
-                            "{} · {:.0}×{:.0}",
-                            app.project.document.title,
-                            app.project.document.width,
-                            app.project.document.height
-                        ))
+                        RichText::new(doc_label)
                         .small()
                         .color(colors::TEXT_MUTED),
                     );
                 });
             });
         });
+    intents
 }
 
 /// Minimal markdown → [`egui::text::LayoutJob`] for toolbar tips.
@@ -679,8 +780,81 @@ fn show_toolbar_hover_tip(
     });
 }
 
-fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
-    let alpha = app.ui_anim.toolbar_alpha();
+/// Toolbar actions for the caller to execute (dock, tabs, AV, stroke/fill).
+pub enum ToolbarIntent {
+    ToggleDockPanel(crate::left_dock::LeftDockPanel),
+    PromoteTab(ActionTab),
+    SplitAvClip,
+    CreateDawClip,
+    ApplyStrokeFill,
+}
+
+/// Narrow view-model for the floating toolbar: the only app state it may touch.
+pub struct ToolbarView<'a> {
+    pub alpha: f32,
+    pub tool_state: &'a mut crate::tools::ToolState,
+    pub active_layer_kind: Option<crate::document::LayerKind>,
+    pub raster_select_offered: bool,
+    pub expanded: &'a mut bool,
+    pub drag_active: &'a mut bool,
+    pub outer_rect: &'a mut Option<egui::Rect>,
+    pub polygon_sides: u32,
+    pub fill_stops: &'a mut Vec<crate::document::GradientStop>,
+    pub stroke_stops: &'a mut Vec<crate::document::GradientStop>,
+    pub stroke_width: &'a mut f32,
+    pub dock_active: Option<crate::left_dock::LeftDockPanel>,
+}
+
+/// Tool selection shared by tap and drag-select. Returns a tab to promote, if any.
+fn select_tool(
+    tools: &mut crate::tools::ToolState,
+    stroke_width: &mut f32,
+    tool: crate::tools::ToolKind,
+) -> Option<ActionTab> {
+    use crate::tools::ToolKind;
+    if tools.active != ToolKind::Eyedropper {
+        tools.last_active_tool = tools.active;
+    }
+    if tool != ToolKind::Brush && *stroke_width <= 0.01 {
+        *stroke_width = 2.0;
+    }
+    tools.active = tool;
+    match tool {
+        ToolKind::Node | ToolKind::Polygon | ToolKind::Text | ToolKind::Arc => {
+            Some(ActionTab::Geometry)
+        }
+        ToolKind::Pen | ToolKind::Brush => Some(ActionTab::ColorStroke),
+        // Raster tools: Geometry tab first (size/placement); Paint is opt-in via strip.
+        ToolKind::RasterBrush
+        | ToolKind::Eraser
+        | ToolKind::BucketFill
+        | ToolKind::Smudge
+        | ToolKind::RasterSelect => Some(ActionTab::Geometry),
+        _ => None,
+    }
+}
+
+fn floating_toolbar(
+    view: ToolbarView<'_>,
+    ctx: &Context,
+    work: Rect,
+) -> Vec<ToolbarIntent> {
+    use crate::tools::ToolKind;
+    let mut intents = Vec::new();
+    let ToolbarView {
+        alpha,
+        tool_state,
+        active_layer_kind,
+        raster_select_offered,
+        expanded,
+        drag_active,
+        outer_rect,
+        polygon_sides,
+        fill_stops,
+        stroke_stops,
+        stroke_width,
+        dock_active,
+    } = view;
     let inset = theme::overlay_work_rect(work);
 
     let is_android = cfg!(target_os = "android");
@@ -693,21 +867,21 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     let collapsed_inner_w = btn_size;
     let collapsed_inner_h = btn_size;
 
-    let is_video_or_audio_layer = app.project.document.active_layer()
-        .map_or(false, |l| l.kind == crate::document::LayerKind::AV);
-    let is_flowchart_layer = app.project.document.active_layer()
-        .map_or(false, |l| l.kind == crate::document::LayerKind::Flowchart);
-    let is_node_editor_layer = app.project.document.active_layer()
-        .map_or(false, |l| l.kind == crate::document::LayerKind::NodeEditor);
-    if is_video_or_audio_layer && app.tools.active != ToolKind::Select && app.tools.active != ToolKind::Eyedropper {
-        app.tools.active = ToolKind::Select;
+    let is_video_or_audio_layer =
+        active_layer_kind == Some(crate::document::LayerKind::AV);
+    let is_flowchart_layer =
+        active_layer_kind == Some(crate::document::LayerKind::Flowchart);
+    let is_node_editor_layer =
+        active_layer_kind == Some(crate::document::LayerKind::NodeEditor);
+    if is_video_or_audio_layer && tool_state.active != ToolKind::Select && tool_state.active != ToolKind::Eyedropper {
+        tool_state.active = ToolKind::Select;
     }
-    if is_flowchart_layer && matches!(app.tools.active, ToolKind::Text | ToolKind::Brush | ToolKind::Pen) {
-        app.tools.active = ToolKind::Select;
+    if is_flowchart_layer && matches!(tool_state.active, ToolKind::Text | ToolKind::Brush | ToolKind::Pen) {
+        tool_state.active = ToolKind::Select;
     }
     // Node Editor: no drawing tools (Circle/Rect/Pen/…).
-    if is_node_editor_layer && app.tools.active != ToolKind::Select {
-        app.tools.active = ToolKind::Select;
+    if is_node_editor_layer && tool_state.active != ToolKind::Select {
+        tool_state.active = ToolKind::Select;
     }
 
     // Tools list
@@ -747,15 +921,15 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             ToolKind::Eyedropper,
         ];
         // Raster Select only when a single Image object is selected.
-        if app.selection_is_single_image() {
+        if raster_select_offered {
             // Insert after Smudge, before Eyedropper
             if let Some(pos) = t.iter().position(|k| *k == ToolKind::Eyedropper) {
                 t.insert(pos, ToolKind::RasterSelect);
             } else {
                 t.push(ToolKind::RasterSelect);
             }
-        } else if app.tools.active == ToolKind::RasterSelect {
-            app.tools.active = ToolKind::Select;
+        } else if tool_state.active == ToolKind::RasterSelect {
+            tool_state.active = ToolKind::Select;
         }
         t
     };
@@ -771,7 +945,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     let tip_max_w = toolbar_card_w * 2.0;
 
     // Use egui's built-in bool animator for smooth transitions
-    let expand_t = ctx.animate_bool(egui::Id::new("toolbar_expanded_anim"), app.toolbar_expanded);
+    let expand_t = ctx.animate_bool(egui::Id::new("toolbar_expanded_anim"), *expanded);
 
     let inner_w = egui::lerp(collapsed_inner_w..=expanded_inner_w, expand_t);
     let inner_h = egui::lerp(collapsed_inner_h..=expanded_inner_h, expand_t);
@@ -780,7 +954,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
         inset.min,
         egui::vec2(inner_w + 2.0 * margin_x, inner_h + 2.0 * margin_y),
     );
-    app.toolbar_outer_rect = Some(rect);
+    *outer_rect = Some(rect);
 
     let get_tool_icon = |tool: ToolKind, polygon_sides: u32| -> &'static str {
         match tool {
@@ -846,7 +1020,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     };
 
     // Find active tool index
-    let active_index = tools.iter().position(|&t| t == app.tools.active).unwrap_or(0);
+    let active_index = tools.iter().position(|&t| t == tool_state.active).unwrap_or(0);
     let (ax_grid, ay_grid) = get_grid_pos(active_index);
 
     // Active button position lerps from (0,0) (collapsed) to its grid position
@@ -864,12 +1038,12 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     );
 
     // 1. If collapsed, detect press/drag start on the collapsed button
-    if !app.toolbar_expanded {
+    if !*expanded {
         if pointer_down {
             if let Some(pos) = pointer_pos {
                 if collapsed_btn_rect.contains(pos) {
-                    app.toolbar_expanded = true;
-                    app.toolbar_drag_active = true;
+                    *expanded = true;
+                    *drag_active = true;
                     ctx.request_repaint();
                 }
             }
@@ -877,11 +1051,11 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     }
 
     // 2. Click outside when toggled open to collapse
-    if app.toolbar_expanded && !app.toolbar_drag_active {
+    if *expanded && !*drag_active {
         if pointer_down {
             if let Some(pos) = pointer_pos {
                 if !rect.contains(pos) && !ctx.memory(|mem| mem.any_popup_open()) {
-                    app.toolbar_expanded = false;
+                    *expanded = false;
                     ctx.request_repaint();
                 }
             }
@@ -921,7 +1095,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             let is_hovered = pointer_pos.map_or(false, |pos| button_screen_rect.contains(pos));
 
             // Only allow hover interaction when expanded
-            let hovered = is_hovered && (app.toolbar_expanded || expand_t > 0.9);
+            let hovered = is_hovered && (*expanded || expand_t > 0.9);
             if hovered {
                 hovered_tool = Some(tool);
             }
@@ -934,7 +1108,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             };
 
             if button_alpha > 0.01 {
-                let selected = app.tools.active == tool;
+                let selected = tool_state.active == tool;
 
                 let fill = if selected {
                     if hovered {
@@ -969,7 +1143,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                 );
 
                 // Draw icon text
-                let icon = get_tool_icon(tool, app.polygon_sides);
+                let icon = get_tool_icon(tool, polygon_sides);
                 let icon_size = if is_android { 20.0 } else { 18.0 };
                 ui.painter().text(
                     button_screen_rect.center(),
@@ -1008,7 +1182,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                 let local_rect = Rect::from_center_size(center, egui::vec2(btn_w, btn_w));
                 let button_screen_rect = local_rect.translate(local_origin.to_vec2());
                 let is_hovered = pointer_pos.map_or(false, |pos| button_screen_rect.contains(pos));
-                let hovered = is_hovered && (app.toolbar_expanded || expand_t > 0.9);
+                let hovered = is_hovered && (*expanded || expand_t > 0.9);
                 if hovered {
                     hovered_av_action_outer = Some(if i == 0 { "split" } else { "daw" });
                 }
@@ -1056,10 +1230,10 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
             let button_alpha = alpha * expand_t;
 
             if button_alpha > 0.01 {
-                let mut c = if app.tools.active == ToolKind::Brush {
-                    app.tools.brush.fill_stops.first().map(|s| s.color.to_egui()).unwrap_or(egui::Color32::WHITE)
+                let mut c = if tool_state.active == ToolKind::Brush {
+                    tool_state.brush.fill_stops.first().map(|s| s.color.to_egui()).unwrap_or(egui::Color32::WHITE)
                 } else {
-                    app.ui_fill_stops.first().map(|s| s.color.to_egui()).unwrap_or(egui::Color32::WHITE)
+                    fill_stops.first().map(|s| s.color.to_egui()).unwrap_or(egui::Color32::WHITE)
                 };
                 
                 // Render the color edit button inside the slot
@@ -1075,19 +1249,18 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                                 c.a() as f32 / 255.0,
                             ],
                         };
-                        if app.tools.active == ToolKind::Brush {
-                            for s in app.tools.brush.fill_stops.iter_mut() {
+                        if tool_state.active == ToolKind::Brush {
+                            for s in tool_state.brush.fill_stops.iter_mut() {
                                 s.color = paint;
                             }
                         } else {
-                            for s in app.ui_fill_stops.iter_mut() {
+                            for s in fill_stops.iter_mut() {
                                 s.color = paint;
                             }
-                            for s in app.ui_stroke_stops.iter_mut() {
+                            for s in stroke_stops.iter_mut() {
                                 s.color = paint;
                             }
-                            app.apply_fill_to_selection();
-                            app.apply_stroke_to_selection();
+                            intents.push(ToolbarIntent::ApplyStrokeFill);
                         }
                     }
                 });
@@ -1140,7 +1313,7 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                 origin + egui::vec2(0.0, cy),
                 egui::vec2(btn_size, btn_size),
             );
-            let selected = app.left_dock.active == Some(*panel);
+            let selected = dock_active == Some(*panel);
             let is_hovered = pointer_pos.map_or(false, |pos| button_screen_rect.contains(pos));
             let fill = if selected {
                 colors::ACCENT_DIM.gamma_multiply(alpha)
@@ -1175,104 +1348,65 @@ fn floating_toolbar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
                 egui::Sense::click(),
             );
             if collab_resp.clicked() {
-                app.left_dock.toggle(*panel);
-                app.toolbar_drag_active = false;
+                intents.push(ToolbarIntent::ToggleDockPanel(*panel));
+                *drag_active = false;
             }
         }
     });
 
-    let select_tool = |app: &mut VadadeeBerryApp, tool: ToolKind| {
-        if app.tools.active != ToolKind::Eyedropper {
-            app.tools.last_active_tool = app.tools.active;
-        }
-        if tool != ToolKind::Brush && app.ui_stroke_width <= 0.01 {
-            app.ui_stroke_width = 2.0;
-        }
-        app.tools.active = tool;
-        match tool {
-            ToolKind::Node | ToolKind::Polygon | ToolKind::Text | ToolKind::Arc => {
-                promote_action_tab(app, ActionTab::Geometry);
-            }
-            ToolKind::Pen | ToolKind::Brush => {
-                promote_action_tab(app, ActionTab::ColorStroke);
-            }
-            // Raster tools: Geometry tab first (size/placement); Paint is opt-in via strip.
-            ToolKind::RasterBrush
-            | ToolKind::Eraser
-            | ToolKind::BucketFill
-            | ToolKind::Smudge
-            | ToolKind::RasterSelect => {
-                promote_action_tab(app, ActionTab::Geometry);
-            }
-            _ => {}
-        }
-    };
-
     // 3. Handle release actions
-    if app.toolbar_expanded && pointer_released {
-        if app.toolbar_drag_active {
+    if *expanded && pointer_released {
+        if *drag_active {
             // Drag release
             if let Some(tool) = hovered_tool {
                 // If it was just a quick tap inside the active button, don't drag-select, keep open
                 if let Some(pos) = pointer_pos {
                     if collapsed_btn_rect.contains(pos) {
                         // Toggled open state
-                        app.toolbar_drag_active = false;
+                        *drag_active = false;
                     } else {
                         // Drag-selected a tool!
-                        select_tool(app, tool);
-                        app.toolbar_expanded = false;
-                        app.toolbar_drag_active = false;
+                        if let Some(tab) = select_tool(tool_state, stroke_width, tool) {
+                            intents.push(ToolbarIntent::PromoteTab(tab));
+                        }
+                        *expanded = false;
+                        *drag_active = false;
                     }
                 }
             } else if let Some(action) = hovered_av_action_outer {
                 match action {
-                    "split" => app.split_active_av_clip_at_playhead(),
-                    "daw" => app.create_daw_clip_at_playhead(),
+                    "split" => intents.push(ToolbarIntent::SplitAvClip),
+                    "daw" => intents.push(ToolbarIntent::CreateDawClip),
                     _ => {}
                 }
-                app.toolbar_expanded = false;
-                app.toolbar_drag_active = false;
+                *expanded = false;
+                *drag_active = false;
             } else {
                 // Released outside -> collapse (unless a popup is open)
                 if !ctx.memory(|mem| mem.any_popup_open()) {
-                    app.toolbar_expanded = false;
+                    *expanded = false;
                 }
-                app.toolbar_drag_active = false;
+                *drag_active = false;
             }
         } else {
             // Clicked open state click
             if let Some(tool) = hovered_tool {
-                select_tool(app, tool);
-                app.toolbar_expanded = false;
+                if let Some(tab) = select_tool(tool_state, stroke_width, tool) {
+                    intents.push(ToolbarIntent::PromoteTab(tab));
+                }
+                *expanded = false;
             } else if let Some(action) = hovered_av_action_outer {
                 match action {
-                    "split" => app.split_active_av_clip_at_playhead(),
-                    "daw" => app.create_daw_clip_at_playhead(),
+                    "split" => intents.push(ToolbarIntent::SplitAvClip),
+                    "daw" => intents.push(ToolbarIntent::CreateDawClip),
                     _ => {}
                 }
-                app.toolbar_expanded = false;
+                *expanded = false;
             }
         }
         ctx.request_repaint();
     }
-}
-
-/// Programmatic tab focus (tool switch, geometry, etc.).
-/// `position` is a zero-based index in the tab strip (clamped to the list length).
-pub fn promote_action_tab(app: &mut VadadeeBerryApp, tab: ActionTab) {
-    promote_action_tab_at(app, tab, 0);
-}
-
-pub fn promote_action_tab_at(app: &mut VadadeeBerryApp, tab: ActionTab, position: usize) {
-    if app.action_tab != tab {
-        app.ui_anim.on_tab_change();
-    }
-    app.action_tab_order.retain(|t| *t != tab);
-    let pos = position.min(app.action_tab_order.len());
-    app.action_tab_order.insert(pos, tab);
-    app.action_tab = tab;
-    app.action_tab_scroll_home = true;
+    intents
 }
 
 /// User clicked a tab in the strip.
@@ -1297,7 +1431,7 @@ fn select_action_tab_from_strip(app: &mut VadadeeBerryApp, tab: ActionTab) {
             app.ui_anim.on_tab_change_secondary();
             app.action_tab = tab;
         }
-        _ => promote_action_tab(app, tab),
+        _ => app.promote_action_tab( tab),
     }
 }
 
@@ -1319,12 +1453,12 @@ fn action_tab_strip(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let mut first_tab: Option<egui::Response> = None;
                     for (i, tab) in app.action_tab_order.clone().into_iter().enumerate() {
-                        if !tab.visible_in_strip(app) {
+                        if !action_tab_visible_in_strip(tab, app) {
                             continue;
                         }
                         let selected = app.action_tab == tab;
                         let tab_alpha = app.ui_anim.tab_label_alpha(selected);
-                        let text = tab.strip_label(app);
+                        let text = action_tab_strip_label(tab, app);
                         let label = format!("{} {}", tab.icon(), text);
                         let resp = theme::action_tab_chip(ui, selected, &label, tab_alpha)
                             .on_hover_text(&text);
@@ -1369,7 +1503,35 @@ fn action_bar_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             .show(ui, |ui| {
                 ui.set_width(w);
                 match app.action_tab {
-                    ActionTab::Export => export_section(app, ui),
+                    ActionTab::Export => {
+                        page_section(app, ui);
+                        ui.add_space(8.0);
+                        ui.separator();
+                        let content_secs = crate::document::animation_content_duration_secs(&app.project, app.playback.fps);
+                        for intent in export_section(
+                            ExportView {
+                                selection_empty: app.selection.is_empty(),
+                                image_format: &mut app.export_image_format,
+                                dpi: &mut app.export_dpi,
+                                image_selection_only: &mut app.export_image_selection_only,
+                                export: &mut app.video_export,
+                            },
+                            ui,
+                            content_secs,
+                        ) {
+                            match intent {
+                                ExportIntent::ResizeToSelection => app.resize_to_selection(),
+                                ExportIntent::ExportImage => app.request_export_image(),
+                                ExportIntent::ExportSvg => app.request_export_svg(),
+                                ExportIntent::SaveProject => app.request_save_project(),
+                                ExportIntent::OpenSvg => app.request_open_svg(),
+                                ExportIntent::ImportImage => app.request_import_image(),
+                                ExportIntent::RequestVideoExport(ctx) => {
+                                    app.request_video_export(ctx);
+                                }
+                            }
+                        }
+                    }
                     ActionTab::Layer => layers_section(app, ui),
                     ActionTab::ColorStroke => appearance_section(app, ui),
                     ActionTab::Objects => objects_section(app, ui),
@@ -1377,7 +1539,36 @@ fn action_bar_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ActionTab::Paint => paint_section(app, ui),
                     ActionTab::PathMagic => path_magic_section(app, ui),
                     ActionTab::Animation => animation_section(app, ui),
-                    ActionTab::Parameter => crate::node_editor_ui::parameter_tab_ui(app, ui),
+                    ActionTab::Parameter => {
+                        let audio_status = app.audio_extract_status.clone();
+                        let audio_busy = |path: &str| {
+                            audio_status
+                                .lock()
+                                .ok()
+                                .and_then(|m| m.get(path).map(|s| s.is_extracting()))
+                                .unwrap_or(false)
+                        };
+                        let outcome = crate::node_editor_ui::parameter_tab_ui(
+                            &mut crate::node_editor_ui::NodeEditorView {
+                                state: &mut app.node_editor_ui,
+                                project: &mut app.project,
+                                selection: &mut app.selection,
+            status: &mut app.status_message,
+                                frame: app.playback.frame,
+                                fps: app.playback.fps,
+                                textures: &mut app.graph_preview_textures,
+                                image_textures: &app.image_textures,
+                                audio_extract_busy: &audio_busy,
+                            },
+                            ui,
+                        );
+                        if let Some(f) = outcome.apply_animation_frame {
+                            app.apply_animation_for_frame(f);
+                        }
+                        if outcome.switch_to_animation_tab {
+                            app.action_tab = ActionTab::Animation;
+                        }
+                    }
                 }
             });
     });
@@ -1448,7 +1639,7 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     if on_path_offer {
         if let Some((objects, path_id)) = app.selection_path_and_objects() {
             let pop = app.ui_anim.on_path_offer_pop();
-            let obj_label = object_on_path_object_label(app, &objects);
+            let obj_label = object_on_path_object_label(&app.project, &objects);
             let rise = (1.0 - pop) * 14.0;
             let alpha = pop.clamp(0.0, 1.0);
             let scale = 0.86 + 0.14 * pop;
@@ -1493,7 +1684,7 @@ fn path_magic_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             let mut settings_changed = false;
             let close = object_on_path_container(ui, app, expand, alpha, |ui, app| {
             if let Some((objects, path_id)) = app.object_on_path_panel_context() {
-                let obj_label = object_on_path_object_label(app, &objects);
+                let obj_label = object_on_path_object_label(&app.project, &objects);
                 ui.label(
                     RichText::new(format!("{obj_label} along path"))
                         .small()
@@ -1841,8 +2032,8 @@ fn clamp_object_label(name: &str, max_chars: usize) -> String {
     }
 }
 
-fn node_display_name(app: &VadadeeBerryApp, id: crate::document::NodeId) -> String {
-    app.project
+fn node_display_name(project: &crate::document::ProjectFile, id: crate::document::NodeId) -> String {
+    project
         .nodes
         .get(id)
         .map(|n| {
@@ -1857,7 +2048,7 @@ fn node_display_name(app: &VadadeeBerryApp, id: crate::document::NodeId) -> Stri
 
 /// Path Magic: Boolean (shape+shape or N-way) or Clip Mask (image+shape solid face).
 fn boolean_and_clip_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
-    use crate::app::BooleanPairMode;
+    use crate::document::BooleanPairMode;
     use crate::document::BooleanOpKind;
 
     let has_bool = app.selection_has_boolean_effect();
@@ -1918,8 +2109,8 @@ fn boolean_and_clip_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         return;
     };
 
-    let a_full = node_display_name(app, a_id);
-    let b_full = node_display_name(app, b_id);
+    let a_full = node_display_name(&app.project, a_id);
+    let b_full = node_display_name(&app.project, b_id);
     let max_c = ((ui.available_width() / 7.5) as usize).clamp(8, 28);
 
     let title = match mode_kind {
@@ -1939,7 +2130,7 @@ fn boolean_and_clip_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 .on_hover_text(
                     multi_shapes
                         .iter()
-                        .map(|id| node_display_name(app, *id))
+                        .map(|id| node_display_name(&app.project, *id))
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
@@ -2207,9 +2398,9 @@ fn object_on_path_container(
     close
 }
 
-fn object_on_path_object_label(app: &VadadeeBerryApp, objects: &[crate::document::NodeId]) -> String {
+fn object_on_path_object_label(project: &crate::document::ProjectFile, objects: &[crate::document::NodeId]) -> String {
     if objects.len() == 1 {
-        app.project
+        project
             .nodes
             .get(objects[0])
             .map(|n| n.name.clone())
@@ -2322,15 +2513,44 @@ fn floating_action_bar(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     });
 }
 
-fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
-    page_section(app, ui);
-    ui.add_space(8.0);
-    ui.separator();
+/// Export tab body (page settings are rendered separately by the caller).
+/// Returns intents for the caller to execute (file dialogs, export jobs).
+pub enum ExportIntent {
+    ResizeToSelection,
+    ExportImage,
+    ExportSvg,
+    SaveProject,
+    OpenSvg,
+    ImportImage,
+    RequestVideoExport(egui::Context),
+}
 
-    if !app.selection.is_empty() {
+pub struct ExportView<'a> {
+    pub selection_empty: bool,
+    pub image_format: &'a mut crate::io::ExportImageFormat,
+    pub dpi: &'a mut f32,
+    pub image_selection_only: &'a mut bool,
+    pub export: &'a mut crate::export_types::VideoExportState,
+}
+
+fn export_section(
+    view: ExportView<'_>,
+    ui: &mut Ui,
+    content_secs: f32,
+) -> Vec<ExportIntent> {
+    let mut intents = Vec::new();
+    let ExportView {
+        selection_empty,
+        image_format,
+        dpi,
+        image_selection_only,
+        export,
+    } = view;
+
+    if !selection_empty {
         ui.label(RichText::new("Selection Options").strong());
         if ui.button("Resize as selected").clicked() {
-            app.resize_to_selection();
+            intents.push(ExportIntent::ResizeToSelection);
         }
         ui.add_space(8.0);
         ui.separator();
@@ -2340,7 +2560,7 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label("Image type:");
         egui::ComboBox::from_id_salt("export_image_format")
-            .selected_text(app.export_image_format.label())
+            .selected_text(image_format.label())
             .show_ui(ui, |ui| {
                 for fmt in [
                     io::ExportImageFormat::Png,
@@ -2349,10 +2569,10 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     io::ExportImageFormat::RawRgba,
                 ] {
                     if ui
-                        .selectable_label(app.export_image_format == fmt, fmt.label())
+                        .selectable_label(*image_format == fmt, fmt.label())
                         .clicked()
                     {
-                        app.export_image_format = fmt;
+                        *image_format = fmt;
                     }
                 }
             });
@@ -2361,7 +2581,7 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label("DPI");
         ui.add(
-            egui::DragValue::new(&mut app.export_dpi)
+            egui::DragValue::new(dpi)
                 .range(72.0..=600.0)
                 .speed(1.0)
                 .fixed_decimals(0),
@@ -2371,23 +2591,23 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         );
     });
     ui.checkbox(
-        &mut app.export_image_selection_only,
+        image_selection_only,
         "Export selection only (image)",
     );
     if ui.button("Export image…").clicked() {
-        app.request_export_image();
+        intents.push(ExportIntent::ExportImage);
     }
     if ui.button("Export SVG…").clicked() {
-        app.request_export_svg();
+        intents.push(ExportIntent::ExportSvg);
     }
     if ui.button("Save project…").clicked() {
-        app.request_save_project();
+        intents.push(ExportIntent::SaveProject);
     }
     if ui.button("Open SVG…").clicked() {
-        app.request_open_svg();
+        intents.push(ExportIntent::OpenSvg);
     }
     if ui.button("Import Image…").clicked() {
-        app.request_import_image();
+        intents.push(ExportIntent::ImportImage);
     }
 
     ui.add_space(8.0);
@@ -2411,12 +2631,10 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         ui.add_space(6.0);
 
 
-
-        let content_secs = app.animation_content_duration_secs();
         ui.horizontal(|ui| {
             ui.label("Duration");
-            let mut dur = if app.video_export.export_duration_secs > 0.05 {
-                app.video_export.export_duration_secs
+            let mut dur = if export.export_duration_secs > 0.05 {
+                export.export_duration_secs
             } else {
                 content_secs
             };
@@ -2432,16 +2650,16 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 )
                 .changed()
             {
-                app.video_export.export_duration_secs = dur;
+                export.export_duration_secs = dur;
             }
             if ui
                 .button(RichText::new("Auto").small())
                 .on_hover_text(format!("Use full timeline content ({content_secs:.2}s)"))
                 .clicked()
             {
-                app.video_export.export_duration_secs = 0.0;
+                export.export_duration_secs = 0.0;
             }
-            if app.video_export.export_duration_secs > 0.05 && content_secs > 0.05 {
+            if export.export_duration_secs > 0.05 && content_secs > 0.05 {
                 ui.label(
                     RichText::new(format!("(content {content_secs:.1}s)"))
                         .small()
@@ -2452,7 +2670,7 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
         ui.horizontal(|ui| {
             ui.label("Cycles");
-            let mut cycles = app.video_export.export_cycles.max(1) as i32;
+            let mut cycles = export.export_cycles.max(1) as i32;
             if ui
                 .add(
                     egui::DragValue::new(&mut cycles)
@@ -2465,11 +2683,11 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 )
                 .changed()
             {
-                app.video_export.export_cycles = cycles.clamp(1, 100) as u32;
+                export.export_cycles = cycles.clamp(1, 100) as u32;
             }
-            let cycle_n = app.video_export.export_cycles.max(1);
-            let one = if app.video_export.export_duration_secs > 0.05 {
-                app.video_export.export_duration_secs
+            let cycle_n = export.export_cycles.max(1);
+            let one = if export.export_duration_secs > 0.05 {
+                export.export_duration_secs
             } else {
                 content_secs
             };
@@ -2483,7 +2701,7 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         // Frame rate (integer)
         ui.horizontal(|ui| {
             ui.label("Frame rate");
-            let mut fps = app.video_export.fps as i32;
+            let mut fps = export.fps as i32;
             if ui
                 .add(
                     egui::DragValue::new(&mut fps)
@@ -2493,7 +2711,7 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 )
                 .changed()
             {
-                app.video_export.fps = fps.clamp(1, 240) as u32;
+                export.fps = fps.clamp(1, 240) as u32;
             }
         });
 
@@ -2501,18 +2719,18 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.label("CPU");
             egui::ComboBox::from_id_salt("video_export_power")
-                .selected_text(app.video_export.power_level.label())
+                .selected_text(export.power_level.label())
                 .width(100.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
-                        &mut app.video_export.power_level,
-                        crate::app::ExportPowerLevel::PowerSaving,
-                        crate::app::ExportPowerLevel::PowerSaving.label(),
+                        &mut export.power_level,
+                        crate::export_types::ExportPowerLevel::PowerSaving,
+                        crate::export_types::ExportPowerLevel::PowerSaving.label(),
                     );
                     ui.selectable_value(
-                        &mut app.video_export.power_level,
-                        crate::app::ExportPowerLevel::FullPower,
-                        crate::app::ExportPowerLevel::FullPower.label(),
+                        &mut export.power_level,
+                        crate::export_types::ExportPowerLevel::FullPower,
+                        crate::export_types::ExportPowerLevel::FullPower.label(),
                     );
                 });
         });
@@ -2521,16 +2739,16 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.label("FX quality");
             egui::ComboBox::from_id_salt("video_export_fx_quality")
-                .selected_text(app.video_export.fx_quality.label())
+                .selected_text(export.fx_quality.label())
                 .width(120.0)
                 .show_ui(ui, |ui| {
                     for q in [
-                        crate::app::ExportFxQuality::Draft,
-                        crate::app::ExportFxQuality::Normal,
-                        crate::app::ExportFxQuality::High,
+                        crate::export_types::ExportFxQuality::Draft,
+                        crate::export_types::ExportFxQuality::Normal,
+                        crate::export_types::ExportFxQuality::High,
                     ] {
                         ui.selectable_value(
-                            &mut app.video_export.fx_quality,
+                            &mut export.fx_quality,
                             q,
                             q.label(),
                         );
@@ -2545,7 +2763,7 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         // Resolution
         ui.horizontal(|ui| {
             ui.label("Resolution");
-            let mut res = app.video_export.resolution_pct;
+            let mut res = export.resolution_pct;
             egui::ComboBox::from_id_salt("video_res_combo")
                 .selected_text(format!("{}%", res))
                 .width(80.0)
@@ -2554,31 +2772,31 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         ui.selectable_value(&mut res, r, format!("{}%", r));
                     }
                 });
-            app.video_export.resolution_pct = res;
+            export.resolution_pct = res;
         });
 
         // Bitrate
         ui.horizontal(|ui| {
             ui.label("Bitrate");
-            let mut kb = app.video_export.bitrate_kbps;
+            let mut kb = export.bitrate_kbps;
             ui.add(egui::DragValue::new(&mut kb).range(500..=80000).suffix(" kbps").speed(100.0));
-            app.video_export.bitrate_kbps = kb;
+            export.bitrate_kbps = kb;
         });
 
         // Format
         ui.horizontal(|ui| {
             ui.label("Format");
             egui::ComboBox::from_id_salt("video_fmt_combo")
-                .selected_text(app.video_export.format.label())
+                .selected_text(export.format.label())
                 .width(130.0)
                 .show_ui(ui, |ui| {
                     for &fmt in &[
-                        crate::app::VideoFormat::Mp4,
-                        crate::app::VideoFormat::Mkv,
-                        crate::app::VideoFormat::Webm,
-                        crate::app::VideoFormat::Mov,
+                        crate::export_types::VideoFormat::Mp4,
+                        crate::export_types::VideoFormat::Mkv,
+                        crate::export_types::VideoFormat::Webm,
+                        crate::export_types::VideoFormat::Mov,
                     ] {
-                        ui.selectable_value(&mut app.video_export.format, fmt, fmt.label());
+                        ui.selectable_value(&mut export.format, fmt, fmt.label());
                     }
                 });
         });
@@ -2586,13 +2804,13 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         ui.add_space(6.0);
 
         // Export button
-        let btn_text = if app.video_export.rendering {
+        let btn_text = if export.rendering {
             "⏳ Rendering…"
         } else {
             "▶ Export Video"
         };
         let export_btn = ui.add_enabled(
-            !app.video_export.rendering,
+            !export.rendering,
             egui::Button::new(
                 RichText::new(btn_text)
                     .color(egui::Color32::from_rgb(80, 200, 120)),
@@ -2601,9 +2819,10 @@ fn export_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             .min_size(egui::vec2(ui.available_width() - 8.0, 28.0)),
         );
         if export_btn.clicked() {
-            app.request_video_export(ui.ctx().clone());
+            intents.push(ExportIntent::RequestVideoExport(ui.ctx().clone()));
         }
     });
+    intents
 }
 
 /// Close any dialog when Escape is pressed (shared helper).
@@ -2614,13 +2833,18 @@ fn dialog_escape_close(ctx: &egui::Context, open: &mut bool) {
 }
 
 /// Overlay list when multiple objects share the same click hit.
-fn hit_pick_menu_overlay(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
-    let Some((screen, candidates)) = app.hit_pick_menu.clone() else {
-        return;
+/// Returns the picked id for the caller to select (behavior stays on app).
+fn hit_pick_menu_overlay(
+    menu: &mut Option<(egui::Pos2, Vec<crate::document::NodeId>)>,
+    project: &crate::document::ProjectFile,
+    ctx: &egui::Context,
+) -> Option<crate::document::NodeId> {
+    let Some((screen, candidates)) = menu.clone() else {
+        return None;
     };
     if candidates.is_empty() {
-        app.hit_pick_menu = None;
-        return;
+        *menu = None;
+        return None;
     }
     let mut open = true;
     let mut picked: Option<crate::document::NodeId> = None;
@@ -2644,8 +2868,7 @@ fn hit_pick_menu_overlay(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
                     );
                     ui.separator();
                     for &id in &candidates {
-                        let (icon, name) = app
-                            .project
+                        let (icon, name) = project
                             .nodes
                             .get(id)
                             .map(|n| {
@@ -2690,9 +2913,13 @@ fn hit_pick_menu_overlay(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
             }
         });
     if let Some(id) = picked {
-        app.select_from_hit_picker(id);
-    } else if dismiss {
-        app.hit_pick_menu = None;
+        *menu = None;
+        Some(id)
+    } else {
+        if dismiss {
+            *menu = None;
+        }
+        None
     }
 }
 
@@ -2810,9 +3037,13 @@ fn plotter_formula_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
     }
 }
 
-fn object_rename_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
-    let Some((id_copy, is_layer_copy)) = app
-        .object_rename_dialog
+fn object_rename_dialog(
+    dialog: &mut Option<(uuid::Uuid, String, bool)>,
+    project: &mut crate::document::ProjectFile,
+    history: &mut crate::history::History,
+    ctx: &egui::Context,
+) {
+    let Some((id_copy, is_layer_copy)) = dialog
         .as_ref()
         .map(|(id, _, layer)| (*id, *layer))
     else {
@@ -2840,7 +3071,7 @@ fn object_rename_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
                     .color(colors::TEXT_MUTED),
             );
             ui.add_space(4.0);
-            if let Some((_, draft, _)) = app.object_rename_dialog.as_mut() {
+            if let Some((_, draft, _)) = dialog.as_mut() {
                 let te = ui.add(
                     egui::TextEdit::singleline(draft)
                         .id(egui::Id::new(("object_rename_edit", id_copy)))
@@ -2867,15 +3098,13 @@ fn object_rename_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
             });
         });
     if apply {
-        let name = app
-            .object_rename_dialog
+        let name = dialog
             .as_ref()
             .map(|(_, d, _)| d.trim().to_string())
             .unwrap_or_default();
         if !name.is_empty() {
             if is_layer_copy {
-                if let Some(layer) = app
-                    .project
+                if let Some(layer) = project
                     .document
                     .layers
                     .iter_mut()
@@ -2883,39 +3112,50 @@ fn object_rename_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
                 {
                     layer.name = name;
                 }
-            } else if let Some(node) = app.project.nodes.get(id_copy) {
+            } else if let Some(node) = project.nodes.get(id_copy) {
                 let before = node.clone();
                 let mut after = before.clone();
                 after.name = name;
                 if before != after {
-                    app.history.push(
-                        &mut app.project,
-                        crate::history::ProjectEdit::PatchNode {
-                            id: id_copy,
-                            before,
-                            after,
-                        },
+                    crate::commands::CommandDispatcher::dispatch(
+                        crate::commands::CommandContext { project, history },
+                        crate::commands::EditorCommand::Edit(
+                            crate::history::ProjectEdit::PatchNode {
+                                id: id_copy,
+                                before,
+                                after,
+                            },
+                        ),
                     );
                 }
             }
         }
         ctx.data_mut(|d| d.remove::<bool>(egui::Id::new(("rename_focus", id_copy))));
-        app.object_rename_dialog = None;
+        *dialog = None;
     } else if close || !open {
         ctx.data_mut(|d| d.remove::<bool>(egui::Id::new(("rename_focus", id_copy))));
-        app.object_rename_dialog = None;
+        *dialog = None;
     }
 }
 
 /// DAW piano roll as a modal dialog (double-click DAW clip), not a slide-up floater.
-fn daw_piano_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
-    if app.piano_roll_clip.is_none() {
+fn daw_piano_dialog(
+    clip: &mut Option<uuid::Uuid>,
+    project: &mut crate::document::ProjectFile,
+    tool: &mut crate::av_ui::PianoTool,
+    fps: u32,
+    zoom: &mut f32,
+    scroll_offset: &mut f32,
+    pitch_scroll: &mut f32,
+    ctx: &egui::Context,
+) {
+    if clip.is_none() {
         return;
     }
     let mut open = true;
     dialog_escape_close(ctx, &mut open);
     if !open {
-        app.piano_roll_clip = None;
+        *clip = None;
         return;
     }
     egui::Window::new(format!("{} DAW Piano", icons::MUSIC))
@@ -2928,25 +3168,43 @@ fn daw_piano_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .open(&mut open)
         .show(ctx, |ui| {
-            crate::av_ui::piano_roll_panel(app, ui, ctx);
+            crate::av_ui::piano_roll_panel(
+                crate::av_ui::PianoRollView {
+                    project: &mut *project,
+                    clip: &mut *clip,
+                    tool: &mut *tool,
+                    fps,
+                    zoom: &mut *zoom,
+                    scroll_offset: &mut *scroll_offset,
+                    pitch_scroll: &mut *pitch_scroll,
+                },
+                ui,
+                ctx,
+            );
         });
     if !open {
-        app.piano_roll_clip = None;
+        *clip = None;
     }
 }
 
-fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
-    if !app.video_export.progress_visible {
-        return;
+/// Returns true when the user requested cancel (caller stops the worker).
+fn video_export_progress_window(
+    export: &mut crate::export_types::VideoExportState,
+    hud: &crate::sys_stats::SystemHud,
+    ctx: &egui::Context,
+) -> bool {
+    if !export.progress_visible {
+        return false;
     }
-    let Some(prog) = app.video_export.progress else {
-        return;
+    let Some(prog) = export.progress else {
+        return false;
     };
     let mut open = true;
+    let mut cancel = false;
     dialog_escape_close(ctx, &mut open);
-    if !open && !app.video_export.rendering {
-        app.video_export.progress_visible = false;
-        return;
+    if !open && !export.rendering {
+        export.progress_visible = false;
+        return false;
     }
     egui::Window::new("Render to Video")
         .id(egui::Id::new("video_progress_dlg"))
@@ -2956,17 +3214,17 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
         .show(ctx, |ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new(&app.video_export.status_msg)
+                    RichText::new(&export.status_msg)
                         .color(colors::TEXT_MUTED)
                         .italics(),
                 );
                 // Frame counter from worker (authoritative), not UI receive batches.
-                if app.video_export.rendering && app.video_export.total_frames > 0 {
+                if export.rendering && export.total_frames > 0 {
                     ui.label(
                         RichText::new(format!(
                             "Frame {} / {}",
-                            app.video_export.worker_frame_done,
-                            app.video_export.total_frames
+                            export.worker_frame_done,
+                            export.total_frames
                         ))
                         .small()
                         .color(colors::TEXT_MUTED),
@@ -2975,14 +3233,14 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
                 ui.add_space(6.0);
 
                 // P7a: smoothed bar (eases toward worker target; no multi-frame jumps).
-                let bar_prog = if app.video_export.rendering {
-                    app.video_export.progress_smooth.clamp(0.0, 1.0)
+                let bar_prog = if export.rendering {
+                    export.progress_smooth.clamp(0.0, 1.0)
                 } else {
                     prog
                 };
                 let pb = egui::ProgressBar::new(bar_prog)
                     .show_percentage()
-                    .animate(app.video_export.rendering)
+                    .animate(export.rendering)
                     .desired_width(ui.available_width());
                 ui.add(pb);
                 ui.add_space(10.0);
@@ -2998,7 +3256,7 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
                         );
                         ui.add_space(4.0);
                         ui.label(
-                            RichText::new(format!("\"{}\"", app.video_export.current_joke))
+                            RichText::new(format!("\"{}\"", hud.current_joke))
                                 .color(colors::ACCENT)
                                 .italics()
                         );
@@ -3023,9 +3281,9 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
                             .show(ui, |ui| {
                                 // CPU Temperature and Usage
                                 ui.label(RichText::new("CPU Suffering:").color(colors::TEXT_MUTED));
-                                let cpu_temp_color = if app.video_export.sys_stats.cpu_temp > 80.0 {
+                                let cpu_temp_color = if hud.stats.cpu_temp > 80.0 {
                                     egui::Color32::from_rgb(255, 100, 100)
-                                } else if app.video_export.sys_stats.cpu_temp > 65.0 {
+                                } else if hud.stats.cpu_temp > 65.0 {
                                     egui::Color32::from_rgb(255, 180, 100)
                                 } else {
                                     colors::TEXT
@@ -3033,8 +3291,8 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
                                 ui.label(
                                     RichText::new(format!(
                                         "{:.1}% ({:.1}°C)",
-                                        app.video_export.sys_stats.cpu_usage,
-                                        app.video_export.sys_stats.cpu_temp
+                                        hud.stats.cpu_usage,
+                                        hud.stats.cpu_temp
                                     ))
                                     .color(cpu_temp_color)
                                     .strong(),
@@ -3043,13 +3301,13 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
 
                                 // GPU Usage
                                 ui.label(RichText::new("GPU Suffering:").color(colors::TEXT_MUTED));
-                                let gpu_color = if app.video_export.sys_stats.gpu_usage > 80.0 {
+                                let gpu_color = if hud.stats.gpu_usage > 80.0 {
                                     egui::Color32::from_rgb(255, 100, 100)
                                 } else {
                                     colors::TEXT
                                 };
                                 ui.label(
-                                    RichText::new(format!("{:.1}%", app.video_export.sys_stats.gpu_usage))
+                                    RichText::new(format!("{:.1}%", hud.stats.gpu_usage))
                                         .color(gpu_color)
                                         .strong(),
                                 );
@@ -3060,9 +3318,9 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
                                 ui.label(
                                     RichText::new(format!(
                                         "{:.1} MB (System: {:.1} / {:.1} GB)",
-                                        app.video_export.sys_stats.ram_rss_mb,
-                                        app.video_export.sys_stats.ram_sys_used_gb,
-                                        app.video_export.sys_stats.ram_sys_total_gb
+                                        hud.stats.ram_rss_mb,
+                                        hud.stats.ram_sys_used_gb,
+                                        hud.stats.ram_sys_total_gb
                                     ))
                                     .color(colors::TEXT)
                                     .strong(),
@@ -3071,15 +3329,15 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
 
                                 // Speed from worker EMA (stable; not UI poll gaps).
                                 ui.label(RichText::new("Export Speed:").color(colors::TEXT_MUTED));
-                                let speed_text = if app.video_export.sec_per_frame > 1e-6 {
-                                    let spf = app.video_export.sec_per_frame;
+                                let speed_text = if export.sec_per_frame > 1e-6 {
+                                    let spf = export.sec_per_frame;
                                     let fps = 1.0 / spf;
-                                    let eta = if app.video_export.worker_frame_done
-                                        < app.video_export.total_frames
-                                        && app.video_export.total_frames > 0
+                                    let eta = if export.worker_frame_done
+                                        < export.total_frames
+                                        && export.total_frames > 0
                                     {
-                                        let rem = (app.video_export.total_frames
-                                            - app.video_export.worker_frame_done)
+                                        let rem = (export.total_frames
+                                            - export.worker_frame_done)
                                             as f32
                                             * spf;
                                         if rem < 60.0 {
@@ -3106,22 +3364,27 @@ fn video_export_progress_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) 
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    if app.video_export.rendering {
+                    if export.rendering {
                         if ui.button("Cancel").clicked() {
-                            app.cancel_video_export();
-                            app.video_export.progress_visible = false;
+                            export.progress_visible = false;
+                            cancel = true;
                         }
                     }
                     if ui.button("Hide").clicked() {
-                        app.video_export.progress_visible = false;
+                        export.progress_visible = false;
                     }
                 });
             });
         });
+    cancel
 }
 
-fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
-    let Some(layer_id) = app.show_shader_editor_window else {
+fn shader_editor_window(
+    dialog: &mut Option<uuid::Uuid>,
+    project: &mut crate::document::ProjectFile,
+    ctx: &egui::Context,
+) {
+    let Some(layer_id) = *dialog else {
         return;
     };
     
@@ -3129,8 +3392,8 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
     let mut open = true;
     let mut title = "Shader Editor".to_string();
     let mut current_pass = None;
-    
-    if let Some(l) = app.project.document.layers.iter_mut().find(|layer| layer.id == layer_id) {
+
+    if let Some(l) = project.document.layers.iter_mut().find(|layer| layer.id == layer_id) {
         if l.kind == crate::document::LayerKind::Shading {
             if l.shading_passes.is_empty() {
                 l.shading_passes
@@ -3147,7 +3410,7 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
     }
     
     if current_pass.is_none() {
-        app.show_shader_editor_window = None;
+        *dialog = None;
         return;
     }
     
@@ -3286,7 +3549,7 @@ fn shader_editor_window(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
         });
         
     if !open {
-        app.show_shader_editor_window = None;
+        *dialog = None;
     }
 }
 
@@ -3449,7 +3712,7 @@ fn floating_video_editor(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     let max_w = inset.width() - 2.0 * gap - width_reduction;
 
     let track_count = crate::av_ui::collect_timeline_rows(&app.project.document.layers).len();
-    let extracting = video_audio_extracting(app);
+    let extracting = video_audio_extracting(&app.audio_extract_status);
     let show_details = app.project.document.active_layer().is_some_and(|l| {
         l.kind == crate::document::LayerKind::AV
     });
@@ -3479,8 +3742,10 @@ fn floating_video_editor(app: &mut VadadeeBerryApp, ctx: &Context, work: Rect) {
     }
 }
 
-fn video_audio_extracting(app: &VadadeeBerryApp) -> bool {
-    app.audio_extract_status.lock().ok().is_some_and(|m| {
+fn video_audio_extracting(
+    status: &std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>,
+) -> bool {
+    status.lock().ok().is_some_and(|m| {
         m.values()
             .any(|s| matches!(s, AudioExtractStatus::Extracting { .. }))
     })
@@ -3498,11 +3763,14 @@ fn video_editor_panel_height(track_count: usize, extracting: bool, show_details:
     h.max(130.0)
 }
 
-fn best_video_extract_progress(app: &VadadeeBerryApp) -> Option<f32> {
-    let map = app.audio_extract_status.lock().ok()?;
+fn best_video_extract_progress(
+    status: &std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>,
+    project: &crate::document::ProjectFile,
+) -> Option<f32> {
+    let map = status.lock().ok()?;
     let mut best = 0.0f32;
     let mut any = false;
-    for layer in &app.project.document.layers {
+    for layer in &project.document.layers {
         if layer.kind != crate::document::LayerKind::AV || layer.video_path.is_empty() {
             continue;
         }
@@ -3522,10 +3790,10 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
         }
     }
 
-    let fps = app.anim_fps as f32;
-    let max_frames = app.get_max_animation_frame() as f32;
+    let fps = app.playback.fps as f32;
+    let max_frames = crate::document::max_animation_frame(&app.project, app.playback.fps) as f32;
     
-    let mut curr_frame = app.anim_current_frame;
+    let mut curr_frame = app.playback.frame;
     let mut scroll = app.anim_timeline_scroll;
 
     // Auto-follow playhead: scroll so the playhead stays in the middle 70% of the timeline viewport
@@ -3579,7 +3847,7 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
 
         // Split / DAW live on the main floating toolbar when an AV layer is selected.
 
-        if let Some(progress) = best_video_extract_progress(app) {
+        if let Some(progress) = best_video_extract_progress(&app.audio_extract_status, &app.project) {
             ui.ctx().request_repaint();
             paint_video_editor_extract_banner(ui, progress);
             ui.add_space(4.0);
@@ -4160,7 +4428,7 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                     return None;
                 }
                 // Prefer selected clip on this layer; else clip under playhead; else first.
-                let t = app.anim_current_frame as f32 / app.anim_fps as f32;
+                let t = app.playback.frame as f32 / app.playback.fps as f32;
                 l.av_clips
                     .iter()
                     .find(|c| app.selection.contains(&c.id))
@@ -4300,8 +4568,8 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
     if close_editor {
         app.show_video_editor_window = None;
     }
-    if curr_frame != app.anim_current_frame {
-        app.anim_current_frame = curr_frame;
+    if curr_frame != app.playback.frame {
+        app.playback.frame = curr_frame;
     }
     if scroll != app.anim_timeline_scroll {
         app.anim_timeline_scroll = scroll;
@@ -4508,27 +4776,27 @@ fn status_bar_body(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     }
 
                     // playback controls
-                    let play_icon = if app.anim_is_playing { "" } else { "" };
-                    let play_tooltip = if app.anim_is_playing { "Pause" } else { "Play" };
+                    let play_icon = if app.playback.playing { "" } else { "" };
+                    let play_tooltip = if app.playback.playing { "Pause" } else { "Play" };
                     
-                    let max_anim_frame = app.get_max_animation_frame();
+                    let max_anim_frame = crate::document::max_animation_frame(&app.project, app.playback.fps);
                     let btn_next = ui.button(RichText::new("").font(nerd_font_id(12.0)));
                     if btn_next.clicked() {
-                        app.anim_current_frame = app.anim_current_frame + 1; // allow beyond to support >100 frames
+                        app.playback.frame = app.playback.frame + 1; // allow beyond to support >100 frames
                     }
                     btn_next.on_hover_text("Forward (1 frame)");
 
                     let btn_play = ui.button(RichText::new(play_icon).font(nerd_font_id(12.0)));
                     if btn_play.clicked() {
-                        app.anim_is_playing = !app.anim_is_playing;
-                        if app.anim_is_playing {
+                        app.playback.playing = !app.playback.playing;
+                        if app.playback.playing {
                             let now = std::time::Instant::now();
-                            app.anim_playback_wall = Some(now);
-                            app.anim_play_origin = Some((now, app.anim_current_frame));
-                            app.anim_time_accumulator = 0.0;
+                            app.playback.wall_tick = Some(now);
+                            app.playback.play_origin = Some((now, app.playback.frame));
+                            app.playback.time_accumulator = 0.0;
                         } else {
-                            app.anim_playback_wall = None;
-                            app.anim_play_origin = None;
+                            app.playback.wall_tick = None;
+                            app.playback.play_origin = None;
                             app.stop_all_video_streams();
                         }
                     }
@@ -4536,16 +4804,16 @@ fn status_bar_body(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
                     let btn_prev = ui.button(RichText::new("").font(nerd_font_id(12.0)));
                     if btn_prev.clicked() {
-                        app.anim_current_frame = app.anim_current_frame.saturating_sub(1);
+                        app.playback.frame = app.playback.frame.saturating_sub(1);
                     }
                     btn_prev.on_hover_text("Backward (1 frame)");
 
                     let btn_rewind = ui.button(RichText::new("").font(nerd_font_id(12.0)));
                     if btn_rewind.clicked() {
-                        app.anim_current_frame = 0;
-                        app.anim_is_playing = false;
-                        app.anim_playback_wall = None;
-                        app.anim_play_origin = None;
+                        app.playback.frame = 0;
+                        app.playback.playing = false;
+                        app.playback.wall_tick = None;
+                        app.playback.play_origin = None;
                         app.stop_all_video_streams();
                     }
                     btn_rewind.on_hover_text("Back to start");
@@ -5003,7 +5271,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         app.set_active_layer(i);
                         app.selection = vec![layer_id];
                         app.node_editor_ui.open(layer_id);
-                        promote_action_tab(app, ActionTab::Parameter);
+                        app.promote_action_tab( ActionTab::Parameter);
                     }
                 }
             });
@@ -5938,7 +6206,7 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             app.set_active_layer(idx);
                         }
                         app.node_editor_ui.open(layer_id);
-                        promote_action_tab(app, ActionTab::Parameter);
+                        app.promote_action_tab( ActionTab::Parameter);
                     }
                     resp.on_hover_text(
                         "Click: select layer · Double-click: open Node Editor",
@@ -5966,7 +6234,7 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             }
                             app.selection = vec![layer_id];
                             app.node_editor_ui.open(layer_id);
-                            promote_action_tab(app, ActionTab::Parameter);
+                            app.promote_action_tab( ActionTab::Parameter);
                         }
                     }
                 });
@@ -6031,7 +6299,7 @@ fn objects_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             app.node_editor_ui.selected = Some(row.id);
                             app.node_editor_ui.selected_link = None;
                             // Output Object is for transform / z-order — keep Geometry tab.
-                            promote_action_tab(app, ActionTab::Geometry);
+                            app.promote_action_tab( ActionTab::Geometry);
                         }
                         if resp.double_clicked() {
                             if let Some(idx) = app
@@ -6287,7 +6555,7 @@ fn ne_output_proxy_inspector(
                 app.node_editor_ui.selected_link = None;
             }
             // Stay on Geometry when focusing Output for placement / order.
-            promote_action_tab(app, ActionTab::Geometry);
+            app.promote_action_tab( ActionTab::Geometry);
         }
         if ui
             .small_button("Select layer")
@@ -7673,7 +7941,7 @@ fn geometry_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 .on_hover_text("Layers, mask, float transform, brush engine")
                 .clicked()
             {
-                promote_action_tab(app, ActionTab::Paint);
+                app.promote_action_tab( ActionTab::Paint);
             }
             ui.add_space(4.0);
 
@@ -9092,21 +9360,16 @@ pub fn show_on_page_text_editor(
         if let Some(r) = focus_resp {
             r.request_focus();
         }
-        #[cfg(target_os = "android")]
-        {
-            if let Some(android_app) = crate::ANDROID_APP.get() {
-                let text = app.ui_text_content.clone();
-                app.last_android_text = text.clone();
-                let len = text.chars().count();
-                let state = winit::platform::android::activity::input::TextInputState {
-                    text: text.clone(),
-                    selection: winit::platform::android::activity::input::TextSpan { start: len, end: len },
-                    compose_region: None,
-                };
-                android_app.set_text_input_state(state);
-                android_app.show_soft_input(true);
-            }
-        }
+        // Native soft keyboard via the platform bridge (Android shows it;
+        // desktop/iOS-stub ignore it) — no `winit` calls from widgets.
+        let text = app.ui_text_content.clone();
+        app.last_android_text = text.clone();
+        let len = text.chars().count();
+        app.text_input.show(&crate::platform::TextInputState {
+            text,
+            cursor_start: len,
+            cursor_end: len,
+        });
         app.on_page_text_focus_pending = false;
     }
 
@@ -9139,12 +9402,7 @@ fn text_style_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, for_new_text: bool) 
                     );
                     if resp.clicked() {
                         ui.ctx().memory_mut(|mem| mem.stop_text_input());
-                        #[cfg(target_os = "android")]
-                        {
-                            if let Some(android_app) = crate::ANDROID_APP.get() {
-                                android_app.hide_soft_input(false);
-                            }
-                        }
+                        app.text_input.hide();
                     }
                 });
             });
@@ -9768,7 +10026,7 @@ fn draw_3d_calligraphy_nib(ui: &mut egui::Ui, active_width: f32, is_drawing: boo
 
 struct TrackPlotInfo<'a> {
     label: &'static str,
-    track: &'a mut crate::app::KeyframeTrack,
+    track: &'a mut crate::document::KeyframeTrack,
     color: egui::Color32,
     default_val: f64,
 }
@@ -9861,7 +10119,7 @@ fn draw_timeline_track(
                 for kf in &plot.track.keyframes {
                     val_min = val_min.min(kf.value);
                     val_max = val_max.max(kf.value);
-                    if kf.interpolation == crate::app::InterpolationMode::Bezier {
+                    if kf.interpolation == crate::document::InterpolationMode::Bezier {
                         val_min = val_min.min(kf.value + kf.handle_right.1);
                         val_max = val_max.max(kf.value + kf.handle_right.1);
                         val_min = val_min.min(kf.value + kf.handle_left.1);
@@ -10018,7 +10276,7 @@ fn draw_timeline_track(
                     let stroke_w = if is_selected { 2.0 } else { 1.0 };
                     let radius = if is_selected { 6.0 } else { 4.5 };
                     
-                    if kf.interpolation == crate::app::InterpolationMode::Bezier {
+                    if kf.interpolation == crate::document::InterpolationMode::Bezier {
                         let pts = [
                             egui::pos2(center.x, center.y - radius),
                             egui::pos2(center.x + radius, center.y),
@@ -10138,7 +10396,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     app.sync_stale_media_layer_durations();
     // Ghost End frames come from keyframes on deleted objects.
     let _ = app.prune_orphan_animation_tracks();
-    let content_max_frame = app.get_max_animation_frame();
+    let content_max_frame = crate::document::max_animation_frame(&app.project, app.playback.fps);
 
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
@@ -10168,12 +10426,12 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ui.label(RichText::new("Idle").color(colors::TEXT_MUTED));
                 }
                 
-                ui.label(RichText::new(format!("Frame {}", app.anim_current_frame)).color(colors::TEXT));
+                ui.label(RichText::new(format!("Frame {}", app.playback.frame)).color(colors::TEXT));
 
                 ui.add_space(8.0);
-                let mut fps = app.anim_fps;
+                let mut fps = app.playback.fps;
                 if ui.add(egui::DragValue::new(&mut fps).range(1..=120).suffix(" fps")).changed() {
-                    app.anim_fps = fps;
+                    app.playback.fps = fps;
                 }
                 ui.label(RichText::new("Speed:").color(colors::TEXT_MUTED));
                 ui.add_space(8.0);
@@ -10195,20 +10453,20 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 ui.add_space(8.0);
                                 egui::ComboBox::from_id_salt("kf_interp_combo")
                                     .selected_text(match selected_mode {
-                                        crate::app::InterpolationMode::Linear => "Linear",
-                                        crate::app::InterpolationMode::Bezier => "Bezier/Smooth",
+                                        crate::document::InterpolationMode::Linear => "Linear",
+                                        crate::document::InterpolationMode::Bezier => "Bezier/Smooth",
                                     })
                                     .show_ui(ui, |ui| {
-                                        if ui.selectable_value(&mut selected_mode, crate::app::InterpolationMode::Linear, "Linear").clicked() {
-                                            interp_changed = Some(crate::app::InterpolationMode::Linear);
+                                        if ui.selectable_value(&mut selected_mode, crate::document::InterpolationMode::Linear, "Linear").clicked() {
+                                            interp_changed = Some(crate::document::InterpolationMode::Linear);
                                         }
-                                        if ui.selectable_value(&mut selected_mode, crate::app::InterpolationMode::Bezier, "Bezier/Smooth").clicked() {
-                                            interp_changed = Some(crate::app::InterpolationMode::Bezier);
+                                        if ui.selectable_value(&mut selected_mode, crate::document::InterpolationMode::Bezier, "Bezier/Smooth").clicked() {
+                                            interp_changed = Some(crate::document::InterpolationMode::Bezier);
                                         }
                                     });
                                 if let Some(new_mode) = interp_changed {
                                     kf.interpolation = new_mode;
-                                    if new_mode == crate::app::InterpolationMode::Bezier {
+                                    if new_mode == crate::document::InterpolationMode::Bezier {
                                         if let Some((next_frame, next_value)) = next_kf_val {
                                             kf.handle_right = (
                                                 (next_frame - kf.frame) as f64 * 0.5,
@@ -10235,7 +10493,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 after: after_timeline,
                             },
                         );
-                        app.apply_animation_for_frame(app.anim_current_frame);
+                        app.apply_animation_for_frame(app.playback.frame);
                     }
                 }
             });
@@ -10245,7 +10503,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         ui.separator();
         ui.add_space(6.0);
 
-        let mut curr_frame = app.anim_current_frame; // no min(content); support high frames >100
+        let mut curr_frame = app.playback.frame; // no min(content); support high frames >100
         let mut scroll = app.anim_timeline_scroll;
 
         // Auto-follow playhead: scroll so the playhead stays in the middle 70% of the timeline viewport
@@ -10264,7 +10522,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         ui.horizontal(|ui| {
             // Frame number indicator (slider removed as scroll is done via drag/grab and wheel)
             ui.label(RichText::new(format!("Current Frame: {}", curr_frame)).strong().color(colors::TEXT));
-            let content_secs = (content_max_frame + 1) as f32 / app.anim_fps.max(1) as f32;
+            let content_secs = (content_max_frame + 1) as f32 / app.playback.fps.max(1) as f32;
             ui.label(
                 RichText::new(format!(
                     "End: frame {content_max_frame} ({content_secs:.2}s)"
@@ -10877,8 +11135,8 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         app.anim_dragged_keyframe = dragged;
 
         // no hard min(content_max_frame) to support setting frames > prior max (e.g. 100+)
-        if curr_frame != app.anim_current_frame {
-            app.anim_current_frame = curr_frame;
+        if curr_frame != app.playback.frame {
+            app.playback.frame = curr_frame;
         }
         if scroll != app.anim_timeline_scroll {
             app.anim_timeline_scroll = scroll;
@@ -11142,15 +11400,15 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                                     ui.add_space(8.0);
                                     let combo = egui::ComboBox::from_id_salt("graph_kf_interp_combo")
                                         .selected_text(match selected_mode {
-                                            crate::app::InterpolationMode::Linear => "Linear",
-                                            crate::app::InterpolationMode::Bezier => "Bezier/Smooth",
+                                            crate::document::InterpolationMode::Linear => "Linear",
+                                            crate::document::InterpolationMode::Bezier => "Bezier/Smooth",
                                         })
                                         .show_ui(ui, |ui| {
-                                            if ui.selectable_value(&mut selected_mode, crate::app::InterpolationMode::Linear, "Linear").clicked() {
-                                                kf.interpolation = crate::app::InterpolationMode::Linear;
+                                            if ui.selectable_value(&mut selected_mode, crate::document::InterpolationMode::Linear, "Linear").clicked() {
+                                                kf.interpolation = crate::document::InterpolationMode::Linear;
                                             }
-                                            if ui.selectable_value(&mut selected_mode, crate::app::InterpolationMode::Bezier, "Bezier/Smooth").clicked() {
-                                                kf.interpolation = crate::app::InterpolationMode::Bezier;
+                                            if ui.selectable_value(&mut selected_mode, crate::document::InterpolationMode::Bezier, "Bezier/Smooth").clicked() {
+                                                kf.interpolation = crate::document::InterpolationMode::Bezier;
                                                 if let Some((next_frame, next_value)) = next_kf_val {
                                                     kf.handle_right = (
                                                         (next_frame - kf.frame) as f64 * 0.5,
@@ -11162,7 +11420,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                                             }
                                         });
                                     if combo.response.changed() {
-                                        app.apply_animation_for_frame(app.anim_current_frame);
+                                        app.apply_animation_for_frame(app.playback.frame);
                                     }
                                     ui.label(RichText::new(format!("Keyframe (Frame {}):", frame)).color(colors::TEXT_MUTED));
                                 }
@@ -11396,7 +11654,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             .chain(stack_fns.iter().map(|sf| sf.end_frame()))
             .max()
             .unwrap_or(0)
-            .max(app.get_max_animation_frame())
+            .max(crate::document::max_animation_frame(&app.project, app.playback.fps))
             .max(100);
 
         // Frame-width control (how many frames the graph plot shows).
@@ -11870,7 +12128,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                 let radius = if is_selected { 6.0 } else { 4.5 };
                 
                 // Draw Bezier handle if interpolation is Bezier and we have a next keyframe
-                if kf.interpolation == crate::app::InterpolationMode::Bezier && _i + 1 < keyframes_len {
+                if kf.interpolation == crate::document::InterpolationMode::Bezier && _i + 1 < keyframes_len {
                     let kf_next = &track.keyframes[_i + 1];
                     let right_pt = to_screen(kf.frame as f64 + kf.handle_right.0, kf.value + kf.handle_right.1);
                     let next_center = to_screen(kf_next.frame as f64, kf_next.value);
@@ -11894,7 +12152,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                     }
                 }
                 
-                if kf.interpolation == crate::app::InterpolationMode::Bezier {
+                if kf.interpolation == crate::document::InterpolationMode::Bezier {
                     let pts = [
                         egui::pos2(center.x, center.y - radius),
                         egui::pos2(center.x + radius, center.y),
@@ -11968,7 +12226,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                         anim_mut.ensure_stack_start_keyframes();
                         anim_mut.ensure_stack_end_keyframes();
                     }
-                    app.apply_animation_for_frame(app.anim_current_frame);
+                    app.apply_animation_for_frame(app.playback.frame);
                 }
             } else {
                 // Drag ended — commit to history
@@ -12003,7 +12261,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                             }
                         }
                     }
-                    app.apply_animation_for_frame(app.anim_current_frame);
+                    app.apply_animation_for_frame(app.playback.frame);
                 }
             } else {
                 // Drag ended — commit to history
@@ -12017,7 +12275,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
         }
         
         // Draw playhead line
-        let play_frac = (app.anim_current_frame as f32 - graph_scroll) / graph_visible;
+        let play_frac = (app.playback.frame as f32 - graph_scroll) / graph_visible;
         if (0.0..=1.0).contains(&play_frac) {
             let playhead_x = rect.left() + play_frac * rect.width();
             painter.line_segment(
@@ -12038,7 +12296,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                         if let Some(sf) = stack_fns.iter().find(|s| s.id == sid) {
                             app.anim_graph_selected_stack = Some(sid);
                             app.anim_graph_stack_drag =
-                                Some(crate::app::AnimGraphStackDrag::ResizeEnd {
+                                Some(crate::document::AnimGraphStackDrag::ResizeEnd {
                                     id: sid,
                                     orig_duration: sf.duration_frames,
                                 });
@@ -12050,7 +12308,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                             let (gf, _) = to_graph(mpos);
                             app.anim_graph_selected_stack = Some(sid);
                             app.anim_graph_stack_drag =
-                                Some(crate::app::AnimGraphStackDrag::Move {
+                                Some(crate::document::AnimGraphStackDrag::Move {
                                     id: sid,
                                     grab_frame: gf,
                                     orig_start: sf.start_frame,
@@ -12115,7 +12373,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                 if let Some(mpos) = ui.input(|i| i.pointer.hover_pos()) {
                     let (gf, _) = to_graph(mpos);
                     match drag {
-                        crate::app::AnimGraphStackDrag::Move {
+                        crate::document::AnimGraphStackDrag::Move {
                             id,
                             grab_frame,
                             orig_start,
@@ -12178,10 +12436,10 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                                 }
                             }
                             if moved {
-                                app.apply_animation_for_frame(app.anim_current_frame);
+                                app.apply_animation_for_frame(app.playback.frame);
                             }
                         }
-                        crate::app::AnimGraphStackDrag::ResizeEnd { id, orig_duration } => {
+                        crate::document::AnimGraphStackDrag::ResizeEnd { id, orig_duration } => {
                             let _ = orig_duration;
                             let end = gf.round().max(0.0) as usize;
                             let mut apply = false;
@@ -12232,7 +12490,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                                 }
                             }
                             if apply {
-                                app.apply_animation_for_frame(app.anim_current_frame);
+                                app.apply_animation_for_frame(app.playback.frame);
                             }
                         }
                     }
@@ -12330,7 +12588,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                                         track.keyframes.iter_mut().find(|k| k.frame == lf)
                                     {
                                         lk.interpolation =
-                                            crate::app::InterpolationMode::Bezier;
+                                            crate::document::InterpolationMode::Bezier;
                                         lk.handle_right = (
                                             (range * 0.33).clamp(1.0, range.max(1.0)),
                                             (right_val - left_val) * 0.33,
@@ -12347,7 +12605,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
                                 },
                             );
                             app.anim_graph_selected_segment = None;
-                            app.apply_animation_for_frame(app.anim_current_frame);
+                            app.apply_animation_for_frame(app.playback.frame);
                         }
                     }
                 }
@@ -12551,7 +12809,7 @@ x,y,r,g,b,a,s = start constants. abs(x) for positive; mod(a,m) or a%m (0..|m|). 
             &mut app.project,
             crate::history::ProjectEdit::PatchTimeline { before, after },
         );
-        app.apply_animation_for_frame(app.anim_current_frame);
+        app.apply_animation_for_frame(app.playback.frame);
     }
 }
 
@@ -12631,7 +12889,7 @@ fn apply_stack_animation_function(
     app.anim_graph_selected_stack = Some(id);
     app.anim_graph_selected_segment = None;
     app.anim_graph_region_select = None;
-    app.apply_animation_for_frame(app.anim_current_frame);
+    app.apply_animation_for_frame(app.playback.frame);
 }
 
 fn delete_stack_animation_function(
@@ -12654,7 +12912,7 @@ fn delete_stack_animation_function(
     if app.anim_graph_selected_stack == Some(stack_id) {
         app.anim_graph_selected_stack = None;
     }
-    app.apply_animation_for_frame(app.anim_current_frame);
+    app.apply_animation_for_frame(app.playback.frame);
 }
 
 fn graph_stack_formula_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
@@ -12759,7 +13017,7 @@ fn graph_stack_formula_dialog(app: &mut VadadeeBerryApp, ctx: &egui::Context) {
             &mut app.project,
             crate::history::ProjectEdit::PatchTimeline { before, after },
         );
-        app.apply_animation_for_frame(app.anim_current_frame);
+        app.apply_animation_for_frame(app.playback.frame);
         close = true;
     }
     if close || !open {
@@ -12784,7 +13042,7 @@ fn animation_node_editor_params(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_id
             .color(colors::ACCENT),
     );
     ui.label(
-        RichText::new(format!("Current Frame: {}", app.anim_current_frame))
+        RichText::new(format!("Current Frame: {}", app.playback.frame))
             .strong(),
     );
     ui.separator();
@@ -12821,7 +13079,7 @@ fn animation_node_editor_params(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_id
             .collect()
     };
 
-    let frame = app.anim_current_frame;
+    let frame = app.playback.frame;
     let before_timeline = app.project.anim_timeline.clone();
     let mut entry = app
         .project
@@ -12908,7 +13166,7 @@ fn animation_node_editor_params(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_id
                 after: after_timeline,
             },
         );
-        app.apply_animation_for_frame(app.anim_current_frame);
+        app.apply_animation_for_frame(app.playback.frame);
     } else if open_graph.is_some() {
         // Ensure timeline slot exists so the graph editor can sample the track.
         app.project.anim_timeline.nodes.insert(layer_id, entry);
@@ -12980,7 +13238,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     };
     ui.label(RichText::new(title).strong().color(colors::ACCENT));
     ui.add_space(4.0);
-    ui.label(RichText::new(format!("Current Frame: {}", app.anim_current_frame)).strong());
+    ui.label(RichText::new(format!("Current Frame: {}", app.playback.frame)).strong());
     ui.separator();
     ui.add_space(4.0);
 
@@ -13030,7 +13288,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
     let before_timeline = app.project.anim_timeline.clone();
     let mut entry = app.project.anim_timeline.nodes.entry(id).or_default().clone();
-    let frame = app.anim_current_frame;
+    let frame = app.playback.frame;
 
     let render_prop_row = |ui: &mut Ui, label: &str, track: &mut KeyframeTrack, default_val: f64, min: f64, max: f64, speed: f64| -> (bool, Option<f64>) {
         let has_kf = track.keyframes.iter().any(|kf| kf.frame == frame);
@@ -13364,7 +13622,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             geom_floats.len()
         };
         while entry.geom_tracks.len() < need_tracks_upto {
-            entry.geom_tracks.push(crate::app::KeyframeTrack::default());
+            entry.geom_tracks.push(crate::document::KeyframeTrack::default());
         }
 
         // Gather human-readable labels and config
@@ -13499,7 +13757,7 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                                 let mut t2 = if i + 1 < entry.geom_tracks.len() {
                                     entry.geom_tracks[i + 1].clone()
                                 } else {
-                                    crate::app::KeyframeTrack::default()
+                                    crate::document::KeyframeTrack::default()
                                 };
                                 let current1 = geom_floats[i];
                                 let current2 = if i + 1 < geom_floats.len() {
@@ -13699,16 +13957,16 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                             let mut interp = kf.interpolation;
                             let _combo = egui::ComboBox::from_id_salt("act_kf_interp_combo")
                                 .selected_text(match interp {
-                                    crate::app::InterpolationMode::Linear => "Linear",
-                                    crate::app::InterpolationMode::Bezier => "Bezier/Smooth",
+                                    crate::document::InterpolationMode::Linear => "Linear",
+                                    crate::document::InterpolationMode::Bezier => "Bezier/Smooth",
                                 })
                                 .show_ui(ui, |ui| {
-                                    if ui.selectable_value(&mut interp, crate::app::InterpolationMode::Linear, "Linear").clicked() {
-                                        kf.interpolation = crate::app::InterpolationMode::Linear;
+                                    if ui.selectable_value(&mut interp, crate::document::InterpolationMode::Linear, "Linear").clicked() {
+                                        kf.interpolation = crate::document::InterpolationMode::Linear;
                                         entry_changed = true;
                                     }
-                                    if ui.selectable_value(&mut interp, crate::app::InterpolationMode::Bezier, "Bezier/Smooth").clicked() {
-                                        kf.interpolation = crate::app::InterpolationMode::Bezier;
+                                    if ui.selectable_value(&mut interp, crate::document::InterpolationMode::Bezier, "Bezier/Smooth").clicked() {
+                                        kf.interpolation = crate::document::InterpolationMode::Bezier;
                                         if let Some((next_frame, next_value)) = next_kf_val {
                                             kf.handle_right = (
                                                 (next_frame - kf.frame) as f64 * 0.5,
@@ -13746,6 +14004,6 @@ fn animation_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             &mut app.project,
             crate::history::ProjectEdit::PatchTimeline { before: before_timeline, after: after_timeline },
         );
-        app.apply_animation_for_frame(app.anim_current_frame);
+        app.apply_animation_for_frame(app.playback.frame);
     }
 }

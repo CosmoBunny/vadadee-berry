@@ -871,22 +871,48 @@ pub fn probe_media_duration_secs(path: &str) -> Option<f32> {
 }
 
 /// Decode a video frame reusing a process-wide stream for the same path (avoids reopen every frame).
+/// Decode with a small per-path stream cache (independent ownership per
+/// media file).
+///
+/// Previously a single global slot: any second video — or the export worker
+/// interleaving with UI preview — evicted the open stream, forcing a full
+/// `avformat_open_input` + `find_stream_info` reopen on nearly every call.
+/// Now each path keeps its own `VideoStream` (capped, FIFO-evicted), so
+/// preview and export holds don't thrash each other. Locking is unchanged:
+/// the map mutex is held across `get_frame`, which serializes internally on
+/// `LIBAV_LOCK` (single STREAM→LIBAV order, no inversion anywhere).
 pub fn decode_frame_cached(
     video_path: &str,
     source_frame: usize,
     fps: f32,
 ) -> Option<(u32, u32, Vec<u8>)> {
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
-    static STREAM: Mutex<Option<(String, VideoStream)>> = Mutex::new(None);
-    let mut guard = STREAM.lock().ok()?;
-    let need_open = guard
-        .as_ref()
-        .map(|(p, _)| p.as_str() != video_path)
-        .unwrap_or(true);
-    if need_open {
-        *guard = VideoStream::open(video_path).map(|s| (video_path.to_string(), s));
+    const MAX_CACHED_STREAMS: usize = 4;
+    struct PathCache {
+        streams: HashMap<String, VideoStream>,
+        order: VecDeque<String>,
     }
-    if let Some((_, stream)) = guard.as_mut() {
+    static STREAMS: Mutex<Option<PathCache>> = Mutex::new(None);
+    let mut guard = STREAMS.lock().ok()?;
+    let cache = guard.get_or_insert_with(|| PathCache {
+        streams: HashMap::new(),
+        order: VecDeque::new(),
+    });
+    if !cache.streams.contains_key(video_path) {
+        while cache.streams.len() >= MAX_CACHED_STREAMS {
+            if let Some(old) = cache.order.pop_front() {
+                cache.streams.remove(&old);
+            } else {
+                break;
+            }
+        }
+        if let Some(stream) = VideoStream::open(video_path) {
+            cache.order.push_back(video_path.to_string());
+            cache.streams.insert(video_path.to_string(), stream);
+        }
+    }
+    if let Some(stream) = cache.streams.get_mut(video_path) {
         if let Some(rgba) = stream.get_frame(source_frame, fps) {
             return Some(rgba);
         }

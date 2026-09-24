@@ -1,0 +1,242 @@
+flowchart TD
+  subgraph icons[icons]
+    icons["icons"]
+  end
+  subgraph theme[theme]
+    theme["theme"]
+  end
+  subgraph selection[selection]
+    selection["selection"]
+  end
+  subgraph canvas[canvas]
+    canvas["canvas"]
+  end
+  subgraph main[main]
+    main["main"]
+  end
+  subgraph fonts[fonts]
+    fonts["fonts"]
+  end
+  subgraph mcp[mcp]
+    mcp__drawing["mcp::drawing"]
+    mcp["mcp"]
+    mcp__node_editor["mcp::node_editor"]
+    mcp__path_parse["mcp::path_parse"]
+  end
+  subgraph cv[cv]
+    cv__jobs["cv::jobs"]
+    cv["cv"]
+    cv__opencv_face["cv::opencv_face"]
+    cv__ops["cv::ops"]
+    cv__track["cv::track"]
+  end
+  subgraph shading[shading]
+    shading__cpu_effects["shading::cpu_effects"]
+    shading__cpu_hex_export["shading::cpu_hex_export"]
+    shading__graph_blur["shading::graph_blur"]
+    shading["shading"]
+    shading__procedural_blackhole["shading::procedural_blackhole"]
+    shading__wgpu_pass["shading::wgpu_pass"]
+  end
+  subgraph animation[animation]
+    animation["animation"]
+  end
+  subgraph state[state]
+    state["state"]
+  end
+  subgraph perf[perf]
+    perf["perf"]
+  end
+  subgraph node_editor_ui[node_editor_ui]
+    node_editor_ui["node_editor_ui"]
+  end
+  subgraph io[io]
+    io["io"]
+  end
+  subgraph layer_cache[layer_cache]
+    layer_cache["layer_cache"]
+  end
+  subgraph audio_extract[audio_extract]
+    audio_extract["audio_extract"]
+  end
+  subgraph app[app]
+    app["app"]
+  end
+  subgraph video_decode[video_decode]
+    video_decode["video_decode"]
+  end
+  subgraph document[document]
+    document__animation["document::animation"]
+    document__av_clip["document::av_clip"]
+    document__expr["document::expr"]
+    document__flowchart["document::flowchart"]
+    document["document"]
+    document__music["document::music"]
+    document__node_graph["document::node_graph"]
+    document__node["document::node"]
+    document__path_effects["document::path_effects"]
+    document__septic["document::septic"]
+    document__shading["document::shading"]
+    document__style["document::style"]
+  end
+  subgraph commands[commands]
+    commands["commands"]
+  end
+  subgraph text_glyph[text_glyph]
+    text_glyph["text_glyph"]
+  end
+  subgraph render[render]
+    render["render"]
+  end
+  subgraph export_audio[export_audio]
+    export_audio["export_audio"]
+  end
+  subgraph ui[ui]
+    ui["ui"]
+  end
+  subgraph recorder[recorder]
+    recorder__async_bridge["recorder::async_bridge"]
+    recorder__async_recorder["recorder::async_recorder"]
+    recorder["recorder"]
+    recorder__sync["recorder::sync"]
+  end
+  subgraph left_dock[left_dock]
+    left_dock["left_dock"]
+  end
+  subgraph sys_stats[sys_stats]
+    sys_stats["sys_stats"]
+  end
+  subgraph collab[collab]
+    collab__desktop["collab::desktop"]
+    collab["collab"]
+    collab__protocol["collab::protocol"]
+    collab__relay["collab::relay"]
+    collab__stub["collab::stub"]
+    collab__sync_project["collab::sync_project"]
+  end
+  subgraph export_worker[export_worker]
+    export_worker["export_worker"]
+  end
+  subgraph history[history]
+    history["history"]
+  end
+  subgraph av_ui[av_ui]
+    av_ui["av_ui"]
+  end
+  subgraph blend[blend]
+    blend["blend"]
+  end
+  subgraph tools[tools]
+    tools["tools"]
+    tools__weight_flow["tools::weight_flow"]
+  end
+  subgraph screen_capture[screen_capture]
+    screen_capture["screen_capture"]
+  end
+  subgraph path_physics[path_physics]
+    path_physics["path_physics"]
+  end
+  subgraph raster[raster]
+    raster["raster"]
+  end
+  subgraph bin[bin]
+    bin__vadadee_mcp_stdio["bin::vadadee_mcp_stdio"]
+  end
+  subgraph export_types[export_types]
+    export_types["export_types"]
+  end
+  subgraph spatial_index[spatial_index]
+    spatial_index["spatial_index"]
+  end
+  subgraph gradient_ui[gradient_ui]
+    gradient_ui["gradient_ui"]
+  end
+  subgraph lib[lib]
+    lib["lib"]
+  end
+  animation --> tools
+  animation --> ui
+  animation --> theme
+  app --> animation
+  app --> canvas
+  app --> fonts
+  app --> commands
+  app --> history
+  app --> io
+  app --> render
+  app --> theme
+  app --> tools
+  app --> audio_extract
+  app --> document
+  app --> ui
+  app --> export_types
+  app --> gradient_ui
+  app --> path_physics
+  app --> mcp
+  app --> mcp__drawing
+  av_ui --> app
+  av_ui --> document
+  av_ui --> icons
+  blend --> document
+  collab__desktop --> collab__protocol
+  collab__stub --> collab__protocol
+  collab__sync_project --> document
+  commands --> document
+  commands --> history
+  document__animation --> document
+  document__path_effects --> document
+  export_audio --> export_types
+  export_audio --> document
+  export_worker --> export_types
+  export_worker --> document
+  export_worker --> io
+  export_worker --> recorder
+  export_worker --> video_decode
+  fonts --> icons
+  gradient_ui --> theme
+  history --> document
+  history --> export_types
+  io --> document
+  layer_cache --> document
+  left_dock --> animation
+  left_dock --> app
+  left_dock --> collab
+  left_dock --> icons
+  left_dock --> theme
+  left_dock --> tools
+  mcp__drawing --> document
+  mcp__node_editor --> document
+  node_editor_ui --> app
+  node_editor_ui --> icons
+  node_editor_ui --> theme
+  path_physics --> tools__weight_flow
+  recorder__sync --> video_decode
+  render --> canvas
+  render --> document
+  render --> theme
+  render --> gradient_ui
+  render --> tools
+  screen_capture --> document__septic
+  screen_capture --> recorder
+  selection --> document
+  shading__cpu_effects --> document
+  shading__cpu_effects --> shading__procedural_blackhole
+  shading__cpu_hex_export --> document
+  shading__wgpu_pass --> document
+  spatial_index --> document
+  text_glyph --> canvas
+  text_glyph --> document
+  text_glyph --> fonts
+  text_glyph --> render
+  theme --> icons
+  tools --> document
+  tools__weight_flow --> document
+  tools__weight_flow --> path_physics
+  ui --> animation
+  ui --> app
+  ui --> audio_extract
+  ui --> document
+  ui --> icons
+  ui --> io
+  ui --> theme
+  ui --> tools

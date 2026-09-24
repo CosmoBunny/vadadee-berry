@@ -348,10 +348,10 @@ mod p7_proxy_history_tests {
 
     #[test]
     fn export_fx_quality_levels() {
-        use crate::app::ExportFxQuality;
-        assert_eq!(ExportFxQuality::Draft.max_side(), 128);
-        assert_eq!(ExportFxQuality::Normal.max_side(), 256);
-        assert_eq!(ExportFxQuality::High.max_side(), 512);
+        use crate::export_types::ExportFxQuality;
+        assert_eq!(ExportFxQuality::Draft.max_side(), 720);
+        assert_eq!(ExportFxQuality::Normal.max_side(), 1080);
+        assert_eq!(ExportFxQuality::High.max_side(), 1440);
         assert!((ExportFxQuality::Draft.blur_step() - 2.0).abs() < 1e-6);
         assert!((ExportFxQuality::Normal.blur_step() - 1.0).abs() < 1e-6);
         assert!((ExportFxQuality::High.blur_step() - 0.5).abs() < 1e-6);

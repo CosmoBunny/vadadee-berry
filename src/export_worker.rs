@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use rustc_hash::FxHashMap;
 
-use crate::app::{ExportFxQuality, ExportPowerLevel, VideoFormat};
+use crate::export_types::{ExportFxQuality, ExportPowerLevel, VideoFormat};
 use crate::document::{Fill, NodeId, ProjectFile};
 use crate::io::{self, VideoFrameMap, VideoLayerBuffer};
 use crate::recorder::{Frame, RecorderConfig, SyncRecorder};
@@ -209,6 +209,10 @@ struct ExportSession<'a> {
     /// Last FX key uploaded for NE layer id (skip re-upload when unchanged).
     ne_tex_fx_key: std::collections::HashMap<uuid::Uuid, String>,
     fonts: crate::fonts::FontRegistry,
+    /// Frame-persistent headless painter: context, font atlas and decoded
+    /// images survive across fallback frames (per-frame rebuilds were pure
+    /// waste — the scene animates, the compilation doesn't).
+    painter: crate::export_render::PainterSession,
     /// P7a: EMA of wall time per frame on the worker (drives UI speed, not UI poll gaps).
     sec_per_frame_ema: f32,
     /// Stage EMAs (milliseconds) — shows up in progress so we can see decode vs raster vs encode.
@@ -278,6 +282,7 @@ impl<'a> ExportSession<'a> {
             image_textures: std::collections::HashMap::new(),
             ne_tex_fx_key: std::collections::HashMap::new(),
             fonts: crate::fonts::FontRegistry::new(),
+            painter: crate::export_render::PainterSession::new(),
             sec_per_frame_ema: 0.0,
             ema_decode_ms: 0.0,
             ema_raster_ms: 0.0,
@@ -335,27 +340,23 @@ impl<'a> ExportSession<'a> {
         !self.needs_full_painter_export()
     }
 
-    /// Fast CPU composite: page + AV frames + NE FilePath (cached bake). No egui/GPU.
+    /// Fast CPU composite: page + static painter segments + AV + NE bake.
+    /// Dimensions/transforms via authoritative [`crate::render_pipeline`]
+    /// contract. Static vector layers use the same `draw_nodes_ex` + effect
+    /// passes as preview (no SVG `<text>` reconstruction); only true
+    /// overlays (AV pixels, shading, NE bakes) composite as pixmaps.
+    /// Frame state arrives as [`crate::render_pipeline::RenderContext`].
     fn rasterize_frame_fast_cpu(
         &mut self,
-        current_frame: usize,
-        time_secs: f32,
+        ctx: &crate::render_pipeline::RenderContext,
     ) -> Option<(u32, u32, Vec<u8>)> {
-        use resvg::tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
+        use resvg::tiny_skia::{Color, Pixmap, PixmapPaint};
 
         let doc_w = self.project.document.width;
         let doc_h = self.project.document.height;
-        let mut pixel_w = (doc_w as f32 * self.scale).round() as u32;
-        let mut pixel_h = (doc_h as f32 * self.scale).round() as u32;
-        if pixel_w % 2 != 0 {
-            pixel_w = pixel_w.saturating_sub(1);
-        }
-        if pixel_h % 2 != 0 {
-            pixel_h = pixel_h.saturating_sub(1);
-        }
-        if pixel_w == 0 || pixel_h == 0 {
-            return None;
-        }
+        let target =
+            crate::render_pipeline::RenderTarget::for_video(doc_w, doc_h, self.scale)?;
+        let (pixel_w, pixel_h) = (target.width, target.height);
 
         let mut pixmap = Pixmap::new(pixel_w, pixel_h)?;
         let pc = self.project.document.page_color;
@@ -369,11 +370,11 @@ impl<'a> ExportSession<'a> {
         pixmap.fill(bg);
 
         let max_side = self.ne_bake_max_side(pixel_w, pixel_h);
-        let scale = self.scale;
-        let scale_x = pixel_w as f32 / doc_w as f32;
-        let scale_y = pixel_h as f32 / doc_h as f32;
-        let svg_scale = Transform::from_scale(scale_x, scale_y);
-        let usvg_opt = crate::fonts::usvg_options();
+
+        // Consecutive static layers flush as ONE painter segment to preserve
+        // stack order against interleaved overlays. Split borrows keep
+        // `project` (immutable) and `fonts` (mutable) disjoint.
+        let mut pending_static: Vec<NodeId> = Vec::new();
 
         // Collect NE jobs that need bake without holding pixmap mut + caches.
         // (bake uses session caches; we do NE after other layers.)
@@ -386,48 +387,51 @@ impl<'a> ExportSession<'a> {
                     if layer.nodes.is_empty() {
                         continue;
                     }
-                    let svg = io::document_svg_single_image_layer(
-                        self.project,
-                        layer,
-                        &std::collections::HashSet::new(),
-                    );
-                    if let Ok(tree) = usvg::Tree::from_str(&svg, &usvg_opt) {
-                        resvg::render(&tree, svg_scale, &mut pixmap.as_mut());
-                    }
+                    pending_static.extend(layer.nodes.iter().copied());
                 }
                 crate::document::LayerKind::AV => {
+                    {
+                        let project = &self.project;
+                        let session = &mut self.painter;
+                        crate::io::flush_static_segment(
+                            &mut pixmap,
+                            project,
+                            &mut pending_static,
+                            &target,
+                            session,
+                        );
+                    }
                     let Some(buf) = self.video_frames.get(&layer.id) else {
                         continue;
                     };
-                    let Some(mut src) = Pixmap::new(buf.width, buf.height) else {
+                    // Shared AV overlay (same geometry/opacity as io fallback).
+                    let project = &self.project;
+                    if crate::io::blit_av_layer(
+                        &mut pixmap,
+                        &target,
+                        project,
+                        layer,
+                        buf,
+                        ctx,
+                    )
+                    .is_none()
+                    {
                         continue;
-                    };
-                    src.data_mut().copy_from_slice(&buf.rgba);
-                    let (dx, dy, rot, opacity) =
-                        io::layer_anim_transform(layer, self.project, current_frame);
-                    let (dw, dh) =
-                        io::video_layer_dest_size(layer, buf.width, buf.height);
-                    let x = (dx as f32) * scale;
-                    let y = (dy as f32) * scale;
-                    let w = dw * scale;
-                    let h = dh * scale;
-                    let sx = w / buf.width as f32;
-                    let sy = h / buf.height as f32;
-                    let transform = if rot != 0.0 {
-                        Transform::from_translate(x, y).pre_concat(
-                            Transform::from_translate(w / 2.0, h / 2.0)
-                                .pre_rotate(rot as f32)
-                                .pre_translate(-w / 2.0, -h / 2.0)
-                                .pre_scale(sx, sy),
-                        )
-                    } else {
-                        Transform::from_translate(x, y).pre_scale(sx, sy)
-                    };
-                    let mut paint = PixmapPaint::default();
-                    paint.opacity = opacity;
-                    pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
+                    }
                 }
                 crate::document::LayerKind::Shading => {
+                    // Flush static painter segment before the shading overlay.
+                    {
+                        let project = &self.project;
+                        let session = &mut self.painter;
+                        crate::io::flush_static_segment(
+                            &mut pixmap,
+                            project,
+                            &mut pending_static,
+                            &target,
+                            session,
+                        );
+                    }
                     // Prefer **real WGSL** via GPU offscreen (same module as live canvas paint
                     // callback) — not the painter's full scene buffer, but the same shader.
                     // CPU hex is only a last-resort fallback (looks "fake").
@@ -451,7 +455,7 @@ impl<'a> ExportSession<'a> {
                         crate::io::apply_shading_passes_skia_public(
                             &mut pixmap,
                             &layer.shading_passes,
-                            time_secs,
+                            ctx.time_secs,
                         );
                         continue;
                     }
@@ -461,7 +465,7 @@ impl<'a> ExportSession<'a> {
                             pass,
                             pixel_w,
                             pixel_h,
-                            time_secs,
+                            ctx.time_secs,
                         ) {
                             Ok(src) if src.len() == pixmap.data().len() => {
                                 pixmap.data_mut().copy_from_slice(&src);
@@ -485,16 +489,39 @@ impl<'a> ExportSession<'a> {
                     let _ = crate::shading::cpu_hex_export::try_fill_pixmap_hex(
                         &mut pixmap,
                         pass,
-                        time_secs,
+                        ctx.time_secs,
                     );
                 }
-                crate::document::LayerKind::NodeEditor => {}
-                crate::document::LayerKind::ScreenRecord => {}
+                crate::document::LayerKind::NodeEditor
+                | crate::document::LayerKind::ScreenRecord => {
+                    // Overlays handled after the main loop; flush statics first.
+                    let project = &self.project;
+                    let session = &mut self.painter;
+                    crate::io::flush_static_segment(
+                        &mut pixmap,
+                        project,
+                        &mut pending_static,
+                        &target,
+                        session,
+                    );
+                }
                 _ => {}
             }
         }
+        {
+            let project = &self.project;
+            let session = &mut self.painter;
+            crate::io::flush_static_segment(
+                &mut pixmap,
+                project,
+                &mut pending_static,
+                &target,
+                session,
+            );
+        }
 
-        // P7c: NE AppObjects — vector SVG of source ids, composited onto the page.
+        // P7c: NE AppObjects — same painter as preview, blitted in stack order
+        // (was: document_svg_nodes_only → resvg round-trip).
         for layer in &self.project.document.layers {
             if !layer.visible
                 || !layer.is_renderer
@@ -512,11 +539,18 @@ impl<'a> ExportSession<'a> {
             if ids.is_empty() {
                 continue;
             }
-            let svg = io::document_svg_nodes_only(self.project, ids);
-            if let Ok(tree) = usvg::Tree::from_str(&svg, &usvg_opt) {
-                resvg::render(&tree, svg_scale, &mut pixmap.as_mut());
+            let project = &self.project;
+            let session = &mut self.painter;
+            // Un-hides sources for the NE-slot paint (mirrors canvas).
+            if let Some(rgba) = session.render_ne_appobjects(project, ids, &target) {
+                crate::io::blit_transparent_full_frame(
+                    &mut pixmap,
+                    pixel_w,
+                    pixel_h,
+                    &rgba,
+                );
             }
-            let _ = time_secs;
+            let _ = ctx.time_secs;
         }
 
         // NE FilePath / CV bake: session caches + sticky last-key reuse.
@@ -581,10 +615,9 @@ impl<'a> ExportSession<'a> {
                 .iter()
                 .find(|l| l.id == layer_id)?;
             let (tw, th) = rgba.dimensions();
-            let Some(mut src) = Pixmap::new(tw, th) else {
+            let Some(src) = crate::io::straight_rgba_to_pixmap(tw, th, rgba.as_raw()) else {
                 continue;
             };
-            src.data_mut().copy_from_slice(rgba.as_raw());
             let (dx, dy, mut w, mut h, rot_rad) =
                 layer.ne_output_paint_geom(&self.project.nodes, &eval);
             let def_w = layer.width as f64;
@@ -605,26 +638,13 @@ impl<'a> ExportSession<'a> {
                 w = nw.max(1.0);
                 h = nh.max(1.0);
             }
-            let x = (dx as f32) * scale;
-            let y = (dy as f32) * scale;
-            let dw = (w as f32) * scale;
-            let dh = (h as f32) * scale;
-            let sx = dw / tw as f32;
-            let sy = dh / th as f32;
             let rot_deg = rot_rad.to_degrees() as f32;
-            let transform = if rot_deg.abs() > 1e-4 {
-                Transform::from_translate(x, y).pre_concat(
-                    Transform::from_translate(dw / 2.0, dh / 2.0)
-                        .pre_rotate(rot_deg)
-                        .pre_translate(-dw / 2.0, -dh / 2.0)
-                        .pre_scale(sx, sy),
-                )
-            } else {
-                Transform::from_translate(x, y).pre_scale(sx, sy)
-            };
+            let transform = crate::render_pipeline::pixmap_transform(
+                &target, dx, dy, w, h, rot_deg, tw, th,
+            );
             let paint = PixmapPaint::default();
             pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
-            let _ = time_secs;
+            let _ = ctx.time_secs;
         }
 
         Some((pixel_w, pixel_h, pixmap.take()))
@@ -952,25 +972,27 @@ impl<'a> ExportSession<'a> {
             let dec_ms = t_dec0.elapsed().as_secs_f32() * 1000.0;
             Self::bump_ema(&mut self.ema_decode_ms, dec_ms);
 
+            // One size promise + frame state per frame, shared by every
+            // raster path below (GPU, CPU fallback, io fallback).
+            let doc_w = self.project.document.width;
+            let doc_h = self.project.document.height;
+            let Some(target) = crate::render_pipeline::RenderTarget::for_video(
+                doc_w,
+                doc_h,
+                self.scale,
+            ) else {
+                return Err("Zero width or height for export".to_string());
+            };
+            let ctx =
+                crate::render_pipeline::RenderContext::new(anim_frame, timeline_sec);
+
             // Prefer CPU path — GPU/egui was 8–15s/frame for NE FilePath.
             let t_rast0 = Instant::now();
             let (w, h, rgba) = if use_cpu {
-                self.rasterize_frame_fast_cpu(anim_frame, timeline_sec)
+                self.rasterize_frame_fast_cpu(&ctx)
                     .ok_or_else(|| "Frame rasterize failed".to_string())?
             } else if let Some(render_state) = self.wgpu_render.clone() {
-                let doc_w = self.project.document.width;
-                let doc_h = self.project.document.height;
-                let mut pixel_w = (doc_w as f32 * self.scale).round() as u32;
-                let mut pixel_h = (doc_h as f32 * self.scale).round() as u32;
-                if pixel_w % 2 != 0 {
-                    pixel_w = pixel_w.saturating_sub(1);
-                }
-                if pixel_h % 2 != 0 {
-                    pixel_h = pixel_h.saturating_sub(1);
-                }
-                if pixel_w == 0 || pixel_h == 0 {
-                    return Err("Zero width or height for export".to_string());
-                }
+                let (pixel_w, pixel_h) = (target.width, target.height);
 
                 if let Some(buf) = self.rasterize_frame_offscreen_gpu(
                     &render_state,
@@ -981,24 +1003,14 @@ impl<'a> ExportSession<'a> {
                 ) {
                     (pixel_w, pixel_h, buf)
                 } else {
-                    io::composite_export_frame(
-                        self.project,
-                        anim_frame,
-                        &self.video_frames,
-                        self.scale,
-                        timeline_sec,
-                    )
-                    .ok_or_else(|| "Frame rasterize failed".to_string())?
+                    let project = &*self.project;
+                    io::composite_export_frame(project, &ctx, &self.video_frames, &target)
+                        .ok_or_else(|| "Frame rasterize failed".to_string())?
                 }
             } else {
-                io::composite_export_frame(
-                    self.project,
-                    anim_frame,
-                    &self.video_frames,
-                    self.scale,
-                    timeline_sec,
-                )
-                .ok_or_else(|| "Frame rasterize failed".to_string())?
+                let project = &*self.project;
+                io::composite_export_frame(project, &ctx, &self.video_frames, &target)
+                    .ok_or_else(|| "Frame rasterize failed".to_string())?
             };
             let rast_ms = t_rast0.elapsed().as_secs_f32() * 1000.0;
             Self::bump_ema(&mut self.ema_raster_ms, rast_ms);
@@ -1745,22 +1757,11 @@ impl<'a> ExportSession<'a> {
             let _ = self.ensure_ne_fx_texture(*lid, eval, max_side);
         }
 
-        // P6c: hide AppObject sources that feed NE Output (match canvas).
-        let mut hidden_sources = std::collections::HashSet::new();
-        for layer in &self.project.document.layers {
-            if !layer.visible || layer.kind != crate::document::LayerKind::NodeEditor {
-                continue;
-            }
-            if let Some(g) = &layer.node_graph {
-                if let crate::document::GraphImageSource::AppObjects(ids) =
-                    g.resolve_output_image().image
-                {
-                    for id in ids {
-                        hidden_sources.insert(id);
-                    }
-                }
-            }
-        }
+        // Canvas parity: the full hidden set (effect sources, group
+        // children, NE AppObjects originals) — NOT just AppObjects. A narrow
+        // set double-paints clipped/grouped/tiled sources in base + effects.
+        let hidden_sources =
+            crate::render_pipeline::hidden_effect_sources(self.project);
 
         let origin = egui::Pos2::ZERO;
         let viewport = crate::canvas::Viewport {
@@ -1776,7 +1777,9 @@ impl<'a> ExportSession<'a> {
         };
 
         let draw_order = self.project.document.ordered_node_ids();
-        let loft_paths = std::collections::HashSet::new();
+        // Global loft set, exactly like canvas_ui (empty here would fill
+        // loft forms in video but not preview).
+        let loft_paths = crate::render_pipeline::loft_form_paths(&self.project.document);
         let image_textures = self.image_textures.clone();
         let fonts = &self.fonts;
 
@@ -1808,7 +1811,7 @@ impl<'a> ExportSession<'a> {
                             .copied()
                             .filter(|id| layer_set.contains(id))
                             .collect();
-                        crate::render::draw_nodes(
+                        crate::render::draw_nodes_ex(
                             &painter,
                             &self.project.nodes,
                             &layer_draw_order,
@@ -1821,6 +1824,7 @@ impl<'a> ExportSession<'a> {
                             &loft_paths,
                             &fonts,
                             &image_textures,
+                            self.project.document.page_color_egui(),
                         );
                     }
                     crate::document::LayerKind::AV => {
@@ -1828,38 +1832,24 @@ impl<'a> ExportSession<'a> {
                         if !layer.shows_video_at(time_secs) {
                             // skip — no freeze-frame outside clip
                         } else if let Some(tex) = image_textures.get(&layer.id) {
-                            let mut dx = layer.x as f64;
-                            let mut dy = layer.y as f64;
-                            let mut rot = layer.rotation as f64;
-                            let mut opacity = 1.0f32;
-                            if let Some(track) = self.project.anim_timeline.nodes.get(&layer.id) {
-                                if let Some(o) = track.opacity.interpolate(current_frame) {
-                                    opacity = o as f32;
-                                }
-                                if let Some(x) = track.pos_x.interpolate(current_frame) {
-                                    dx = x;
-                                }
-                                if let Some(y) = track.pos_y.interpolate(current_frame) {
-                                    dy = y;
-                                }
-                                if let Some(r) = track.rotation.interpolate(current_frame) {
-                                    rot = r;
-                                }
-                            }
-                            let tex_w = tex.size()[0] as f32;
-                            let tex_h = tex.size()[1] as f32;
-                            let aspect = if tex_h > 0.0 { tex_w / tex_h } else { 1.0 };
-                            let mut w = layer.width;
-                            let mut h = layer.height;
-                            if layer.aspect_ratio_locked {
-                                if w / h > aspect {
-                                    w = h * aspect;
-                                } else {
-                                    h = w / aspect;
-                                }
-                            }
+                            // Shared geometry helpers (same numbers as the
+                            // CPU fallback path, not a second computation).
+                            let (dx, dy, rot, opacity) = io::layer_anim_transform(
+                                layer,
+                                self.project,
+                                current_frame,
+                            );
+                            let tex_size = tex.size();
+                            let (w, h) = io::video_layer_dest_size(
+                                layer,
+                                tex_size[0] as u32,
+                                tex_size[1] as u32,
+                            );
                             let tl = viewport.doc_to_screen((dx, dy), origin);
-                            let br = viewport.doc_to_screen((dx + w as f64, dy + h as f64), origin);
+                            let br = viewport.doc_to_screen(
+                                (dx + w as f64, dy + h as f64),
+                                origin,
+                            );
                             let rect = egui::Rect::from_min_max(tl, br);
                             let rot_rad = (rot as f32).to_radians();
                             paint_rotated_image(&painter, tex.id(), rect, rot_rad, opacity);
@@ -1905,7 +1895,7 @@ impl<'a> ExportSession<'a> {
                                             for id in &order {
                                                 hide.remove(id);
                                             }
-                                            crate::render::draw_nodes(
+                                            crate::render::draw_nodes_ex(
                                                 &painter,
                                                 &self.project.nodes,
                                                 &order,
@@ -1918,6 +1908,7 @@ impl<'a> ExportSession<'a> {
                                                 &loft_paths,
                                                 &fonts,
                                                 &image_textures,
+                                                self.project.document.page_color_egui(),
                                             );
                                         }
                                     }
@@ -2305,5 +2296,89 @@ mod duration_plan_tests {
         let time_right = frame as f64 / anim_fps as f64;
         assert!((time_wrong - 2.0).abs() < 1e-6, "bug: hardcode 30 → 2s");
         assert!((time_right - 1.0).abs() < 1e-6, "fix: same fps → 1s");
+    }
+}
+
+#[cfg(test)]
+mod fallback_parity_tests {
+    use super::*;
+    use crate::document::{Document, Node, Paint, TextStyle};
+
+    fn static_config() -> ExportJobConfig {
+        ExportJobConfig {
+            output_path: std::path::PathBuf::from("/tmp/vadadee-parity.mp4"),
+            work_dir: std::path::PathBuf::from("/tmp"),
+            fps: 30,
+            resolution_pct: 100,
+            bitrate_kbps: 8000,
+            format: VideoFormat::Mp4,
+            power: ExportPowerLevel::PowerSaving,
+            fx_quality: ExportFxQuality::Normal,
+            total_frames: 1,
+            anim_fps: 30,
+            max_anim_frame: 0,
+            cycle_frame_count: 1,
+            export_cycles: 1,
+        }
+    }
+
+    /// The two CPU fallback compositors share helpers but are still two code
+    /// paths: worker fast-CPU must agree with the io fallback frame on a
+    /// static document (rect + text, no overlays), or they have drifted.
+    #[test]
+    fn fast_cpu_matches_io_fallback_on_static_doc() {
+        let mut project = Document::new_empty_project();
+        let rect = Node::rect(
+            60.0,
+            60.0,
+            200.0,
+            120.0,
+            Fill::Solid(Paint::from_hex(0xc0392b, 1.0)),
+        );
+        let rid = rect.id;
+        project.nodes.insert(rect);
+        let mut text = Node::text(
+            80.0,
+            220.0,
+            TextStyle {
+                content: "Parity".into(),
+                font_size: 36.0,
+                ..Default::default()
+            },
+        );
+        text.style.fill = Fill::Solid(Paint::from_hex(0x000000, 1.0));
+        let tid = text.id;
+        project.nodes.insert(text);
+        project.document.append_to_active_layer(rid);
+        project.document.append_to_active_layer(tid);
+
+        let config = static_config();
+        let cancel = AtomicBool::new(false);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut session = ExportSession::new(
+            &mut project,
+            &config,
+            &cancel,
+            &tx,
+            None,
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let ctx = crate::render_pipeline::RenderContext::new(0, 0.0);
+        let (w1, h1, r1) = session
+            .rasterize_frame_fast_cpu(&ctx)
+            .expect("worker frame");
+        let target = crate::render_pipeline::RenderTarget::for_video(
+            session.project.document.width,
+            session.project.document.height,
+            session.scale,
+        )
+        .expect("target");
+        assert_eq!((w1, h1), (target.width, target.height));
+        let proj: &ProjectFile = session.project;
+        let (w2, h2, r2) =
+            crate::io::composite_export_frame(proj, &ctx, &session.video_frames, &target)
+                .expect("io frame");
+        assert_eq!((w1, h1), (w2, h2));
+        assert_eq!(r1, r2, "worker and io fallback frames must agree");
     }
 }

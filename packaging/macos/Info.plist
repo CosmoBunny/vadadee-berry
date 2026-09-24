@@ -14,10 +14,10 @@
     <string>com.vadadee.berry</string>
 
     <key>CFBundleVersion</key>
-    <string>0.1.0</string>
+    <string>0.0.2</string>
 
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.0.2</string>
 
     <!-- Type / role -->
     <key>CFBundlePackageType</key>

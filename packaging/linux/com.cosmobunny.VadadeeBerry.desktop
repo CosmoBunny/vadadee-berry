@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Vadadee Berry
+GenericName=Vector and video editor
+Comment=Vector, video and design editor
+Exec=vadadee-berry %F
+Icon=com.cosmobunny.VadadeeBerry
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+MimeType=application/x-vadadee-project;
+StartupWMClass=vadadee-berry
+StartupNotify=true
+Keywords=vector;video;design;editor;raster;animation;

@@ -1,11 +1,13 @@
 #![warn(clippy::all, rust_2018_idioms)]
 
+pub mod action_tab;
 pub mod av_ui;
 pub mod node_editor_ui;
 pub mod animation;
 pub mod blend;
 pub mod app;
 pub mod canvas;
+pub mod commands;
 pub mod document;
 pub mod fonts;
 pub mod gradient_ui;
@@ -13,6 +15,8 @@ pub mod history;
 pub mod icons;
 pub mod io;
 pub mod layer_cache;
+pub mod selection;
+pub mod state;
 pub mod perf;
 pub mod shading;
 pub mod spatial_index;
@@ -23,11 +27,15 @@ pub mod theme;
 pub mod tools;
 pub mod raster;
 pub mod path_physics;
+pub mod platform;
 pub mod ui;
 pub mod video_decode;
 pub mod cv;
 pub mod export_worker;
 pub mod export_audio;
+pub mod export_render;
+pub mod render_pipeline;
+pub mod export_types;
 pub mod recorder;
 pub mod audio_extract;
 #[cfg(not(target_os = "android"))]

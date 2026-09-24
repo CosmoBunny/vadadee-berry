@@ -235,6 +235,13 @@ impl BooleanOpKind {
     }
 }
 
+/// How two selected nodes relate for Path Magic boolean / clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BooleanPairMode {
+    VectorBoolean { a: NodeId, b: NodeId },
+    ImageClip { source: NodeId, mask: NodeId },
+}
+
 /// Live boolean path effect: result is a path node; operands can be hidden until bake.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BooleanEffect {

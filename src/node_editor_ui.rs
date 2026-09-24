@@ -3,9 +3,9 @@
 use egui::{Color32, Context, Pos2, Rect, RichText, Sense, Ui, Vec2};
 use uuid::Uuid;
 
-use crate::app::VadadeeBerryApp;
 use crate::document::{
-    GraphNodeKind, GraphParam, GraphParamKind, LayerKind, NodeGraph, PortDir, PortType,
+    GraphNodeKind, GraphParam, GraphParamKind, LayerKind, NodeGraph, NodeId, PortDir, PortType,
+    ProjectFile,
 };
 use crate::icons::{self, nerd_font_id};
 use crate::theme::colors;
@@ -145,32 +145,167 @@ impl NodeEditorUiState {
     }
 }
 
-pub fn show_node_editor_dialog(app: &mut VadadeeBerryApp, ctx: &Context) {
-    let Some(layer_id) = app.node_editor_ui.open_layer_id else {
+/// GPU texture cache for node-editor graph previews (media stills, video
+/// frames, CV bakes). Moved out of the application struct — the only
+/// consumers are the node-editor preview paths, so the editor owns it now.
+#[derive(Default)]
+pub struct GraphPreviewTextures {
+    pub(crate) map: std::collections::HashMap<String, egui::TextureHandle>,
+}
+
+impl GraphPreviewTextures {
+    /// Upload a CV bake-cache RGBA for node previews.
+    pub fn ensure_bake_texture(
+        &mut self,
+        key: &str,
+        ctx: &Context,
+    ) -> Option<egui::TextureId> {
+        if let Some(t) = self.map.get(key) {
+            return Some(t.id());
+        }
+        let rgba = crate::cv::global_cv_cache().get_rgba_image(key)?;
+        let (w, h) = rgba.dimensions();
+        let pixels = rgba.into_raw();
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+        let handle = ctx.load_texture(
+            format!("vadadee-berry-graph-bake-{}", key.chars().take(48).collect::<String>()),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        let id = handle.id();
+        self.map.insert(key.to_string(), handle);
+        Some(id)
+    }
+
+    /// Load (or fetch) a media path texture for a video time. Skips UI video
+    /// decode while an audio extract holds the lock when `audio_extract_busy`.
+    pub fn ensure_path_texture_at(
+        &mut self,
+        path: &str,
+        video_time_sec: Option<f64>,
+        fps: f32,
+        audio_extract_busy: bool,
+        ctx: &Context,
+    ) -> Option<egui::TextureHandle> {
+        let key = match video_time_sec {
+            Some(t) => format!("{path}|t{t:.3}"),
+            None => path.to_string(),
+        };
+        if let Some(t) = self.map.get(&key) {
+            return Some(t.clone());
+        }
+        let last_key = format!("{path}|last");
+        // While WAV extract holds LIBAV_LOCK, skip UI video decode for this path —
+        // competing for the lock freezes the app until extract finishes (~frame 200+).
+        if audio_extract_busy {
+            if let Some(t) = self.map.get(&last_key) {
+                return Some(t.clone());
+            }
+            // One cheap frame-0 still so the canvas isn't empty before extract.
+            if video_time_sec.is_some() {
+                if let Some(t) = self.map.get(path) {
+                    return Some(t.clone());
+                }
+            }
+        }
+        let rgba = match crate::document::load_graph_media_rgba(path, video_time_sec, fps) {
+            Some(img) => img,
+            None => {
+                // Decode miss (libav busy / seek fail): keep last good frame — no white flash.
+                if let Some(t) = self.map.get(&last_key) {
+                    return Some(t.clone());
+                }
+                return None;
+            }
+        };
+        let (w, h) = rgba.dimensions();
+        let pixels = rgba.into_raw();
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+        let handle = ctx.load_texture(
+            format!("vadadee-berry-graph-path-{}", key),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.map.insert(key, handle.clone());
+        self.map
+            .insert(last_key, handle.clone());
+        // Cap timed-frame cache; never drop `|last` slots (prevents white flashes).
+        if self.map.len() > 64 {
+            let drop: Vec<String> = self
+                .map
+                .keys()
+                .filter(|k| k.contains("|t") && !k.ends_with("|last"))
+                .take(16)
+                .cloned()
+                .collect();
+            for k in drop {
+                self.map.remove(&k);
+            }
+        }
+        Some(handle)
+    }
+
+    pub fn texture_id(&self, key: &str) -> Option<egui::TextureId> {
+        self.map.get(key).map(|t| t.id())
+    }
+
+    /// Texture pixel size for node-editor previews (aspect-fit).
+    pub fn texture_size(&self, key: &str) -> Option<[usize; 2]> {
+        self.map.get(key).map(|t| t.size())
+    }
+}
+
+/// Narrow view-model for the node editor: the only app state the editor may
+/// touch. Keeps node_editor_ui independent of the application struct.
+pub struct NodeEditorView<'a> {
+    pub state: &'a mut NodeEditorUiState,
+    pub project: &'a mut ProjectFile,
+    pub selection: &'a mut Vec<NodeId>,
+    pub status: &'a mut String,
+    pub frame: usize,
+    pub fps: u32,
+    pub textures: &'a mut GraphPreviewTextures,
+    pub image_textures: &'a std::collections::HashMap<NodeId, egui::TextureHandle>,
+    /// Per-path WAV-extract lock probe (skips UI video decode while busy).
+    pub audio_extract_busy: &'a dyn Fn(&str) -> bool,
+}
+
+/// Deferred effects the caller (app) applies after the panel runs — things
+/// the editor must not do itself (animation evaluation, tab switches).
+#[derive(Default)]
+pub struct NodeEditorOutcome {
+    pub apply_animation_frame: Option<usize>,
+    pub switch_to_animation_tab: bool,
+}
+
+pub fn show_node_editor_dialog(view: &mut NodeEditorView<'_>, ctx: &Context) {
+    let Some(layer_id) = view.state.open_layer_id else {
         return;
     };
-    let layer_idx = app
+    let layer_idx = view
         .project
         .document
         .layers
         .iter()
         .position(|l| l.id == layer_id);
     let Some(layer_idx) = layer_idx else {
-        app.node_editor_ui.close();
+        view.state.close();
         return;
     };
-    if app.project.document.layers[layer_idx].kind != LayerKind::NodeEditor {
-        app.node_editor_ui.close();
+    if view.project.document.layers[layer_idx].kind != LayerKind::NodeEditor {
+        view.state.close();
         return;
     }
-    app.project.document.layers[layer_idx].ensure_node_graph();
+    view.project.document.layers[layer_idx].ensure_node_graph();
 
     // Mode shortcuts / Esc → Idle. Never closes the window on Esc.
-    node_editor_mode_keys(app, ctx);
+    node_editor_mode_keys(view, ctx);
 
     let mut open = true;
     let title = {
-        let name = &app.project.document.layers[layer_idx].name;
+        let name = &view.project.document.layers[layer_idx].name;
         format!("{} Node Editor — {}", icons::NODE_EDITOR, name)
     };
 
@@ -178,7 +313,7 @@ pub fn show_node_editor_dialog(app: &mut VadadeeBerryApp, ctx: &Context) {
     // canvas is painter-only + hard clip; no ui.interact off the canvas rect.
     let max_h = ctx.content_rect().height() * 0.92;
     let max_w = ctx.content_rect().width() * 0.96;
-    let mut win_size = app.node_editor_ui.window_size;
+    let mut win_size = view.state.window_size;
     win_size.x = win_size.x.clamp(480.0, max_w);
     win_size.y = win_size.y.clamp(280.0, max_h);
 
@@ -217,7 +352,7 @@ pub fn show_node_editor_dialog(app: &mut VadadeeBerryApp, ctx: &Context) {
                         0.0,
                         Color32::from_rgb(40, 44, 58),
                     );
-                    node_editor_toolbar(app, ui, layer_idx);
+                    node_editor_toolbar(view, ui, layer_idx);
                 },
             );
 
@@ -234,7 +369,7 @@ pub fn show_node_editor_dialog(app: &mut VadadeeBerryApp, ctx: &Context) {
                     |ui| {
                         ui.set_clip_rect(canvas_rect);
                         ui.set_max_size(canvas_rect.size());
-                        node_editor_canvas(app, ui, layer_idx);
+                        node_editor_canvas(view, ui, layer_idx);
                     },
                 );
             }
@@ -247,7 +382,7 @@ pub fn show_node_editor_dialog(app: &mut VadadeeBerryApp, ctx: &Context) {
         let new_size = r.size();
         // Accept size changes only when they stay within bounds (user resize grip).
         // If something tried to blow past max, snap back next frame via default_size.
-        app.node_editor_ui.window_size = Vec2::new(
+        view.state.window_size = Vec2::new(
             new_size.x.clamp(480.0, max_w),
             new_size.y.clamp(280.0, max_h),
         );
@@ -255,31 +390,31 @@ pub fn show_node_editor_dialog(app: &mut VadadeeBerryApp, ctx: &Context) {
 
     // Only the window [x] / hide control closes the editor — not Esc.
     if !open {
-        app.node_editor_ui.close();
+        view.state.close();
     }
 
-    show_object_from_app_picker(app, ctx, layer_idx);
+    show_object_from_app_picker(view, ctx, layer_idx);
 }
 
 /// ObjectFromApp “Sel” dialog: multi-select document objects.
-fn show_object_from_app_picker(app: &mut VadadeeBerryApp, ctx: &Context, layer_idx: usize) {
-    let Some(graph_node_id) = app.node_editor_ui.object_picker_for else {
+fn show_object_from_app_picker(view: &mut NodeEditorView<'_>, ctx: &Context, layer_idx: usize) {
+    let Some(graph_node_id) = view.state.object_picker_for else {
         return;
     };
     let mut open = true;
     let mut apply = false;
     let mut cancel = false;
-    let mut draft = app.node_editor_ui.object_picker_ids.clone();
+    let mut draft = view.state.object_picker_ids.clone();
 
     // Collect candidate objects (skip NE output proxies / empty groups optional).
     let mut items: Vec<(Uuid, String, &'static str)> = Vec::new();
-    for layer in &app.project.document.layers {
+    for layer in &view.project.document.layers {
         if layer.kind != LayerKind::Image && layer.kind != LayerKind::AV {
             // Still list nodes from Image layers primarily; also any node in store
             // referenced by any layer.nodes.
         }
         for &nid in &layer.nodes {
-            if let Some(n) = app.project.nodes.get(nid) {
+            if let Some(n) = view.project.nodes.get(nid) {
                 let kind = match &n.kind {
                     crate::document::NodeKind::Group { .. } => "Group",
                     crate::document::NodeKind::Image { .. } => "Image",
@@ -321,7 +456,7 @@ fn show_object_from_app_picker(app: &mut VadadeeBerryApp, ctx: &Context, layer_i
             );
             ui.horizontal(|ui| {
                 if ui.button("Use canvas selection").clicked() {
-                    draft = app.selection.clone();
+                    draft = view.selection.clone();
                 }
                 if ui.button("Clear").clicked() {
                     draft.clear();
@@ -360,26 +495,26 @@ fn show_object_from_app_picker(app: &mut VadadeeBerryApp, ctx: &Context, layer_i
             });
         });
 
-    app.node_editor_ui.object_picker_ids = draft.clone();
+    view.state.object_picker_ids = draft.clone();
     if apply {
-        if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+        if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
             if let Some(node) = g.nodes.get_mut(&graph_node_id) {
                 if let GraphNodeKind::ObjectFromApp { node_ids } = &mut node.kind {
                     *node_ids = draft;
                 }
             }
         }
-        app.node_editor_ui.object_picker_for = None;
-        app.node_editor_ui.object_picker_ids.clear();
+        view.state.object_picker_for = None;
+        view.state.object_picker_ids.clear();
     } else if cancel || !open {
-        app.node_editor_ui.object_picker_for = None;
-        app.node_editor_ui.object_picker_ids.clear();
+        view.state.object_picker_for = None;
+        view.state.object_picker_ids.clear();
     }
 }
 
 /// Esc → Idle (never close). A → Add, E → Edit, V → View.
 /// While typing in Value/Expr, only Esc unfocuses; letter keys go to the text field.
-fn node_editor_mode_keys(app: &mut VadadeeBerryApp, ctx: &Context) {
+fn node_editor_mode_keys(view: &mut NodeEditorView<'_>, ctx: &Context) {
     let text_focused = ctx.wants_keyboard_input();
     if text_focused {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -400,42 +535,42 @@ fn node_editor_mode_keys(app: &mut VadadeeBerryApp, ctx: &Context) {
     });
 
     if esc {
-        app.node_editor_ui.tool = NodeEditorToolMode::Idle;
-        app.node_editor_ui.node_drag = None;
-        app.node_editor_ui.wire_drag = None;
-        app.node_editor_ui.add_menu_at = None;
-        app.node_editor_ui.wire_cursor = None;
+        view.state.tool = NodeEditorToolMode::Idle;
+        view.state.node_drag = None;
+        view.state.wire_drag = None;
+        view.state.add_menu_at = None;
+        view.state.wire_cursor = None;
         return;
     }
     if a {
-        app.node_editor_ui.tool = NodeEditorToolMode::Add;
-        app.node_editor_ui.node_drag = None;
-        app.node_editor_ui.wire_drag = None;
+        view.state.tool = NodeEditorToolMode::Add;
+        view.state.node_drag = None;
+        view.state.wire_drag = None;
         return;
     }
     if e {
-        app.node_editor_ui.tool = if app.node_editor_ui.tool == NodeEditorToolMode::Edit {
+        view.state.tool = if view.state.tool == NodeEditorToolMode::Edit {
             NodeEditorToolMode::Idle
         } else {
             NodeEditorToolMode::Edit
         };
-        if app.node_editor_ui.tool != NodeEditorToolMode::Edit {
-            app.node_editor_ui.node_drag = None;
-            app.node_editor_ui.wire_drag = None;
+        if view.state.tool != NodeEditorToolMode::Edit {
+            view.state.node_drag = None;
+            view.state.wire_drag = None;
         }
         return;
     }
     if v {
-        app.node_editor_ui.tool = NodeEditorToolMode::View;
-        app.node_editor_ui.node_drag = None;
-        app.node_editor_ui.wire_drag = None;
+        view.state.tool = NodeEditorToolMode::View;
+        view.state.node_drag = None;
+        view.state.wire_drag = None;
     }
 }
 
-fn node_editor_toolbar(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
+fn node_editor_toolbar(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usize) {
     let mut add_btn_rect = Rect::NOTHING;
     let mut view_btn_rect = Rect::NOTHING;
-    let tool = app.node_editor_ui.tool;
+    let tool = view.state.tool;
 
     // Mode buttons as explicit selectable buttons (always readable labels).
     let mode_btn = |ui: &mut Ui, on: bool, label: &str| -> egui::Response {
@@ -467,14 +602,14 @@ fn node_editor_toolbar(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize)
         .on_hover_text("Idle — pan only (Esc)")
         .clicked()
     {
-        app.node_editor_ui.tool = NodeEditorToolMode::Idle;
-        app.node_editor_ui.node_drag = None;
-        app.node_editor_ui.wire_drag = None;
+        view.state.tool = NodeEditorToolMode::Idle;
+        view.state.node_drag = None;
+        view.state.wire_drag = None;
     }
     let add_r = mode_btn(ui, tool == NodeEditorToolMode::Add, "Add");
     add_btn_rect = add_r.rect;
     if add_r.on_hover_text("Add nodes — catalog (A)").clicked() {
-        app.node_editor_ui.tool = if tool == NodeEditorToolMode::Add {
+        view.state.tool = if tool == NodeEditorToolMode::Add {
             NodeEditorToolMode::Idle
         } else {
             NodeEditorToolMode::Add
@@ -485,20 +620,20 @@ fn node_editor_toolbar(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize)
         .on_hover_text("Edit — move / wire / values (E)")
         .clicked()
     {
-        app.node_editor_ui.tool = if edit_on {
+        view.state.tool = if edit_on {
             NodeEditorToolMode::Idle
         } else {
             NodeEditorToolMode::Edit
         };
-        if app.node_editor_ui.tool != NodeEditorToolMode::Edit {
-            app.node_editor_ui.node_drag = None;
-            app.node_editor_ui.wire_drag = None;
+        if view.state.tool != NodeEditorToolMode::Edit {
+            view.state.node_drag = None;
+            view.state.wire_drag = None;
         }
     }
     let view_r = mode_btn(ui, tool == NodeEditorToolMode::View, "View");
     view_btn_rect = view_r.rect;
     if view_r.on_hover_text("View — zoom / fit (V)").clicked() {
-        app.node_editor_ui.tool = if tool == NodeEditorToolMode::View {
+        view.state.tool = if tool == NodeEditorToolMode::View {
             NodeEditorToolMode::Idle
         } else {
             NodeEditorToolMode::View
@@ -512,7 +647,7 @@ fn node_editor_toolbar(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize)
             .on_hover_text("Hide node editor")
             .clicked()
         {
-            app.node_editor_ui.close();
+            view.state.close();
         }
         ui.label(
             RichText::new(match tool {
@@ -527,17 +662,17 @@ fn node_editor_toolbar(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize)
     });
 
     // Only Add / View use floating overlays. Edit never does.
-    match app.node_editor_ui.tool {
+    match view.state.tool {
         NodeEditorToolMode::Add => {
             let anchor = Pos2::new(add_btn_rect.left(), ui.max_rect().bottom() + 4.0);
             show_tool_overlay(ui.ctx(), "ne_add_overlay", anchor, |ui| {
-                add_menu_strip(app, ui, layer_idx);
+                add_menu_strip(view, ui, layer_idx);
             });
         }
         NodeEditorToolMode::View => {
             let anchor = Pos2::new(view_btn_rect.left(), view_btn_rect.bottom() + 6.0);
             show_tool_overlay(ui.ctx(), "ne_view_overlay", anchor, |ui| {
-                view_menu_strip(app, ui, layer_idx);
+                view_menu_strip(view, ui, layer_idx);
             });
         }
         NodeEditorToolMode::Idle | NodeEditorToolMode::Edit => {}
@@ -566,7 +701,7 @@ fn show_tool_overlay(
         });
 }
 
-fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
+fn add_menu_strip(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usize) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Add:").strong());
         let mut spawn: Option<GraphNodeKind> = None;
@@ -590,7 +725,7 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
                 ui.close();
             }
             if ui.button("Object from Application").clicked() {
-                let ids = app.selection.clone();
+                let ids = view.selection.clone();
                 spawn = Some(GraphNodeKind::ObjectFromApp { node_ids: ids });
                 ui.close();
             }
@@ -859,7 +994,7 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
         });
         ui.menu_button("Parameter ▾", |ui| {
             if ui.button("Real").clicked() {
-                if let Some(g) = app.project.document.layers[layer_idx]
+                if let Some(g) = view.project.document.layers[layer_idx]
                     .node_graph
                     .as_mut()
                 {
@@ -871,7 +1006,7 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
                 ui.close();
             }
             if ui.button("Color").clicked() {
-                if let Some(g) = app.project.document.layers[layer_idx]
+                if let Some(g) = view.project.document.layers[layer_idx]
                     .node_graph
                     .as_mut()
                 {
@@ -888,7 +1023,7 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
                 ui.close();
             }
             if ui.button("Position").clicked() {
-                if let Some(g) = app.project.document.layers[layer_idx]
+                if let Some(g) = view.project.document.layers[layer_idx]
                     .node_graph
                     .as_mut()
                 {
@@ -903,30 +1038,30 @@ fn add_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
         });
 
         if let Some(kind) = spawn {
-            spawn_node_centered(app, layer_idx, kind);
+            spawn_node_centered(view, layer_idx, kind);
         }
     });
 }
 
-fn view_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
+fn view_menu_strip(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usize) {
     ui.horizontal(|ui| {
         if ui.button("Zoom +").on_hover_text("Ctrl +").clicked() {
-            if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+            if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
                 g.view.zoom = (g.view.zoom * 1.15).clamp(0.15, 8.0);
             }
         }
         if ui.button("Zoom −").on_hover_text("Ctrl -").clicked() {
-            if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+            if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
                 g.view.zoom = (g.view.zoom / 1.15).clamp(0.15, 8.0);
             }
         }
         if ui.button("Fit").clicked() {
-            fit_graph_view(app, layer_idx, false);
+            fit_graph_view(view, layer_idx, false);
         }
         if ui.button("Fit selection").clicked() {
-            fit_graph_view(app, layer_idx, true);
+            fit_graph_view(view, layer_idx, true);
         }
-        if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_ref() {
+        if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_ref() {
             ui.label(
                 RichText::new(format!("zoom {:.0}%", g.view.zoom * 100.0))
                     .small()
@@ -936,8 +1071,8 @@ fn view_menu_strip(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
     });
 }
 
-fn spawn_node_centered(app: &mut VadadeeBerryApp, layer_idx: usize, kind: GraphNodeKind) {
-    let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() else {
+fn spawn_node_centered(view: &mut NodeEditorView<'_>, layer_idx: usize, kind: GraphNodeKind) {
+    let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() else {
         return;
     };
     // Place near view center.
@@ -945,15 +1080,15 @@ fn spawn_node_centered(app: &mut VadadeeBerryApp, layer_idx: usize, kind: GraphN
     let y = -g.view.pan_y / g.view.zoom + 60.0
         + (g.nodes.len() as f32 % 5.0) * 24.0;
     let id = g.add_node(kind, x, y);
-    app.node_editor_ui.selected = Some(id);
-    app.status_message = "Node added".into();
+    view.state.selected = Some(id);
+    *view.status = "Node added".into();
 }
 
-fn fit_graph_view(app: &mut VadadeeBerryApp, layer_idx: usize, selection_only: bool) {
-    let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() else {
+fn fit_graph_view(view: &mut NodeEditorView<'_>, layer_idx: usize, selection_only: bool) {
+    let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() else {
         return;
     };
-    let sel = app.node_editor_ui.selected;
+    let sel = view.state.selected;
     let mut min_x = f32::MAX;
     let mut min_y = f32::MAX;
     let mut max_x = f32::MIN;
@@ -1036,7 +1171,7 @@ fn flat_text_button(ui: &mut Ui, label: &str) -> egui::Response {
     )
 }
 
-fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) {
+fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usize) {
     let avail = ui.available_size();
     // Fixed canvas footprint — must equal available only (no min grow).
     let (rect, response) = ui.allocate_exact_size(avail, Sense::click_and_drag());
@@ -1057,9 +1192,9 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
         )
     });
     // Precompute whether press started on a node (for pan vs move).
-    let preview_nid = app.node_editor_ui.preview_node;
+    let preview_nid = view.state.preview_node;
     let press_on_node = ui.input(|i| i.pointer.press_origin()).is_some_and(|o| {
-        app.project.document.layers[layer_idx]
+        view.project.document.layers[layer_idx]
             .node_graph
             .as_ref()
             .map(|gg| {
@@ -1078,12 +1213,12 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
             })
             .unwrap_or(false)
     });
-    let can_edit = app.node_editor_ui.can_edit();
-    let allow_pan = app.node_editor_ui.wire_drag.is_none()
-        && app.node_editor_ui.node_drag.is_none()
+    let can_edit = view.state.can_edit();
+    let allow_pan = view.state.wire_drag.is_none()
+        && view.state.node_drag.is_none()
         && (!can_edit || !press_on_node);
 
-    if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+    if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
         if ctrl && plus {
             g.view.zoom = (g.view.zoom * 1.12).clamp(0.15, 8.0);
         }
@@ -1104,17 +1239,17 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
     }
 
     // Grid
-    if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_ref() {
+    if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_ref() {
         paint_grid(&painter, rect, g.view.pan_x, g.view.pan_y, g.view.zoom);
     }
 
     // Interaction + draw need mutable graph + ui state carefully.
     let pointer = response.interact_pointer_pos();
-    let edit = app.node_editor_ui.can_edit();
+    let edit = view.state.can_edit();
 
     // Collect node rects in screen space for hit testing
     let mut node_screen: Vec<(Uuid, Rect)> = Vec::new();
-    if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_ref() {
+    if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_ref() {
         for n in g.nodes.values() {
             let prev = preview_nid == Some(n.id);
             let r = graph_to_screen(n.x, n.y, node_width(n), node_height(n, prev), rect, &g.view);
@@ -1123,10 +1258,10 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
     }
 
     // Wire preview
-    if let Some((from_n, from_p)) = app.node_editor_ui.wire_drag.clone() {
+    if let Some((from_n, from_p)) = view.state.wire_drag.clone() {
         if let Some(mp) = pointer {
-            app.node_editor_ui.wire_cursor = Some(mp);
-            if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_ref() {
+            view.state.wire_cursor = Some(mp);
+            if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_ref() {
                 if let Some(node) = g.nodes.get(&from_n) {
                     if let Some(start) = port_screen_pos(
                         node,
@@ -1155,9 +1290,9 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
     // Draw existing links + hit-test for connector select.
     let mut wire_hit: Option<Uuid> = None;
     let mut wire_hit_dist = f32::MAX;
-    if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_ref() {
-        let sel_node = app.node_editor_ui.selected;
-        let sel_link = app.node_editor_ui.selected_link;
+    if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_ref() {
+        let sel_node = view.state.selected;
+        let sel_link = view.state.selected_link;
         for link in &g.links {
             let Some(a) = g.nodes.get(&link.from_node) else {
                 continue;
@@ -1262,35 +1397,35 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
     let mut begin_node_drag: Option<(Uuid, Vec2)> = None;
 
     // Clone ids for iteration
-    let node_ids: Vec<Uuid> = app.project.document.layers[layer_idx]
+    let node_ids: Vec<Uuid> = view.project.document.layers[layer_idx]
         .node_graph
         .as_ref()
         .map(|g| g.nodes.keys().copied().collect())
         .unwrap_or_default();
 
     for nid in node_ids {
-        let (node_clone, view) = {
-            let g = app.project.document.layers[layer_idx]
+        let (node_clone, gview) = {
+            let g = view.project.document.layers[layer_idx]
                 .node_graph
                 .as_ref()
                 .unwrap();
             let n = g.nodes.get(&nid).unwrap().clone();
             (n, g.view.clone())
         };
-        let preview_open = app.node_editor_ui.preview_node == Some(nid);
+        let preview_open = view.state.preview_node == Some(nid);
         let r = graph_to_screen(
             node_clone.x,
             node_clone.y,
             node_width(&node_clone),
             node_height(&node_clone, preview_open),
             rect,
-            &view,
+            &gview,
         );
         // Outside the canvas: still hit-test for drag if started, but never allocate widgets
         // off-canvas (that was expanding the Node Editor window).
         let on_canvas = r.intersects(rect);
-        let selected = app.node_editor_ui.selected == Some(nid);
-        let live_real = app.project.document.layers[layer_idx]
+        let selected = view.state.selected == Some(nid);
+        let live_real = view.project.document.layers[layer_idx]
             .node_graph
             .as_ref()
             .and_then(|g| g.last_real_out(nid));
@@ -1304,14 +1439,14 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
             &node_clone,
             selected,
             live_real,
-            &view,
+            &gview,
         );
 
         // Title bar: show delete while pointer is over the title strip (incl. trash hit target).
-        let title_h = (22.0 * view.zoom).clamp(18.0, 28.0);
+        let title_h = (22.0 * gview.zoom).clamp(18.0, 28.0);
         let title_rect = Rect::from_min_size(r.min, Vec2::new(r.width(), title_h));
         let ptr = pointer.unwrap_or(Pos2::new(-99999.0, -99999.0));
-        let del_size = (18.0 * view.zoom.max(0.85)).max(16.0);
+        let del_size = (18.0 * gview.zoom.max(0.85)).max(16.0);
         let del_rect = Rect::from_center_size(
             Pos2::new(r.max.x - del_size * 0.7, r.min.y + title_h * 0.5),
             Vec2::splat(del_size),
@@ -1327,7 +1462,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 del_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 icons::DELETE,
-                nerd_font_id(12.0 * view.zoom.max(0.85)),
+                nerd_font_id(12.0 * gview.zoom.max(0.85)),
                 Color32::from_rgb(255, 100, 110),
             );
             if del_hover {
@@ -1341,10 +1476,10 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
         // Port hits
         let ports = node_clone.ports();
         for (pi, port) in ports.iter().enumerate() {
-            let pr = port_rect_for(&node_clone, port, pi, rect, &view, preview_open);
+            let pr = port_rect_for(&node_clone, port, pi, rect, &gview, preview_open);
             let hot = pointer.map(|p| pr.expand(4.0).contains(p)).unwrap_or(false);
             let col = port_type_color(port.ty);
-            let pr_r = (PORT_R * view.zoom.max(0.7)).clamp(4.0, 10.0);
+            let pr_r = (PORT_R * gview.zoom.max(0.7)).clamp(4.0, 10.0);
             painter.circle_filled(pr.center(), pr_r, col);
             painter.circle_stroke(
                 pr.center(),
@@ -1353,13 +1488,13 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
             );
             // Port name labels — only when pin center is inside canvas (no bleed).
             let label_font =
-                egui::FontId::proportional((9.0 * view.zoom).clamp(7.0, 15.0));
+                egui::FontId::proportional((9.0 * gview.zoom).clamp(7.0, 15.0));
             let label_col = Color32::from_rgb(160, 168, 184);
             if canvas_clip.contains(pr.center()) {
                 match port.dir {
                     PortDir::Input => {
                         painter.text(
-                            pr.center() + Vec2::new(8.0 * view.zoom.max(0.7), 0.0),
+                            pr.center() + Vec2::new(8.0 * gview.zoom.max(0.7), 0.0),
                             egui::Align2::LEFT_CENTER,
                             &port.name,
                             label_font.clone(),
@@ -1377,7 +1512,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                             port.name.clone()
                         };
                         painter.text(
-                            pr.center() - Vec2::new(8.0 * view.zoom.max(0.7), 0.0),
+                            pr.center() - Vec2::new(8.0 * gview.zoom.max(0.7), 0.0),
                             egui::Align2::RIGHT_CENTER,
                             out_label,
                             label_font,
@@ -1391,7 +1526,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 }
             }
             // Half-cut unconnected look: dark wedge
-            let connected = app.project.document.layers[layer_idx]
+            let connected = view.project.document.layers[layer_idx]
                 .node_graph
                 .as_ref()
                 .map(|g| {
@@ -1427,7 +1562,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 && hot
                 && response.drag_stopped()
                 && port.dir == PortDir::Input
-                && app.node_editor_ui.wire_drag.is_some()
+                && view.state.wire_drag.is_some()
             {
                 finish_wire = Some((nid, port.id.clone()));
             }
@@ -1436,18 +1571,18 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
         // Sticky node drag: primary press on body (not port, not delete) → grab until release.
         // Later nodes in iteration win (drawn on top).
         if edit
-            && app.node_editor_ui.wire_drag.is_none()
+            && view.state.wire_drag.is_none()
             && response.drag_started()
-            && app.node_editor_ui.node_drag.is_none()
+            && view.state.node_drag.is_none()
         {
             if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
                 let on_del = del_rect.expand(2.0).contains(origin);
                 let on_port = ports.iter().enumerate().any(|(pi, port)| {
-                    let pr = port_rect_for(&node_clone, port, pi, rect, &view, preview_open);
+                    let pr = port_rect_for(&node_clone, port, pi, rect, &gview, preview_open);
                     pr.expand(6.0).contains(origin)
                 });
                 if r.contains(origin) && !on_del && !on_port {
-                    let (gx, gy) = screen_to_graph(origin, rect, &view);
+                    let (gx, gy) = screen_to_graph(origin, rect, &gview);
                     begin_node_drag =
                         Some((nid, Vec2::new(gx - node_clone.x, gy - node_clone.y)));
                 }
@@ -1465,7 +1600,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
 
         // Painter-only node chrome (no allocate_ui_at_rect — that was resizing the window).
         {
-            let z = view.zoom.max(0.5);
+            let z = gview.zoom.max(0.5);
             let title_h = (22.0 * z).clamp(16.0, 32.0);
             let pad = 5.0 * z;
             let bottom_h = (15.0 * z).clamp(12.0, 22.0);
@@ -1610,9 +1745,9 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                             GraphNodeKind::ObjectFromApp { node_ids } => node_ids.clone(),
                             _ => Vec::new(),
                         };
-                        app.node_editor_ui.object_picker_for = Some(nid);
-                        app.node_editor_ui.object_picker_ids = if current.is_empty() {
-                            app.selection.clone()
+                        view.state.object_picker_for = Some(nid);
+                        view.state.object_picker_ids = if current.is_empty() {
+                            view.selection.clone()
                         } else {
                             current
                         };
@@ -1629,7 +1764,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 .intersect(canvas_clip);
                 if img_rect.width() > 8.0 && img_rect.height() > 8.0 {
                     if is_mouse_player {
-                        let (mx, my, mshake, mevt) = app.project.document.layers[layer_idx]
+                        let (mx, my, mshake, mevt) = view.project.document.layers[layer_idx]
                             .node_graph
                             .as_ref()
                             .map(|g| {
@@ -1651,7 +1786,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                             z,
                         );
                     } else {
-                        let preview_eval = app.project.document.layers[layer_idx]
+                        let preview_eval = view.project.document.layers[layer_idx]
                             .node_graph
                             .as_ref()
                             .map(|g| {
@@ -1683,19 +1818,23 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                         if let Some(eval) = preview_eval {
                             let tid = match &eval.image {
                                 crate::document::GraphImageSource::BakedCache { key } => {
-                                    app.ensure_graph_bake_texture(key, ui.ctx())
+                                    view.textures.ensure_bake_texture(key, ui.ctx())
                                 }
                                 crate::document::GraphImageSource::FilePath(path) => {
-                                    let _ = app.ensure_graph_path_texture_at(
+                                    let _ = view.textures.ensure_path_texture_at(
                                         path,
                                         eval.video_time_sec,
+                                        view.fps as f32,
+                                        (view.audio_extract_busy)(path),
                                         ui.ctx(),
                                     );
                                     let key = eval.media_cache_key(path);
-                                    app.graph_path_texture_id(&key)
+                                    view.textures.texture_id(&key)
                                 }
                                 crate::document::GraphImageSource::AppObjects(ids) => {
-                                    ids.iter().find_map(|id| app.image_texture_id(*id))
+                                    ids.iter().find_map(|id| {
+                                        view.image_textures.get(id).map(|t| t.id())
+                                    })
                                 }
                                 crate::document::GraphImageSource::Empty => None,
                             };
@@ -1708,13 +1847,15 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                                 let (tw, th) = match &eval.image {
                                     crate::document::GraphImageSource::FilePath(path) => {
                                         let key = eval.media_cache_key(path);
-                                        app.graph_path_texture_size(&key)
-                                            .or_else(|| app.graph_path_texture_size(path))
+                                        view.textures
+                                            .texture_size(&key)
+                                            .or_else(|| view.textures.texture_size(path))
                                             .map(|s| (s[0] as f32, s[1] as f32))
                                             .unwrap_or((img_rect.width(), img_rect.height()))
                                     }
-                                    crate::document::GraphImageSource::BakedCache { key } => app
-                                        .graph_path_texture_size(key)
+                                    crate::document::GraphImageSource::BakedCache { key } => view
+                                        .textures
+                                        .texture_size(key)
                                         .map(|s| (s[0] as f32, s[1] as f32))
                                         .unwrap_or((img_rect.width(), img_rect.height())),
                                     _ => (img_rect.width(), img_rect.height()),
@@ -1756,7 +1897,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                     link_col,
                 );
                 if click && prev_rect.contains(ptr) {
-                    app.node_editor_ui.preview_node =
+                    view.state.preview_node =
                         if preview_open { None } else { Some(nid) };
                 }
             }
@@ -1816,11 +1957,11 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
 
         // Value / Expr: only when the field fully fits inside the canvas (no edge bleed,
         // no Area outside the window that fights layout).
-        if edit && app.node_editor_ui.selected == Some(nid) {
+        if edit && view.state.selected == Some(nid) {
             if matches!(node_clone.kind, GraphNodeKind::Value { .. }) {
                 let edit_rect = Rect::from_min_size(
-                    Pos2::new(r.min.x + 10.0 * view.zoom.max(0.7), r.min.y + 26.0 * view.zoom.max(0.7)),
-                    Vec2::new((r.width() - 20.0).max(20.0), (18.0 * view.zoom).clamp(16.0, 28.0)),
+                    Pos2::new(r.min.x + 10.0 * gview.zoom.max(0.7), r.min.y + 26.0 * gview.zoom.max(0.7)),
+                    Vec2::new((r.width() - 20.0).max(20.0), (18.0 * gview.zoom).clamp(16.0, 28.0)),
                 );
                 if canvas_clip.contains(edit_rect.min)
                     && canvas_clip.contains(edit_rect.max - Vec2::splat(0.5))
@@ -1864,8 +2005,8 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                     _ => String::new(),
                 };
                 let edit_rect = Rect::from_min_size(
-                    Pos2::new(r.min.x + 8.0 * view.zoom.max(0.7), r.min.y + 26.0 * view.zoom.max(0.7)),
-                    Vec2::new((r.width() - 16.0).max(20.0), (18.0 * view.zoom).clamp(16.0, 28.0)),
+                    Pos2::new(r.min.x + 8.0 * gview.zoom.max(0.7), r.min.y + 26.0 * gview.zoom.max(0.7)),
+                    Vec2::new((r.width() - 16.0).max(20.0), (18.0 * gview.zoom).clamp(16.0, 28.0)),
                 );
                 if canvas_clip.contains(edit_rect.min)
                     && canvas_clip.contains(edit_rect.max - Vec2::splat(0.5))
@@ -1899,30 +2040,30 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
     }
 
     // Hover affordance for connector pick.
-    if wire_hit.is_some() && app.node_editor_ui.wire_drag.is_none() {
+    if wire_hit.is_some() && view.state.wire_drag.is_none() {
         response.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
     }
 
     // Click empty / wire: select connector (prefer wire over deselect).
-    if response.clicked() && app.node_editor_ui.wire_drag.is_none() {
+    if response.clicked() && view.state.wire_drag.is_none() {
         if let Some(lid) = wire_hit {
-            app.node_editor_ui.selected_link = Some(lid);
-            app.node_editor_ui.selected = None;
+            view.state.selected_link = Some(lid);
+            view.state.selected = None;
             click_select = None;
-            app.status_message = "Connector selected — Delete/Backspace to remove".into();
+            *view.status = "Connector selected — Delete/Backspace to remove".into();
         } else if click_select.is_none() {
             // Clicked empty canvas (not a node) → clear wire selection.
             let on_any_node = pointer.is_some_and(|mp| {
                 node_screen.iter().any(|(_, nr)| nr.contains(mp))
             });
             if !on_any_node {
-                app.node_editor_ui.selected_link = None;
+                view.state.selected_link = None;
             }
         }
     }
     if click_select.is_some() {
         // Selecting a node clears link selection.
-        app.node_editor_ui.selected_link = None;
+        view.state.selected_link = None;
     }
 
     // Keyboard: Delete / Backspace — selected wire first, else selected node.
@@ -1934,45 +2075,45 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
         });
     if key_delete {
-        if let Some(lid) = app.node_editor_ui.selected_link {
+        if let Some(lid) = view.state.selected_link {
             delete_link = Some(lid);
-        } else if let Some(id) = app.node_editor_ui.selected {
+        } else if let Some(id) = view.state.selected {
             delete_id = Some(id);
         }
     }
 
     // Apply mutations
     if let Some(lid) = delete_link {
-        if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+        if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
             g.links.retain(|l| l.id != lid);
         }
-        app.node_editor_ui.selected_link = None;
-        app.status_message = "Connector deleted".into();
+        view.state.selected_link = None;
+        *view.status = "Connector deleted".into();
         click_select = None;
     }
     if let Some(id) = delete_id {
-        if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+        if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
             g.remove_node(id);
         }
-        if app.node_editor_ui.selected == Some(id) {
-            app.node_editor_ui.selected = None;
+        if view.state.selected == Some(id) {
+            view.state.selected = None;
         }
-        app.node_editor_ui.selected_link = None;
-        app.node_editor_ui.node_drag = None;
-        app.node_editor_ui.wire_drag = None;
-        app.status_message = "Node deleted".into();
+        view.state.selected_link = None;
+        view.state.node_drag = None;
+        view.state.wire_drag = None;
+        *view.status = "Node deleted".into();
         click_select = None;
     }
     if let Some(grab) = begin_node_drag {
-        app.node_editor_ui.node_drag = Some(grab);
-        app.node_editor_ui.selected = Some(grab.0);
-        app.node_editor_ui.selected_link = None;
+        view.state.node_drag = Some(grab);
+        view.state.selected = Some(grab.0);
+        view.state.selected_link = None;
     }
     // Sticky drag: follow pointer every frame while held.
-    if let Some((id, grab_off)) = app.node_editor_ui.node_drag {
+    if let Some((id, grab_off)) = view.state.node_drag {
         if response.dragged() || ui.input(|i| i.pointer.primary_down()) {
             if let Some(mp) = pointer.or_else(|| ui.input(|i| i.pointer.interact_pos())) {
-                if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+                if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
                     let (gx, gy) = screen_to_graph(mp, rect, &g.view);
                     if let Some(n) = g.nodes.get_mut(&id) {
                         n.x = gx - grab_off.x;
@@ -1982,51 +2123,51 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
             }
         }
         if response.drag_stopped() || ui.input(|i| i.pointer.primary_released()) {
-            app.node_editor_ui.node_drag = None;
+            view.state.node_drag = None;
         }
     }
     if let Some(w) = start_wire {
-        app.node_editor_ui.wire_drag = Some(w);
-        app.node_editor_ui.node_drag = None; // don't move while wiring
+        view.state.wire_drag = Some(w);
+        view.state.node_drag = None; // don't move while wiring
     }
     if response.drag_stopped() {
-        if let Some((from_n, from_p)) = app.node_editor_ui.wire_drag.take() {
+        if let Some((from_n, from_p)) = view.state.wire_drag.take() {
             if let Some((to_n, to_p)) = finish_wire {
-                if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+                if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
                     match g.try_add_link(from_n, &from_p, to_n, &to_p) {
-                        Ok(()) => app.status_message = "Connected".into(),
-                        Err(e) => app.status_message = e,
+                        Ok(()) => *view.status = "Connected".into(),
+                        Err(e) => *view.status = e,
                     }
                 }
             } else if let Some(mp) = pointer {
                 // Drop on empty → add menu
                 let on_node = node_screen.iter().any(|(_, r)| r.contains(mp));
                 if !on_node {
-                    app.node_editor_ui.add_menu_at = Some((mp, Some((from_n, from_p))));
+                    view.state.add_menu_at = Some((mp, Some((from_n, from_p))));
                 }
             }
         }
-        app.node_editor_ui.wire_cursor = None;
-        app.node_editor_ui.node_drag = None;
+        view.state.wire_cursor = None;
+        view.state.node_drag = None;
     }
     if delete_id.is_none() {
         if let Some(id) = click_select {
-            app.node_editor_ui.selected = Some(id);
+            view.state.selected = Some(id);
         } else if response.clicked()
-            && app.node_editor_ui.wire_drag.is_none()
-            && app.node_editor_ui.node_drag.is_none()
+            && view.state.wire_drag.is_none()
+            && view.state.node_drag.is_none()
         {
             // Click empty canvas → deselect.
             if let Some(mp) = pointer {
                 let on_any = node_screen.iter().any(|(_, r)| r.contains(mp));
                 if !on_any {
-                    app.node_editor_ui.selected = None;
+                    view.state.selected = None;
                 }
             }
         }
     }
     for (id, v) in value_edits {
-        if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+        if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
             if let Some(n) = g.nodes.get_mut(&id) {
                 if let GraphNodeKind::Value { value } = &mut n.kind {
                     *value = v;
@@ -2035,7 +2176,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
         }
     }
     for (id, e) in expr_edits {
-        if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+        if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
             if let Some(n) = g.nodes.get_mut(&id) {
                 match &mut n.kind {
                     GraphNodeKind::ExprX { expr }
@@ -2047,7 +2188,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
         }
     }
     for (id, path) in path_edits {
-        if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+        if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
             if let Some(n) = g.nodes.get_mut(&id) {
                 match &mut n.kind {
                     GraphNodeKind::ObjectImage { path: p }
@@ -2056,18 +2197,18 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                     | GraphNodeKind::ObjectSeptic { path: p }
                     | GraphNodeKind::ObjectMouse { path: p } => {
                         *p = path.clone();
-                        app.status_message = "Media path set".into();
+                        *view.status = "Media path set".into();
                         // Streaming playback — do not full-decode into RAM on Browse
                         // (that OOM'd machines for long MP3s / thread storms).
                         if matches!(n.kind, GraphNodeKind::ObjectAudio { .. }) && !path.is_empty() {
-                            app.status_message = "Audio path set (streams on Play)".into();
+                            *view.status = "Audio path set (streams on Play)".into();
                         }
                         if matches!(
                             n.kind,
                             GraphNodeKind::ObjectSeptic { .. } | GraphNodeKind::ObjectMouse { .. }
                         ) && !path.is_empty()
                         {
-                            app.status_message = "Septic/Mouse path set".into();
+                            *view.status = "Septic/Mouse path set".into();
                         }
                     }
                     _ => {}
@@ -2077,7 +2218,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
     }
 
     // Root error banner
-    if let Some(err) = app.project.document.layers[layer_idx]
+    if let Some(err) = view.project.document.layers[layer_idx]
         .node_graph
         .as_ref()
         .and_then(|g| g.root_error.clone())
@@ -2092,9 +2233,9 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
     }
 
     // Drop-add menu (type-filtered when dropping a wire).
-    if let Some((pos, wire_from)) = app.node_editor_ui.add_menu_at.clone() {
+    if let Some((pos, wire_from)) = view.state.add_menu_at.clone() {
         let from_ty = wire_from.as_ref().and_then(|(fnid, fpid)| {
-            app.project.document.layers[layer_idx]
+            view.project.document.layers[layer_idx]
                 .node_graph
                 .as_ref()
                 .and_then(|g| g.port_type(*fnid, fpid))
@@ -2109,7 +2250,7 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                 },
                 GraphNodeKind::Brightness,
                 GraphNodeKind::ObjectFromApp {
-                    node_ids: app.selection.clone(),
+                    node_ids: view.selection.clone(),
                 },
             ]
         };
@@ -2136,19 +2277,19 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                         }
                     }
                     if ui.button("Cancel").clicked() {
-                        app.node_editor_ui.add_menu_at = None;
+                        view.state.add_menu_at = None;
                     }
                     if let Some(kind) = choice {
                         let (gx, gy) = screen_to_graph(
                             pos,
                             rect,
-                            &app.project.document.layers[layer_idx]
+                            &view.project.document.layers[layer_idx]
                                 .node_graph
                                 .as_ref()
                                 .map(|g| g.view.clone())
                                 .unwrap_or_default(),
                         );
-                        if let Some(g) = app.project.document.layers[layer_idx]
+                        if let Some(g) = view.project.document.layers[layer_idx]
                             .node_graph
                             .as_mut()
                         {
@@ -2171,9 +2312,9 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
                                     }
                                 }
                             }
-                            app.node_editor_ui.selected = Some(id);
+                            view.state.selected = Some(id);
                         }
-                        app.node_editor_ui.add_menu_at = None;
+                        view.state.add_menu_at = None;
                     }
                 });
             });
@@ -2182,15 +2323,15 @@ fn node_editor_canvas(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_idx: usize) 
     response.context_menu(|ui| {
         if ui.button("Add Value here").clicked() {
             if let Some(mp) = pointer {
-                let view = app.project.document.layers[layer_idx]
+                let gview = view.project.document.layers[layer_idx]
                     .node_graph
                     .as_ref()
                     .map(|g| g.view.clone())
                     .unwrap_or_default();
-                let (gx, gy) = screen_to_graph(mp, rect, &view);
-                if let Some(g) = app.project.document.layers[layer_idx].node_graph.as_mut() {
+                let (gx, gy) = screen_to_graph(mp, rect, &gview);
+                if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut() {
                     let id = g.add_node(GraphNodeKind::Value { value: 0.0 }, gx, gy);
-                    app.node_editor_ui.selected = Some(id);
+                    view.state.selected = Some(id);
                 }
             }
             ui.close();
@@ -2698,23 +2839,24 @@ fn paint_quarter_arc(
 }
 
 /// Parameter tab body for active Node Editor layer.
-pub fn parameter_tab_ui(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+pub fn parameter_tab_ui(view: &mut NodeEditorView<'_>, ui: &mut Ui) -> NodeEditorOutcome {
+    let mut outcome = NodeEditorOutcome::default();
     // Prefer active layer; if selection is a Node Editor layer, switch active to it.
-    if let Some(sel_id) = app.selection.first().copied() {
-        if let Some(i) = app
+    if let Some(sel_id) = view.selection.first().copied() {
+        if let Some(i) = view
             .project
             .document
             .layers
             .iter()
             .position(|l| l.id == sel_id && l.kind == LayerKind::NodeEditor)
         {
-            if app.project.document.active_layer_index != i {
-                app.project.document.active_layer_index = i;
+            if view.project.document.active_layer_index != i {
+                view.project.document.active_layer_index = i;
             }
         }
     }
-    let idx = app.project.document.active_layer_index;
-    let is_ne = app
+    let idx = view.project.document.active_layer_index;
+    let is_ne = view
         .project
         .document
         .layers
@@ -2731,22 +2873,22 @@ pub fn parameter_tab_ui(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 .small()
                 .weak(),
         );
-        return;
+        return outcome;
     }
-    app.project.document.layers[idx].ensure_node_graph();
+    view.project.document.layers[idx].ensure_node_graph();
     // Parameters list = only entries that still have a Param* node in the graph.
-    if let Some(g) = app.project.document.layers[idx].node_graph.as_mut() {
+    if let Some(g) = view.project.document.layers[idx].node_graph.as_mut() {
         g.sync_parameters_with_nodes();
     }
-    let layer_id = app.project.document.layers[idx].id;
-    let frame = app.anim_current_frame;
+    let layer_id = view.project.document.layers[idx].id;
+    let frame = view.frame;
     let mut remove: Option<usize> = None;
     let mut kf_ops: Vec<(String, f64)> = Vec::new();
     let mut open_anim = false;
 
     {
-        let Some(g) = app.project.document.layers[idx].node_graph.as_mut() else {
-            return;
+        let Some(g) = view.project.document.layers[idx].node_graph.as_mut() else {
+            return outcome;
         };
 
         ui.label(RichText::new("Parameters").strong());
@@ -2862,7 +3004,7 @@ pub fn parameter_tab_ui(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     } // drop graph borrow before touching anim_timeline
 
     if !kf_ops.is_empty() {
-        let entry = app
+        let entry = view
             .project
             .anim_timeline
             .nodes
@@ -2874,11 +3016,12 @@ pub fn parameter_tab_ui(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 t.insert(frame, v);
             }
         }
-        app.apply_animation_for_frame(frame);
-        app.status_message = format!("Keyframe at frame {frame}");
+        outcome.apply_animation_frame = Some(frame);
+        *view.status = format!("Keyframe at frame {frame}");
     }
     if open_anim {
-        app.action_tab = crate::ui::ActionTab::Animation;
-        app.selection = vec![layer_id];
+        outcome.switch_to_animation_tab = true;
+        *view.selection = vec![layer_id];
     }
+    outcome
 }

@@ -1,0 +1,61 @@
+# iOS build: Rust core (iOS targets) + Xcode archive.
+# Separate pipeline from desktop release (§31): mobile signing problems must
+# never block desktop artifacts. Must run on macOS runners. Signing uses CI
+# secrets only — never commit keys or provisioning profiles.
+name: iOS
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  ios-check:
+    name: Rust iOS targets (check)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      - name: Check library for iOS targets
+        run: |
+          cargo check --lib --target aarch64-apple-ios
+          cargo check --lib --target aarch64-apple-ios-sim
+          cargo check --lib --target x86_64-apple-ios
+
+  ios-package:
+    name: Xcode archive
+    runs-on: macos-latest
+    needs: ios-check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Xcode archive (unsigned for CI validation)
+        run: |
+          test -d ios || { echo "ios/ project missing — packaging lands here in Phase 7"; exit 1; }
+          xcodebuild -project ios/VadadeeBerry.xcodeproj \
+            -scheme VadadeeBerry \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/VadadeeBerry.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            archive
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-ios-release-archive
+          path: build/VadadeeBerry.xcarchive
+          if-no-files-found: error

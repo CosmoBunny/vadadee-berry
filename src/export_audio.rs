@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::app::VideoFormat;
+use crate::export_types::VideoFormat;
 use crate::document::{LayerKind, ProjectFile};
 
 const EXPORT_SAMPLE_RATE: u32 = 44_100;

@@ -1,43 +1,57 @@
 #!/usr/bin/env bash
 # =============================================================================
 # make_macos_installer.sh
-# Assembles "Vadadee Berry.app" from cross-compiled binaries and packages it
-# into a distributable .dmg (or .zip as fallback).
+# Assembles "Vadadee Berry.app" and packages a distributable .dmg (or .zip).
 #
 # Usage:
 #   ./packaging/macos/make_macos_installer.sh [--arch aarch64|x86_64] [--zip]
+#       [--bin-dir path/to/release/bins]
 #
-# Requirements (on the host Linux machine):
-#   - Built binaries in target/<arch>-apple-darwin/release/
-#   - python3  (for icns generation via png2icns helper)
-#   - libguestfs / genisoimage  OR  create-dmg (for DMG)
-#   - Alternatively the krama-mac-builder Docker image (used automatically)
+# Binary sources (in order):
+#   1. --bin-dir (CI macOS job: target/release from the desktop build step)
+#   2. target/<arch>-apple-darwin/release (cross-compile via docker/zigbuild)
+#
+# Icon: packaging/macos/vadadee-berry.icns (committed, same master as every
+# other format). Regenerated inline with Pillow only if the committed file is
+# missing.
+#
+# DMG backends (in order): hdiutil (native macOS) → create-dmg →
+# genisoimage/mkisofs → ZIP fallback. Bundle ID stays com.vadadee.berry
+# (existing installed identity — do not rename silently).
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$SCRIPT_DIR/../.."
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$ROOT"
 
-# ── Defaults ─────────────────────────────────────────────────────────────────
 ARCH="aarch64"
 FORCE_ZIP=0
-VERSION="0.1.0"
+BIN_DIR=""
 APP_NAME="Vadadee Berry"
 BUNDLE_ID="com.vadadee.berry"
 DIST_DIR="$ROOT/dist/macos"
 
-# ── Parse args ────────────────────────────────────────────────────────────────
+VERSION="$(
+  sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1
+)"
+VERSION="${VERSION:-0.0.2}"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --arch) ARCH="$2"; shift 2 ;;
     --zip)  FORCE_ZIP=1; shift ;;
+    --bin-dir) BIN_DIR="$2"; shift 2 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
 
 TARGET="${ARCH}-apple-darwin"
-BIN_DIR="$ROOT/target/$TARGET/release"
-RELEASE_DIR="$DIST_DIR/${APP_NAME}.app"
+if [[ -z "$BIN_DIR" ]]; then
+  BIN_DIR="$ROOT/target/$TARGET/release"
+fi
+APP_DIR="$DIST_DIR/${APP_NAME}.app"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " Building: $APP_NAME v$VERSION"
@@ -45,174 +59,92 @@ echo " Arch    : $ARCH  ($TARGET)"
 echo " Bins    : $BIN_DIR"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# ── Sanity check binaries ─────────────────────────────────────────────────────
 for bin in vadadee-berry vadadee-mcp-stdio; do
   if [[ ! -f "$BIN_DIR/$bin" ]]; then
-    echo "✗ Missing binary: $BIN_DIR/$bin"
-    echo "  Run: sg docker -c \"docker run --rm -v \$PWD:/io -w /io \\"
-    echo "         -e SDKROOT=/opt/MacOSX11.3.sdk -e MACOSX_DEPLOYMENT_TARGET=11.3 \\"
-    echo "         -e RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' \\"
-    echo "         krama-mac-builder:latest \\"
-    echo "         cargo zigbuild --target $TARGET --release --bin vadadee-berry --bin vadadee-mcp-stdio\""
+    echo "✗ Missing binary: $BIN_DIR/$bin" >&2
+    echo "  Native macOS: cargo build --release, then rerun with --bin-dir target/release" >&2
+    echo "  Cross Linux : sg docker -c \"docker run --rm -v \$PWD:/io -w /io \\" >&2
+    echo "         -e SDKROOT=/opt/MacOSX11.3.sdk -e MACOSX_DEPLOYMENT_TARGET=11.3 \\" >&2
+    echo "         -e RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' \\" >&2
+    echo "         krama-mac-builder:latest \\" >&2
+    echo "         cargo zigbuild --target $TARGET --release --bin vadadee-berry --bin vadadee-mcp-stdio\"" >&2
     exit 1
   fi
 done
 
-# ── Create .app skeleton ──────────────────────────────────────────────────────
 echo
 echo "▶ Assembling .app bundle…"
-rm -rf "$RELEASE_DIR"
-mkdir -p "$RELEASE_DIR/Contents/MacOS"
-mkdir -p "$RELEASE_DIR/Contents/Resources"
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR/Contents/MacOS"
+mkdir -p "$APP_DIR/Contents/Resources"
 
-# Copy binaries
-cp "$BIN_DIR/vadadee-berry"     "$RELEASE_DIR/Contents/MacOS/vadadee-berry"
-cp "$BIN_DIR/vadadee-mcp-stdio" "$RELEASE_DIR/Contents/MacOS/vadadee-mcp-stdio"
-chmod +x "$RELEASE_DIR/Contents/MacOS/vadadee-berry"
-chmod +x "$RELEASE_DIR/Contents/MacOS/vadadee-mcp-stdio"
+cp "$BIN_DIR/vadadee-berry"     "$APP_DIR/Contents/MacOS/vadadee-berry"
+cp "$BIN_DIR/vadadee-mcp-stdio" "$APP_DIR/Contents/MacOS/vadadee-mcp-stdio"
+chmod +x "$APP_DIR/Contents/MacOS/vadadee-berry"
+chmod +x "$APP_DIR/Contents/MacOS/vadadee-mcp-stdio"
 
-# Copy Info.plist
-cp "$SCRIPT_DIR/Info.plist" "$RELEASE_DIR/Contents/Info.plist"
+cp "$SCRIPT_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
+echo -n "APPL????" > "$APP_DIR/Contents/PkgInfo"
 
-# Write PkgInfo (required by macOS)
-echo -n "APPL????" > "$RELEASE_DIR/Contents/PkgInfo"
-
-# ── Generate .icns ─────────────────────────────────────────────────────────────
-# Studio tile from assets/logo.svg (left 100×100), preferred high-res source:
-ICON_SRC="$ROOT/assets/icon_studio_1024.png"
-if [[ ! -f "$ICON_SRC" ]]; then
-  ICON_SRC="$ROOT/assets/vadadee_berry_icon.png"
-fi
-if [[ ! -f "$ICON_SRC" ]]; then
-  ICON_SRC="$ROOT/assets/icon_studio.png"
-fi
-ICNS_OUT="$RELEASE_DIR/Contents/Resources/AppIcon.icns"
-
-if [[ -f "$ICON_SRC" ]]; then
-  echo "▶ Generating AppIcon.icns from $ICON_SRC…"
-  python3 - <<'PYEOF'
-import struct, zlib, os, sys
-from pathlib import Path
-
-src = Path(os.environ.get("ICON_SRC", ""))
-out = Path(os.environ.get("ICNS_OUT", ""))
-
-try:
-    from PIL import Image
-except ImportError:
-    print("  ⚠ Pillow not found — icon will be skipped. Install with: pip install Pillow")
-    sys.exit(0)
-
-img = Image.open(src).convert("RGBA")
-
-# ICNS size codes
-sizes = [16, 32, 64, 128, 256, 512, 1024]
-code_map = {
-    16:   (b'icp4', b'icp5'),   # (1x, 2x)
-    32:   (b'icp5', b'icp6'),
-    64:   (b'icp6', None),
-    128:  (b'ic07', b'ic08'),
-    256:  (b'ic08', b'ic09'),
-    512:  (b'ic09', b'ic10'),
-    1024: (b'ic10', None),
-}
-
-import io as _io
-
-chunks = []
-for sz, (code1x, code2x) in code_map.items():
-    scaled = img.resize((sz, sz), Image.LANCZOS)
-    buf = _io.BytesIO()
-    scaled.save(buf, format="PNG")
-    data = buf.getvalue()
-    chunks.append((code1x, data))
-
-total = 8 + sum(8 + len(d) for _, d in chunks)
-with open(out, "wb") as f:
-    f.write(b"icns")
-    f.write(struct.pack(">I", total))
-    for code, data in chunks:
-        f.write(code)
-        f.write(struct.pack(">I", 8 + len(data)))
-        f.write(data)
-
-print(f"  ✓ Written {out} ({total} bytes, {len(chunks)} sizes)")
-PYEOF
-  ICON_SRC="$ICON_SRC" ICNS_OUT="$ICNS_OUT" python3 - <<'PYEOF'
-import struct, os, sys, io as _io
-from pathlib import Path
-
-src  = Path(os.environ["ICON_SRC"])
-out  = Path(os.environ["ICNS_OUT"])
-
-try:
-    from PIL import Image
-except ImportError:
-    print("  ⚠ Pillow not found — skipping icon. Install: pip install Pillow")
-    sys.exit(0)
-
-img = Image.open(src).convert("RGBA")
-
-sizes = [16, 32, 64, 128, 256, 512, 1024]
-codes = [b'icp4', b'icp5', b'icp6', b'ic07', b'ic08', b'ic09', b'ic10']
-
-chunks = []
-for sz, code in zip(sizes, codes):
-    scaled = img.resize((sz, sz), Image.LANCZOS)
-    buf = _io.BytesIO()
-    scaled.save(buf, format="PNG")
-    chunks.append((code, buf.getvalue()))
-
-total = 8 + sum(8 + len(d) for _, d in chunks)
-out.parent.mkdir(parents=True, exist_ok=True)
-with open(out, "wb") as f:
-    f.write(b"icns")
-    f.write(struct.pack(">I", total))
-    for code, data in chunks:
-        f.write(code)
-        f.write(struct.pack(">I", 8 + len(data)))
-        f.write(data)
-print(f"  ✓ {out.name}  ({total} bytes)")
-PYEOF
+# ── Icon: committed file first, Pillow fallback second ───────────────────────
+ICNS_OUT="$APP_DIR/Contents/Resources/AppIcon.icns"
+if [[ -f "$SCRIPT_DIR/vadadee-berry.icns" ]]; then
+  echo "▶ Using committed icon: packaging/macos/vadadee-berry.icns"
+  cp "$SCRIPT_DIR/vadadee-berry.icns" "$ICNS_OUT"
 else
-  echo "  ⚠ No icon found at $ICON_SRC — skipping .icns"
+  ICON_SRC="$ROOT/assets/icon_studio_1024.png"
+  [[ -f "$ICON_SRC" ]] || ICON_SRC="$ROOT/assets/vadadee_berry_icon.png"
+  if [[ -f "$ICON_SRC" ]] && python3 -c "import PIL.Image" 2>/dev/null; then
+    echo "▶ Generating AppIcon.icns from $ICON_SRC…"
+    ICON_SRC="$ICON_SRC" ICNS_OUT="$ICNS_OUT" python3 - <<'PYEOF'
+import os
+from PIL import Image
+img = Image.open(os.environ["ICON_SRC"]).convert("RGBA")
+img.save(os.environ["ICNS_OUT"],
+         sizes=[(16, 16), (32, 32), (64, 64), (128, 128),
+                (256, 256), (512, 512), (1024, 1024)])
+print("  ✓ AppIcon.icns written")
+PYEOF
+  else
+    echo "  ⚠ No committed .icns and no Pillow fallback — bundle will lack its icon." >&2
+  fi
 fi
 
-echo "  ✓ App bundle assembled at $RELEASE_DIR"
+echo "  ✓ App bundle assembled at $APP_DIR"
 
-# ── Package as DMG or ZIP ─────────────────────────────────────────────────────
-DMG_NAME="${APP_NAME// /_}_${VERSION}_macOS_${ARCH}.dmg"
-ZIP_NAME="${APP_NAME// /_}_${VERSION}_macOS_${ARCH}.zip"
+# ── Package as DMG or ZIP ────────────────────────────────────────────────────
+DMG_NAME="vadadee-berry-${VERSION}-macos-${ARCH}.dmg"
+ZIP_NAME="vadadee-berry-${VERSION}-macos-${ARCH}.zip"
 DMG_OUT="$DIST_DIR/$DMG_NAME"
 ZIP_OUT="$DIST_DIR/$ZIP_NAME"
+RELEASE_DIR="$ROOT/release"
 
 make_zip() {
   echo "▶ Creating ZIP: $ZIP_NAME"
-  cd "$DIST_DIR"
-  zip -r --symlinks "$ZIP_NAME" "${APP_NAME}.app"
+  (cd "$DIST_DIR" && rm -f "$ZIP_NAME" && zip -r -q --symlinks "$ZIP_NAME" "${APP_NAME}.app")
   echo "  ✓ $ZIP_OUT"
 }
 
-make_dmg_genisoimage() {
-  # Create a sparse directory layout then use genisoimage/mkisofs HFS+
-  echo "▶ Creating DMG via genisoimage…"
+make_dmg_hdiutil() {
+  # Native macOS: UDZO image with .app + Applications symlink.
+  echo "▶ Creating DMG via hdiutil…"
   local staging
-  staging=$(mktemp -d)
-  cp -r "$RELEASE_DIR" "$staging/${APP_NAME}.app"
+  staging="$(mktemp -d)"
+  cp -r "$APP_DIR" "$staging/${APP_NAME}.app"
   ln -s /Applications "$staging/Applications"
-  genisoimage -V "Vadadee Berry" \
-    -D -r -apple -hfs \
-    -o "$DMG_OUT" \
-    "$staging" 2>/dev/null
+  rm -f "$DMG_OUT"
+  hdiutil create -volname "$APP_NAME" \
+    -srcfolder "$staging" \
+    -ov -format UDZO "$DMG_OUT" >/dev/null
   rm -rf "$staging"
   echo "  ✓ $DMG_OUT"
 }
 
 make_dmg_create_dmg() {
   echo "▶ Creating DMG via create-dmg…"
+  rm -f "$DMG_OUT"
   create-dmg \
     --volname "$APP_NAME" \
-    --volicon "$RELEASE_DIR/Contents/Resources/AppIcon.icns" \
     --window-pos 200 120 \
     --window-size 660 400 \
     --icon-size 128 \
@@ -220,24 +152,61 @@ make_dmg_create_dmg() {
     --hide-extension "${APP_NAME}.app" \
     --app-drop-link 480 170 \
     "$DMG_OUT" \
-    "$DIST_DIR"
+    "$APP_DIR/.." 2>/dev/null || create-dmg \
+    --volname "$APP_NAME" \
+    --app-drop-link 480 170 \
+    "$DMG_OUT" \
+    "$APP_DIR/.."
   echo "  ✓ $DMG_OUT"
 }
 
+make_dmg_genisoimage() {
+  echo "▶ Creating DMG via genisoimage…"
+  rm -f "$DMG_OUT"
+  local staging
+  staging="$(mktemp -d)"
+  cp -r "$APP_DIR" "$staging/${APP_NAME}.app"
+  ln -s /Applications "$staging/Applications"
+  local tool=genisoimage
+  command -v genisoimage >/dev/null 2>&1 || tool=mkisofs
+  # NOTE: -apple and -hfs are mutually exclusive in genisoimage; -hfsplus
+  # alone still mounts on macOS (resource forks unused by this bundle).
+  "$tool" -V "Vadadee Berry" \
+    -D -r -hfsplus \
+    -o "$DMG_OUT" \
+    "$staging" 2>/dev/null
+  rm -rf "$staging"
+  echo "  ✓ $DMG_OUT"
+}
+
+mkdir -p "$DIST_DIR" "$RELEASE_DIR"
 if [[ $FORCE_ZIP -eq 1 ]]; then
   make_zip
+  FINAL="$ZIP_OUT"
+elif [[ "$(uname -s)" == "Darwin" ]] && command -v hdiutil >/dev/null 2>&1; then
+  make_dmg_hdiutil
+  FINAL="$DMG_OUT"
 elif command -v create-dmg &>/dev/null; then
   make_dmg_create_dmg
+  FINAL="$DMG_OUT"
 elif command -v genisoimage &>/dev/null || command -v mkisofs &>/dev/null; then
   make_dmg_genisoimage
+  FINAL="$DMG_OUT"
 else
-  echo "  ℹ  Neither create-dmg nor genisoimage found — falling back to ZIP."
-  echo "     To get a proper DMG:  sudo apt install genisoimage"
-  echo "     Or:                   brew install create-dmg  (on macOS)"
+  echo "  ℹ Neither hdiutil, create-dmg nor genisoimage found — ZIP fallback."
   make_zip
+  FINAL="$ZIP_OUT"
+fi
+
+cp -f "$FINAL" "$RELEASE_DIR/"
+BASENAME="$(basename "$FINAL")"
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "$RELEASE_DIR" && sha256sum "$BASENAME" > "${BASENAME}.sha256")
+elif command -v shasum >/dev/null 2>&1; then
+  (cd "$RELEASE_DIR" && shasum -a 256 "$BASENAME" > "${BASENAME}.sha256")
 fi
 
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " Done! Distributable is in: $DIST_DIR"
+echo " Done! Distributable: $RELEASE_DIR/$BASENAME"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

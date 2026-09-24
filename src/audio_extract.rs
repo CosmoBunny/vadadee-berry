@@ -961,3 +961,18 @@ pub fn write_mono_f32_as_wav(mono: &[f32], src_rate: u32, output: &Path) -> Resu
     let stereo = resample_interleaved_to_stereo(&pcm, src_rate, 1, OUT_RATE);
     write_wav(output, &stereo, OUT_RATE, OUT_CHANNELS)
 }
+
+/// UI-facing status of a per-video-path audio extraction job.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AudioExtractStatus {
+    /// Left-to-right fill uses `progress` (0..1).
+    Extracting { progress: f32 },
+    Ready(PathBuf),
+    Failed,
+}
+
+impl AudioExtractStatus {
+    pub fn is_extracting(&self) -> bool {
+        matches!(self, Self::Extracting { .. })
+    }
+}

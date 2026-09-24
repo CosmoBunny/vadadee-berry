@@ -3,8 +3,7 @@
 use egui::{Color32, Context, Rect, RichText, Ui};
 use uuid::Uuid;
 
-use crate::app::VadadeeBerryApp;
-use crate::document::{AvClip, Layer, LayerKind, MusicClip};
+use crate::document::{AvClip, Layer, LayerKind, MusicClip, ProjectFile};
 use crate::icons;
 
 
@@ -120,10 +119,16 @@ pub fn queue_append_start_sec(layer: &Layer) -> f32 {
     end.max(0.0)
 }
 
-/// AV-only tools live on the main floating toolbar when an AV layer is selected.
-/// Kept as no-op here so interior editor no longer shows misplaced Split/DAW buttons.
-pub fn av_toolbar(_app: &mut VadadeeBerryApp, _ui: &mut Ui) {
-    // Intentionally empty — Split / DAW are on the main toolbar when AV is active.
+/// Narrow view-model for the piano roll: the only state the panel may touch.
+/// Keeps av_ui independent of the application struct (one killed UI → App edge).
+pub struct PianoRollView<'a> {
+    pub project: &'a mut ProjectFile,
+    pub clip: &'a mut Option<Uuid>,
+    pub tool: &'a mut PianoTool,
+    pub fps: u32,
+    pub zoom: &'a mut f32,
+    pub scroll_offset: &'a mut f32,
+    pub pitch_scroll: &'a mut f32,
 }
 
 pub fn paint_trim_caps(
@@ -276,13 +281,13 @@ pub fn av_clip_rect(
     )
 }
 
-pub fn piano_roll_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, ctx: &Context) {
-    let Some(clip_id) = app.piano_roll_clip else {
+pub fn piano_roll_panel(mut view: PianoRollView<'_>, ui: &mut Ui, ctx: &Context) {
+    let Some(clip_id) = *view.clip else {
         return;
     };
 
     // Search all layers — DAW clips live on DAW-role layers, not only the active one.
-    let Some((layer_idx, clip_name)) = app
+    let Some((layer_idx, clip_name)) = view
         .project
         .document
         .layers
@@ -295,32 +300,32 @@ pub fn piano_roll_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, ctx: &Context) {
                 .map(|c| (i, c.name.clone()))
         })
     else {
-        app.piano_roll_clip = None;
+        *view.clip = None;
         return;
     };
 
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{} DAW Piano — {}", icons::MUSIC, clip_name)).strong());
         ui.separator();
-        if ui.selectable_label(app.piano_tool == PianoTool::Add, format!("{} Add", icons::ADD)).clicked() {
-            app.piano_tool = PianoTool::Add;
+        if ui.selectable_label(*view.tool == PianoTool::Add, format!("{} Add", icons::ADD)).clicked() {
+            *view.tool = PianoTool::Add;
         }
         if ui
-            .selectable_label(app.piano_tool == PianoTool::Remove, format!("{} Remove", icons::REMOVE))
+            .selectable_label(*view.tool == PianoTool::Remove, format!("{} Remove", icons::REMOVE))
             .clicked()
         {
-            app.piano_tool = PianoTool::Remove;
+            *view.tool = PianoTool::Remove;
         }
-        if ui.selectable_label(app.piano_tool == PianoTool::Grab, format!("{} Grab", icons::GRAB)).clicked() {
-            app.piano_tool = PianoTool::Grab;
+        if ui.selectable_label(*view.tool == PianoTool::Grab, format!("{} Grab", icons::GRAB)).clicked() {
+            *view.tool = PianoTool::Grab;
         }
         ui.label(RichText::new("Ctrl+Scroll = zoom | Scroll = pitch").small().weak());
         if ui.button(format!("{} Close", icons::CLOSE)).clicked() {
-            app.piano_roll_clip = None;
+            *view.clip = None;
         }
     });
 
-    let clip_duration = app
+    let clip_duration = view
         .project
         .document
         .layers
@@ -328,7 +333,7 @@ pub fn piano_roll_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, ctx: &Context) {
         .and_then(|l| l.music_clips.iter().find(|c| c.id == clip_id))
         .map(|c| c.duration_sec)
         .unwrap_or(1.0);
-    let ticks_visible = (clip_duration * app.anim_fps as f32 * app.piano_zoom).max(16.0) as u32;
+    let ticks_visible = (clip_duration * view.fps as f32 * *view.zoom).max(16.0) as u32;
     let row_h = 14.0;
     let keys_visible: i32 = 24;
     let grid_w = ui.available_width().max(200.0);
@@ -345,7 +350,7 @@ pub fn piano_roll_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, ctx: &Context) {
 
             let grid_top = rect.top() + 18.0;
             let grid_rect = Rect::from_min_max(egui::pos2(rect.left() + 36.0, grid_top), rect.right_bottom());
-            let pitch_base = 60 + app.piano_pitch_scroll as i32;
+            let pitch_base = 60 + *view.pitch_scroll as i32;
 
             for i in 0..=ticks_visible.min(64) {
                 let x = grid_rect.left() + (i as f32 / ticks_visible as f32) * grid_rect.width();
@@ -386,7 +391,7 @@ pub fn piano_roll_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, ctx: &Context) {
                 );
             }
 
-            let clip_notes: Vec<_> = app
+            let clip_notes: Vec<_> = view
                 .project
                 .document
                 .layers
@@ -411,17 +416,17 @@ pub fn piano_roll_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, ctx: &Context) {
                 painter.rect_filled(nr, 2.0, Color32::from_rgb(180, 90, 255));
             }
 
-            if resp.dragged() && app.piano_tool == PianoTool::Grab {
-                app.piano_scroll_offset += resp.drag_delta().x;
+            if resp.dragged() && *view.tool == PianoTool::Grab {
+                *view.scroll_offset += resp.drag_delta().x;
             }
 
             let scroll = ui.input(|i| i.smooth_scroll_delta);
             let ctrl = ui.input(|i| i.modifiers.ctrl);
             if scroll.y != 0.0 && resp.hovered() {
                 if ctrl {
-                    app.piano_zoom = (app.piano_zoom * (1.0 - scroll.y * 0.002)).clamp(0.25, 8.0);
+                    *view.zoom = (*view.zoom * (1.0 - scroll.y * 0.002)).clamp(0.25, 8.0);
                 } else {
-                    app.piano_pitch_scroll = (app.piano_pitch_scroll - scroll.y * 0.05).clamp(0.0, 88.0);
+                    *view.pitch_scroll = (*view.pitch_scroll - scroll.y * 0.05).clamp(0.0, 88.0);
                 }
                 ctx.request_repaint();
             }
@@ -429,13 +434,13 @@ pub fn piano_roll_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, ctx: &Context) {
             if resp.clicked() {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     if grid_rect.contains(pos) {
-                        match app.piano_tool {
+                        match *view.tool {
                             PianoTool::Add => {
                                 let rel_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
                                 let tick = (rel_x * ticks_visible as f32) as u32;
                                 let row = ((pos.y - grid_rect.top()) / row_h).floor() as i32;
                                 let pitch = (pitch_base + keys_visible - 1 - row).clamp(0, 127) as u8;
-                                if let Some(clip) = app
+                                if let Some(clip) = view
                                     .project
                                     .document
                                     .layers
@@ -446,7 +451,7 @@ pub fn piano_roll_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, ctx: &Context) {
                                 }
                             }
                             PianoTool::Remove => {
-                                if let Some(clip) = app
+                                if let Some(clip) = view
                                     .project
                                     .document
                                     .layers

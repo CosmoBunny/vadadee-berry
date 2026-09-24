@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# AppRun for the Vadadee Berry AppImage.
+# Runs the bundled studio binary from the AppDir root (the .desktop Exec=).
+set -euo pipefail
+HERE="$(dirname "$(readlink -f "${0}")")"
+exec "$HERE/vadadee-berry" "$@"

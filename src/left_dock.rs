@@ -3,9 +3,10 @@
 use egui::scroll_area::ScrollBarVisibility;
 use egui::{Context, FontId, Rect, RichText, ScrollArea, Ui};
 
+use crate::animation::UiAnimation;
 use crate::animation::left_dock_panel_rect;
-use crate::app::VadadeeBerryApp;
-use crate::collab::RemotePeer;
+use crate::canvas::Viewport;
+use crate::collab::{CollabSession, RemotePeer};
 use crate::icons;
 use crate::theme::{self, colors};
 use crate::tools::ToolKind;
@@ -85,50 +86,98 @@ impl Default for LeftDockState {
     }
 }
 
-pub fn show(app: &mut VadadeeBerryApp, ctx: &Context, canvas_work: Rect) {
+/// MCP vision-preview frame state (moved out of `app.rs` so the dock owns it).
+/// Ungated (also exists on Android) so view structs stay cfg-free; the app
+/// field itself remains desktop-only.
+#[derive(Clone, Default)]
+pub struct McpPreviewState {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub bounds: [f64; 4],
+    pub resolution_percent: f32,
+    pub updated_at: f64,
+    pub texture: Option<egui::TextureHandle>,
+}
+
+/// Narrow view-model for the dock frame + panels: the only app state the
+/// dock may touch. Keeps left_dock independent of the application struct.
+pub struct DockFrameView<'a> {
+    pub anim: &'a UiAnimation,
+    pub dock: &'a mut LeftDockState,
+    pub collab: &'a mut CollabSession,
+    /// Desktop-only preview state (`None` on Android).
+    pub preview: Option<&'a mut McpPreviewState>,
+}
+
+/// Narrow view-model for the local cursor bubble editor.
+pub struct CursorBubbleView<'a> {
+    pub cursor_doc: Option<(f64, f64)>,
+    pub viewport: &'a Viewport,
+    pub local_color_rgb: [u8; 3],
+    pub text: &'a mut String,
+    pub edit: bool,
+    pub focus_pending: &'a mut bool,
+}
+
+/// Returns a viewport focus request when "Go to cursor" is clicked.
+pub fn show(
+    frame: DockFrameView<'_>,
+    ctx: &Context,
+    canvas_work: Rect,
+    toolbar_outer_right: Option<f32>,
+) -> Option<(f64, f64)> {
     #[cfg(target_os = "android")]
     {
-        let _ = (app, ctx, canvas_work);
-        return;
+        let _ = (&frame, ctx, canvas_work, toolbar_right);
+        return None;
     }
 
-    let open_t = app.ui_anim.left_dock_open_t();
-    let animating = app.ui_anim.left_dock_running;
-    let opacity = app.ui_anim.left_dock_opacity();
-    if app.left_dock.active.is_none() && !animating && open_t <= 0.001 {
-        return;
+    let DockFrameView {
+        anim,
+        dock,
+        collab,
+        preview,
+    } = frame;
+    let open_t = anim.left_dock_open_t();
+    let animating = anim.left_dock_running;
+    let opacity = anim.left_dock_opacity();
+    if dock.active.is_none() && !animating && open_t <= 0.001 {
+        return None;
     }
-    if opacity <= 0.004 && !animating && app.left_dock.active.is_none() {
-        return;
+    if opacity <= 0.004 && !animating && dock.active.is_none() {
+        return None;
     }
 
     let inset = theme::overlay_work_rect(canvas_work);
-    let toolbar_right = app
-        .toolbar_outer_rect
-        .map(|r| r.max.x)
-        .unwrap_or(inset.left() + theme::TOOLBAR_WIDTH);
+    let toolbar_right =
+        toolbar_outer_right.unwrap_or(inset.left() + theme::TOOLBAR_WIDTH);
     let rect = left_dock_panel_rect(canvas_work, PANEL_WIDTH, open_t, toolbar_right);
 
+    let mut focus_req = None;
     theme::show_action_bar_area(ctx, "left_collab_dock", rect, opacity, |ui| {
-        let tab_offset = app.ui_anim.tab_content_offset();
-        let tab_alpha = app.ui_anim.tab_content_alpha();
+        let tab_offset = anim.tab_content_offset();
+        let tab_alpha = anim.tab_content_alpha();
         ui.label(RichText::new("Live").strong().color(colors::TEXT));
         ui.separator();
         ui.add_space(tab_offset);
         theme::action_content_frame_alpha(tab_alpha).show(ui, |ui| {
-            let panel = app.left_dock.active.unwrap_or(LeftDockPanel::Chat);
+            let panel = dock.active.unwrap_or(LeftDockPanel::Chat);
             match panel {
-                LeftDockPanel::Chat => chat_body(app, ui),
-                LeftDockPanel::Collab => collab_body(app, ui),
+                LeftDockPanel::Chat => chat_body(dock, collab, ui),
+                LeftDockPanel::Collab => {
+                    focus_req = collab_body(dock, collab, preview, ui);
+                }
             }
         });
     });
+    focus_req
 }
 
-fn chat_body(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+fn chat_body(dock: &mut LeftDockState, collab: &mut CollabSession, ui: &mut Ui) {
     ui.label(RichText::new("Chat").strong());
     ui.checkbox(
-        &mut app.left_dock.game_chat_notifications,
+        &mut dock.game_chat_notifications,
         "Game-style popups (bottom-left)",
     );
     ui.separator();
@@ -136,12 +185,12 @@ fn chat_body(app: &mut VadadeeBerryApp, ui: &mut Ui) {
         .id_salt("collab_chat_scroll")
         .max_height(140.0)
         .auto_shrink([false, true])
-        .stick_to_bottom(app.left_dock.chat_scroll_to_end)
+        .stick_to_bottom(dock.chat_scroll_to_end)
         .scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded);
-    app.left_dock.chat_scroll_to_end = false;
+    dock.chat_scroll_to_end = false;
     scroll.show(ui, |ui| {
         ui.set_max_width(ui.available_width());
-        for line in app.collab.chat_log() {
+        for line in collab.chat_log() {
             ui.label(
                 RichText::new(format!("[{}]: {}", line.username, line.text)).small(),
             );
@@ -149,120 +198,135 @@ fn chat_body(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     });
     ui.separator();
     let draft_id = ui.make_persistent_id("collab_chat_draft");
-    if app.left_dock.chat_focus_pending {
+    if dock.chat_focus_pending {
         ui.memory_mut(|m| m.request_focus(draft_id));
-        app.left_dock.chat_focus_pending = false;
+        dock.chat_focus_pending = false;
     }
     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
     ui.horizontal(|ui| {
         let draft = ui.add(
-            egui::TextEdit::singleline(&mut app.left_dock.chat_draft)
+            egui::TextEdit::singleline(&mut dock.chat_draft)
                 .id(draft_id)
                 .hint_text("Message… (Enter to send)")
                 .desired_width(ui.available_width() - 56.0),
         );
         let draft_focused = draft.has_focus();
         if (ui.button("Send").clicked() || (enter && draft_focused))
-            && !app.left_dock.chat_draft.trim().is_empty()
+            && !dock.chat_draft.trim().is_empty()
         {
-            let msg = app.left_dock.chat_draft.trim().to_string();
-            app.left_dock.chat_draft.clear();
-            app.collab.send_chat(msg);
-            app.left_dock.chat_scroll_to_end = true;
+            let msg = dock.chat_draft.trim().to_string();
+            dock.chat_draft.clear();
+            collab.send_chat(msg);
+            dock.chat_scroll_to_end = true;
         }
     });
 }
 
-fn collab_body(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+fn collab_body(
+    dock: &mut LeftDockState,
+    collab: &mut CollabSession,
+    mut preview: Option<&mut McpPreviewState>,
+    ui: &mut Ui,
+) -> Option<(f64, f64)> {
+    let _ = dock;
     ui.label(RichText::new("Collaboration").strong());
     ui.horizontal(|ui| {
         ui.selectable_value(
-            &mut app.collab.ui_config.role,
+            &mut collab.ui_config.role,
             crate::collab::CollabRole::Server,
             "Server",
         );
         ui.selectable_value(
-            &mut app.collab.ui_config.role,
+            &mut collab.ui_config.role,
             crate::collab::CollabRole::Client,
             "Client",
         );
     });
     ui.horizontal(|ui| {
         ui.label("Host");
-        ui.text_edit_singleline(&mut app.collab.ui_config.host);
+        ui.text_edit_singleline(&mut collab.ui_config.host);
         ui.label("Port");
         ui.add(
-            egui::DragValue::new(&mut app.collab.ui_config.port)
+            egui::DragValue::new(&mut collab.ui_config.port)
                 .range(1..=65535)
                 .speed(1),
         );
     });
     ui.label("Room");
-    ui.text_edit_singleline(&mut app.collab.ui_config.room_id);
+    ui.text_edit_singleline(&mut collab.ui_config.room_id);
     ui.label("Username");
-    ui.text_edit_singleline(&mut app.collab.ui_config.username);
+    ui.text_edit_singleline(&mut collab.ui_config.username);
     ui.label("Secret");
     ui.add(
-        egui::TextEdit::singleline(&mut app.collab.ui_config.secret_key).password(true),
+        egui::TextEdit::singleline(&mut collab.ui_config.secret_key).password(true),
     );
     ui.checkbox(
-        &mut app.collab.ui_config.live_canvas_sync,
+        &mut collab.ui_config.live_canvas_sync,
         "Live canvas sync",
     );
     ui.horizontal(|ui| {
-        let start = match app.collab.ui_config.role {
+        let start = match collab.ui_config.role {
             crate::collab::CollabRole::Server => "Start server",
             crate::collab::CollabRole::Client => "Connect",
         };
         if ui.button(start).clicked() {
-            app.collab.start();
+            collab.start();
         }
         if ui.button("Disconnect").clicked() {
-            app.collab.disconnect();
+            collab.disconnect();
         }
     });
-    collab_status_label(ui, app);
-    if app.collab.decrypt_warning_count() > 0 {
+    collab_status_label(collab, ui);
+    if collab.decrypt_warning_count() > 0 {
         ui.colored_label(
             egui::Color32::from_rgb(220, 140, 60),
             format!(
                 "Skipped {} encrypted packet(s)",
-                app.collab.decrypt_warning_count()
+                collab.decrypt_warning_count()
             ),
         );
     }
     #[cfg(not(target_os = "android"))]
     {
-        if app.collab.ui_config.role == crate::collab::CollabRole::Server
-            && app.collab.is_connected()
+        if collab.ui_config.role == crate::collab::CollabRole::Server
+            && collab.is_connected()
         {
             ui.separator();
-            server_setup_panel(ui, app);
+            if let Some(p) = preview.as_mut() {
+                server_setup_panel(collab, p, ui);
+            }
         }
     }
     ui.separator();
-    peers_panel(app, ui);
+    let focus_req = peers_panel(collab, ui);
     #[cfg(not(target_os = "android"))]
     {
-        if app.collab.ui_config.role != crate::collab::CollabRole::Server
-            || !app.collab.is_connected()
+        if collab.ui_config.role != crate::collab::CollabRole::Server
+            || !collab.is_connected()
         {
             ui.separator();
             ui.collapsing("AI (MCP)", |ui| {
                 ui.collapsing("Vision preview", |ui| {
                     let ctx = ui.ctx().clone();
-                    mcp_preview_panel(app, ui, &ctx);
+                    if let Some(preview) = preview.as_mut() {
+                        mcp_preview_panel(preview, ui, &ctx);
+                    }
                 });
                 mcp_setup_hint(ui);
             });
         }
     }
+    focus_req
 }
 
 #[cfg(not(target_os = "android"))]
-fn server_setup_panel(ui: &mut Ui, app: &mut VadadeeBerryApp) {
+fn server_setup_panel(
+    collab: &CollabSession,
+    preview: &mut McpPreviewState,
+    ui: &mut Ui,
+) {
     ui.label(RichText::new("Share with clients").strong());
-    let cfg = &app.collab.ui_config;
+    let cfg = &collab.ui_config;
     let client_text = format!(
         "Role: Client\nHost: {}\nPort: {}\nRoom: {}\nSecret: {}\nUsername: {}",
         cfg.host.trim(),
@@ -277,7 +341,7 @@ fn server_setup_panel(ui: &mut Ui, app: &mut VadadeeBerryApp) {
     ui.label(RichText::new("AI (MCP) setup").strong());
     ui.collapsing("Vision preview", |ui| {
         let ctx = ui.ctx().clone();
-        mcp_preview_panel(app, ui, &ctx);
+        mcp_preview_panel(preview, ui, &ctx);
     });
     mcp_setup_hint(ui);
     let mcp_json = mcp_cursor_config_json();
@@ -285,27 +349,27 @@ fn server_setup_panel(ui: &mut Ui, app: &mut VadadeeBerryApp) {
 }
 
 #[cfg(not(target_os = "android"))]
-fn mcp_preview_panel(app: &mut VadadeeBerryApp, ui: &mut Ui, ctx: &Context) {
-    if app.mcp_preview.width == 0 || app.mcp_preview.height == 0 || app.mcp_preview.rgba.is_empty() {
+fn mcp_preview_panel(preview: &mut McpPreviewState, ui: &mut Ui, ctx: &Context) {
+    if preview.width == 0 || preview.height == 0 || preview.rgba.is_empty() {
         ui.label(RichText::new("No MCP preview yet — call capture_canvas_raster").small().color(colors::TEXT_MUTED));
         return;
     }
-    let w = app.mcp_preview.width;
-    let h = app.mcp_preview.height;
-    if app.mcp_preview.texture.is_none() {
-        let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &app.mcp_preview.rgba);
-        app.mcp_preview.texture = Some(ctx.load_texture(
-            format!("mcp_preview_{}", app.mcp_preview.updated_at.to_bits()),
+    let w = preview.width;
+    let h = preview.height;
+    if preview.texture.is_none() {
+        let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &preview.rgba);
+        preview.texture = Some(ctx.load_texture(
+            format!("mcp_preview_{}", preview.updated_at.to_bits()),
             img,
             egui::TextureOptions::LINEAR,
         ));
     }
-    if let Some(tex) = &app.mcp_preview.texture {
-        let b = &app.mcp_preview.bounds;
+    if let Some(tex) = &preview.texture {
+        let b = &preview.bounds;
         ui.label(
             RichText::new(format!(
                 "MCP preview {}×{} @ {}%  crop ({:.0},{:.0},{:.0},{:.0})",
-                w, h, app.mcp_preview.resolution_percent as i32, b[0], b[1], b[2], b[3]
+                w, h, preview.resolution_percent as i32, b[0], b[1], b[2], b[3]
             ))
             .small(),
         );
@@ -369,20 +433,22 @@ fn copyable_config_block(ui: &mut Ui, id: &str, text: &str, copy_label: &str) {
     }
 }
 
-fn peers_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
+/// Returns a viewport focus request when "Go to cursor" is clicked.
+fn peers_panel(collab: &CollabSession, ui: &mut Ui) -> Option<(f64, f64)> {
+    let mut focus_req = None;
     ui.label(RichText::new("Connected").strong());
-    if let Some(ms) = app.collab.connection_latency_ms() {
+    if let Some(ms) = collab.connection_latency_ms() {
         ui.label(
             RichText::new(format!("Room latency: {ms} ms"))
                 .small()
                 .color(colors::TEXT_MUTED),
         );
     }
-    let peers: Vec<RemotePeer> = app.collab.peers_sorted();
+    let peers: Vec<RemotePeer> = collab.peers_sorted();
     let panel_w = ui.available_width().max(120.0);
     if peers.is_empty() {
         ui.label(RichText::new("No remote peers yet").small().color(colors::TEXT_MUTED));
-        return;
+        return None;
     }
     ScrollArea::vertical()
         .id_salt("collab_peers_scroll")
@@ -404,7 +470,7 @@ fn peers_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         let name = truncate_fit(&peer.username, 18);
                         ui.label(RichText::new(name).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let lat = peer_latency_label(&peer, app.collab.connection_latency_ms());
+                            let lat = peer_latency_label(&peer, collab.connection_latency_ms());
                             ui.label(
                                 RichText::new(lat)
                                     .small()
@@ -416,7 +482,7 @@ fn peers_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         ui.set_max_width(panel_w);
                         if ui.small_button("Go to cursor").clicked() {
                             if let Some((x, y)) = peer.cursor_doc {
-                                app.focus_viewport_on_peer(x, y);
+                                focus_req = Some((x, y));
                             }
                         }
                     });
@@ -425,6 +491,7 @@ fn peers_panel(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 ui.add_space(6.0);
             }
         });
+    focus_req
 }
 
 fn truncate_fit(s: &str, max_chars: usize) -> String {
@@ -449,9 +516,9 @@ fn peer_latency_label(peer: &RemotePeer, room_ms: Option<u32>) -> String {
 }
 
 /// Bottom-left chat toasts above the status bar (slide up + fade).
-pub fn show_chat_toasts(app: &mut VadadeeBerryApp, ctx: &Context) {
-    app.left_dock.tick_toasts();
-    if app.left_dock.chat_toasts.is_empty() {
+pub fn show_chat_toasts(state: &mut LeftDockState, ctx: &Context) {
+    state.tick_toasts();
+    if state.chat_toasts.is_empty() {
         return;
     }
     let screen = ctx.content_rect();
@@ -462,7 +529,7 @@ pub fn show_chat_toasts(app: &mut VadadeeBerryApp, ctx: &Context) {
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
     let mut y_stack = 0.0_f32;
-    for toast in app.left_dock.chat_toasts.iter().rev() {
+    for toast in state.chat_toasts.iter().rev() {
         let age = (now - toast.born).max(0.0) as f32;
         let life = 5.5_f32;
         let t = (age / life).min(1.0);
@@ -494,8 +561,8 @@ pub fn show_chat_toasts(app: &mut VadadeeBerryApp, ctx: &Context) {
     }
 }
 
-fn collab_status_label(ui: &mut Ui, app: &VadadeeBerryApp) {
-    match app.collab.status() {
+fn collab_status_label(collab: &CollabSession, ui: &mut Ui) {
+    match collab.status() {
         crate::collab::CollabStatus::Error(e) => {
             ui.colored_label(colors::ACCENT, format!("Error: {e}"));
         }
@@ -521,31 +588,39 @@ fn collab_status_label(ui: &mut Ui, app: &VadadeeBerryApp) {
 
 const CURSOR_BUBBLE_MAX_W: f32 = 200.0;
 
-pub fn draw_local_cursor_bubble(app: &mut VadadeeBerryApp, ui: &mut Ui, origin: egui::Pos2) {
+pub fn draw_local_cursor_bubble(view: CursorBubbleView<'_>, ui: &mut Ui, origin: egui::Pos2) {
     #[cfg(target_os = "android")]
     {
-        let _ = (app, ui, origin);
+        let _ = (&view, ui, origin);
         return;
     }
-    let Some((dx, dy)) = app.cursor_doc else {
+    let CursorBubbleView {
+        cursor_doc,
+        viewport,
+        local_color_rgb,
+        text,
+        edit,
+        focus_pending,
+    } = view;
+    let Some((dx, dy)) = cursor_doc else {
         return;
     };
-    let pos = app.viewport.doc_to_screen((dx, dy), origin);
-    let color = collab_display_color(app.collab.local_color_rgb);
-    if !app.cursor_bubble_text.is_empty() {
+    let pos = viewport.doc_to_screen((dx, dy), origin);
+    let color = collab_display_color(local_color_rgb);
+    if !text.is_empty() {
         draw_cursor_bubble_label(
             ui.painter(),
             pos + egui::vec2(0.0, -30.0),
-            &app.cursor_bubble_text,
+            text,
             color,
         );
     }
-    if !app.cursor_bubble_edit {
+    if !edit {
         return;
     }
     let anchor = pos + egui::vec2(0.0, -56.0);
     let input_id = egui::Id::new("cursor_bubble_input");
-    if app.cursor_bubble_focus_pending {
+    if *focus_pending {
         ui.ctx().memory_mut(|m| m.request_focus(input_id));
     }
     egui::Area::new(egui::Id::new("local_cursor_bubble"))
@@ -556,38 +631,38 @@ pub fn draw_local_cursor_bubble(app: &mut VadadeeBerryApp, ui: &mut Ui, origin: 
             ui.set_max_width(CURSOR_BUBBLE_MAX_W);
             theme::floating_card_frame(0.95).show(ui, |ui| {
                 let resp = ui.add(
-                    egui::TextEdit::singleline(&mut app.cursor_bubble_text)
+                    egui::TextEdit::singleline(text)
                         .id(input_id)
                         .hint_text("Type at cursor…")
                         .desired_width(CURSOR_BUBBLE_MAX_W - 16.0),
                 );
                 if resp.has_focus() || resp.clicked() {
-                    app.cursor_bubble_focus_pending = false;
-                } else if app.cursor_bubble_focus_pending {
+                    *focus_pending = false;
+                } else if *focus_pending {
                     resp.request_focus();
                 }
             });
         });
-    if app.cursor_bubble_edit {
+    if edit {
         ui.ctx().request_repaint();
     }
 }
 
-pub fn draw_remote_cursors(app: &VadadeeBerryApp, ui: &mut Ui, origin: egui::Pos2) {
+pub fn draw_remote_cursors(collab: &CollabSession, viewport: &Viewport, ui: &mut Ui, origin: egui::Pos2) {
     #[cfg(target_os = "android")]
     {
-        let _ = (app, ui, origin);
+        let _ = (collab, ui, origin);
         return;
     }
-    if !app.collab.is_connected() {
+    if !collab.is_connected() {
         return;
     }
     let painter = ui.painter();
-    for peer in app.collab.peers_sorted() {
+    for peer in collab.peers_sorted() {
         let Some((dx, dy)) = peer.cursor_doc else {
             continue;
         };
-        let pos = app.viewport.doc_to_screen((dx, dy), origin);
+        let pos = viewport.doc_to_screen((dx, dy), origin);
         let color = collab_display_color(peer.color_rgb);
         let drawing = peer
             .tool_label

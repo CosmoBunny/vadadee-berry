@@ -2,7 +2,6 @@
 /target/
 
 # Audio test files
-OZEN.mp3
 *.mp3
 
 # Android / Gradle app directory and build artifacts

@@ -97,7 +97,10 @@ pub fn should_cache_layer(
     if !layer.visible || layer.kind != LayerKind::Image || !layer.is_renderer {
         return false;
     }
-    // SVG/resvg text baseline differs from live glyph paint — raster cache misaligns/blurs text.
+    // Cached textures are 1:1 bitmaps stretched over the page: vector text
+    // would go blurry on zoom, so text layers always paint live (previously
+    // this also dodged an SVG/resvg baseline mismatch — now purely a
+    // resolution-independence choice).
     if layer_has_text_nodes(project, layer, hidden) {
         return false;
     }
@@ -307,7 +310,22 @@ pub fn spawn_layer_raster_job(
                 rasterize_rect_layer_parallel(&rect_items, doc_w, doc_h)
                     .map(|rgba| (doc_w, doc_h, rgba))
             } else {
-                crate::io::rasterize_image_layer(&project, &layer, &hidden, 1.0)
+                // Same painter as the live canvas (base pass only, caller
+                // hidden set; effect passes stay global). Replaces the old
+                // SVG→resvg layer raster, which could disagree with preview
+                // on stroke geometry, images and text.
+                let target = crate::render_pipeline::RenderTarget {
+                    width: doc_w,
+                    height: doc_h,
+                    scale: 1.0,
+                };
+                crate::export_render::render_layer_base_rgba(
+                    &project,
+                    &layer.nodes,
+                    &hidden,
+                    &target,
+                )
+                .map(|rgba| (target.width, target.height, rgba))
             };
             if let Some((w, h, rgba)) = result {
                 let _ = result_tx.send(LayerCacheResult {

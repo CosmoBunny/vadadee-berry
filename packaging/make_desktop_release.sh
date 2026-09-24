@@ -26,7 +26,7 @@ cd "$ROOT"
 VERSION="$(
   sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1
 )"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-0.0.2}"
 
 DO_BUILD=1
 BINS="all"
@@ -152,18 +152,15 @@ for f in logo.svg logo.png icon_studio.png icon_mcp.png icon_studio_1024.png; do
   fi
 done
 
-# Desktop entry (Linux)
+# Desktop entry + icons (Linux): shared packaging-layer identity.
+# The SAME com.cosmobunny.VadadeeBerry.desktop and hicolor icon tree feed
+# AppImage, Flatpak and this tarball — one icon name everywhere so docks and
+# menus never fall back to a generic icon.
 if [[ "$PLATFORM" == "linux" ]]; then
-  cat > "$BUNDLE_DIR/vadadee-berry.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=Vadadee Berry
-Comment=Vector / video / shader creative studio
-Exec=bin/${BIN_STUDIO}
-Icon=assets/icon_studio.png
-Terminal=false
-Categories=Graphics;AudioVideo;
-EOF
+  cp "$ROOT/packaging/linux/com.cosmobunny.VadadeeBerry.desktop" \
+    "$BUNDLE_DIR/com.cosmobunny.VadadeeBerry.desktop"
+  mkdir -p "$BUNDLE_DIR/share/icons"
+  cp -r "$ROOT/packaging/linux/icons/hicolor" "$BUNDLE_DIR/share/icons/hicolor"
 fi
 
 cat > "$BUNDLE_DIR/README.txt" <<EOF
@@ -180,6 +177,11 @@ Logos (from assets/logo.svg, 200×100)
 
 Run (from this directory)
   ./bin/${BIN_STUDIO}
+
+Linux desktop integration (optional manual install)
+  cp com.cosmobunny.VadadeeBerry.desktop ~/.local/share/applications/
+  cp -r share/icons/hicolor/* ~/.local/share/icons/hicolor/
+  update-desktop-database ~/.local/share/applications 2>/dev/null || true
 
 Video import/export needs FFmpeg shared libraries at runtime (optional).
 OpenCV is optional at build time; this build may or may not include it.

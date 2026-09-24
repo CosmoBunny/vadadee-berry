@@ -2,7 +2,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::document::{eval_expr_vars, BezierHandleMode, ExprVars, Fill, NodeId};
+use crate::document::{eval_expr_vars, BezierHandleMode, ExprVars, Fill, NodeId, ProjectFile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InterpolationMode {
@@ -40,6 +40,109 @@ pub struct Keyframe {
     pub handle_right: (f64, f64),
     #[serde(default = "default_handle_mode")]
     pub handle_mode: BezierHandleMode,
+}
+
+/// Graph-editor interaction for stack animation function regions.
+#[derive(Debug, Clone)]
+pub enum AnimGraphStackDrag {
+    Move {
+        id: Uuid,
+        grab_frame: f64,
+        orig_start: usize,
+    },
+    ResizeEnd {
+        id: Uuid,
+        orig_duration: usize,
+    },
+}
+
+/// Timeline content span: max keyframe/effect/media frame over living
+/// nodes/layers. Playhead scrub never extends it. (Moved out of app.rs —
+/// needs only the project plus fps.)
+pub fn content_max_animation_frame(project: &ProjectFile, fps: u32) -> usize {
+    let mut max_f = 0usize;
+    // Only living nodes/layers — deleted objects leave orphan tracks otherwise.
+    for (id, anim) in &project.anim_timeline.nodes {
+        if !project.owns_animation_id(*id) {
+            continue;
+        }
+        let tracks = [
+            &anim.pos_x, &anim.pos_y, &anim.rotation, &anim.opacity,
+            &anim.color_r, &anim.color_g, &anim.color_b, &anim.color_a,
+            &anim.stroke_width, &anim.stroke_r, &anim.stroke_g, &anim.stroke_b, &anim.stroke_a,
+        ];
+        for t in tracks {
+            if let Some(last) = t.keyframes.last() {
+                max_f = max_f.max(last.frame);
+            }
+        }
+        for gt in &anim.geom_tracks {
+            if let Some(last) = gt.keyframes.last() {
+                max_f = max_f.max(last.frame);
+            }
+        }
+        for pt in anim.param_tracks.values() {
+            if let Some(last) = pt.keyframes.last() {
+                max_f = max_f.max(last.frame);
+            }
+        }
+        // Stack animation spans must be reachable by playback.
+        for sf in &anim.stack_functions {
+            max_f = max_f.max(sf.end_frame());
+        }
+    }
+
+    let fps = fps.max(1) as f32;
+    // Node Editor Output Object `run_till` (seconds) extends / caps the timeline.
+    for l in &project.document.layers {
+        if l.kind != super::LayerKind::NodeEditor {
+            continue;
+        }
+        if let Some(g) = l.node_graph.as_ref() {
+            let run_till = g.output_run_till_secs();
+            if run_till > 1e-6 {
+                let end_frame = (run_till as f32 * fps).ceil().max(0.0) as usize;
+                max_f = max_f.max(end_frame);
+            }
+        }
+    }
+    for l in &project.document.layers {
+        if l.kind != super::LayerKind::AV {
+            continue;
+        }
+        // Include the full media queue (not only legacy primary path).
+        if !l.av_clips.is_empty() || !l.music_clips.is_empty() {
+            for c in &l.av_clips {
+                let end_frame = (c.timeline_end_secs() * fps).ceil().max(0.0) as usize;
+                max_f = max_f.max(end_frame);
+            }
+            for m in &l.music_clips {
+                let end_frame = (m.end_sec() * fps).ceil().max(0.0) as usize;
+                max_f = max_f.max(end_frame);
+            }
+        } else if !l.video_path.is_empty() {
+            let end_frame = (l.timeline_end_secs() * fps).ceil().max(0.0) as usize;
+            max_f = max_f.max(end_frame);
+        }
+    }
+
+    // Empty project: short scrub room only (NOT 300 — that made play loop to 300).
+    if max_f == 0 {
+        max_f = 60; // ~1s @60fps / 2s @30fps default
+    }
+    max_f
+}
+
+/// Timeline end = content only. Do not grow with playhead scrub (that
+/// stretched loops to 300 when the user dragged past the last keyframe).
+pub fn max_animation_frame(project: &ProjectFile, fps: u32) -> usize {
+    content_max_animation_frame(project, fps)
+}
+
+/// Content duration in seconds for export loops.
+pub fn animation_content_duration_secs(project: &ProjectFile, fps: u32) -> f32 {
+    let max_frame = max_animation_frame(project, fps);
+    (max_frame + 1) as f32 / fps.max(1) as f32
 }
 
 fn solve_u(x_target: f64, x1: f64, range: f64) -> f64 {
@@ -566,6 +669,21 @@ impl NodeAnimation {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AnimationTimeline {
     pub nodes: std::collections::HashMap<NodeId, NodeAnimation>,
+}
+
+#[cfg(test)]
+mod content_span_tests {
+    use super::*;
+    use crate::document::Document;
+
+    #[test]
+    fn empty_project_gets_default_scrub_room() {
+        let project = Document::new_empty_project();
+        assert_eq!(content_max_animation_frame(&project, 60), 60);
+        assert_eq!(max_animation_frame(&project, 60), 60);
+        let dur = animation_content_duration_secs(&project, 60);
+        assert!((dur - 61.0 / 60.0).abs() < 1e-6);
+    }
 }
 
 #[cfg(test)]

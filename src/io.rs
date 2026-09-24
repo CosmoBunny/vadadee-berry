@@ -698,6 +698,9 @@ pub fn export_selected_svg_string(project: &ProjectFile, selection: &[NodeId], b
 }
 
 /// Rasterize current selection (merged) to RGBA.
+///
+/// Uses the live preview renderer ([`crate::export_render`]) at export scale —
+/// no SVG intermediate, so text layout/baselines/rotation match the canvas.
 pub fn rasterize_selection_rgba(
     project: &ProjectFile,
     selection: &[NodeId],
@@ -707,8 +710,7 @@ pub fn rasterize_selection_rgba(
     if selection.is_empty() {
         return None;
     }
-    let svg = export_selected_svg_string(project, selection, bounds);
-    render_svg_to_rgba_even(&svg, scale)
+    crate::export_render::render_selection_rgba(project, selection, bounds, scale)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -780,16 +782,81 @@ pub fn write_image_file(
     }
 }
 
+/// Full-document raster export through the live preview renderer
+/// ([`crate::export_render`]) — same painter, same text layout as the canvas.
+/// (Vector SVG export stays on `document_svg_string`; only PNG/JPEG/BMP
+/// changed: they must not round-trip through SVG.)
+///
+/// NodeEditor FilePath/BakedCache output composites on top via the shared
+/// [`composite_ne_file_output`] software path (same policy input shape as
+/// video fallback, but baked at full still resolution). Skipped when the
+/// page itself is translucent: the pixmap round-trip is only straight-safe
+/// over an opaque background.
+///
+/// Shading layers apply through the same [`apply_shading_passes_skia_public`]
+/// CPU path as the video fallback (frozen time): still export must show the
+/// same presets instead of a flat page. Unknown custom WGSL is a no-op in
+/// both — only the GPU video path runs real WGSL.
 pub fn export_document_raster(
     project: &ProjectFile,
     format: ExportImageFormat,
     scale: f32,
     path: &Path,
 ) -> Result<(), IoError> {
-    let svg = document_svg_string(project, 0, &std::collections::HashMap::new());
-    let (w, h, rgba) = render_svg_to_rgba_even(&svg, scale)
+    let (w, h, rgba) = crate::export_render::render_document_rgba(project, scale)
         .ok_or_else(|| IoError::Msg("Rasterize failed".into()))?;
-    write_image_file(path, format, w, h, &rgba)
+    let needs_ne = project.document.layers.iter().any(|l| {
+        if !l.visible || !l.is_renderer || l.kind != crate::document::LayerKind::NodeEditor {
+            return false;
+        }
+        l.node_graph.as_ref().is_some_and(|g| {
+            matches!(
+                g.resolve_output_image().image,
+                crate::document::GraphImageSource::FilePath(_)
+                    | crate::document::GraphImageSource::BakedCache { .. }
+            )
+        })
+    });
+    let needs_shading = project.document.layers.iter().any(|l| {
+        l.visible
+            && l.is_renderer
+            && l.kind == crate::document::LayerKind::Shading
+            && l.shading_passes.iter().any(|p| p.enabled)
+    });
+    if (needs_ne || needs_shading) && project.document.page_color[3] >= 0.999 {
+        let target = crate::render_pipeline::RenderTarget {
+            width: w,
+            height: h,
+            scale,
+        };
+        let mut pixmap = straight_rgba_to_pixmap(w, h, &rgba)
+            .ok_or_else(|| IoError::Msg("Rasterize failed".into()))?;
+        // Full still resolution (bake caps internally at 4096).
+        let bake_side = w.max(h).max(64);
+        for layer in &project.document.layers {
+            if !layer.visible || !layer.is_renderer {
+                continue;
+            }
+            match layer.kind {
+                crate::document::LayerKind::Shading => {
+                    apply_shading_passes_skia_public(
+                        &mut pixmap,
+                        &layer.shading_passes,
+                        0.0,
+                    );
+                }
+                crate::document::LayerKind::NodeEditor => {
+                    composite_ne_file_output(&mut pixmap, project, layer, &target, bake_side);
+                }
+                _ => {}
+            }
+        }
+        // Alpha is 1 everywhere (opaque page + over-composite) → take() is
+        // straight-safe.
+        write_image_file(path, format, w, h, &pixmap.take())
+    } else {
+        write_image_file(path, format, w, h, &rgba)
+    }
 }
 
 pub fn export_selection_raster(
@@ -875,8 +942,15 @@ pub fn rasterize_document_view(
         // Only used if caller packs VideoLayerBuffer elsewhere; bare RGBA map is unused here.
         let _ = (k, v);
     }
-    let (pw, ph, mut rgba) =
-        composite_export_frame(project, current_frame, &vf, scale, time_secs)?;
+    let (pw, ph, mut rgba) = {
+        let target = crate::render_pipeline::RenderTarget::for_video(
+            project.document.width,
+            project.document.height,
+            scale,
+        )?;
+        let ctx = crate::render_pipeline::RenderContext::new(current_frame, time_secs);
+        composite_export_frame(project, &ctx, &vf, &target)?
+    };
 
     // Crop to requested view when not the full page.
     let doc_w = project.document.width;
@@ -936,36 +1010,6 @@ pub fn render_svg_to_rgba(svg_data: &str, scale: f32) -> Option<(u32, u32, Vec<u
     Some((pixel_w, pixel_h, pixmap.take()))
 }
 
-pub fn render_svg_to_rgba_even(svg_data: &str, scale: f32) -> Option<(u32, u32, Vec<u8>)> {
-    let opt = crate::fonts::usvg_options();
-    let tree = usvg::Tree::from_str(svg_data, &opt).ok()?;
-
-    let pixmap_size = tree.size().to_int_size();
-    let mut pixel_w = (pixmap_size.width() as f32 * scale).round() as u32;
-    let mut pixel_h = (pixmap_size.height() as f32 * scale).round() as u32;
-    
-    if pixel_w % 2 != 0 {
-        pixel_w = pixel_w.saturating_sub(1);
-    }
-    if pixel_h % 2 != 0 {
-        pixel_h = pixel_h.saturating_sub(1);
-    }
-    
-    if pixel_w == 0 || pixel_h == 0 {
-        return None;
-    }
-    
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(pixel_w, pixel_h)?;
-    
-    let scale_x = pixel_w as f32 / pixmap_size.width() as f32;
-    let scale_y = pixel_h as f32 / pixmap_size.height() as f32;
-    
-    let transform = resvg::tiny_skia::Transform::from_scale(scale_x, scale_y);
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
-    
-    Some((pixel_w, pixel_h, pixmap.take()))
-}
-
 pub(crate) fn layer_anim_transform(
     layer: &crate::document::Layer,
     project: &ProjectFile,
@@ -1010,165 +1054,30 @@ pub(crate) fn video_layer_dest_size(layer: &crate::document::Layer, frame_w: u32
     (w, h)
 }
 
-fn clip_defs_and_maps(
-    project: &ProjectFile,
-) -> (
-    String,
-    std::collections::HashMap<uuid::Uuid, crate::document::ClipMaskEffect>,
-    std::collections::HashSet<uuid::Uuid>,
-) {
-    let mut clip_defs = String::new();
-    let mut clip_map = std::collections::HashMap::new();
-    let mut mask_set = std::collections::HashSet::new();
-    for cm in project.document.clip_masks.values() {
-        clip_map.insert(cm.source_id, cm.clone());
-        if cm.hide_mask {
-            mask_set.insert(cm.mask_id);
-        }
-        if let Some(mask_node) = project.nodes.get(cm.mask_id) {
-            let shape_svg = node_to_svg_fragment(mask_node, &project.nodes);
-            clip_defs.push_str(&format!(
-                r#"  <clipPath id="clip-{}">
-    {}
-  </clipPath>
-"#,
-                cm.id.as_simple(),
-                shape_svg
-            ));
-        }
-    }
-    let defs_str = if clip_defs.is_empty() {
-        String::new()
-    } else {
-        format!("<defs>\n{}</defs>\n", clip_defs)
-    };
-    (defs_str, clip_map, mask_set)
-}
-
-fn append_image_layer_nodes_to_svg(
-    svg: &mut String,
-    layer: &crate::document::Layer,
-    project: &ProjectFile,
-    clip_map: &std::collections::HashMap<uuid::Uuid, crate::document::ClipMaskEffect>,
-    mask_set: &std::collections::HashSet<uuid::Uuid>,
-    hidden: &std::collections::HashSet<crate::document::NodeId>,
-) {
-    for id in &layer.nodes {
-        if mask_set.contains(id) || hidden.contains(id) {
-            continue;
-        }
-        let Some(node) = project.nodes.get(*id) else {
-            continue;
-        };
-        let node_svg = node_to_svg_fragment(node, &project.nodes);
-        if let Some(cm) = clip_map.get(id) {
-            svg.push_str(&format!(
-                r#"<g clip-path="url(#clip-{})">{}</g>"#,
-                cm.id.as_simple(),
-                node_svg
-            ));
-        } else {
-            svg.push_str(&node_svg);
-        }
-    }
-}
-
-pub fn document_svg_single_image_layer(
-    project: &ProjectFile,
-    layer: &crate::document::Layer,
-    hidden: &std::collections::HashSet<crate::document::NodeId>,
-) -> String {
-    let (defs_str, clip_map, mask_set) = clip_defs_and_maps(project);
-    let w = project.document.width;
-    let h = project.document.height;
-    let mut svg = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
-{defs_str}"#,
-    );
-    append_image_layer_nodes_to_svg(&mut svg, layer, project, &clip_map, &mask_set, hidden);
-    svg.push_str("</svg>\n");
-    svg
-}
-
-/// SVG containing only the given node ids (P7c: NE AppObjects export).
-/// Transparent background — intended to composite onto an existing pixmap.
-pub fn document_svg_nodes_only(
-    project: &ProjectFile,
-    node_ids: &[crate::document::NodeId],
-) -> String {
-    let (defs_str, clip_map, mask_set) = clip_defs_and_maps(project);
-    let w = project.document.width;
-    let h = project.document.height;
-    let allow: std::collections::HashSet<_> = node_ids.iter().copied().collect();
-    let mut svg = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
-{defs_str}"#,
-    );
-    for layer in &project.document.layers {
-        if !layer.visible {
-            continue;
-        }
-        if layer.kind != crate::document::LayerKind::Image
-            && layer.kind != crate::document::LayerKind::Flowchart
-        {
-            continue;
-        }
-        for id in &layer.nodes {
-            if !allow.contains(id) || mask_set.contains(id) {
-                continue;
-            }
-            let Some(node) = project.nodes.get(*id) else {
-                continue;
-            };
-            let node_svg = node_to_svg_fragment(node, &project.nodes);
-            if let Some(cm) = clip_map.get(id) {
-                svg.push_str(&format!(
-                    r#"<g clip-path="url(#clip-{})">{}</g>"#,
-                    cm.id.as_simple(),
-                    node_svg
-                ));
-            } else {
-                svg.push_str(&node_svg);
-            }
-        }
-    }
-    svg.push_str("</svg>\n");
-    svg
-}
-
-/// Rasterize one image layer to RGBA at `scale` document-pixels per doc unit.
-pub fn rasterize_image_layer(
-    project: &ProjectFile,
-    layer: &crate::document::Layer,
-    hidden: &std::collections::HashSet<crate::document::NodeId>,
-    scale: f32,
-) -> Option<(u32, u32, Vec<u8>)> {
-    let svg = document_svg_single_image_layer(project, layer, hidden);
-    render_svg_to_rgba_even(&svg, scale)
-}
-
 /// Raster export frame following document layer stack order (bottom → top).
+/// CPU fallback compositor: dimensions and overlay transforms come from the
+/// authoritative [`crate::render_pipeline`] contract. Static vector layers
+/// (Image/Flowchart) are painted with the same `draw_nodes_ex` + effect
+/// passes as preview via [`crate::export_render::render_static_order_rgba`]
+/// — no SVG `<text>` reconstruction. Only true overlays (decoded AV pixels,
+/// CPU shading heuristics, NodeEditor bakes) composite as pixmaps.
+///
+/// `target` is the caller-declared size promise (even dimensions for video);
+/// `ctx` carries frame/time. Callers build both via the contract types —
+/// this function never derives sizes or animation state itself.
+///
+/// Segments share one [`crate::export_render::PainterSession`] for the call
+/// (fonts/atlas/decoded images compiled once, shapes re-recorded per flush).
 pub fn composite_export_frame(
     project: &ProjectFile,
-    current_frame: usize,
+    ctx: &crate::render_pipeline::RenderContext,
     video_frames: &VideoFrameMap,
-    scale: f32,
-    time_secs: f32,
+    target: &crate::render_pipeline::RenderTarget,
 ) -> Option<(u32, u32, Vec<u8>)> {
-    use resvg::tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
+    use resvg::tiny_skia::{Color, Pixmap};
 
-    let doc_w = project.document.width;
-    let doc_h = project.document.height;
-    let mut pixel_w = (doc_w as f32 * scale).round() as u32;
-    let mut pixel_h = (doc_h as f32 * scale).round() as u32;
-    if pixel_w % 2 != 0 {
-        pixel_w = pixel_w.saturating_sub(1);
-    }
-    if pixel_h % 2 != 0 {
-        pixel_h = pixel_h.saturating_sub(1);
-    }
+    // Single authoritative size: even dimensions for video encoders.
+    let (pixel_w, pixel_h) = (target.width, target.height);
     if pixel_w == 0 || pixel_h == 0 {
         return None;
     }
@@ -1184,10 +1093,10 @@ pub fn composite_export_frame(
     .unwrap_or(Color::WHITE);
     pixmap.fill(bg);
 
-    let scale_x = pixel_w as f32 / doc_w as f32;
-    let scale_y = pixel_h as f32 / doc_h as f32;
-    let svg_scale = Transform::from_scale(scale_x, scale_y);
-    let opt = crate::fonts::usvg_options();
+    // Consecutive static layers accumulate here and flush as ONE painter
+    // segment, preserving stack order against interleaved overlays.
+    let mut pending_static: Vec<crate::document::NodeId> = Vec::new();
+    let mut session = crate::export_render::PainterSession::new();
 
     for layer in &project.document.layers {
         if !layer.visible || !layer.is_renderer {
@@ -1195,122 +1104,265 @@ pub fn composite_export_frame(
         }
         match layer.kind {
             crate::document::LayerKind::AV => {
+                flush_static_segment(
+                    &mut pixmap,
+                    project,
+                    &mut pending_static,
+                    target,
+                    &mut session,
+                );
                 let Some(buf) = video_frames.get(&layer.id) else {
                     continue;
                 };
-                let mut src = Pixmap::new(buf.width, buf.height)?;
-                src.data_mut().copy_from_slice(&buf.rgba);
-                let (dx, dy, rot, opacity) =
-                    layer_anim_transform(layer, project, current_frame);
-                let (dw, dh) = video_layer_dest_size(layer, buf.width, buf.height);
-                let x = (dx as f32) * scale;
-                let y = (dy as f32) * scale;
-                let w = dw * scale;
-                let h = dh * scale;
-                let sx = w / buf.width as f32;
-                let sy = h / buf.height as f32;
-                let transform = if rot != 0.0 {
-                    Transform::from_translate(x, y).pre_concat(
-                        Transform::from_translate(w / 2.0, h / 2.0)
-                            .pre_rotate(rot as f32)
-                            .pre_translate(-w / 2.0, -h / 2.0)
-                            .pre_scale(sx, sy),
-                    )
-                } else {
-                    Transform::from_translate(x, y).pre_scale(sx, sy)
-                };
-                let mut paint = PixmapPaint::default();
-                paint.opacity = opacity;
-                pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
+                blit_av_layer(&mut pixmap, target, project, layer, buf, ctx)?;
             }
-            crate::document::LayerKind::Image => {
-                let svg = document_svg_single_image_layer(project, layer, &std::collections::HashSet::new());
-                if let Ok(tree) = usvg::Tree::from_str(&svg, &opt) {
-                    resvg::render(&tree, svg_scale, &mut pixmap.as_mut());
-                }
+            crate::document::LayerKind::Image
+            | crate::document::LayerKind::Flowchart => {
+                // Static vector content: painter segment, NOT svg→resvg.
+                // (Flowchart previously rendered nothing here — now matches preview.)
+                pending_static.extend(layer.nodes.iter().copied());
             }
             crate::document::LayerKind::Shading => {
-                apply_shading_passes_skia(&mut pixmap, &layer.shading_passes, time_secs);
+                flush_static_segment(
+                    &mut pixmap,
+                    project,
+                    &mut pending_static,
+                    target,
+                    &mut session,
+                );
+                apply_shading_passes_skia(&mut pixmap, &layer.shading_passes, ctx.time_secs);
             }
-            crate::document::LayerKind::Flowchart => {}
-            crate::document::LayerKind::ScreenRecord => {}
+            crate::document::LayerKind::ScreenRecord => {
+                flush_static_segment(
+                    &mut pixmap,
+                    project,
+                    &mut pending_static,
+                    target,
+                    &mut session,
+                );
+            }
             crate::document::LayerKind::NodeEditor => {
+                flush_static_segment(
+                    &mut pixmap,
+                    project,
+                    &mut pending_static,
+                    target,
+                    &mut session,
+                );
                 // P6c: software path for NE Output (GPU export uses export_worker caches).
-                if let Some(g) = &layer.node_graph {
-                    let eval = g.resolve_output_image();
-                    if matches!(
-                        eval.image,
-                        crate::document::GraphImageSource::FilePath(_)
-                            | crate::document::GraphImageSource::BakedCache { .. }
-                    ) {
-                        let max_side = pixel_w.max(pixel_h).clamp(256, 2048);
-                        if let Some(rgba) = crate::document::bake_graph_eval_rgba(
-                            &eval,
-                            max_side.min(512),
-                            1.0,
-                            None,
-                            None,
-                        ) {
-                            let (tw, th) = rgba.dimensions();
-                            if let Some(mut src) = resvg::tiny_skia::Pixmap::new(tw, th) {
-                                src.data_mut().copy_from_slice(&rgba);
-                                let (dx, dy, mut w, mut h, rot_rad) = layer
-                                    .ne_output_paint_geom(&project.nodes, &eval);
-                                let def_w = layer.width as f64;
-                                let def_h = layer.height as f64;
-                                let near_default = (w - def_w).abs() < 2.0
-                                    && (h - def_h).abs() < 2.0;
-                                let near_a4 = (w - crate::document::A4_WIDTH_PX).abs()
-                                    < 2.0
-                                    && (h - crate::document::A4_HEIGHT_PX).abs() < 2.0;
-                                if near_default || near_a4 {
-                                    let page_w = doc_w.max(1.0);
-                                    let page_h = doc_h.max(1.0);
-                                    let mut nw = tw as f64;
-                                    let mut nh = th as f64;
-                                    if nw > page_w || nh > page_h {
-                                        let s = (page_w / nw).min(page_h / nh);
-                                        nw *= s;
-                                        nh *= s;
-                                    }
-                                    w = nw.max(1.0);
-                                    h = nh.max(1.0);
-                                }
-                                let x = (dx as f32) * scale;
-                                let y = (dy as f32) * scale;
-                                let dw = (w as f32) * scale;
-                                let dh = (h as f32) * scale;
-                                let sx = dw / tw as f32;
-                                let sy = dh / th as f32;
-                                let rot_deg = rot_rad.to_degrees() as f32;
-                                let transform = if rot_deg.abs() > 1e-4 {
-                                    Transform::from_translate(x, y).pre_concat(
-                                        Transform::from_translate(dw / 2.0, dh / 2.0)
-                                            .pre_rotate(rot_deg)
-                                            .pre_translate(-dw / 2.0, -dh / 2.0)
-                                            .pre_scale(sx, sy),
-                                    )
-                                } else {
-                                    Transform::from_translate(x, y).pre_scale(sx, sy)
-                                };
-                                let paint = PixmapPaint::default();
-                                pixmap.draw_pixmap(
-                                    0,
-                                    0,
-                                    src.as_ref(),
-                                    &paint,
-                                    transform,
-                                    None,
-                                );
-                            }
-                        }
-                    }
-                }
+                composite_ne_file_output(
+                    &mut pixmap,
+                    project,
+                    layer,
+                    target,
+                    pixel_w.max(pixel_h).clamp(256, 2048).min(512),
+                );
             }
+        }
+    }
+    flush_static_segment(&mut pixmap, project, &mut pending_static, target, &mut session);
+
+    // NE AppObjects: base segments hide these sources (painted at the NE
+    // slot instead), so composite them here — same painter as preview, same
+    // position as the worker fast path. Without this, thumbnails of such
+    // docs lose the content entirely.
+    for layer in &project.document.layers {
+        if !layer.visible
+            || !layer.is_renderer
+            || layer.kind != crate::document::LayerKind::NodeEditor
+        {
+            continue;
+        }
+        let Some(g) = &layer.node_graph else {
+            continue;
+        };
+        let eval = g.resolve_output_image();
+        let crate::document::GraphImageSource::AppObjects(ids) = &eval.image else {
+            continue;
+        };
+        if ids.is_empty() {
+            continue;
+        }
+        if let Some(rgba) =
+            session.render_ne_appobjects(project, ids, target)
+        {
+            blit_transparent_full_frame(&mut pixmap, pixel_w, pixel_h, &rgba);
         }
     }
 
     Some((pixel_w, pixel_h, pixmap.take()))
+}
+
+/// Composite a NodeEditor layer's FilePath/BakedCache output onto a frame.
+
+/// Composite a NodeEditor layer's FilePath/BakedCache output onto a frame.
+///
+/// Shared by the video fallback compositor and still export: one bake policy
+/// input (`bake_max_side`), one geometry fit, one transform path. Returns
+/// true when something was composited. `bake_max_side` differs by consumer
+/// (video fallback caps low for speed; still export uses full target size,
+/// bake caps internally at 4096) — same code path, different resolution
+/// promise, no third policy.
+pub(crate) fn composite_ne_file_output(
+    pixmap: &mut resvg::tiny_skia::Pixmap,
+    project: &ProjectFile,
+    layer: &crate::document::Layer,
+    target: &crate::render_pipeline::RenderTarget,
+    bake_max_side: u32,
+) -> bool {
+    let Some(g) = &layer.node_graph else {
+        return false;
+    };
+    let eval = g.resolve_output_image();
+    if !matches!(
+        eval.image,
+        crate::document::GraphImageSource::FilePath(_)
+            | crate::document::GraphImageSource::BakedCache { .. }
+    ) {
+        return false;
+    }
+    let Some(rgba) =
+        crate::document::bake_graph_eval_rgba(&eval, bake_max_side, 1.0, None, None)
+    else {
+        return false;
+    };
+    let (tw, th) = rgba.dimensions();
+    let Some(src) = straight_rgba_to_pixmap(tw, th, &rgba) else {
+        return false;
+    };
+    let (dx, dy, mut w, mut h, rot_rad) =
+        layer.ne_output_paint_geom(&project.nodes, &eval);
+    let doc_w = project.document.width;
+    let doc_h = project.document.height;
+    let def_w = layer.width as f64;
+    let def_h = layer.height as f64;
+    let near_default = (w - def_w).abs() < 2.0 && (h - def_h).abs() < 2.0;
+    let near_a4 = (w - crate::document::A4_WIDTH_PX).abs() < 2.0
+        && (h - crate::document::A4_HEIGHT_PX).abs() < 2.0;
+    if near_default || near_a4 {
+        let page_w = doc_w.max(1.0);
+        let page_h = doc_h.max(1.0);
+        let mut nw = tw as f64;
+        let mut nh = th as f64;
+        if nw > page_w || nh > page_h {
+            let s = (page_w / nw).min(page_h / nh);
+            nw *= s;
+            nh *= s;
+        }
+        w = nw.max(1.0);
+        h = nh.max(1.0);
+    }
+    let rot_deg = rot_rad.to_degrees() as f32;
+    let transform =
+        crate::render_pipeline::pixmap_transform(&target, dx, dy, w, h, rot_deg, tw, th);
+    let paint = resvg::tiny_skia::PixmapPaint::default();
+    pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
+    true
+}
+
+/// Flush one pending static segment: paint accumulated vector nodes with the
+/// same painter + effect passes as preview, then blit in stack order.
+/// Shared by both frame compositors so segment boundaries can't drift.
+/// Paints on the caller's [`crate::export_render::PainterSession`] so font
+/// installs, atlas and decoded images survive across segments and frames.
+pub(crate) fn flush_static_segment(
+    pixmap: &mut resvg::tiny_skia::Pixmap,
+    project: &ProjectFile,
+    pending: &mut Vec<crate::document::NodeId>,
+    target: &crate::render_pipeline::RenderTarget,
+    session: &mut crate::export_render::PainterSession,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    if let Some(rgba) = session.render_static_order(project, pending, target) {
+        blit_transparent_full_frame(pixmap, target.width, target.height, &rgba);
+    }
+    pending.clear();
+}
+
+/// Upload straight-sRGBA bytes into a premultiplied pixmap.
+///
+/// tiny-skia blends in premultiplied space; copying straight bytes in raw
+/// brightens translucent fringes (antialiased text/rect edges, soft bake
+/// alpha) versus what the painter produced. Opaque pixels are unaffected.
+pub(crate) fn straight_rgba_to_pixmap(
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) -> Option<resvg::tiny_skia::Pixmap> {
+    if rgba.len() != (w * h * 4) as usize {
+        return None;
+    }
+    let mut px = resvg::tiny_skia::Pixmap::new(w, h)?;
+    for (d, s) in px
+        .data_mut()
+        .chunks_exact_mut(4)
+        .zip(rgba.chunks_exact(4))
+    {
+        let a = s[3] as u32;
+        d[0] = ((s[0] as u32 * a + 127) / 255) as u8;
+        d[1] = ((s[1] as u32 * a + 127) / 255) as u8;
+        d[2] = ((s[2] as u32 * a + 127) / 255) as u8;
+        d[3] = s[3];
+    }
+    Some(px)
+}
+
+/// Composite one decoded AV frame at its animated layer geometry.
+/// Shared by both frame compositors: single `pixmap_transform` path, single
+/// opacity handling.
+pub(crate) fn blit_av_layer(
+    pixmap: &mut resvg::tiny_skia::Pixmap,
+    target: &crate::render_pipeline::RenderTarget,
+    project: &ProjectFile,
+    layer: &crate::document::Layer,
+    buf: &VideoLayerBuffer,
+    ctx: &crate::render_pipeline::RenderContext,
+) -> Option<()> {
+    let src = straight_rgba_to_pixmap(buf.width, buf.height, &buf.rgba)?;
+    let (dx, dy, rot, opacity) = layer_anim_transform(layer, project, ctx.frame);
+    let (dw, dh) = video_layer_dest_size(layer, buf.width, buf.height);
+    let transform = crate::render_pipeline::pixmap_transform(
+        target,
+        dx,
+        dy,
+        dw as f64,
+        dh as f64,
+        rot as f32,
+        buf.width,
+        buf.height,
+    );
+    let mut paint = resvg::tiny_skia::PixmapPaint::default();
+    paint.opacity = opacity;
+    pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
+    Some(())
+}
+
+/// Blit a full-frame transparent painter buffer onto the frame pixmap.
+/// Straight-sRGBA bytes are repacked through tiny-skia so alpha composites
+/// instead of overwriting.
+pub(crate) fn blit_transparent_full_frame(
+    pixmap: &mut resvg::tiny_skia::Pixmap,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) {
+    if rgba.len() != (w * h * 4) as usize {
+        return;
+    }
+    let Some(src) = straight_rgba_to_pixmap(w, h, rgba) else {
+        return;
+    };
+    let paint = resvg::tiny_skia::PixmapPaint::default();
+    pixmap.draw_pixmap(
+        0,
+        0,
+        src.as_ref(),
+        &paint,
+        resvg::tiny_skia::Transform::identity(),
+        None,
+    );
 }
 
 /// CPU shading for named presets (galaxy / starfield / blackhole). Used by export fast path.
@@ -1546,7 +1598,7 @@ mod tests {
             let svg = format!(
                 r#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><rect width="240" height="240" fill="white"/>{frag}</svg>"#
             );
-            // Must match hybrid export (`export_worker` + `document_svg_single_image_layer`).
+            // Vector SVG text path (unchanged feature: .svg file export).
             let opt = crate::fonts::usvg_options();
             let tree = usvg::Tree::from_str(&svg, &opt).expect("parse svg");
             let mut pm = Pixmap::new(240, 240).expect("pixmap");
@@ -1570,5 +1622,257 @@ mod tests {
             rotated.data(),
             "rotated text raster identical to upright — export would still drop rotation"
         );
+    }
+
+    /// Render-contract lock: the video frame compositor must reproduce the
+    /// authoritative still export for static documents (rect + text, no
+    /// AV/shading/NE layers). Any future scene reinterpretation in either
+    /// path breaks this instead of shipping a preview≠video discrepancy.
+    #[test]
+    fn composite_frame_matches_document_export_for_static_doc() {
+        use crate::document::{Document, Fill, Node, Paint, TextStyle};
+
+        let mut project = Document::new_empty_project();
+        let rect = Node::rect(
+            60.0,
+            60.0,
+            200.0,
+            120.0,
+            Fill::Solid(Paint::from_hex(0xc0392b, 1.0)),
+        );
+        let rect_id = rect.id;
+        project.nodes.insert(rect);
+        let mut text = Node::text(
+            80.0,
+            220.0,
+            TextStyle {
+                content: "Frame".into(),
+                font_size: 36.0,
+                ..Default::default()
+            },
+        );
+        text.style.fill = Fill::Solid(Paint::from_hex(0x000000, 1.0));
+        let text_id = text.id;
+        project.nodes.insert(text);
+        project.document.append_to_active_layer(rect_id);
+        project.document.append_to_active_layer(text_id);
+
+        let (w, h, still) =
+            crate::export_render::render_document_rgba(&project, 1.0)
+                .expect("still export");
+        let vf = VideoFrameMap::default();
+        let target = crate::render_pipeline::RenderTarget::for_video(
+            project.document.width,
+            project.document.height,
+            1.0,
+        )
+        .expect("target");
+        let ctx = crate::render_pipeline::RenderContext::new(0, 0.0);
+        let (fw, fh, frame) =
+            composite_export_frame(&project, &ctx, &vf, &target)
+                .expect("frame composite");
+        // Video encoders need even dims: odd page sides shave one row/col.
+        // The overlap must still be the same render (scale 1.0, origin ZERO).
+        assert_eq!(fw, w - w % 2);
+        assert_eq!(fh, h - h % 2);
+        assert!(ink_pixels(&still) > 500, "fixture must paint ink");
+        let row_bytes = (fw * 4) as usize;
+        let mut worst = 0i32;
+        for y in 0..fh as usize {
+            let fo = y * (w * 4) as usize;
+            let go = y * row_bytes;
+            for (a, b) in still[fo..fo + row_bytes]
+                .iter()
+                .zip(frame[go..go + row_bytes].iter())
+            {
+                worst = worst.max((*a as i32 - *b as i32).abs());
+            }
+        }
+        assert!(
+            worst <= 2,
+            "frame must match still export, worst channel diff {worst}"
+        );
+    }
+
+    /// Frame fallback must composite NE AppObjects output (base segments
+    /// hide these sources). Without the overlay, thumbnails of such docs
+    /// lose the content that preview and video export show.
+    #[test]
+    fn frame_composite_keeps_ne_appobjects_content() {
+        use crate::document::{
+            Document, Fill, GraphNodeKind, Layer, Node, NodeGraph, Paint,
+        };
+
+        let mut project = Document::new_empty_project();
+        let red = Fill::Solid(Paint::from_hex(0xc0392b, 1.0));
+        let rect = Node::rect(120.0, 120.0, 60.0, 60.0, red);
+        let rect_id = rect.id;
+        project.nodes.insert(rect);
+        project.document.append_to_active_layer(rect_id);
+
+        let mut layer = Layer::new_node_editor_layer(uuid::Uuid::new_v4(), "NE".into());
+        let mut g = NodeGraph::new_empty();
+        let out_id = g.output_node_id.expect("seeded output");
+        let src = g.add_node(
+            GraphNodeKind::ObjectFromApp {
+                node_ids: vec![rect_id],
+            },
+            0.0,
+            0.0,
+        );
+        g.try_add_link(src, "out", out_id, "image")
+            .expect("link app object to output");
+        g.eval_reals(0, 30.0);
+        let ev = g.resolve_output_image();
+        assert!(
+            matches!(
+                ev.image,
+                crate::document::GraphImageSource::AppObjects(ref ids)
+                    if ids.contains(&rect_id)
+            ),
+            "fixture must resolve AppObjects, got {:?}",
+            ev.image
+        );
+        layer.node_graph = Some(g);
+        project.document.layers.push(layer);
+
+        let vf = VideoFrameMap::default();
+        let target = crate::render_pipeline::RenderTarget::for_video(
+            project.document.width,
+            project.document.height,
+            1.0,
+        )
+        .expect("target");
+        let ctx = crate::render_pipeline::RenderContext::new(0, 0.0);
+        let (w, h, rgba) = composite_export_frame(&project, &ctx, &vf, &target)
+            .expect("frame composite");
+        assert_eq!((w, h), (target.width, target.height));
+        let px = |x: u32, y: u32| -> [u8; 4] {
+            let i = ((y * w + x) * 4) as usize;
+            [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+        };
+        let bg = px(5, 5);
+        let ink = px(130, 130);
+        let diff = (ink[0] as i32 - bg[0] as i32).abs()
+            + (ink[1] as i32 - bg[1] as i32).abs()
+            + (ink[2] as i32 - bg[2] as i32).abs();
+        assert!(diff > 60, "AppObjects content must survive, got {ink:?} vs {bg:?}");
+    }
+
+    fn ink_pixels(rgba: &[u8]) -> usize {
+        let bg = [rgba[0] as i32, rgba[1] as i32, rgba[2] as i32];
+        rgba.chunks_exact(4)
+            .filter(|p| {
+                (p[0] as i32 - bg[0]).abs()
+                    + (p[1] as i32 - bg[1]).abs()
+                    + (p[2] as i32 - bg[2]).abs()
+                    > 36
+            })
+            .count()
+    }
+
+    /// Still export must composite NodeEditor FilePath output (was: proxy /
+    /// nothing). Uses the shared `composite_ne_file_output` software path at
+    /// full still resolution — same policy shape as video fallback.
+    #[test]
+    fn still_export_composites_ne_file_output() {
+        use crate::document::{Document, GraphNodeKind, Layer, NodeGraph};
+
+        let tag = std::process::id();
+        let dir = std::env::temp_dir();
+        let src_path = dir.join(format!("vadadee_ne_src_{tag}.png"));
+        let out_path = dir.join(format!("vadadee_ne_still_{tag}.png"));
+
+        // 64x64 solid red source image.
+        let img = image::RgbaImage::from_pixel(64, 64, image::Rgba([220, 30, 30, 255]));
+        img.save(&src_path).expect("write temp source");
+
+        let mut project = Document::new_empty_project();
+        let mut layer = Layer::new_node_editor_layer(uuid::Uuid::new_v4(), "NE".into());
+        layer.x = 100.0;
+        layer.y = 100.0;
+        layer.width = 64.0;
+        layer.height = 64.0;
+        let mut g = NodeGraph::new_empty();
+        let out_id = g.output_node_id.expect("seeded output");
+        let img_node = g.add_node(
+            GraphNodeKind::ObjectImage {
+                path: src_path.to_string_lossy().into_owned(),
+            },
+            0.0,
+            0.0,
+        );
+        g.try_add_link(img_node, "out", out_id, "image")
+            .expect("link image to output");
+        g.eval_reals(0, 30.0);
+        let ev = g.resolve_output_image();
+        assert!(
+            matches!(ev.image, crate::document::GraphImageSource::FilePath(_)),
+            "fixture must resolve FilePath, got {:?}",
+            ev.image
+        );
+        layer.node_graph = Some(g);
+        project.document.layers.push(layer);
+
+        export_document_raster(&project, ExportImageFormat::Png, 1.0, &out_path)
+            .expect("still export");
+        let back = image::open(&out_path).expect("read back").to_rgba8();
+        let (w, h) = (back.width(), back.height());
+        assert_eq!((w, h), (794, 1123));
+        let bg = back.get_pixel(5, 5);
+        let ink = back.get_pixel(110, 110);
+        let diff = (ink[0] as i32 - bg[0] as i32).abs()
+            + (ink[1] as i32 - bg[1] as i32).abs()
+            + (ink[2] as i32 - bg[2] as i32).abs();
+        assert!(diff > 60, "NE output must appear, ink {ink:?} vs bg {bg:?}");
+
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    /// Still export must apply shading layers through the shared CPU path
+    /// (was: flat page). Same presets as the video fallback at frozen time;
+    /// unknown custom WGSL stays a no-op in both.
+    #[test]
+    fn still_export_applies_shading_presets() {
+        use crate::document::{Document, Layer, ShadingPass};
+
+        let tag = std::process::id();
+        let dir = std::env::temp_dir();
+        let plain_path = dir.join(format!("vadadee_shade_plain_{tag}.png"));
+        let shade_path = dir.join(format!("vadadee_shade_star_{tag}.png"));
+
+        let plain = Document::new_empty_project();
+        export_document_raster(&plain, ExportImageFormat::Png, 1.0, &plain_path)
+            .expect("plain export");
+
+        let mut project = Document::new_empty_project();
+        let mut layer = Layer::new_shading_layer(uuid::Uuid::new_v4(), "Shade".into());
+        layer
+            .shading_passes
+            .push(ShadingPass::new_preset("Starfield", String::new()));
+        project.document.layers.push(layer);
+        export_document_raster(&project, ExportImageFormat::Png, 1.0, &shade_path)
+            .expect("shaded export");
+
+        let a = image::open(&plain_path).expect("read plain").to_rgba8();
+        let b = image::open(&shade_path).expect("read shaded").to_rgba8();
+        assert_eq!((a.width(), a.height()), (b.width(), b.height()));
+        let n = (a.width() * a.height()) as usize;
+        let mut total = 0u64;
+        for i in 0..n {
+            let o = i * 4;
+            for c in 0..3 {
+                total += (a.as_raw()[o + c] as i32 - b.as_raw()[o + c] as i32).abs() as u64;
+            }
+        }
+        let mean = total as f64 / (n * 3) as f64;
+        assert!(
+            mean > 5.0,
+            "shading preset must change still export, mean diff {mean}"
+        );
+
+        let _ = std::fs::remove_file(&plain_path);
+        let _ = std::fs::remove_file(&shade_path);
     }
 }
