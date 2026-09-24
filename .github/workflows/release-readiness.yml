@@ -1,0 +1,154 @@
+# Release readiness: is it feasible to cut a new tag right now?
+#
+# Runs on PRs and manually — never on tags (it gates tag creation, it must
+# not depend on one). Answers three questions before anyone runs
+# `git tag vX.Y.Z`:
+#   1. version-gate: Cargo.toml version has no existing tag, lockfile and
+#      all versioned packaging files agree with it.
+#   2. packaging-gate: every installer script parses, committed icons match
+#      the generator, desktop/metainfo/wxs identities agree.
+#   3. code-gate: the exact minimal-feature lib build + unit tests a tag
+#      release would compile actually pass.
+#
+# A red readiness run means: do NOT tag yet.
+name: Release readiness
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  version-gate:
+    name: Version / tag feasibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version consistency + tag availability
+        run: |
+          set -euo pipefail
+          VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test -n "$VER" || { echo "ERROR: no version in Cargo.toml"; exit 1; }
+          echo "Cargo version: $VER"
+          if git ls-remote --tags origin "refs/tags/v$VER" | grep -q .; then
+            echo "ERROR: tag v$VER already exists — bump Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Tag v$VER is available."
+          LOCK="$(grep -A1 'name = "vadadee-berry"' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')"
+          test "$LOCK" = "$VER" || { echo "ERROR: Cargo.lock ($LOCK) != Cargo.toml ($VER)"; exit 1; }
+          for f in packaging/macos/Info.plist; do
+            grep -q "<string>$VER</string>" "$f" || { echo "ERROR: $f missing version $VER"; exit 1; }
+          done
+          for f in packaging/make_desktop_release.sh packaging/linux/build_deb.sh packaging/macos/make_macos_installer.sh; do
+            grep -q "VERSION:-$VER" "$f" || { echo "ERROR: $f fallback is not $VER"; exit 1; }
+          done
+          echo "version-gate OK"
+
+  packaging-gate:
+    name: Packaging validation (no compilers needed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install validators
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends desktop-file-utils appstream
+          python3 -m pip install --quiet pillow
+      - name: Shell syntax (all packaging scripts)
+        run: |
+          set -euo pipefail
+          for f in packaging/make_desktop_release.sh \
+                   packaging/linux/render_icons.sh \
+                   packaging/linux/appimage/build_appimage.sh \
+                   packaging/linux/build_deb.sh \
+                   packaging/flatpak/build_flatpak.sh \
+                   packaging/macos/make_macos_installer.sh; do
+            bash -n "$f" || exit 1
+          done
+          echo "bash -n OK"
+      - name: Committed icons match the generator
+        run: |
+          set -euo pipefail
+          ./packaging/linux/render_icons.sh
+          git diff --exit-code -- packaging/linux/icons/ \
+            || { echo "ERROR: committed icon tree differs from render_icons.sh output"; exit 1; }
+          for s in 16 32 48 64 128 256 512; do
+            test -f "packaging/linux/icons/hicolor/${s}x${s}/apps/com.cosmobunny.VadadeeBerry.png"
+          done
+          echo "icons OK"
+      - name: Desktop entry + metainfo validate
+        run: |
+          set -euo pipefail
+          desktop-file-validate packaging/linux/com.cosmobunny.VadadeeBerry.desktop
+          appstreamcli validate --no-net packaging/flatpak/com.cosmobunny.VadadeeBerry.metainfo.xml || true
+      - name: Single app identity everywhere
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import re, sys, xml.dom.minidom
+          APP = "com.cosmobunny.VadadeeBerry"
+          fails = []
+          def check(cond, msg):
+              if not cond:
+                  fails.append(msg)
+          desktop = open("packaging/linux/com.cosmobunny.VadadeeBerry.desktop").read()
+          check(f"Icon={APP}\n" in desktop, "desktop Icon= entry")
+          meta = open("packaging/flatpak/com.cosmobunny.VadadeeBerry.metainfo.xml").read()
+          check(f"<id>{APP}</id>" in meta, "metainfo id")
+          check("VadadeeBerry.desktop" in meta or f"{APP}.desktop" in meta, "metainfo launchable")
+          yml = open("packaging/flatpak/com.cosmobunny.VadadeeBerry.yml").read()
+          check(f"app-id: {APP}" in yml, "flatpak app-id")
+          wxs = open("packaging/windows/VadadeeBerry.wxs").read()
+          xml.dom.minidom.parse("packaging/windows/VadadeeBerry.wxs")
+          guids = re.findall(r'Guid="([^"]+)"|UpgradeCode="([^"]+)"', wxs)
+          vals = [a or b for a, b in guids]
+          import uuid
+          for v in vals:
+              uuid.UUID(v)
+          check(len(vals) == len(set(vals)) and len(vals) > 0, "wxs GUIDs unique")
+          for req in ("VadadeeBerryExe", "vadadee-berry.ico", "$(var.Version)", "$(var.BinDir)"):
+              check(req in wxs, f"wxs references {req}")
+          for req in ("vadadee-berry.ico", "vadadee-berry.icns"):
+              import os
+              check(os.path.isfile(f"packaging/windows/{req}") or os.path.isfile(f"packaging/macos/{req}"),
+                    f"icon file {req}")
+          if fails:
+              print("IDENTITY FAILURES:"); [print(" -", m) for m in fails]; sys.exit(1)
+          print("identity OK")
+          PYEOF
+      - name: Workflows parse
+        run: |
+          set -euo pipefail
+          python3 -c "import yaml, glob; [yaml.safe_load(open(f)) for f in glob.glob('.github/workflows/*.yml')]; print('workflows OK')"
+
+  code-gate:
+    name: Minimal-feature lib check + tests (what a tag builds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux system deps (no OpenCV — tag builds are minimal)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-3-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev \
+            libasound2-dev libpipewire-0.3-dev libspa-0.2-dev clang libclang-dev llvm-dev
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: readiness-${{ runner.os }}
+      - name: Check + test (minimal features, like tag releases)
+        run: |
+          set -euo pipefail
+          cargo check --lib --no-default-features
+          cargo test --lib --no-default-features

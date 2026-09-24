@@ -28,10 +28,14 @@ jobs:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
       - uses: Swatinem/rust-cache@v2
       - name: Check library for iOS targets
+        # Minimal feature set: OpenCV (default feature) has no iOS system
+        # libraries — mobile never ships it (matches release policy).
+        # Desktop-only deps (rfd, device_query, screen_capture) are gated
+        # off iOS in Cargo.toml / lib.rs for the same reason.
         run: |
-          cargo check --lib --target aarch64-apple-ios
-          cargo check --lib --target aarch64-apple-ios-sim
-          cargo check --lib --target x86_64-apple-ios
+          cargo check --lib --no-default-features --target aarch64-apple-ios
+          cargo check --lib --no-default-features --target aarch64-apple-ios-sim
+          cargo check --lib --no-default-features --target x86_64-apple-ios
 
   ios-package:
     name: Xcode archive

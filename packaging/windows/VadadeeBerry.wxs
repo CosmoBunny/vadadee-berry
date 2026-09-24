@@ -1,4 +1,4 @@
-<!-- Vadadee Berry Windows installer (WiX Toolset v4).
+<!-- Vadadee Berry Windows installer (WiX Toolset v5, v4 wxs schema).
      Consumed by packaging/windows/build_installer.ps1, which passes
      Version + BinDir. Every file below is explicit — nothing ships by
      accident. GUIDs are stable (namespace-derived, committed) so upgrades

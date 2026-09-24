@@ -41,10 +41,12 @@ jobs:
           test -x "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
           echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
       - name: Check library for Android targets
+        # Minimal feature set: OpenCV (default feature) has no Android/iOS
+        # system libraries — mobile never ships it (matches release policy).
         run: |
-          cargo check --lib --target aarch64-linux-android
-          cargo check --lib --target armv7-linux-androideabi
-          cargo check --lib --target x86_64-linux-android
+          cargo check --lib --no-default-features --target aarch64-linux-android
+          cargo check --lib --no-default-features --target armv7-linux-androideabi
+          cargo check --lib --no-default-features --target x86_64-linux-android
 
   android-package:
     name: Gradle APK/AAB

@@ -5,7 +5,7 @@
 .DESCRIPTION
     Uses binaries already built by the desktop release job
     (make_desktop_release.sh / cargo build --release), stages them with the
-    shared icon, and builds VadadeeBerry.wxs with the WiX v4 .NET tool
+    shared icon, and builds VadadeeBerry.wxs with the WiX v5 .NET tool
     (installed on demand; needs network on first use).
 
 .PARAMETER BinDir
@@ -53,11 +53,14 @@ foreach ($f in @($wxs, $ico)) {
     }
 }
 
-# WiX v4 as a dotnet tool (windows-latest runners ship dotnet).
+# WiX v5 as a dotnet tool (windows-latest runners ship dotnet).
+# Pinned to v5 on purpose: v7 gates usage behind an OSMF EULA acceptance
+# step (WIX7015) that has no place in unattended CI, while v5 uses the same
+# v4 wxs schema this package is authored in.
 $wix = (Get-Command wix -ErrorAction SilentlyContinue)?.Source
 if (-not $wix) {
-    Write-Host 'Installing WiX Toolset v4 (needs network)...'
-    dotnet tool install --global wix
+    Write-Host 'Installing WiX Toolset v5 (needs network)...'
+    dotnet tool install --global wix --version '5.*'
     $wix = (Get-Command wix -ErrorAction SilentlyContinue)?.Source
 }
 if (-not $wix) {
@@ -72,11 +75,13 @@ $outPath = Join-Path $OutDir $outName
 if (Test-Path $outPath) { Remove-Item $outPath -Force }
 
 # Build from the packaging dir so the relative icon source resolves.
+# NOTE: -d takes its value as the NEXT token (attached -dName= form is
+# rejected: WIX0118).
 Push-Location (Join-Path $PSScriptRoot '.')
 try {
     & $wix build VadadeeBerry.wxs `
-        "-dVersion=$version" `
-        "-dBinDir=$BinDir" `
+        -d "Version=$version" `
+        -d "BinDir=$BinDir" `
         -o "$outPath"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
