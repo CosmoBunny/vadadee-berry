@@ -498,7 +498,7 @@ impl SystemHud {
     }
 
     fn pick_joke(&mut self, sec_per_frame: f32) {
-        let is_mobile = cfg!(target_os = "android");
+        let is_mobile = cfg!(any(target_os = "android", target_os = "ios"));
         self.current_joke = choose_joke(
             &self.joke_rules,
             self.stats.cpu_usage,

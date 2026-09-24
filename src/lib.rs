@@ -38,7 +38,7 @@ pub mod render_pipeline;
 pub mod export_types;
 pub mod recorder;
 pub mod audio_extract;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod screen_capture;
 pub mod collab;
 pub mod sys_stats;

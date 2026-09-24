@@ -1688,6 +1688,12 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
                         font.clone(),
                         link_col,
                     );
+                    // Native file picker: desktop only (no rfd backend on
+                    // mobile — same treatment as every other file dialog).
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    // Native file picker: desktop only (no rfd backend on
+                    // mobile — same treatment as every other file dialog).
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if click && browse_rect.contains(ptr) {
                         let mut dlg = rfd::FileDialog::new();
                         dlg = match &node_clone.kind {

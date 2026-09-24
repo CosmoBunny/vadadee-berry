@@ -216,7 +216,7 @@ pub struct VadadeeBerryApp {
     audio_prepare_rx:
         std::collections::HashMap<uuid::Uuid, std::sync::mpsc::Receiver<Option<crate::audio_extract::AudioPrepareResult>>>,
     /// Active OS screen captures (Screen Record layers) — desktop only.
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub screen_captures: std::collections::HashMap<uuid::Uuid, crate::screen_capture::ScreenCaptureSession>,
 
     pub project: ProjectFile,
@@ -363,7 +363,7 @@ pub struct VadadeeBerryApp {
     pub eyedropper_t: f32,
     pub eyedropper_target_pos: Option<(f64, f64)>,
     /// Tracks Ctrl+V for paste fallback when egui-winit swallows the hotkey (image-only clipboard).
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
     paste_hotkey_was_down: bool,
     /// Multi-frame paste shown on the 2nd status-bar label ("Pasting…").
     paste_progress: Option<PasteProgress>,
@@ -400,17 +400,17 @@ pub struct VadadeeBerryApp {
     pub cursor_bubble_edit: bool,
     pub cursor_bubble_focus_pending: bool,
     pub cursor_bubble_text: String,
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     mcp_bridge: Option<crate::mcp::McpBridge>,
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub mcp_preview: crate::left_dock::McpPreviewState,
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     mcp_preview_update_tx: std::sync::mpsc::Sender<McpPreviewUpdate>,
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     mcp_preview_update_rx: std::sync::mpsc::Receiver<McpPreviewUpdate>,
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pending_mcp_bulk_rects: Vec<Vec<Node>>,
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     mcp_bulk_staging: Vec<Node>,
     spatial_index: crate::spatial_index::SpatialIndex,
     cached_draw_order: Vec<NodeId>,
@@ -438,7 +438,7 @@ struct FloodFillAnim {
     base_rgba: Vec<u8>,
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Debug)]
 struct McpPreviewUpdate {
     rgba: Vec<u8>,
@@ -518,7 +518,7 @@ impl VadadeeBerryApp {
         let mut initial_status = "Idle".to_string();
         let mut initial_save_path: Option<std::path::PathBuf> = None;
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             let args: Vec<String> = std::env::args().collect();
             if args.len() > 1 {
@@ -538,16 +538,16 @@ impl VadadeeBerryApp {
             }
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let (mcp_preview_update_tx, mcp_preview_update_rx) = std::sync::mpsc::channel();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let (mcp_preview_update_tx, mcp_preview_update_rx) = (std::sync::mpsc::channel().0, std::sync::mpsc::channel().1); // dummy
 
         let (layer_cache_result_tx, layer_cache_result_rx) = std::sync::mpsc::channel();
         let wgpu_render = cc.wgpu_render_state.clone();
 
         // Drop stale regenerable extracts left from previous runs (crash / no clean exit).
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         purge_vadadee_disk_caches(CachePurgeOpts::on_startup());
 
         let app = Self {
@@ -618,7 +618,7 @@ impl VadadeeBerryApp {
             audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             audio_prepare_rx: std::collections::HashMap::new(),
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             screen_captures: std::collections::HashMap::new(),
 
             project: initial_project,
@@ -770,7 +770,7 @@ impl VadadeeBerryApp {
             eyedropper_releasing: false,
             eyedropper_t: 0.0,
             eyedropper_target_pos: None,
-            #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+            #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
             paste_hotkey_was_down: false,
             paste_progress: None,
             toolbar_expanded: false,
@@ -797,17 +797,17 @@ impl VadadeeBerryApp {
             cursor_bubble_edit: false,
             cursor_bubble_focus_pending: false,
             cursor_bubble_text: String::new(),
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             mcp_bridge: crate::mcp::McpBridge::try_start(),
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             mcp_preview: crate::left_dock::McpPreviewState::default(),
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             mcp_preview_update_tx,
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             mcp_preview_update_rx,
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             pending_mcp_bulk_rects: Vec::new(),
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             mcp_bulk_staging: Vec::new(),
             spatial_index: crate::spatial_index::SpatialIndex::default(),
             cached_draw_order: Vec::new(),
@@ -989,7 +989,7 @@ impl VadadeeBerryApp {
         }
         if let Some(json) = self.collab.take_pending_canvas_json() {
             if let Ok(loaded) = serde_json::from_str::<ProjectFile>(&json) {
-                #[cfg(not(target_os = "android"))]
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 {
                     crate::collab::merge_remote(
                         &mut self.project,
@@ -1008,7 +1008,7 @@ impl VadadeeBerryApp {
                     self.pending_mcp_bulk_rects.clear();
                     self.mcp_bulk_staging.clear();
                 }
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_os = "ios"))]
                 {
                     self.project = loaded;
                 }
@@ -1091,7 +1091,7 @@ impl VadadeeBerryApp {
             if !force_push {
                 self.collab_canvas_sync_accum = 0.0;
             }
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             {
                 const COLLAB_CANVAS_MAX_NODES: usize = 500;
                 if self.collab.canvas_outbound_enabled()
@@ -1110,7 +1110,7 @@ impl VadadeeBerryApp {
                     }
                 }
             }
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             if let Ok(json) = serde_json::to_string(&self.project) {
                 self.collab.send_canvas_if_changed(&json, force_push);
             }
@@ -1141,12 +1141,12 @@ impl VadadeeBerryApp {
     }
 
     pub fn request_import_image(&mut self) {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             self.status_message = "Image import from files is not available on Android yet".into();
             return;
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
             .pick_file()
@@ -2899,7 +2899,7 @@ impl VadadeeBerryApp {
     }
 
     /// Start OS screen capture for a Screen Record layer.
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn start_screen_record(&mut self, layer_idx: usize) {
         let Some(layer) = self.project.document.layers.get(layer_idx).cloned() else {
             return;
@@ -2961,13 +2961,13 @@ impl VadadeeBerryApp {
         }
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub fn start_screen_record(&mut self, _layer_idx: usize) {
         self.status_message = "Screen record not available on Android".into();
     }
 
     /// Stop capture and write `.sepscrr` + sibling `.mp4`.
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn stop_screen_record(&mut self, layer_idx: usize) {
         let Some(layer) = self.project.document.layers.get(layer_idx) else {
             return;
@@ -3004,18 +3004,18 @@ impl VadadeeBerryApp {
         }
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub fn stop_screen_record(&mut self, _layer_idx: usize) {
         self.status_message = "Screen record not available on Android".into();
     }
 
     /// True if this layer id has an active capture.
     pub fn is_screen_recording(&self, layer_id: uuid::Uuid) -> bool {
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             self.screen_captures.contains_key(&layer_id)
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             let _ = layer_id;
             false
@@ -3963,7 +3963,7 @@ impl VadadeeBerryApp {
         };
 
         // 3. Set image to system clipboard
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             match arboard::Clipboard::new() {
                 Ok(mut cb) => {
@@ -3989,14 +3989,14 @@ impl VadadeeBerryApp {
                 }
             }
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             self.status_message = "Clipboard image copy not supported on Android".into();
         }
     }
 
     pub fn request_video_export(&mut self, ctx: egui::Context) {
-        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+        #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
         {
             let ext = self.video_export.format.extension();
             if let Some(path) = rfd::FileDialog::new()
@@ -4007,7 +4007,7 @@ impl VadadeeBerryApp {
                 self.begin_video_export(path, ctx);
             }
         }
-        #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+        #[cfg(any(target_arch = "wasm32", any(target_os = "android", target_os = "ios")))]
         {
             self.status_message = "Video export is only available on desktop".into();
         }
@@ -4406,12 +4406,12 @@ impl VadadeeBerryApp {
                         self.finish_paste("Layer locked".into());
                         return;
                     }
-                    #[cfg(target_os = "android")]
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
                     {
                         self.finish_paste("System image paste is not available on Android".into());
                         return;
                     }
-                    #[cfg(not(target_os = "android"))]
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     {
                         let Ok(mut cb) = arboard::Clipboard::new() else {
                             self.finish_paste("Nothing to paste".into());
@@ -4533,7 +4533,7 @@ impl VadadeeBerryApp {
         self.paste_progress.is_some()
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
     fn system_clipboard_has_image(&self) -> bool {
         arboard::Clipboard::new()
             .ok()
@@ -4541,7 +4541,7 @@ impl VadadeeBerryApp {
             .is_some_and(|img| img.width > 0 && img.height > 0)
     }
 
-    #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+    #[cfg(any(target_arch = "wasm32", any(target_os = "android", target_os = "ios")))]
     fn system_clipboard_has_image(&self) -> bool {
         false
     }
@@ -4929,7 +4929,7 @@ impl VadadeeBerryApp {
     }
 
     fn process_file_dialogs(&mut self) {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             if self.pending_open_svg
                 || self.pending_open_project
@@ -4940,7 +4940,7 @@ impl VadadeeBerryApp {
                 self.pending_open_svg = false;
                 self.pending_open_project = false;
                 self.pending_save_project = false;
-                #[cfg(not(target_os = "android"))]
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 {
                     self.pending_mcp_bulk_rects.clear();
                     self.mcp_bulk_staging.clear();
@@ -4952,7 +4952,7 @@ impl VadadeeBerryApp {
             }
             return;
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             if self.pending_open_project {
                 self.pending_open_project = false;
@@ -5336,7 +5336,7 @@ impl VadadeeBerryApp {
 
     /// egui-winit drops Ctrl+V when the clipboard has only image/png (no text), so no
     /// Event::Paste or Key::V reaches egui. Poll the physical hotkey as a fallback.
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
     fn handle_paste_hotkey_fallback(&mut self, ctx: &Context, events_handled_paste: bool) {
         if !ctx.input(|i| i.focused) {
             return;
@@ -5987,11 +5987,11 @@ impl VadadeeBerryApp {
     }
 
     fn mcp_bulk_active(&self) -> bool {
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             !self.pending_mcp_bulk_rects.is_empty() || !self.mcp_bulk_staging.is_empty()
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             false
         }
@@ -14550,7 +14550,7 @@ fn run_video_decode_thread(
             return;
         };
         self.restore_text_focus_pan();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             if let Some(android_app) = crate::ANDROID_APP.get() {
                 android_app.hide_soft_input(false);
@@ -14727,7 +14727,7 @@ fn run_video_decode_thread(
     pub fn delete_on_page_text_node(&mut self, id: NodeId) {
         self.on_page_text_edit = None;
         self.restore_text_focus_pan();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             if let Some(android_app) = crate::ANDROID_APP.get() {
                 android_app.hide_soft_input(false);
@@ -18383,7 +18383,7 @@ fn run_video_decode_thread(
         serde_json::to_string_pretty(&items).map_err(|e| e.to_string())
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_capture_canvas_raster(
         &mut self,
         resolution_percent: f32,
@@ -20937,9 +20937,9 @@ fn run_video_decode_thread(
     }
 
     fn process_pending_mcp_bulk_rects(&mut self) {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         { return; }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             const MAX_PER_FRAME: usize = 64;
             let mut chunk: Vec<Node> = Vec::new();
@@ -20982,11 +20982,11 @@ fn run_video_decode_thread(
     }
 
     pub(crate) fn poll_mcp_bridge(&mut self) {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             return;
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             // Drain any completed heavy captures from bg threads (preview side effects)
             while let Ok(up) = self.mcp_preview_update_rx.try_recv() {
@@ -21092,7 +21092,7 @@ fn run_video_decode_thread(
         }
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn handle_mcp_request(
         &mut self,
         req: crate::mcp::McpHostRequest,
@@ -21328,7 +21328,7 @@ fn run_video_decode_thread(
 impl eframe::App for VadadeeBerryApp {
     fn on_exit(&mut self) {
         // Stop capture / audio first so we don't delete WAVs still held open.
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             self.screen_captures.clear();
         }
@@ -21340,7 +21340,7 @@ impl eframe::App for VadadeeBerryApp {
         if let Ok(mut m) = self.audio_pcm_cache.lock() {
             m.clear();
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         purge_vadadee_disk_caches(CachePurgeOpts::on_exit());
     }
 
@@ -21849,9 +21849,9 @@ impl eframe::App for VadadeeBerryApp {
             self.advance_paste_operation(ctx);
         }
         let paste_from_events = self.handle_object_clipboard_shortcuts(ctx);
-        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+        #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
         self.handle_paste_hotkey_fallback(ctx, paste_from_events);
-        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+        #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
         self.handle_text_paste_fallback(ctx);
         if self.ui_anim.needs_repaint() || self.paste_progress.is_some() {
             ctx.request_repaint();
@@ -21863,7 +21863,7 @@ impl eframe::App for VadadeeBerryApp {
         if self.sync_audio_playback() {
             ctx.request_repaint();
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             // Screen record mouse track is global (X11 / evdev) — not the app window.
             // Keep UI warm while recording so stop / status stay responsive.
@@ -22397,7 +22397,7 @@ mod tests {
                 audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 audio_prepare_rx: std::collections::HashMap::new(),
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             screen_captures: std::collections::HashMap::new(),
 
                 project: Document::new_default_project(),
@@ -22525,7 +22525,7 @@ mod tests {
                 eyedropper_releasing: false,
                 eyedropper_t: 0.0,
                 eyedropper_target_pos: None,
-                #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+                #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
                 paste_hotkey_was_down: false,
                 paste_progress: None,
                 toolbar_expanded: false,
@@ -22552,23 +22552,23 @@ mod tests {
             cursor_bubble_edit: false,
             cursor_bubble_focus_pending: false,
             cursor_bubble_text: String::new(),
-                #[cfg(not(target_os = "android"))]
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 mcp_bridge: None,
-                #[cfg(not(target_os = "android"))]
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 mcp_preview: crate::left_dock::McpPreviewState::default(),
-                #[cfg(not(target_os = "android"))]
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 mcp_preview_update_tx: {
                     let (tx, _rx) = std::sync::mpsc::channel();
                     tx
                 },
-                #[cfg(not(target_os = "android"))]
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 mcp_preview_update_rx: {
                     let (_tx, rx) = std::sync::mpsc::channel();
                     rx
                 },
-                #[cfg(not(target_os = "android"))]
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 pending_mcp_bulk_rects: Vec::new(),
-                #[cfg(not(target_os = "android"))]
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 mcp_bulk_staging: Vec::new(),
                 spatial_index: crate::spatial_index::SpatialIndex::default(),
                 cached_draw_order: Vec::new(),

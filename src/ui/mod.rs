@@ -242,9 +242,9 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             floating_timeline_window(app, &ctx, floater_work);
             floating_video_editor(app, &ctx, floater_work);
             // Desktop-only preview state; the dock takes `None` on Android.
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             let preview = Some(&mut app.mcp_preview);
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             let preview: Option<&mut crate::left_dock::McpPreviewState> = None;
             if let Some((fx, fy)) = crate::left_dock::show(
                 crate::left_dock::DockFrameView {
@@ -857,9 +857,9 @@ fn floating_toolbar(
     } = view;
     let inset = theme::overlay_work_rect(work);
 
-    let is_android = cfg!(target_os = "android");
-    let btn_size = if is_android { 48.0 } else { 40.0 };
-    let spacing = if is_android { 8.0 } else { 6.0 };
+    let is_mobile = cfg!(any(target_os = "android", target_os = "ios"));
+    let btn_size = if is_mobile { 48.0 } else { 40.0 };
+    let spacing = if is_mobile { 8.0 } else { 6.0 };
     let margin_x = 8.0;
     let margin_y = 10.0;
 
@@ -1131,7 +1131,7 @@ fn floating_toolbar(
                 };
 
                 let stroke_w = if selected || hovered { 1.5 } else { 1.0 };
-                let corner_radius = egui::CornerRadius::same(if is_android { 8 } else { 6 });
+                let corner_radius = egui::CornerRadius::same(if is_mobile { 8 } else { 6 });
 
                 // Draw button rect
                 ui.painter().rect(
@@ -1144,7 +1144,7 @@ fn floating_toolbar(
 
                 // Draw icon text
                 let icon = get_tool_icon(tool, polygon_sides);
-                let icon_size = if is_android { 20.0 } else { 18.0 };
+                let icon_size = if is_mobile { 20.0 } else { 18.0 };
                 ui.painter().text(
                     button_screen_rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -1154,7 +1154,7 @@ fn floating_toolbar(
                 );
 
                 // Desktop hover tip — word-wrap, max width 2× toolbar.
-                if hovered && !is_android {
+                if hovered && !is_mobile {
                     show_toolbar_hover_tip(ui, "tool_tip", get_tool_tip(tool), tip_max_w);
                 }
             }
@@ -1194,7 +1194,7 @@ fn floating_toolbar(
                 };
                 ui.painter().rect(
                     button_screen_rect,
-                    egui::CornerRadius::same(if is_android { 8 } else { 6 }),
+                    egui::CornerRadius::same(if is_mobile { 8 } else { 6 }),
                     fill,
                     egui::Stroke::new(
                         if hovered { 1.5 } else { 1.0 },
@@ -1202,7 +1202,7 @@ fn floating_toolbar(
                     ),
                     egui::StrokeKind::Inside,
                 );
-                let icon_size = if is_android { 20.0 } else { 18.0 };
+                let icon_size = if is_mobile { 20.0 } else { 18.0 };
                 ui.painter().text(
                     button_screen_rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -1210,7 +1210,7 @@ fn floating_toolbar(
                     icons::nerd_font_id(icon_size * scale),
                     colors::TEXT.gamma_multiply(button_alpha),
                 );
-                if hovered && !is_android {
+                if hovered && !is_mobile {
                     show_toolbar_hover_tip(ui, ("av_action_tip", i), tip, tip_max_w);
                 }
             }
@@ -1266,7 +1266,7 @@ fn floating_toolbar(
                 });
 
                 // Draw a sleek color wheel/palette icon on top of it so the user knows it's a picker
-                let icon_size = if is_android { 20.0 } else { 18.0 };
+                let icon_size = if is_mobile { 20.0 } else { 18.0 };
                 let brightness = c.r() as f32 * 0.299 + c.g() as f32 * 0.587 + c.b() as f32 * 0.114;
                 let text_color = if brightness > 150.0 {
                     egui::Color32::BLACK.gamma_multiply(button_alpha)
@@ -1324,7 +1324,7 @@ fn floating_toolbar(
             };
             ui.painter().rect(
                 button_screen_rect,
-                egui::CornerRadius::same(if is_android { 8 } else { 6 }),
+                egui::CornerRadius::same(if is_mobile { 8 } else { 6 }),
                 fill,
                 egui::Stroke::new(
                     if selected || is_hovered { 1.5 } else { 1.0 },
@@ -1336,10 +1336,10 @@ fn floating_toolbar(
                 button_screen_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 *icon,
-                icons::nerd_font_id(if is_android { 20.0 } else { 18.0 }),
+                icons::nerd_font_id(if is_mobile { 20.0 } else { 18.0 }),
                 colors::TEXT.gamma_multiply(alpha),
             );
-            if is_hovered && !is_android {
+            if is_hovered && !is_mobile {
                 show_toolbar_hover_tip(ui, ("collab_tip", *panel as u8), tip, tip_max_w);
             }
             let collab_resp = ui.interact(
@@ -3560,7 +3560,7 @@ fn shading_wgsl_file_buttons(ui: &mut egui::Ui, pass: &mut crate::document::Shad
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.spacing_mut().item_spacing.y = 4.0;
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             if ui
                 .add(
@@ -5146,7 +5146,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             app.add_screen_record_layer(&format!("Screen Record {n}"));
             ui.close();
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             if ui.button("Media from file… (auto Video/Audio layer)").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
@@ -5506,7 +5506,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     if ui.add(te).changed() {
                         l.capture_dir = dir;
                     }
-                    #[cfg(not(target_os = "android"))]
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if ui
                         .add_enabled(!recording, egui::Button::new("…").small())
                         .on_hover_text("Choose folder for new recordings (timestamped .sepscrr + .mp4)")
@@ -5754,7 +5754,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 ui.add_space(4.0);
                 match role {
                     crate::document::AvRole::Video => {
-                        #[cfg(not(target_os = "android"))]
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         {
                             if ui
                                 .button(format!("{} From path… (video/image)", icons::VIDEO))
@@ -5801,7 +5801,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                         }
                     }
                     crate::document::AvRole::Audio => {
-                        #[cfg(not(target_os = "android"))]
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         {
                             if ui
                                 .button(format!("{} From path… (audio)", icons::AUDIO))
@@ -5899,7 +5899,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
 
                     ui.horizontal(|ui| {
                         ui.label("Path:");
-                        #[cfg(not(target_os = "android"))]
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         if ui.button("Browse...").clicked() {
                             let dlg = rfd::FileDialog::new()
                                 .add_filter("Media (AV)", &["mp4", "mkv", "avi", "mov", "webm", "mp3", "wav", "aac", "m4a", "flac", "ogg"]);

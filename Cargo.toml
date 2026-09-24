@@ -74,15 +74,21 @@ features = ["imgproc", "objdetect", "clang-runtime"]
 # ── Host (non-Android) shared deps ────────────────────────────────────────────
 [target.'cfg(not(target_os = "android"))'.dependencies]
 env_logger = "0.11.8"
-rfd = "0.15.4"
 arboard = { version = "3", features = ["image-data"] }
-device_query = "4.0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tokio-tungstenite = { version = "0.23", features = ["connect"] }
 futures-util = "0.3"
 aes-gcm = "0.10"
 rand = "0.8"
 sha2 = "0.10"
+
+# ── Desktop-only deps: rfd (file dialogs) and device_query have no iOS
+# backend (rfd 0.15 / device_query 4.0.1 fail to compile for
+# aarch64-apple-ios), so they stay off both mobile targets. Call sites are
+# gated with cfg(not(any(target_os = "android", target_os = "ios"))).
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+rfd = "0.15.4"
+device_query = "4.0.1"
 
 # ── Linux: Wayland/X11 + ScreenCast (ashpd) + PipeWire continuous capture ─────
 [target.'cfg(target_os = "linux")'.dependencies]

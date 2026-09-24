@@ -220,12 +220,12 @@ pub fn is_wayland_session() -> bool {
 
 impl ScreenCaptureSession {
     pub fn start(cfg: ScreenCaptureStart) -> Result<Self, String> {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             let _ = cfg;
             return Err("Screen capture is not available on Android".into());
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             if is_wayland_session() {
                 start_wayland_portal_rust(cfg)
@@ -978,7 +978,7 @@ struct MouseTracker {
     abs_live: bool,
     rel_live: bool,
     /// Cached device_query handle (not Sync — lives only on the mouse thread).
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     dq: Option<device_query::DeviceState>,
 }
 
@@ -1024,15 +1024,15 @@ impl MouseTracker {
                 evdev.len()
             );
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let dq = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             device_query::DeviceState::new()
         }))
         .ok();
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let (sx, sy, sdown, abs_ok) =
             poll_global_pointer_capture(dq.as_ref(), full_w, full_h, cap_w, cap_h);
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let (sx, sy, sdown, abs_ok) = (0.5, 0.5, false, false);
         // Seed from abs only if it looks real (not a frozen mid-screen XWayland ghost).
         let seed = abs_ok && !is_likely_frozen_mid(sx, sy);
@@ -1049,7 +1049,7 @@ impl MouseTracker {
             last_abs: if abs_ok { Some((sx, sy)) } else { None },
             abs_live: false,
             rel_live: false,
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             dq,
         }
     }
@@ -1107,7 +1107,7 @@ impl MouseTracker {
         }
 
         // ── Absolute (X11 / XWayland) ─────────────────────────────────────
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let (ax, ay, adown, abs_ok) = poll_global_pointer_capture(
             self.dq.as_ref(),
             self.full_w,
@@ -1115,7 +1115,7 @@ impl MouseTracker {
             self.width,
             self.height,
         );
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let (ax, ay, adown, abs_ok) = (0.5, 0.5, false, false);
 
         if abs_ok {
@@ -1140,7 +1140,7 @@ impl MouseTracker {
             self.rel_live = false;
             if !adown {
                 // Keep button from abs when not forced true above.
-                #[cfg(not(target_os = "android"))]
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 {
                     self.button_down = adown;
                 }
@@ -1274,7 +1274,7 @@ impl MouseTracker {
 ///
 /// `full_*` = X11 root / device_query pixel space. `cap_*` = portal stream / selected
 /// monitor. Without this, multi-monitor or fractional-scale roots pull the track left.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn poll_global_pointer_capture(
     dq: Option<&device_query::DeviceState>,
     full_w: f64,
@@ -1489,7 +1489,7 @@ fn probe_screen_size() -> Option<(u32, u32)> {
     None
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn start_x11grab(cfg: ScreenCaptureStart) -> Result<ScreenCaptureSession, String> {
     let (width, height) = probe_screen_size().unwrap_or((1920, 1080));
     let fps = cfg.fps.clamp(1, 120);
@@ -1650,7 +1650,7 @@ struct PortalCursor {
 
 /// Open ScreenCast session → PipeWire node id + remote FD.
 /// Keeps the portal session alive for the duration of the recording thread.
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
 struct PortalPwRemote {
     /// Dropping this ends the screencast on some portals.
     _session: ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>,
@@ -1660,7 +1660,7 @@ struct PortalPwRemote {
     size_hint: Option<(u32, u32)>,
 }
 
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
 async fn open_screencast_remote(capture_cursor: bool) -> Result<PortalPwRemote, String> {
     use ashpd::desktop::{
         PersistMode,
@@ -1749,7 +1749,7 @@ async fn open_screencast_remote(capture_cursor: bool) -> Result<PortalPwRemote, 
 }
 
 /// Convert a mapped PipeWire video buffer to tightly-packed RGBA.
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
 fn pw_buffer_to_rgba(
     src: &[u8],
     width: u32,
@@ -1856,7 +1856,7 @@ const SPA_META_CURSOR: u32 = 5;
 ///
 /// `spa_meta_cursor.position` is the hotspot on the stream surface (matches embedded
 /// cursor tip). Half-pixel centering avoids a consistent ~0.5px left/up bias.
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
 fn extract_spa_meta_cursor(spa_buf: *mut std::ffi::c_void, stream_w: u32, stream_h: u32) -> Option<(f64, f64)> {
     if spa_buf.is_null() || stream_w < 2 || stream_h < 2 {
         return None;
@@ -1897,7 +1897,7 @@ fn extract_spa_meta_cursor(spa_buf: *mut std::ffi::c_void, stream_w: u32, stream
 }
 
 /// Run PipeWire mainloop: connect to portal FD, MAP_BUFFERS, push RGBA + cursor into slots.
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
 fn run_pipewire_capture(
     node_id: u32,
     fd: std::os::fd::OwnedFd,
@@ -2153,7 +2153,7 @@ fn run_pipewire_capture(
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
 fn start_wayland_portal_rust(cfg: ScreenCaptureStart) -> Result<ScreenCaptureSession, String> {
     if let Some(parent) = cfg.sepscrr_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
@@ -2415,7 +2415,7 @@ fn start_wayland_portal_rust(cfg: ScreenCaptureStart) -> Result<ScreenCaptureSes
     })
 }
 
-#[cfg(all(not(target_os = "linux"), not(target_os = "android")))]
+#[cfg(all(not(target_os = "linux"), not(any(target_os = "android", target_os = "ios"))))]
 fn start_wayland_portal_rust(_cfg: ScreenCaptureStart) -> Result<ScreenCaptureSession, String> {
     Err("ScreenCast PipeWire capture is only available on Linux".into())
 }

@@ -127,7 +127,7 @@ pub fn show(
     canvas_work: Rect,
     toolbar_outer_right: Option<f32>,
 ) -> Option<(f64, f64)> {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = (&frame, ctx, canvas_work, toolbar_right);
         return None;
@@ -286,7 +286,7 @@ fn collab_body(
             ),
         );
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         if collab.ui_config.role == crate::collab::CollabRole::Server
             && collab.is_connected()
@@ -299,7 +299,7 @@ fn collab_body(
     }
     ui.separator();
     let focus_req = peers_panel(collab, ui);
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         if collab.ui_config.role != crate::collab::CollabRole::Server
             || !collab.is_connected()
@@ -319,7 +319,7 @@ fn collab_body(
     focus_req
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn server_setup_panel(
     collab: &CollabSession,
     preview: &mut McpPreviewState,
@@ -348,7 +348,7 @@ fn server_setup_panel(
     copyable_config_block(ui, "mcp_cursor_cfg", &mcp_json, "Copy MCP config");
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn mcp_preview_panel(preview: &mut McpPreviewState, ui: &mut Ui, ctx: &Context) {
     if preview.width == 0 || preview.height == 0 || preview.rgba.is_empty() {
         ui.label(RichText::new("No MCP preview yet — call capture_canvas_raster").small().color(colors::TEXT_MUTED));
@@ -397,7 +397,7 @@ fn mcp_setup_hint(ui: &mut Ui) {
     );
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn mcp_cursor_config_json() -> String {
     serde_json::json!({
         "mcpServers": {
@@ -589,7 +589,7 @@ fn collab_status_label(collab: &CollabSession, ui: &mut Ui) {
 const CURSOR_BUBBLE_MAX_W: f32 = 200.0;
 
 pub fn draw_local_cursor_bubble(view: CursorBubbleView<'_>, ui: &mut Ui, origin: egui::Pos2) {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = (&view, ui, origin);
         return;
@@ -649,7 +649,7 @@ pub fn draw_local_cursor_bubble(view: CursorBubbleView<'_>, ui: &mut Ui, origin:
 }
 
 pub fn draw_remote_cursors(collab: &CollabSession, viewport: &Viewport, ui: &mut Ui, origin: egui::Pos2) {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = (collab, ui, origin);
         return;
