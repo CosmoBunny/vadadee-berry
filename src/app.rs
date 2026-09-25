@@ -350,6 +350,10 @@ pub struct VadadeeBerryApp {
     gradient_flow_drag: Option<GradientFlowDrag>,
     canvas_screen_rect: Option<egui::Rect>,
     canvas_origin: Pos2,
+    /// Frame the whole document on the next canvas frame (set when opening
+    /// files). Fit — not a fixed zoom preset — is the default view, so a
+    /// 200×100 logo opens large instead of postage-stamp small.
+    fit_view_on_next_frame: bool,
     pending_open_svg: bool,
     pending_open_project: bool,
     /// Snapshot of the project before the last Open Project (Ctrl+O).
@@ -768,6 +772,7 @@ impl VadadeeBerryApp {
             gradient_flow_drag: None,
             canvas_screen_rect: None,
             canvas_origin: Pos2::ZERO,
+            fit_view_on_next_frame: false,
             pending_open_svg: false,
             pending_open_project: false,
             cached_project: None,
@@ -5003,8 +5008,7 @@ impl VadadeeBerryApp {
                             }
                             self.selection.clear();
                             self.history.clear();
-                            self.viewport.pan = egui::vec2(48.0, 48.0);
-                            self.viewport.zoom = 0.85;
+                            self.fit_view_on_next_frame = true;
                             self.refresh_all_media_layer_durations();
                             self.status_message = format!("Opened project: {}", path.display());
                         }
@@ -5032,6 +5036,7 @@ impl VadadeeBerryApp {
                                 ProjectEdit::SetDocument { before, after },
                             );
                             self.selection.clear();
+                            self.fit_view_on_next_frame = true;
                             self.status_message = format!("Opened {}", path.display());
                         }
                         Err(e) => self.status_message = format!("Open failed: {e}"),
@@ -10006,6 +10011,22 @@ impl VadadeeBerryApp {
         self.canvas_screen_rect = Some(rect);
         self.canvas_origin = origin;
 
+        // Default-to-Fit (set when opening files): scale the whole document
+        // into the available canvas with padding, preserving aspect ratio.
+        // scale = min(viewport_w / doc_w, viewport_h / doc_h).
+        if self.fit_view_on_next_frame {
+            self.fit_view_on_next_frame = false;
+            if let Some((z, pan)) = crate::canvas::Viewport::fit_document_view(
+                self.project.document.width as f32,
+                self.project.document.height as f32,
+                rect.width(),
+                rect.height(),
+            ) {
+                self.viewport.zoom = z;
+                self.viewport.pan = pan;
+            }
+        }
+
         if response.clicked() || response.drag_started() {
             ui.ctx().memory_mut(|mem| mem.request_focus(response.id));
         }
@@ -10033,8 +10054,7 @@ impl VadadeeBerryApp {
                             self.project = loaded_proj;
                             self.selection.clear();
                             self.history.clear();
-                            self.viewport.pan = egui::vec2(48.0, 48.0);
-                            self.viewport.zoom = 0.85;
+                            self.fit_view_on_next_frame = true;
                             self.status_message = format!("Loaded project: {}", p.display());
                         }
                         Err(e) => {
@@ -10046,8 +10066,7 @@ impl VadadeeBerryApp {
                         self.project = loaded_proj;
                         self.selection.clear();
                         self.history.clear();
-                        self.viewport.pan = egui::vec2(48.0, 48.0);
-                        self.viewport.zoom = 0.85;
+                        self.fit_view_on_next_frame = true;
                         self.status_message = format!("Loaded project: {}", f.name);
                     }
                 }
@@ -23209,6 +23228,7 @@ mod tests {
                 gradient_flow_drag: None,
                 canvas_screen_rect: None,
                 canvas_origin: Pos2::ZERO,
+                fit_view_on_next_frame: false,
                 pending_open_svg: false,
                 pending_open_project: false,
                 cached_project: None,

@@ -197,7 +197,11 @@ thread_local! {
     static TEXT_CACHE: std::cell::RefCell<std::collections::HashMap<TextCacheKey, CachedText>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-fn build_text_path_relative(
+/// Glyph outlines in document units (zoom baked in). `pub(crate)` so the
+/// SVG text-as-outlines export reuses the exact preview geometry: same
+/// face bytes, same `layout_lines`, same hanging-baseline origin. Pass
+/// `zoom = 1.0` for document-space paths.
+pub(crate) fn build_text_path_relative(
     face: &Face<'_>,
     zoom: f32,
     style: &TextStyle,

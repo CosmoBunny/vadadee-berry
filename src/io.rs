@@ -89,14 +89,15 @@ pub fn import_svg(path: &Path) -> Result<ProjectFile, IoError> {
     let mut nodes = NodeStore::default();
     let mut layer_nodes = Vec::new();
 
-    for child in tree.root().children() {
-        if let usvg::Node::Path(ref path) = *child {
-            if let Some(node) = path_from_usvg(path) {
-                let id = nodes.insert(node);
-                layer_nodes.push(id);
-            }
-        }
-    }
+    // Recurse groups (artwork commonly nests everything in <g>); paths
+    // become Path nodes and text becomes editable Text nodes.
+    import_usvg_children(
+        tree.root().children(),
+        &usvg::Transform::default(),
+        1.0,
+        &mut nodes,
+        &mut layer_nodes,
+    );
 
     if layer_nodes.is_empty() {
         let id = nodes.insert(Node::rect(
@@ -120,22 +121,92 @@ pub fn import_svg(path: &Path) -> Result<ProjectFile, IoError> {
     Ok(ProjectFile::new(document, nodes))
 }
 
-fn path_from_usvg(path: &usvg::Path) -> Option<Node> {
+/// Walk usvg nodes depth-first, accumulating group transforms and opacity.
+/// Paths become Path nodes; text chunks become editable Text nodes (first
+/// span style). Anything else (images, masks-as-content, filters) is skipped:
+/// the importer is geometry-faithful but intentionally lossy for effects.
+fn import_usvg_children(
+    children: &[usvg::Node],
+    parent_xf: &usvg::Transform,
+    parent_opacity: f32,
+    nodes: &mut NodeStore,
+    layer_nodes: &mut Vec<uuid::Uuid>,
+) {
+    for child in children {
+        match child {
+            usvg::Node::Group(g) => {
+                let xf = compose_usvg_transform(parent_xf, &g.transform());
+                let opacity = parent_opacity * g.opacity().get();
+                import_usvg_children(&g.children(), &xf, opacity, nodes, layer_nodes);
+            }
+            usvg::Node::Path(path) => {
+                if let Some(node) = path_from_usvg(path, parent_xf, parent_opacity) {
+                    layer_nodes.push(nodes.insert(node));
+                }
+            }
+            usvg::Node::Text(text) => {
+                for chunk in text.chunks() {
+                    if let Some(node) = text_chunk_from_usvg(text, chunk, parent_opacity) {
+                        layer_nodes.push(nodes.insert(node));
+                    }
+                }
+            }
+            usvg::Node::Image(_) => {}
+        }
+    }
+}
+
+/// Affine composition: apply `b`, then `a` (parent × child).
+fn compose_usvg_transform(a: &usvg::Transform, b: &usvg::Transform) -> usvg::Transform {
+    usvg::Transform {
+        sx: a.sx * b.sx + a.kx * b.ky,
+        kx: a.sx * b.kx + a.kx * b.sy,
+        ky: a.ky * b.sx + a.sy * b.ky,
+        sy: a.ky * b.kx + a.sy * b.sy,
+        tx: a.sx * b.tx + a.kx * b.ty + a.tx,
+        ty: a.ky * b.tx + a.sy * b.ty + a.ty,
+    }
+}
+
+fn apply_usvg_transform(t: &usvg::Transform, x: f64, y: f64) -> (f64, f64) {
+    (
+        t.sx as f64 * x + t.kx as f64 * y + t.tx as f64,
+        t.ky as f64 * x + t.sy as f64 * y + t.ty as f64,
+    )
+}
+
+/// Mean axis scale of a transform (for stroke widths under scale).
+fn usvg_transform_scale(t: &usvg::Transform) -> f32 {
+    let sx = (t.sx * t.sx + t.ky * t.ky).sqrt();
+    let sy = (t.kx * t.kx + t.sy * t.sy).sqrt();
+    ((sx + sy) * 0.5).max(1e-6)
+}
+
+fn path_from_usvg(path: &usvg::Path, xf: &usvg::Transform, opacity_mul: f32) -> Option<Node> {
     let tiny = path.data();
     let mut bez = BezPath::new();
     for seg in tiny.segments() {
         use usvg::tiny_skia_path::PathSegment;
         match seg {
-            PathSegment::MoveTo(p) => bez.move_to((p.x as f64, p.y as f64)),
-            PathSegment::LineTo(p) => bez.line_to((p.x as f64, p.y as f64)),
-            PathSegment::QuadTo(p1, p2) => {
-                bez.quad_to((p1.x as f64, p1.y as f64), (p2.x as f64, p2.y as f64));
+            PathSegment::MoveTo(p) => {
+                let (x, y) = apply_usvg_transform(xf, p.x as f64, p.y as f64);
+                bez.move_to((x, y));
             }
-            PathSegment::CubicTo(p1, p2, p3) => bez.curve_to(
-                (p1.x as f64, p1.y as f64),
-                (p2.x as f64, p2.y as f64),
-                (p3.x as f64, p3.y as f64),
-            ),
+            PathSegment::LineTo(p) => {
+                let (x, y) = apply_usvg_transform(xf, p.x as f64, p.y as f64);
+                bez.line_to((x, y));
+            }
+            PathSegment::QuadTo(p1, p2) => {
+                let (x1, y1) = apply_usvg_transform(xf, p1.x as f64, p1.y as f64);
+                let (x2, y2) = apply_usvg_transform(xf, p2.x as f64, p2.y as f64);
+                bez.quad_to((x1, y1), (x2, y2));
+            }
+            PathSegment::CubicTo(p1, p2, p3) => {
+                let (x1, y1) = apply_usvg_transform(xf, p1.x as f64, p1.y as f64);
+                let (x2, y2) = apply_usvg_transform(xf, p2.x as f64, p2.y as f64);
+                let (x3, y3) = apply_usvg_transform(xf, p3.x as f64, p3.y as f64);
+                bez.curve_to((x1, y1), (x2, y2), (x3, y3));
+            }
             PathSegment::Close => bez.close_path(),
         }
     }
@@ -147,7 +218,7 @@ fn path_from_usvg(path: &usvg::Path) -> Option<Node> {
                     c.red as f32 / 255.0,
                     c.green as f32 / 255.0,
                     c.blue as f32 / 255.0,
-                    fill.opacity().get(),
+                    fill.opacity().get() * opacity_mul,
                 ],
             });
         }
@@ -159,16 +230,78 @@ fn path_from_usvg(path: &usvg::Path) -> Option<Node> {
                     c.red as f32 / 255.0,
                     c.green as f32 / 255.0,
                     c.blue as f32 / 255.0,
-                    stroke.opacity().get(),
+                    stroke.opacity().get() * opacity_mul,
                 ],
             });
-            node.style.stroke.width = stroke.width().get();
+            node.style.stroke.width = stroke.width().get() * usvg_transform_scale(xf);
         }
     }
     let kind = NodeKind::Path {
         path: PathData::from_bez(&node.bez_path()),
     };
     node.kind = kind;
+    Some(node)
+}
+
+/// One SVG text chunk → one editable Text node (first span wins for style).
+/// Chunk (x, y) is the SVG baseline origin, matching our export convention
+/// (`dominant-baseline="hanging"` at canvas y), so our own files round-trip.
+/// Start-anchored text maps exactly; middle/end anchors keep their anchor
+/// x (our TextStyle has no anchor field — documented limitation).
+fn text_chunk_from_usvg(
+    text: &usvg::Text,
+    chunk: &usvg::TextChunk,
+    parent_opacity: f32,
+) -> Option<Node> {
+    let content = chunk.text().to_string();
+    if content.is_empty() {
+        return None;
+    }
+    let span = chunk.spans().first()?;
+    let font = span.font();
+    let family = font
+        .families()
+        .first()
+        .map(|f| match f {
+            usvg::FontFamily::Named(name) => crate::fonts::sanitize_svg_font_family(name),
+            // Generic families → editor default (same resolution the
+            // preview path uses when no named face matches).
+            _ => crate::document::TextStyle::default().font_family,
+        })
+        .unwrap_or_else(|| crate::document::TextStyle::default().font_family);
+    // Chunk position is local to the text element; abs_transform already
+    // contains every ancestor, so it maps straight to document coords.
+    let abs = text.abs_transform();
+    let (x, y) = apply_usvg_transform(
+        &abs,
+        chunk.x().unwrap_or(0.0) as f64,
+        chunk.y().unwrap_or(0.0) as f64,
+    );
+    let style = crate::document::TextStyle {
+        content,
+        font_size: span.font_size().get(),
+        font_family: family,
+        bold: font.weight() >= 700,
+        italic: matches!(
+            font.style(),
+            usvg::FontStyle::Italic | usvg::FontStyle::Oblique
+        ),
+        width: 0.0,
+    };
+    let mut node = Node::text(x, y, style);
+    if let Some(fill) = span.fill() {
+        if let usvg::Paint::Color(c) = fill.paint() {
+            node.style.fill = Fill::Solid(Paint {
+                rgba: [
+                    c.red as f32 / 255.0,
+                    c.green as f32 / 255.0,
+                    c.blue as f32 / 255.0,
+                    fill.opacity().get() * parent_opacity,
+                ],
+            });
+        }
+    }
+    node.style.opacity = parent_opacity;
     Some(node)
 }
 
@@ -717,6 +850,88 @@ fn paint_attr(p: &Paint) -> String {
         (p.rgba[2] * 255.0) as u8,
         p.rgba[3],
     )
+}
+
+/// Portable text export: the same glyph outlines the canvas preview draws
+/// (same face bytes via [`crate::fonts::FontRegistry`], same
+/// [`TextStyle::layout_lines`], same hanging-baseline origin at `zoom = 1`),
+/// serialized as an SVG `<path>` in document coordinates. Unlike editable
+/// `<text>`, outlines cannot suffer font substitution in other renderers.
+/// Default file export keeps editable text; call this when portability
+/// matters. Returns `None` for non-text nodes, empty text, or a missing
+/// font face.
+pub fn text_node_outlined_svg(
+    node: &Node,
+    registry: &crate::fonts::FontRegistry,
+) -> Option<String> {
+    let (x, y, style) = match &node.kind {
+        NodeKind::Text { x, y, style } => (*x, *y, style),
+        _ => return None,
+    };
+    if style.content.is_empty() {
+        return None;
+    }
+    let bytes = registry.query_face_bytes(&style.font_family, style.bold, style.italic)?;
+    let face = ttf_parser::Face::parse(&bytes, 0).ok()?;
+    let (path, _bbox) = crate::text_glyph::build_text_path_relative(&face, 1.0, style)?;
+    let d = lyon_path_to_svg_d(&path, x as f32, y as f32);
+    if d.is_empty() {
+        return None;
+    }
+    let fill_grad_id = format!("toutfill-{}", node.id.as_simple());
+    let stroke_grad_id = format!("toutstroke-{}", node.id.as_simple());
+    let (fill, fill_defs) = fill_svg(&node.style.fill, &fill_grad_id);
+    let (stroke, stroke_defs) =
+        if node.style.stroke.width > 0.0 && node.style.stroke.style.is_visible() {
+            stroke_svg(&node.style.stroke, &stroke_grad_id)
+        } else {
+            (r#"stroke="none""#.into(), String::new())
+        };
+    let op = node.style.opacity;
+    let el = format!(r#"<path d="{d}" {fill} {stroke} opacity="{op}"/>"#);
+    let rot = node.transform.rotation_rad;
+    if rot.abs() > 1e-12 {
+        let b = crate::document::text_bounds(x, y, style);
+        let cx = (b.x0 + b.x1) * 0.5;
+        let cy = (b.y0 + b.y1) * 0.5;
+        Some(format!(
+            r#"{fill_defs}{stroke_defs}<g transform="rotate({} {cx} {cy})">{el}</g>"#,
+            rot.to_degrees()
+        ))
+    } else {
+        Some(format!(r#"{fill_defs}{stroke_defs}{el}"#))
+    }
+}
+
+/// Serialize lyon path events to SVG path data, translated by `(ox, oy)`.
+fn lyon_path_to_svg_d(path: &lyon::path::Path, ox: f32, oy: f32) -> String {
+    use lyon::path::Event;
+    let mut d = String::new();
+    let pt = |p: lyon::math::Point| format!("{},{}", p.x + ox, p.y + oy);
+    for evt in path.iter() {
+        match evt {
+            Event::Begin { at } => {
+                d.push_str(&format!("M{} ", pt(at)));
+            }
+            Event::Line { to, .. } => {
+                d.push_str(&format!("L{} ", pt(to)));
+            }
+            Event::Quadratic { ctrl, to, .. } => {
+                d.push_str(&format!("Q{} {} ", pt(ctrl), pt(to)));
+            }
+            Event::Cubic {
+                ctrl1, ctrl2, to, ..
+            } => {
+                d.push_str(&format!("C{} {} {} ", pt(ctrl1), pt(ctrl2), pt(to)));
+            }
+            Event::End { close, .. } => {
+                if close {
+                    d.push_str("Z ");
+                }
+            }
+        }
+    }
+    d
 }
 
 fn path_to_svg_d(path: &PathData) -> String {
@@ -1599,6 +1814,100 @@ mod tests {
         let d = path_to_svg_d(&path);
         assert!(d.contains('C') || d.contains('c'), "expected cubic in {d}");
         assert!(d.contains('Z') || d.contains('z'));
+    }
+
+    /// Supplied-file traits: 200x100 doc, artwork nested in <g>, editable
+    /// text. Import must keep groups (no cropping) and text (no drops);
+    /// export must emit document bounds verbatim (no zoom factor, no pad).
+    #[test]
+    fn svg_import_keeps_groups_and_text_and_export_keeps_bounds() {
+        let svg = r#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100">
+<rect width="200" height="100" fill="rgb(255,255,255)"/>
+<g><path d="M10,10 L190,10 L190,90 L10,90 Z" fill="rgb(0,0,0)" stroke="none"/></g>
+<g><text x="18.25" y="31.95" font-size="64" font-family="Helvetica" dominant-baseline="hanging" fill="rgb(0,0,0)">V</text></g>
+</svg>"#;
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("vadadee-svg-rt-{}.svg", std::process::id()));
+        std::fs::write(&p, svg).unwrap();
+        let proj = import_svg(&p).expect("import");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!((proj.document.width, proj.document.height), (200.0, 100.0));
+        let layer = &proj.document.layers[0];
+        // Background rect + grouped path + grouped text (usvg parses rect
+        // as a path node).
+        assert_eq!(
+            layer.nodes.len(),
+            3,
+            "bg rect, grouped path + text must import"
+        );
+        let mut saw_path = false;
+        let mut saw_text = false;
+        for id in &layer.nodes {
+            match &proj.nodes.get(*id).unwrap().kind {
+                crate::document::NodeKind::Path { .. } => saw_path = true,
+                crate::document::NodeKind::Text { x, y, style } => {
+                    saw_text = true;
+                    assert_eq!(style.content, "V");
+                    assert!((x - 18.25).abs() < 0.01 && (*y - 31.95).abs() < 0.01);
+                    assert_eq!(style.font_size, 64.0);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_path && saw_text);
+        let out = document_svg_string(&proj, 0, &std::collections::HashMap::new());
+        assert!(
+            out.contains(r#"width="200" height="100" viewBox="0 0 200 100""#),
+            "export keeps document bounds"
+        );
+        assert!(out.contains(">V<"), "text round-trips as editable text");
+    }
+
+    /// Portable text path: same face/layout as preview, serialized outlines,
+    /// bounds anchored at the text origin (no `<text>` left to substitute).
+    #[test]
+    fn outlined_text_matches_origin_geometry() {
+        use crate::document::{Node, TextStyle};
+        let registry = crate::fonts::FontRegistry::new();
+        let style = TextStyle {
+            content: "Vb".into(),
+            font_size: 48.0,
+            ..Default::default()
+        };
+        let node = Node::text(10.0, 20.0, style);
+        let frag = text_node_outlined_svg(&node, &registry).expect("outlines");
+        assert!(frag.contains("<path d=\"M"));
+        assert!(!frag.contains("<text"));
+        // Parse the d="..." back: finite bounds, positive area, anchored at
+        // the text origin (same hanging-baseline convention as preview).
+        let d = frag
+            .split_once("d=\"")
+            .expect("d attr")
+            .1
+            .split_once('"')
+            .expect("d end")
+            .0;
+        let nums: Vec<f32> = d
+            .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == 'e'))
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        assert!(nums.len() >= 4);
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for w in nums.chunks_exact(2) {
+            x0 = x0.min(w[0]);
+            y0 = y0.min(w[1]);
+            x1 = x1.max(w[0]);
+            y1 = y1.max(w[1]);
+        }
+        assert!(x0.is_finite() && (x1 - x0) > 0.0 && (y1 - y0) > 0.0);
+        assert!((x0 - 10.0).abs() < 48.0 && (y0 - 20.0).abs() < 96.0);
+        // Empty text and non-text nodes yield None.
+        let mut empty_style = TextStyle::default();
+        empty_style.content.clear();
+        assert!(text_node_outlined_svg(&Node::text(0.0, 0.0, empty_style), &registry).is_none());
+        let rect = Node::rect(0.0, 0.0, 10.0, 10.0, crate::document::Fill::default());
+        assert!(text_node_outlined_svg(&rect, &registry).is_none());
     }
 
     #[test]
