@@ -69,6 +69,20 @@ if (-not $wix) {
 }
 & $wix --version
 
+# BootstrapperApplications extension (provides WixStdBA for the Bundle).
+# Pinned to the installed WiX major (5.0.2): the -ext flag alone does NOT
+# fetch it, and the build fails with WIX0144 without it.
+& $wix extension add WixToolset.BootstrapperApplications.wixext/5.0.2
+if ($LASTEXITCODE -ne 0) {
+    Write-Error 'Failed to install WixToolset.BootstrapperApplications.wixext required by VadadeeBerry.Bundle.wxs.'
+    exit 1
+}
+$extList = (& $wix extension list) -join "`n"
+if ($extList -notmatch 'WixToolset\.BootstrapperApplications\.wixext') {
+    Write-Error 'Failed to install WixToolset.BootstrapperApplications.wixext required by VadadeeBerry.Bundle.wxs.'
+    exit 1
+}
+
 $outName = "vadadee-berry-$version-windows-x86_64-setup.exe"
 $msiName = "vadadee-berry-$version-windows-x86_64.msi"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
@@ -86,10 +100,6 @@ if (Test-Path $msiPath) { Remove-Item $msiPath -Force }
 # Build from the packaging dir so the relative icon source resolves.
 # NOTE: -d takes its value as the NEXT token (attached -dName= form is
 # rejected: WIX0118).
-# Output type note: `-o *-setup.exe` against a <Package> source intentionally
-# targets the MSI-semantics .exe package output (not a Burn bundle). The
-# WIX1109 entry-point note the build emits is informational; do not "fix" it
-# by converting to a Bundle.
 Push-Location (Join-Path $PSScriptRoot '.')
 try {
     & $wix build VadadeeBerry.wxs `
