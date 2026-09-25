@@ -128,12 +128,9 @@ pub fn show(
     canvas_work: Rect,
     toolbar_outer_right: Option<f32>,
 ) -> Option<(f64, f64)> {
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    {
-        let _ = (&frame, ctx, canvas_work, toolbar_outer_right);
-        return None;
-    }
-
+    // One canonical dock on every platform: same panels, same sizing.
+    // Mobile-only sections are compiled out; the rest renders as-is
+    // (clipping/scrolling beats a separate compact UI).
     let DockFrameView {
         anim, dock, collab, ..
     } = frame;
@@ -593,11 +590,7 @@ fn collab_status_label(collab: &CollabSession, ui: &mut Ui) {
 const CURSOR_BUBBLE_MAX_W: f32 = 200.0;
 
 pub fn draw_local_cursor_bubble(view: CursorBubbleView<'_>, ui: &mut Ui, origin: egui::Pos2) {
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    {
-        let _ = (&view, ui, origin);
-        return;
-    }
+    // Same bubble on every platform; touch operates the same TextEdit.
     let CursorBubbleView {
         cursor_doc,
         viewport,
@@ -653,11 +646,7 @@ pub fn draw_remote_cursors(
     ui: &mut Ui,
     origin: egui::Pos2,
 ) {
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    {
-        let _ = (collab, ui, origin);
-        return;
-    }
+    // Same remote cursors on every platform.
     if !collab.is_connected() {
         return;
     }

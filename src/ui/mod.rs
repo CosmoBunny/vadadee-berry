@@ -1,7 +1,5 @@
 use egui::{Context, Rect, RichText, ScrollArea, Ui, scroll_area::ScrollBarVisibility};
 
-pub mod mobile;
-
 use crate::animation::action_bar_overlay_rect;
 use crate::app::VadadeeBerryApp;
 use crate::audio_extract::AudioExtractStatus;
@@ -868,9 +866,11 @@ fn floating_toolbar(view: ToolbarView<'_>, ctx: &Context, work: Rect) -> Vec<Too
     } = view;
     let inset = theme::overlay_work_rect(work);
 
-    let is_mobile = cfg!(any(target_os = "android", target_os = "ios"));
-    let btn_size = if is_mobile { 48.0 } else { 40.0 };
-    let spacing = if is_mobile { 8.0 } else { 6.0 };
+    // One canonical toolbar size on every platform; touch uses the same
+    // buttons. Hover highlights stay desktop-only (touch has no hover).
+    let no_hover = cfg!(any(target_os = "android", target_os = "ios"));
+    let btn_size = 40.0;
+    let spacing = 6.0;
     let margin_x = 8.0;
     let margin_y = 10.0;
 
@@ -1144,7 +1144,7 @@ fn floating_toolbar(view: ToolbarView<'_>, ctx: &Context, work: Rect) -> Vec<Too
                 };
 
                 let stroke_w = if selected || hovered { 1.5 } else { 1.0 };
-                let corner_radius = egui::CornerRadius::same(if is_mobile { 8 } else { 6 });
+                let corner_radius = egui::CornerRadius::same(6);
 
                 // Draw button rect
                 ui.painter().rect(
@@ -1157,7 +1157,7 @@ fn floating_toolbar(view: ToolbarView<'_>, ctx: &Context, work: Rect) -> Vec<Too
 
                 // Draw icon text
                 let icon = get_tool_icon(tool, polygon_sides);
-                let icon_size = if is_mobile { 20.0 } else { 18.0 };
+                let icon_size = 18.0;
                 ui.painter().text(
                     button_screen_rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -1167,7 +1167,7 @@ fn floating_toolbar(view: ToolbarView<'_>, ctx: &Context, work: Rect) -> Vec<Too
                 );
 
                 // Desktop hover tip — word-wrap, max width 2× toolbar.
-                if hovered && !is_mobile {
+                if hovered && !no_hover {
                     show_toolbar_hover_tip(ui, "tool_tip", get_tool_tip(tool), tip_max_w);
                 }
             }
@@ -1203,7 +1203,7 @@ fn floating_toolbar(view: ToolbarView<'_>, ctx: &Context, work: Rect) -> Vec<Too
                 };
                 ui.painter().rect(
                     button_screen_rect,
-                    egui::CornerRadius::same(if is_mobile { 8 } else { 6 }),
+                    egui::CornerRadius::same(6),
                     fill,
                     egui::Stroke::new(
                         if hovered { 1.5 } else { 1.0 },
@@ -1211,7 +1211,7 @@ fn floating_toolbar(view: ToolbarView<'_>, ctx: &Context, work: Rect) -> Vec<Too
                     ),
                     egui::StrokeKind::Inside,
                 );
-                let icon_size = if is_mobile { 20.0 } else { 18.0 };
+                let icon_size = 18.0;
                 ui.painter().text(
                     button_screen_rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -1219,7 +1219,7 @@ fn floating_toolbar(view: ToolbarView<'_>, ctx: &Context, work: Rect) -> Vec<Too
                     icons::nerd_font_id(icon_size * scale),
                     colors::TEXT.gamma_multiply(button_alpha),
                 );
-                if hovered && !is_mobile {
+                if hovered && !no_hover {
                     show_toolbar_hover_tip(ui, ("av_action_tip", i), tip, tip_max_w);
                 }
             }
@@ -1283,7 +1283,7 @@ fn floating_toolbar(view: ToolbarView<'_>, ctx: &Context, work: Rect) -> Vec<Too
                 });
 
                 // Draw a sleek color wheel/palette icon on top of it so the user knows it's a picker
-                let icon_size = if is_mobile { 20.0 } else { 18.0 };
+                let icon_size = 18.0;
                 let brightness = c.r() as f32 * 0.299 + c.g() as f32 * 0.587 + c.b() as f32 * 0.114;
                 let text_color = if brightness > 150.0 {
                     egui::Color32::BLACK.gamma_multiply(button_alpha)
@@ -1338,7 +1338,7 @@ fn floating_toolbar(view: ToolbarView<'_>, ctx: &Context, work: Rect) -> Vec<Too
             };
             ui.painter().rect(
                 button_screen_rect,
-                egui::CornerRadius::same(if is_mobile { 8 } else { 6 }),
+                egui::CornerRadius::same(6),
                 fill,
                 egui::Stroke::new(
                     if selected || is_hovered { 1.5 } else { 1.0 },
@@ -1350,10 +1350,10 @@ fn floating_toolbar(view: ToolbarView<'_>, ctx: &Context, work: Rect) -> Vec<Too
                 button_screen_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 *icon,
-                icons::nerd_font_id(if is_mobile { 20.0 } else { 18.0 }),
+                icons::nerd_font_id(18.0),
                 colors::TEXT.gamma_multiply(alpha),
             );
-            if is_hovered && !is_mobile {
+            if is_hovered && !no_hover {
                 show_toolbar_hover_tip(ui, ("collab_tip", *panel as u8), tip, tip_max_w);
             }
             let collab_resp = ui.interact(

@@ -390,9 +390,6 @@ pub struct VadadeeBerryApp {
     /// System-status HUD (stats + jokes) shown during export. Separate state:
     /// it has nothing to do with the render itself.
     pub system_hud: crate::sys_stats::SystemHud,
-    /// Mobile presentation state (sheets, navigation). Pure UI; never owns
-    /// document data.
-    pub mobile_ui: crate::ui::mobile::MobileUiState,
     /// OS text-input bridge (soft keyboard + IME). All native calls go
     /// through this trait — never `winit` directly from widgets.
     pub text_input: Box<dyn crate::platform::NativeTextInput>,
@@ -801,7 +798,6 @@ impl VadadeeBerryApp {
             path_overlay_rect: None,
             video_export: VideoExportState::default(),
             system_hud: crate::sys_stats::SystemHud::new(),
-            mobile_ui: crate::ui::mobile::MobileUiState::default(),
             text_input: crate::platform::text_input::create_text_input(),
             project_save_path: initial_save_path,
             left_dock: crate::left_dock::LeftDockState::default(),
@@ -22582,16 +22578,10 @@ impl eframe::App for VadadeeBerryApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        // Presentation shell dispatch (§27): viewport-driven, never OS-driven.
-        // Compact/medium widths get the mobile shell; large widths keep the
-        // desktop chrome byte-for-byte identical.
-        let device = crate::platform::classify_device(ui.ctx().content_rect().size());
-        match device {
-            crate::platform::UiDeviceClass::Desktop => ui::chrome(self, ui),
-            crate::platform::UiDeviceClass::Phone | crate::platform::UiDeviceClass::Tablet => {
-                crate::ui::mobile::MobileShell::show(self, ui)
-            }
-        }
+        // One canonical editor UI on every platform (desktop, phone,
+        // tablet). Platform differences live in input handling and OS
+        // services — never in a separate visual shell.
+        ui::chrome(self, ui)
     }
 }
 
@@ -23249,7 +23239,6 @@ mod tests {
                 path_overlay_rect: None,
                 video_export: VideoExportState::default(),
                 system_hud: crate::sys_stats::SystemHud::new(),
-                mobile_ui: crate::ui::mobile::MobileUiState::default(),
                 text_input: crate::platform::text_input::create_text_input(),
                 project_save_path: None,
                 left_dock: crate::left_dock::LeftDockState::default(),
