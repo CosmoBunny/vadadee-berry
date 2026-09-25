@@ -1,7 +1,9 @@
-# Android build: Rust core (Android targets) + Gradle APK/AAB.
-# Separate pipeline from desktop release (§31): mobile signing problems must
-# never block desktop artifacts. Artifacts are named vadadee-berry-android-*,
-# never placed under release/*.tar.gz|zip.
+# Android release: Rust core (Android targets) -> native libs -> Gradle APK/AAB.
+# Separate pipeline from desktop release: mobile signing problems must never
+# block desktop artifacts. This workflow BUILDS (never merely `cargo check`):
+# three release cdylib/rlib targets staged per architecture, plus release
+# APK/AAB when the android/ Gradle host exists. Artifacts are named
+# vadadee-berry-android-*, never placed under release/*.tar.gz|zip.
 name: Android
 
 on:
@@ -18,27 +20,27 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  android-check:
-    name: Rust Android targets (check)
+  android-build:
+    name: Android Release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
       - uses: Swatinem/rust-cache@v2
+
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-      - name: Install Android SDK/NDK packages (explicit — no obsolete `tools`)
-        # setup-android alone does NOT install the NDK, and must not be
-        # asked for the obsolete `tools` package (sdkmanager: "Failed to
-        # find package 'tools'", exit 1). Install the exact package set
-        # explicitly. Without the NDK, crates with C++ build scripts
-        # (e.g. android-activity via cc-rs) fail with:
-        #   failed to find tool "aarch64-linux-android-clang++"
-        # cc-rs discovers the toolchain from ANDROID_NDK_HOME.
-        # NOTE: this block is intentionally identical in android-check and
-        # android-package — keep them in sync.
+        # packages: '' = install nothing automatically; the exact set below
+        # is installed explicitly (the obsolete `tools` package no longer
+        # exists upstream — sdkmanager fails on it with exit 1).
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Install Android SDK/NDK packages
         run: |
           set -euo pipefail
           sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
@@ -51,59 +53,104 @@ jobs:
           test -x "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
           test -x "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
           echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
-      - name: Check library for Android targets
-        # Minimal feature set: OpenCV (default feature) has no Android/iOS
-        # system libraries — mobile never ships it (matches release policy).
-        run: |
-          cargo check --lib --no-default-features --target aarch64-linux-android
-          cargo check --lib --no-default-features --target armv7-linux-androideabi
-          cargo check --lib --no-default-features --target x86_64-linux-android
 
-  android-package:
-    name: Gradle APK/AAB
-    runs-on: ubuntu-latest
-    needs: android-check
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Configure Android linkers
+        run: |
+          set -euo pipefail
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android35-clang"
+            echo "CXX_aarch64_linux_android=$NDK_BIN/aarch64-linux-android35-clang++"
+            echo "CC_armv7_linux_androideabi=$NDK_BIN/armv7a-linux-androideabi35-clang"
+            echo "CXX_armv7_linux_androideabi=$NDK_BIN/armv7a-linux-androideabi35-clang++"
+            echo "CC_x86_64_linux_android=$NDK_BIN/x86_64-linux-android35-clang"
+            echo "CXX_x86_64_linux_android=$NDK_BIN/x86_64-linux-android35-clang++"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android35-clang"
+            echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$NDK_BIN/armv7a-linux-androideabi35-clang"
+            echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$NDK_BIN/x86_64-linux-android35-clang"
+          } >> "$GITHUB_ENV"
+
+      - name: Build Rust Android libraries
+        # Release policy: minimal features (no OpenCV — no Android system
+        # libraries for it). This is a build, not a check.
+        run: |
+          set -euo pipefail
+          cargo build --lib --release --no-default-features --target aarch64-linux-android
+          cargo build --lib --release --no-default-features --target armv7-linux-androideabi
+          cargo build --lib --release --no-default-features --target x86_64-linux-android
+
+      - name: Stage native artifacts
+        run: |
+          set -euo pipefail
+          echo "=== Cargo outputs ==="
+          find target/aarch64-linux-android/release -maxdepth 1 -type f -print
+          find target/armv7-linux-androideabi/release -maxdepth 1 -type f -print
+          find target/x86_64-linux-android/release -maxdepth 1 -type f -print
+          rm -rf android-artifacts
+          mkdir -p android-artifacts/aarch64-linux-android android-artifacts/armv7-linux-androideabi android-artifacts/x86_64-linux-android
+          cp target/aarch64-linux-android/release/*.so android-artifacts/aarch64-linux-android/ 2>/dev/null || true
+          cp target/aarch64-linux-android/release/*.rlib android-artifacts/aarch64-linux-android/ 2>/dev/null || true
+          cp target/armv7-linux-androideabi/release/*.so android-artifacts/armv7-linux-androideabi/ 2>/dev/null || true
+          cp target/armv7-linux-androideabi/release/*.rlib android-artifacts/armv7-linux-androideabi/ 2>/dev/null || true
+          cp target/x86_64-linux-android/release/*.so android-artifacts/x86_64-linux-android/ 2>/dev/null || true
+          cp target/x86_64-linux-android/release/*.rlib android-artifacts/x86_64-linux-android/ 2>/dev/null || true
+          echo "=== Staged ==="
+          find android-artifacts -type f -print
+
+      - name: Set up Java for Gradle
+        if: ${{ hashFiles('android/**') != '' }}
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
-      - uses: Swatinem/rust-cache@v2
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-      - name: Install Android SDK/NDK packages (explicit — no obsolete `tools`)
-        # Same package set as android-check (Gradle native builds need the
-        # NDK too). See the check job for why this list is explicit.
-        # NOTE: intentionally identical in both jobs — keep them in sync.
+
+      - name: Build Android APK (release)
+        if: ${{ hashFiles('android/**') != '' }}
         run: |
           set -euo pipefail
-          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0" \
-            "ndk;27.0.12077973"
-          yes | sdkmanager --licenses >/dev/null || true
-          NDK_DIR="$ANDROID_SDK_ROOT/ndk/27.0.12077973"
-          test -x "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
-          test -x "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
-          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
-      - name: Build debug APK
-        # Packaging runs only once the Gradle host exists. Until then the
-        # Rust check above is the Android milestone — skip loudly instead
-        # of failing the tag.
+          chmod +x android/gradlew
+          ./android/gradlew -p android assembleRelease
+
+      - name: Build Android AAB (release)
+        if: ${{ hashFiles('android/**') != '' }}
         run: |
-          if [ ! -d android ]; then
-            echo "NOTICE: no android/ Gradle host project yet — skipping packaging (check job above is the milestone)."
-            exit 0
-          fi
-          ./gradlew -p android assembleDebug
-      - name: Upload APK artifact
+          set -euo pipefail
+          ./android/gradlew -p android bundleRelease
+
+      - name: Generate build manifest
+        run: |
+          set -euo pipefail
+          {
+            echo "Vadadee Berry Android Build"
+            echo
+            echo "Commit: $GITHUB_SHA"
+            echo "Targets:"
+            echo "  aarch64-linux-android"
+            echo "  armv7-linux-androideabi"
+            echo "  x86_64-linux-android"
+            echo
+            echo "Artifacts:"
+            find android-artifacts -type f -print 2>/dev/null || true
+            find android -type f \( -name "*.apk" -o -name "*.aab" \) -print 2>/dev/null || true
+          } > android-artifacts/BUILD-MANIFEST.txt
+          cat android-artifacts/BUILD-MANIFEST.txt
+
+      - name: Upload Android artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vadadee-berry-android-debug-apk
-          path: android/**/build/outputs/apk/debug/*.apk
-          if-no-files-found: warn
+          name: vadadee-berry-android
+          path: |
+            android-artifacts/**
+            android/**/build/outputs/apk/release/*.apk
+            android/**/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+
+      - name: Require Android Gradle project
+        # The native build above is the milestone; APK/AAB packaging needs
+        # the android/ host. Fail loudly when it is missing instead of
+        # silently reporting a packaging success — native artifacts are
+        # already uploaded above.
+        if: ${{ hashFiles('android/**') == '' }}
+        run: |
+          echo "::error::Android Gradle project is missing; native Rust Android build completed, but APK/AAB packaging cannot be performed."
+          exit 1
