@@ -14,6 +14,7 @@ use crate::document::{
 use crate::fonts::FontRegistry;
 use crate::history::{History, ProjectEdit, snapshot_document, snapshot_project};
 use crate::io;
+use crate::platform::ClipboardService;
 use crate::render;
 use crate::theme;
 use crate::tools::{self, DragNewShape, MarqueeSelect, SelectDrag, ToolKind, ToolState};
@@ -4011,24 +4012,20 @@ impl VadadeeBerryApp {
         // 3. Set image to system clipboard
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
-            match arboard::Clipboard::new() {
-                Ok(mut cb) => {
-                    let img = arboard::ImageData {
-                        width: w as usize,
-                        height: h as usize,
-                        bytes: std::borrow::Cow::from(bytes),
-                    };
-                    if let Err(e) = cb.set_image(img) {
-                        self.status_message = format!("Clipboard copy failed: {e}");
-                    } else {
-                        self.status_message = format!(
-                            "Copied selection PNG {}×{} @ {:.0} DPI (scale {:.2}×)",
-                            w, h, self.export_dpi, dpi_scale
-                        );
-                    }
+            let mut clipboard = crate::platform::clipboard::create_clipboard();
+            match clipboard.set_image(crate::platform::ClipboardImage {
+                width: w as usize,
+                height: h as usize,
+                bytes,
+            }) {
+                Ok(()) => {
+                    self.status_message = format!(
+                        "Copied selection PNG {}×{} @ {:.0} DPI (scale {:.2}×)",
+                        w, h, self.export_dpi, dpi_scale
+                    );
                 }
                 Err(e) => {
-                    self.status_message = format!("Clipboard error: {e}");
+                    self.status_message = format!("Clipboard copy failed: {e}");
                 }
             }
         }
@@ -4465,11 +4462,8 @@ impl VadadeeBerryApp {
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     {
-                        let Ok(mut cb) = arboard::Clipboard::new() else {
-                            self.finish_paste("Nothing to paste".into());
-                            return;
-                        };
-                        let Ok(img) = cb.get_image() else {
+                        let mut clipboard = crate::platform::clipboard::create_clipboard();
+                        let Ok(Some(img)) = clipboard.get_image() else {
                             self.finish_paste("Nothing to paste".into());
                             return;
                         };
@@ -4479,9 +4473,7 @@ impl VadadeeBerryApp {
                             self.finish_paste("Nothing to paste".into());
                             return;
                         };
-                        let Some(rgba_img) =
-                            image::RgbaImage::from_raw(w, h, img.bytes.into_owned())
-                        else {
+                        let Some(rgba_img) = image::RgbaImage::from_raw(w, h, img.bytes) else {
                             self.finish_paste("Nothing to paste".into());
                             return;
                         };
@@ -4587,9 +4579,10 @@ impl VadadeeBerryApp {
         not(any(target_os = "android", target_os = "ios"))
     ))]
     fn system_clipboard_has_image(&self) -> bool {
-        arboard::Clipboard::new()
+        crate::platform::clipboard::create_clipboard()
+            .get_image()
             .ok()
-            .and_then(|mut cb| cb.get_image().ok())
+            .flatten()
             .is_some_and(|img| img.width > 0 && img.height > 0)
     }
 
@@ -5175,12 +5168,11 @@ impl VadadeeBerryApp {
 
             // Never inject paste for Ctrl+Shift+V (reserved for flip when selection exists).
             if paste_pressed && !i.modifiers.shift {
-                if let Ok(mut cb) = arboard::Clipboard::new() {
-                    if let Ok(text) = cb.get_text() {
-                        i.events.push(egui::Event::Paste(text));
-                        let _ = i.consume_key(egui::Modifiers::COMMAND, egui::Key::V);
-                        let _ = i.consume_key(egui::Modifiers::CTRL, egui::Key::V);
-                    }
+                let mut clipboard = crate::platform::clipboard::create_clipboard();
+                if let Ok(Some(text)) = clipboard.get_text() {
+                    i.events.push(egui::Event::Paste(text));
+                    let _ = i.consume_key(egui::Modifiers::COMMAND, egui::Key::V);
+                    let _ = i.consume_key(egui::Modifiers::CTRL, egui::Key::V);
                 }
             }
         });

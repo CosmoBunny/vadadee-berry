@@ -6,12 +6,14 @@
 //! the per-platform submodules behind the narrow traits declared here.
 
 pub mod capabilities;
+pub mod clipboard;
 pub mod file_service;
 pub mod text_input;
 
 pub use capabilities::{
     PlatformCapabilities, SafeAreaInsets, UiDeviceClass, UiLayout, UiMetrics, classify_device,
 };
+pub use clipboard::{ClipboardError, ClipboardImage, ClipboardService};
 pub use file_service::{
     FileImportRequest, FileService, FileServiceError, ImportedFile, mime_for_name,
 };
