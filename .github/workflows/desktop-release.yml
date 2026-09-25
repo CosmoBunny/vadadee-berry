@@ -2,6 +2,16 @@
 # Artifacts land under release/ (via packaging/make_desktop_release.sh) and are
 # uploaded for download. On version tags (v*), they are attached to a GitHub Release.
 #
+# Dependency graph (each stage uploads immediately, so a packaging failure
+# never hides an already-built artifact):
+#   cargo build --release --no-default-features
+#     ├── tar.gz / zip                      (base bundle, always)
+#     ├── Linux: AppImage · .deb · Flatpak  (independent packagers)
+#     ├── Windows: -setup.exe               (WiX consumes the built .exe)
+#     └── macOS: .dmg                       (.app first, then image)
+# Mobile (Android APK / iOS archive) lives in android.yml / ios.yml and is
+# validation-only: publish below intentionally attaches desktop artifacts.
+#
 # Release policy (explicit — see Cargo.toml [features], default = ["opencv"]):
 # official tag releases intentionally use the MINIMAL feature set
 # (--no-default-features, no OpenCV). OpenCV builds are opt-in via manual
@@ -185,6 +195,21 @@ jobs:
           echo "---- release/ ----"
           ls -lah release/
 
+      # Isolation (§20): upload the base bundle NOW, before any packager
+      # runs — a later AppImage/.deb/Flatpak/WiX/DMG failure must not hide
+      # the successful Rust build. Same artifact name as below; uploads
+      # to one name merge.
+      - name: Upload base bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-desktop-${{ matrix.platform }}-${{ runner.arch }}
+          path: |
+            release/*.tar.gz
+            release/*.zip
+            release/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
       # Linux distribution formats live here — never in the shared dependency
       # block above, and never expected from Windows/macOS jobs.
       - name: Install Flatpak tooling (Linux only)
@@ -204,6 +229,17 @@ jobs:
           ./packaging/linux/appimage/build_appimage.sh
           ls -lah release/*.AppImage
 
+      - name: Upload Linux AppImage
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-desktop-${{ matrix.platform }}-${{ runner.arch }}
+          path: |
+            release/*.AppImage
+            release/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Build Linux Flatpak bundle
         if: matrix.platform == 'linux'
         run: |
@@ -212,6 +248,17 @@ jobs:
           ./packaging/flatpak/build_flatpak.sh
           ls -lah release/*.flatpak
 
+      - name: Upload Linux Flatpak bundle
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-desktop-${{ matrix.platform }}-${{ runner.arch }}
+          path: |
+            release/*.flatpak
+            release/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Build Linux .deb
         if: matrix.platform == 'linux'
         run: |
@@ -219,6 +266,17 @@ jobs:
           chmod +x packaging/linux/build_deb.sh
           ./packaging/linux/build_deb.sh
           ls -lah release/*.deb
+
+      - name: Upload Linux .deb
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-desktop-${{ matrix.platform }}-${{ runner.arch }}
+          path: |
+            release/*.deb
+            release/*.sha256
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Install-test Linux .deb
         if: matrix.platform == 'linux'
@@ -237,6 +295,17 @@ jobs:
           .\packaging\windows\build_installer.ps1
           Get-ChildItem release\*-setup.exe
 
+      - name: Upload Windows installer
+        if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-desktop-${{ matrix.platform }}-${{ runner.arch }}
+          path: |
+            release/*-setup.exe
+            release/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Build macOS DMG
         if: matrix.platform == 'macos'
         run: |
@@ -245,7 +314,20 @@ jobs:
           ./packaging/macos/make_macos_installer.sh --arch aarch64 --bin-dir target/release
           ls -lah release/*.dmg
 
+      - name: Upload macOS DMG
+        if: matrix.platform == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-desktop-${{ matrix.platform }}-${{ runner.arch }}
+          path: |
+            release/*.dmg
+            release/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload release archives (workflow artifact)
+        # Catch-all safety net for anything the stage uploads above missed;
+        # same artifact name, so files merge rather than duplicate.
         uses: actions/upload-artifact@v4
         with:
           name: vadadee-berry-desktop-${{ matrix.platform }}-${{ runner.arch }}
@@ -263,6 +345,9 @@ jobs:
 
   publish:
     name: Publish GitHub Release assets
+    # Desktop artifacts only. Mobile outputs (Android debug APK, iOS
+    # unsigned archive) are validation-only and intentionally NOT published:
+    # they are unsigned CI checkpoints, not shippable releases.
     needs: desktop
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest

@@ -147,6 +147,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: readiness-${{ runner.os }}
+      - name: Preflight (fmt + metadata, before the expensive build)
+        run: |
+          set -euo pipefail
+          cargo fmt --check
+          cargo metadata --no-deps --format-version 1 > /dev/null
+          echo "preflight OK"
       - name: Check + test (minimal features, like tag releases)
         run: |
           set -euo pipefail

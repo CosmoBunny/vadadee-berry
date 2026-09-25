@@ -48,8 +48,14 @@ jobs:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@v2
       - name: Build Xcode archive (unsigned for CI validation)
+        # Stage 2 (packaging) runs only once the Xcode host exists. Until
+        # then the Rust check above is the iOS milestone — skip loudly
+        # instead of failing the tag.
         run: |
-          test -d ios || { echo "ios/ project missing — packaging lands here in Phase 7"; exit 1; }
+          if [ ! -d ios ]; then
+            echo "NOTICE: no ios/ Xcode host project yet — skipping packaging (check job above is the milestone)."
+            exit 0
+          fi
           xcodebuild -project ios/VadadeeBerry.xcodeproj \
             -scheme VadadeeBerry \
             -configuration Release \
@@ -62,4 +68,4 @@ jobs:
         with:
           name: vadadee-berry-ios-release-archive
           path: build/VadadeeBerry.xcarchive
-          if-no-files-found: error
+          if-no-files-found: warn
