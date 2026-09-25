@@ -541,7 +541,8 @@ impl VadadeeBerryApp {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let (mcp_preview_update_tx, mcp_preview_update_rx) = std::sync::mpsc::channel();
         #[cfg(any(target_os = "android", target_os = "ios"))]
-        let (mcp_preview_update_tx, mcp_preview_update_rx) = (std::sync::mpsc::channel().0, std::sync::mpsc::channel().1); // dummy
+        let (_mcp_preview_update_tx, _mcp_preview_update_rx) =
+            std::sync::mpsc::channel::<McpPreviewUpdate>(); // dummy: fields are desktop-only
 
         let (layer_cache_result_tx, layer_cache_result_rx) = std::sync::mpsc::channel();
         let wgpu_render = cc.wgpu_render_state.clone();
@@ -3875,13 +3876,17 @@ impl VadadeeBerryApp {
         {
             return self.status_message.clone();
         }
-        if !self.screen_captures.is_empty() {
-            let n = self.screen_captures.len();
-            return if n == 1 {
-                "Recording screen…".into()
-            } else {
-                format!("Recording {n} screens…")
-            };
+        // Screen-record status is desktop-only (field absent on mobile).
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            if !self.screen_captures.is_empty() {
+                let n = self.screen_captures.len();
+                return if n == 1 {
+                    "Recording screen…".into()
+                } else {
+                    format!("Recording {n} screens…")
+                };
+            }
         }
         // Window / workspace not active — show before tool live status.
         if !ctx.input(|i| i.focused) {
@@ -14550,7 +14555,7 @@ fn run_video_decode_thread(
             return;
         };
         self.restore_text_focus_pan();
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(target_os = "android")]
         {
             if let Some(android_app) = crate::ANDROID_APP.get() {
                 android_app.hide_soft_input(false);
@@ -14727,7 +14732,7 @@ fn run_video_decode_thread(
     pub fn delete_on_page_text_node(&mut self, id: NodeId) {
         self.on_page_text_edit = None;
         self.restore_text_focus_pan();
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(target_os = "android")]
         {
             if let Some(android_app) = crate::ANDROID_APP.get() {
                 android_app.hide_soft_input(false);
@@ -19363,6 +19368,7 @@ fn run_video_decode_thread(
         ))
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_drawing_tool(&mut self, name: &str, args: serde_json::Value) -> Result<String, String> {
         use crate::document::{ArcJoin, Fill, Node, NodeKind, TextStyle};
         use crate::mcp::drawing::{fill_from_style, parse_arc_join, style_from_args, stroke_from_style};

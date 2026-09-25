@@ -129,7 +129,7 @@ pub fn show(
 ) -> Option<(f64, f64)> {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
-        let _ = (&frame, ctx, canvas_work, toolbar_right);
+        let _ = (&frame, ctx, canvas_work, toolbar_outer_right);
         return None;
     }
 

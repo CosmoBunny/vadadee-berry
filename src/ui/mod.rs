@@ -5566,7 +5566,13 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     });
                 }
                 if !recording {
-                    let tip = if crate::screen_capture::is_wayland_session() {
+                    // screen_capture module is desktop-only; mobile has no
+                    // Wayland/X11 distinction.
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    let wayland = crate::screen_capture::is_wayland_session();
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    let wayland = false;
+                    let tip = if wayland {
                         "Wayland portal shots + optional system audio. FPS pads to wall clock. Mouse: input group or over Vadadee."
                     } else {
                         "X11 grab + optional Pulse audio. Empty path → cache."
@@ -5574,7 +5580,7 @@ fn layers_section(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                     ui.label(
                         RichText::new(format!(
                             "{} · {} fps{}",
-                            if crate::screen_capture::is_wayland_session() {
+                            if wayland {
                                 "Portal"
                             } else {
                                 "X11"
