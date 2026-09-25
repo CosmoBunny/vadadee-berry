@@ -35,7 +35,7 @@ on:
           - mcp
         default: all
       with_opencv:
-        description: "Enable OpenCV feature (slower; needs system OpenCV; Linux/macOS CI only)"
+        description: "Enable OpenCV feature (slower; needs system OpenCV; Linux/macOS CI only — Windows always builds minimal)"
         type: boolean
         default: false
   push:
@@ -126,7 +126,25 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ github.event_name == 'workflow_dispatch' && inputs.with_opencv || false }}" = "true" ]; then
-            brew install opencv llvm
+            # Pinned OpenCV 4.x via the versioned formula (tracks 4.x,
+            # currently 4.14.0): unversioned `opencv` is 5.x, which the
+            # opencv Rust crate (0.93.7) rejects (needs 3.2/3.4/4.x).
+            # opencv@4 is keg-only, so its pkg-config/CMake paths are
+            # exposed explicitly for the crate's build script.
+            brew install opencv@4 llvm pkg-config cmake
+            OCV_PREFIX="$(brew --prefix opencv@4)"
+            echo "OpenCV 4 prefix: $OCV_PREFIX"
+            PKG_CONFIG_PATH="$OCV_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+            export PKG_CONFIG_PATH
+            echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+            echo "OpenCV_DIR=$OCV_PREFIX/lib/cmake/opencv4" >> "$GITHUB_ENV"
+            echo "---- OpenCV diagnostics ----"
+            brew --prefix opencv@4
+            pkg-config --modversion opencv4
+            pkg-config --cflags opencv4
+            pkg-config --libs opencv4
+            test "$(pkg-config --modversion opencv4 | cut -d. -f1)" = "4" \
+              || { echo "ERROR: expected OpenCV 4.x"; exit 1; }
             echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
           fi
 
@@ -151,22 +169,28 @@ jobs:
           echo "bins=$BINS" >> "$GITHUB_OUTPUT"
 
           # Trigger → feature matrix (explicit):
-          #   manual dispatch, checkbox false → minimal (--no-default-features)
-          #   manual dispatch, checkbox true  → default features (OpenCV)
-          #   tag push v*                     → minimal (--no-default-features)
-          WITH_OPENCV="false"
+          #   manual dispatch, checkbox false → minimal (--no-default-features, all)
+          #   manual dispatch, checkbox true  → Linux/macOS: OpenCV;
+          #                                    Windows: minimal + warning
+          #   tag push v*                     → minimal (--no-default-features, all)
+          REQUESTED_OPENCV="false"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.with_opencv }}" = "true" ]; then
-            WITH_OPENCV="true"
+            REQUESTED_OPENCV="true"
           fi
-          echo "with_opencv=$WITH_OPENCV" >> "$GITHUB_OUTPUT"
-          # Windows CI does not provision system OpenCV: fail early with a
-          # clear message instead of a late bindgen compile error.
-          if [ "$WITH_OPENCV" = "true" ] && [ "${{ runner.os }}" = "Windows" ]; then
-            echo "ERROR: OpenCV builds are not configured for Windows CI yet."
-            echo "Run with with_opencv=false, or provision OpenCV (vcpkg/Chocolatey)"
-            echo "plus OpenCV_DIR/PKG_CONFIG_PATH first."
-            exit 1
+          # Effective mode is per platform: Windows CI has no OpenCV
+          # environment, so it always builds minimal (warn, never fail —
+          # a global checkbox must not red the Windows leg).
+          EFFECTIVE_OPENCV="false"
+          if [ "$REQUESTED_OPENCV" = "true" ]; then
+            if [ "${{ runner.os }}" = "Linux" ] || [ "${{ runner.os }}" = "macOS" ]; then
+              EFFECTIVE_OPENCV="true"
+            fi
           fi
+          if [ "$REQUESTED_OPENCV" = "true" ] && [ "${{ runner.os }}" = "Windows" ]; then
+            echo "WARNING: OpenCV is not supported by the Windows CI environment yet."
+            echo "Building Windows release without OpenCV."
+          fi
+          echo "with_opencv=$EFFECTIVE_OPENCV" >> "$GITHUB_OUTPUT"
 
       - name: Build, bundle, copy to release/
         shell: bash

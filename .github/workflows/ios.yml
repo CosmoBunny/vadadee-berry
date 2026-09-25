@@ -1,7 +1,9 @@
-# iOS build: Rust core (iOS targets) + Xcode archive.
-# Separate pipeline from desktop release (§31): mobile signing problems must
-# never block desktop artifacts. Must run on macOS runners. Signing uses CI
-# secrets only — never commit keys or provisioning profiles.
+# iOS release: Rust core (iOS targets) -> native libs -> Xcode archive.
+# Separate pipeline from desktop release: mobile signing problems must never
+# block desktop artifacts. This workflow BUILDS (never merely `cargo check`):
+# three release targets staged as device/simulator binaries, plus an Xcode
+# archive when the ios/ host exists. Must run on macOS runners. Signing uses
+# CI secrets only — never commit keys or provisioning profiles.
 name: iOS
 
 on:
@@ -18,44 +20,77 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  ios-check:
-    name: Rust iOS targets (check)
+  ios-build:
+    name: iOS Release
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
-      - uses: Swatinem/rust-cache@v2
-      - name: Check library for iOS targets
-        # Minimal feature set: OpenCV (default feature) has no iOS system
-        # libraries — mobile never ships it (matches release policy).
-        # Desktop-only deps (rfd, device_query, screen_capture) are gated
-        # off iOS in Cargo.toml / lib.rs for the same reason.
-        run: |
-          cargo check --lib --no-default-features --target aarch64-apple-ios
-          cargo check --lib --no-default-features --target aarch64-apple-ios-sim
-          cargo check --lib --no-default-features --target x86_64-apple-ios
 
-  ios-package:
-    name: Xcode archive
-    runs-on: macos-latest
-    needs: ios-check
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios, aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@v2
-      - name: Build Xcode archive (unsigned for CI validation)
-        # Stage 2 (packaging) runs only once the Xcode host exists. Until
-        # then the Rust check above is the iOS milestone — skip loudly
-        # instead of failing the tag.
+
+      - name: Build Rust iOS libraries
+        # Release policy: minimal features (no OpenCV — no iOS system
+        # libraries for it; desktop-only deps are gated off iOS in
+        # Cargo.toml / lib.rs). This is a build, not a check.
         run: |
-          if [ ! -d ios ]; then
-            echo "NOTICE: no ios/ Xcode host project yet — skipping packaging (check job above is the milestone)."
-            exit 0
-          fi
+          set -euo pipefail
+          cargo build --lib --release --no-default-features --target aarch64-apple-ios
+          cargo build --lib --release --no-default-features --target aarch64-apple-ios-sim
+          cargo build --lib --release --no-default-features --target x86_64-apple-ios
+
+      - name: Stage native artifacts
+        run: |
+          set -euo pipefail
+          echo "=== Cargo outputs ==="
+          find target/aarch64-apple-ios/release -maxdepth 1 -type f -print
+          find target/aarch64-apple-ios-sim/release -maxdepth 1 -type f -print
+          find target/x86_64-apple-ios/release -maxdepth 1 -type f -print
+          rm -rf ios-artifacts
+          mkdir -p ios-artifacts/device ios-artifacts/simulator
+          cp target/aarch64-apple-ios/release/*.dylib ios-artifacts/device/ 2>/dev/null || true
+          cp target/aarch64-apple-ios/release/*.a ios-artifacts/device/ 2>/dev/null || true
+          cp target/aarch64-apple-ios/release/*.rlib ios-artifacts/device/ 2>/dev/null || true
+          cp target/aarch64-apple-ios-sim/release/*.dylib ios-artifacts/simulator/ 2>/dev/null || true
+          cp target/aarch64-apple-ios-sim/release/*.a ios-artifacts/simulator/ 2>/dev/null || true
+          cp target/aarch64-apple-ios-sim/release/*.rlib ios-artifacts/simulator/ 2>/dev/null || true
+          cp target/x86_64-apple-ios/release/*.dylib ios-artifacts/simulator/ 2>/dev/null || true
+          cp target/x86_64-apple-ios/release/*.a ios-artifacts/simulator/ 2>/dev/null || true
+          cp target/x86_64-apple-ios/release/*.rlib ios-artifacts/simulator/ 2>/dev/null || true
+          echo "=== Staged ==="
+          find ios-artifacts -type f -print
+
+      - name: Generate build manifest
+        run: |
+          set -euo pipefail
+          {
+            echo "Vadadee Berry iOS Build"
+            echo
+            echo "Commit: $GITHUB_SHA"
+            echo "Targets:"
+            echo "  aarch64-apple-ios (device)"
+            echo "  aarch64-apple-ios-sim (simulator)"
+            echo "  x86_64-apple-ios (simulator)"
+            echo
+            echo "Artifacts:"
+            find ios-artifacts -type f -print 2>/dev/null || true
+          } > ios-artifacts/BUILD-MANIFEST.txt
+          cat ios-artifacts/BUILD-MANIFEST.txt
+
+      - name: Upload iOS Rust artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-ios-rust
+          path: ios-artifacts/**
+          if-no-files-found: error
+
+      - name: Build Xcode archive (unsigned for CI validation)
+        if: ${{ hashFiles('ios/**') != '' }}
+        run: |
+          set -euo pipefail
           xcodebuild -project ios/VadadeeBerry.xcodeproj \
             -scheme VadadeeBerry \
             -configuration Release \
@@ -63,9 +98,22 @@ jobs:
             -archivePath build/VadadeeBerry.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             archive
-      - name: Upload archive artifact
+
+      - name: Upload Xcode archive
+        if: ${{ hashFiles('ios/**') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: vadadee-berry-ios-release-archive
+          name: vadadee-berry-ios-xcarchive
           path: build/VadadeeBerry.xcarchive
-          if-no-files-found: warn
+          if-no-files-found: error
+
+      - name: Require iOS Xcode project
+        # The native build above is the milestone; archiving needs the ios/
+        # host. Fail loudly when it is missing instead of silently reporting
+        # an Xcode success — Rust artifacts are already uploaded above.
+        if: ${{ hashFiles('ios/**') == '' }}
+        run: |
+          echo "No ios/ Xcode host project exists."
+          echo "Rust iOS release binaries were built successfully."
+          echo "Xcode/IPA packaging is unavailable until the iOS host project is added."
+          exit 1
