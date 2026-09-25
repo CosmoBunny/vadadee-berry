@@ -98,7 +98,8 @@ impl PlatformCapabilities {
             file_picker: false,
             screen_capture: false,
             external_files: true,
-            share_sheet: true,
+            // No share-sheet export yet; stays false until wired + tested.
+            share_sheet: false,
         }
     }
 
@@ -115,7 +116,8 @@ impl PlatformCapabilities {
             file_picker: false,
             screen_capture: false,
             external_files: true,
-            share_sheet: true,
+            // No share-sheet export yet; stays false until wired + tested.
+            share_sheet: false,
         }
     }
 }
@@ -343,12 +345,12 @@ mod tests {
         let d = PlatformCapabilities::desktop();
         assert!(d.keyboard && d.filesystem && !d.touch && !d.share_sheet);
         let a = PlatformCapabilities::android();
-        assert!(a.touch && a.share_sheet && a.external_files && !a.filesystem);
-        // Android has a real IME bridge but no picker wiring yet.
-        assert!(a.native_text_input && !a.file_picker);
+        assert!(a.touch && a.external_files && !a.filesystem);
+        // Android has a real IME bridge but no picker/share wiring yet.
+        assert!(a.native_text_input && !a.file_picker && !a.share_sheet);
         let i = PlatformCapabilities::ios();
-        assert!(i.touch && i.share_sheet && !i.keyboard);
-        // iOS bridges are stubs: egui owns text, no picker/filesystem.
-        assert!(!i.native_text_input && !i.file_picker && !i.filesystem);
+        assert!(i.touch && !i.keyboard);
+        // iOS bridges are stubs: egui owns text, no picker/filesystem/share.
+        assert!(!i.native_text_input && !i.file_picker && !i.filesystem && !i.share_sheet);
     }
 }
