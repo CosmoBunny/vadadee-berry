@@ -55,20 +55,44 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
 
       - name: Configure Android linkers
+        # cc-rs (used by android-activity's GameActivity C++ glue) resolves
+        # CC/CXX/AR/RANLIB per target from these env vars. The NDK ships no
+        # `<triple>-ar` binaries, so AR/RANLIB must point at llvm-ar /
+        # llvm-ranlib explicitly — no /usr/bin symlinks.
         run: |
           set -euo pipefail
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           {
             echo "CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android35-clang"
             echo "CXX_aarch64_linux_android=$NDK_BIN/aarch64-linux-android35-clang++"
+
             echo "CC_armv7_linux_androideabi=$NDK_BIN/armv7a-linux-androideabi35-clang"
             echo "CXX_armv7_linux_androideabi=$NDK_BIN/armv7a-linux-androideabi35-clang++"
+
             echo "CC_x86_64_linux_android=$NDK_BIN/x86_64-linux-android35-clang"
             echo "CXX_x86_64_linux_android=$NDK_BIN/x86_64-linux-android35-clang++"
+
+            echo "AR_aarch64_linux_android=$NDK_BIN/llvm-ar"
+            echo "AR_armv7_linux_androideabi=$NDK_BIN/llvm-ar"
+            echo "AR_x86_64_linux_android=$NDK_BIN/llvm-ar"
+
+            echo "RANLIB_aarch64_linux_android=$NDK_BIN/llvm-ranlib"
+            echo "RANLIB_armv7_linux_androideabi=$NDK_BIN/llvm-ranlib"
+            echo "RANLIB_x86_64_linux_android=$NDK_BIN/llvm-ranlib"
+
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android35-clang"
             echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$NDK_BIN/armv7a-linux-androideabi35-clang"
             echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$NDK_BIN/x86_64-linux-android35-clang"
           } >> "$GITHUB_ENV"
+          test -x "$NDK_BIN/llvm-ar"
+          test -x "$NDK_BIN/llvm-ranlib"
+          test -x "$NDK_BIN/aarch64-linux-android35-clang++"
+          test -x "$NDK_BIN/armv7a-linux-androideabi35-clang++"
+          test -x "$NDK_BIN/x86_64-linux-android35-clang"
+          echo "LLVM archiver:"
+          "$NDK_BIN/llvm-ar" --version
+          echo "LLVM ranlib:"
+          "$NDK_BIN/llvm-ranlib" --version
 
       - name: Build Rust Android libraries
         # Release policy: minimal features (no OpenCV — no Android system
