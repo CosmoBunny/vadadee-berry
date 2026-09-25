@@ -132,6 +132,17 @@ pub fn run_desktop() -> eframe::Result<()> {
     )
 }
 
+/// iOS host entry, called once from the Swift application shell on the main
+/// thread (winit's iOS backend requires the event loop on the main thread).
+/// eframe drives the editor from here and never returns.
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn vadadee_berry_ios_main() {
+    if let Err(err) = run_desktop() {
+        log::error!("eframe exited with error: {err}");
+    }
+}
+
 #[cfg(target_os = "android")]
 pub static ANDROID_APP: std::sync::OnceLock<winit::platform::android::activity::AndroidApp> =
     std::sync::OnceLock::new();

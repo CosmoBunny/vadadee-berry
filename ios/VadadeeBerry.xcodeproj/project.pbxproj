@@ -1,0 +1,235 @@
+// !$*UTF8*$!
+{
+    archiveVersion = 1;
+    classes = {
+    };
+    objectVersion = 56;
+    objects = {
+
+/* Begin PBXBuildFile section */
+        AA0000000000000000000010 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000031 /* AppDelegate.swift */; };
+        AA0000000000000000000011 /* libvadadee_berry.a in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000034 /* libvadadee_berry.a */; };
+        AA0000000000000000000020 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000040 /* Foundation.framework */; };
+        AA0000000000000000000021 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000041 /* UIKit.framework */; };
+        AA0000000000000000000022 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000042 /* CoreGraphics.framework */; };
+        AA0000000000000000000023 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000043 /* CoreFoundation.framework */; };
+        AA0000000000000000000024 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000044 /* QuartzCore.framework */; };
+        AA0000000000000000000025 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000045 /* Security.framework */; };
+        AA0000000000000000000026 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000046 /* SystemConfiguration.framework */; };
+        AA0000000000000000000027 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000047 /* Metal.framework */; };
+        AA0000000000000000000028 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000048 /* MetalKit.framework */; };
+        AA0000000000000000000029 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000049 /* AVFoundation.framework */; };
+        AA000000000000000000002A /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA000000000000000000004A /* AudioToolbox.framework */; };
+        AA000000000000000000002B /* CoreMotion.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA000000000000000000004B /* CoreMotion.framework */; };
+        AA000000000000000000002C /* GameController.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA000000000000000000004C /* GameController.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+        AA0000000000000000000030 /* VadadeeBerry.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VadadeeBerry.app; sourceTree = BUILT_PRODUCTS_DIR; };
+        AA0000000000000000000031 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+        AA0000000000000000000032 /* VadadeeBerry-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "VadadeeBerry-Bridging-Header.h"; sourceTree = "<group>"; };
+        AA0000000000000000000033 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+        AA0000000000000000000034 /* libvadadee_berry.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "../target/aarch64-apple-ios/release/libvadadee_berry.a"; sourceTree = SOURCE_ROOT; };
+        AA0000000000000000000040 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+        AA0000000000000000000041 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+        AA0000000000000000000042 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+        AA0000000000000000000043 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
+        AA0000000000000000000044 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+        AA0000000000000000000045 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+        AA0000000000000000000046 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
+        AA0000000000000000000047 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+        AA0000000000000000000048 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+        AA0000000000000000000049 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
+        AA000000000000000000004A /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
+        AA000000000000000000004B /* CoreMotion.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMotion.framework; path = System/Library/Frameworks/CoreMotion.framework; sourceTree = SDKROOT; };
+        AA000000000000000000004C /* GameController.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = GameController.framework; path = System/Library/Frameworks/GameController.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+        AA0000000000000000000007 /* Frameworks */ = {
+            isa = PBXFrameworksBuildPhase;
+            buildActionMask = 2147483647;
+            files = (
+                AA0000000000000000000011 /* libvadadee_berry.a in Frameworks */,
+                AA0000000000000000000020 /* Foundation.framework in Frameworks */,
+                AA0000000000000000000021 /* UIKit.framework in Frameworks */,
+                AA0000000000000000000022 /* CoreGraphics.framework in Frameworks */,
+                AA0000000000000000000023 /* CoreFoundation.framework in Frameworks */,
+                AA0000000000000000000024 /* QuartzCore.framework in Frameworks */,
+                AA0000000000000000000025 /* Security.framework in Frameworks */,
+                AA0000000000000000000026 /* SystemConfiguration.framework in Frameworks */,
+                AA0000000000000000000027 /* Metal.framework in Frameworks */,
+                AA0000000000000000000028 /* MetalKit.framework in Frameworks */,
+                AA0000000000000000000029 /* AVFoundation.framework in Frameworks */,
+                AA000000000000000000002A /* AudioToolbox.framework in Frameworks */,
+                AA000000000000000000002B /* CoreMotion.framework in Frameworks */,
+                AA000000000000000000002C /* GameController.framework in Frameworks */,
+            );
+            runOnlyForDeploymentPostprocessing = 0;
+        };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+        AA0000000000000000000002 = {
+            isa = PBXGroup;
+            children = (
+                AA0000000000000000000003 /* VadadeeBerry */,
+                AA0000000000000000000004 /* Products */,
+            );
+            sourceTree = "<group>";
+        };
+        AA0000000000000000000003 /* VadadeeBerry */ = {
+            isa = PBXGroup;
+            children = (
+                AA0000000000000000000031 /* AppDelegate.swift */,
+                AA0000000000000000000032 /* VadadeeBerry-Bridging-Header.h */,
+                AA0000000000000000000033 /* Info.plist */,
+            );
+            path = VadadeeBerry;
+            sourceTree = "<group>";
+        };
+        AA0000000000000000000004 /* Products */ = {
+            isa = PBXGroup;
+            children = (
+                AA0000000000000000000030 /* VadadeeBerry.app */,
+            );
+            name = Products;
+            sourceTree = "<group>";
+        };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+        AA0000000000000000000005 /* VadadeeBerry */ = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = AA0000000000000000000055 /* Build configuration list for PBXNativeTarget "VadadeeBerry" */;
+            buildPhases = (
+                AA0000000000000000000006 /* Sources */,
+                AA0000000000000000000007 /* Frameworks */,
+            );
+            buildRules = (
+            );
+            dependencies = (
+            );
+            name = VadadeeBerry;
+            productName = VadadeeBerry;
+            productReference = AA0000000000000000000030 /* VadadeeBerry.app */;
+            productType = "com.apple.product-type.application";
+        };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+        AA0000000000000000000001 /* Project object */ = {
+            isa = PBXProject;
+            attributes = {
+                LastUpgradeCheck = 1600;
+            };
+            buildConfigurationList = AA0000000000000000000054 /* Build configuration list for PBXProject "VadadeeBerry" */;
+            compatibilityVersion = "Xcode 14.0";
+            developmentRegion = en;
+            hasScannedForEncodings = 0;
+            knownRegions = (
+                en,
+                Base,
+            );
+            mainGroup = AA0000000000000000000002;
+            productRefGroup = AA0000000000000000000004 /* Products */;
+            projectDirPath = "";
+            projectRoot = "";
+            targets = (
+                AA0000000000000000000005 /* VadadeeBerry */,
+            );
+        };
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+        AA0000000000000000000006 /* Sources */ = {
+            isa = PBXSourcesBuildPhase;
+            buildActionMask = 2147483647;
+            files = (
+                AA0000000000000000000010 /* AppDelegate.swift in Sources */,
+            );
+            runOnlyForDeploymentPostprocessing = 0;
+        };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+        AA0000000000000000000050 /* Debug */ = {
+            isa = XCBuildConfiguration;
+            buildSettings = {
+            };
+            name = Debug;
+        };
+        AA0000000000000000000051 /* Release */ = {
+            isa = XCBuildConfiguration;
+            buildSettings = {
+            };
+            name = Release;
+        };
+        AA0000000000000000000052 /* Debug */ = {
+            isa = XCBuildConfiguration;
+            buildSettings = {
+                CODE_SIGN_IDENTITY = "";
+                CURRENT_PROJECT_VERSION = 1;
+                GENERATE_INFOPLIST_FILE = NO;
+                INFOPLIST_FILE = VadadeeBerry/Info.plist;
+                IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+                LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+                LIBRARY_SEARCH_PATHS = "$(inherited) $(SOURCE_ROOT)/../target/aarch64-apple-ios/release";
+                MARKETING_VERSION = 0.0.2;
+                PRODUCT_BUNDLE_IDENTIFIER = com.cosmobunny.VadadeeBerry;
+                PRODUCT_NAME = "$(TARGET_NAME)";
+                SDKROOT = iphoneos;
+                SWIFT_OBJC_BRIDGING_HEADER = VadadeeBerry/VadadeeBerry-Bridging-Header.h;
+                SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+                SWIFT_VERSION = 5.0;
+                TARGETED_DEVICE_FAMILY = "1,2";
+            };
+            name = Debug;
+        };
+        AA0000000000000000000053 /* Release */ = {
+            isa = XCBuildConfiguration;
+            buildSettings = {
+                CODE_SIGN_IDENTITY = "";
+                CURRENT_PROJECT_VERSION = 1;
+                GENERATE_INFOPLIST_FILE = NO;
+                INFOPLIST_FILE = VadadeeBerry/Info.plist;
+                IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+                LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+                LIBRARY_SEARCH_PATHS = "$(inherited) $(SOURCE_ROOT)/../target/aarch64-apple-ios/release";
+                MARKETING_VERSION = 0.0.2;
+                PRODUCT_BUNDLE_IDENTIFIER = com.cosmobunny.VadadeeBerry;
+                PRODUCT_NAME = "$(TARGET_NAME)";
+                SDKROOT = iphoneos;
+                SWIFT_COMPILATION_MODE = wholemodule;
+                SWIFT_OBJC_BRIDGING_HEADER = VadadeeBerry/VadadeeBerry-Bridging-Header.h;
+                SWIFT_OPTIMIZATION_LEVEL = "-O";
+                SWIFT_VERSION = 5.0;
+                TARGETED_DEVICE_FAMILY = "1,2";
+            };
+            name = Release;
+        };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+        AA0000000000000000000054 /* Build configuration list for PBXProject "VadadeeBerry" */ = {
+            isa = XCConfigurationList;
+            buildConfigurations = (
+                AA0000000000000000000050 /* Debug */,
+                AA0000000000000000000051 /* Release */,
+            );
+            defaultConfigurationIsVisible = 0;
+            defaultConfigurationName = Release;
+        };
+        AA0000000000000000000055 /* Build configuration list for PBXNativeTarget "VadadeeBerry" */ = {
+            isa = XCConfigurationList;
+            buildConfigurations = (
+                AA0000000000000000000052 /* Debug */,
+                AA0000000000000000000053 /* Release */,
+            );
+            defaultConfigurationIsVisible = 0;
+            defaultConfigurationName = Release;
+        };
+/* End XCConfigurationList section */
+    };
+    rootObject = AA0000000000000000000001 /* Project object */;
+}

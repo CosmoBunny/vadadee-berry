@@ -2,8 +2,10 @@
 # Separate pipeline from desktop release: mobile signing problems must never
 # block desktop artifacts. This workflow BUILDS (never merely `cargo check`):
 # three release targets staged as device/simulator binaries, plus an Xcode
-# archive when the ios/ host exists. Must run on macOS runners. Signing uses
-# CI secrets only — never commit keys or provisioning profiles.
+# archive of the ios/ host (Swift shell + Rust staticlib) when it exists.
+# Must run on macOS runners. Archive is unsigned (CODE_SIGNING_ALLOWED=NO);
+# no IPA is produced until signing/export is configured. Signing uses CI
+# secrets only — never commit keys or provisioning profiles.
 name: iOS
 
 on:
@@ -106,14 +108,3 @@ jobs:
           name: vadadee-berry-ios-xcarchive
           path: build/VadadeeBerry.xcarchive
           if-no-files-found: error
-
-      - name: Require iOS Xcode project
-        # The native build above is the milestone; archiving needs the ios/
-        # host. Fail loudly when it is missing instead of silently reporting
-        # an Xcode success — Rust artifacts are already uploaded above.
-        if: ${{ hashFiles('ios/**') == '' }}
-        run: |
-          echo "No ios/ Xcode host project exists."
-          echo "Rust iOS release binaries were built successfully."
-          echo "Xcode/IPA packaging is unavailable until the iOS host project is added."
-          exit 1
