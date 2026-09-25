@@ -14,11 +14,11 @@ pub enum TopBarAction {
     OpenMenu,
     Undo,
     Redo,
-    Export,
 }
 
-/// Render the phone top bar. Pure presentation: reads title + undo/redo
-/// availability, returns what the user asked for.
+/// Render the phone top bar: [Menu] [title] [Undo] [Redo].
+/// Pure presentation: reads title + undo/redo availability, returns what
+/// the user asked for. Export lives in the Export sheet, not the bar.
 pub fn show_top_bar(
     title: &str,
     can_undo: bool,
@@ -35,7 +35,7 @@ pub fn show_top_bar(
                 [m.toolbar_button_size, m.toolbar_button_size],
                 egui::Button::new("‹"),
             )
-            .on_hover_text("Projects")
+            .on_hover_text("Menu")
             .clicked()
         {
             action = TopBarAction::OpenMenu;
@@ -43,26 +43,6 @@ pub fn show_top_bar(
         ui.label(egui::RichText::new(title).strong().size(17.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(layout.safe_area.right);
-            if ui
-                .add_sized(
-                    [m.toolbar_button_size, m.toolbar_button_size],
-                    egui::Button::new("⋮"),
-                )
-                .on_hover_text("Menu")
-                .clicked()
-            {
-                action = TopBarAction::OpenMenu;
-            }
-            if ui
-                .add_sized(
-                    [m.toolbar_button_size, m.toolbar_button_size],
-                    egui::Button::new("⤴"),
-                )
-                .on_hover_text("Export")
-                .clicked()
-            {
-                action = TopBarAction::Export;
-            }
             if ui
                 .add_enabled(can_redo, egui::Button::new("↷"))
                 .on_hover_text("Redo")

@@ -62,7 +62,6 @@ impl MobileShell {
             TopBarAction::OpenMenu => app.mobile_ui.toggle_sheet(MobileSheet::Menu),
             TopBarAction::Undo => app.do_undo(),
             TopBarAction::Redo => app.do_redo(),
-            TopBarAction::Export => app.request_export_image(),
         }
 
         // Bottom toolbar.

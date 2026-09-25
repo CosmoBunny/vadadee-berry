@@ -17,7 +17,7 @@ pub enum ToolbarAction {
     OpenTools,
 }
 
-/// Render the bottom toolbar: 8 phone tools + overflow. Highlights the
+/// Render the bottom toolbar: 5 phone tools + `More` overflow. Highlights the
 /// button matching the editor's active tool. Pure presentation.
 pub fn show_bottom_toolbar(
     active_kind: ToolKind,

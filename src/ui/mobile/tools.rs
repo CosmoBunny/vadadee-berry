@@ -23,16 +23,14 @@ pub enum MobileTool {
 }
 
 impl MobileTool {
-    /// Toolbar order (before the `More` overflow).
-    pub const BAR: [Self; 8] = [
+    /// Phone bottom toolbar: Select / Move / Text / Brush / Shape, then the
+    /// `More` overflow. Everything else lives in the Tools sheet.
+    pub const BAR: [Self; 5] = [
         Self::Select,
         Self::Move,
-        Self::Shape,
-        Self::Pen,
-        Self::Brush,
         Self::Text,
-        Self::Fill,
-        Self::Eraser,
+        Self::Brush,
+        Self::Shape,
     ];
 
     /// The shared editor tool this presents. `Move` has no dedicated editor
