@@ -1,8 +1,10 @@
 <!-- Vadadee Berry Windows installer (WiX Toolset v5, v4 wxs schema).
      Consumed by packaging/windows/build_installer.ps1, which passes
-     Version + BinDir. Every file below is explicit — nothing ships by
-     accident. GUIDs are stable (namespace-derived, committed) so upgrades
-     and repair keep working across releases; do not regenerate them.
+     Version + BinDir and builds `-o ...-setup.exe` (MSI semantics in an
+     .exe package output; the WIX1109 entry-point note is informational).
+     Every file below is explicit — nothing ships by accident. GUIDs are
+     stable (namespace-derived, committed) so upgrades and repair keep
+     working across releases; do not regenerate them.
 
      Contents: studio + MCP binaries, Start Menu shortcut, optional desktop
      shortcut (DESKTOP_SHORTCUT=1, on by default), per-user file association
@@ -10,7 +12,10 @@
      extension is matched progressively by Explorer, so plain .json files
      are NOT hijacked), and a standard uninstaller entry.
 
-     Scope is perUser under LocalAppData (no UAC prompt).
+     Scope is perUser under LocalAppData (no UAC prompt). Directories use
+     the v4/v5 StandardDirectory model (no TARGETDIR wrapper). Shortcut
+     icons resolve through the Icon element below — the .ico is a build
+     input only, never an installed file.
 
      NOTE: the .exe icon itself comes from the Rust build (no build.rs
      icon embedding yet); shortcuts use packaging/windows/vadadee-berry.ico
@@ -29,71 +34,69 @@
 
     <Media Id="1" Cabinet="vadadee.cab" EmbedCab="yes" />
 
-    <Directory Id="TARGETDIR" Name="SourceDir">
-      <Directory Id="LocalAppDataFolder">
-        <Directory Id="INSTALLDIR" Name="Vadadee Berry">
-          <Component Id="StudioExe" Guid="d92456d1-b176-5db5-ac91-84da20937a2f">
-            <File Id="VadadeeBerryExe" Source="$(var.BinDir)/vadadee-berry.exe" KeyPath="yes" />
-            <!-- File association: compound project extension only (.json untouched).
-                 ProgId must hang off a Component in the v4/v5 schema (WIX0005
-                 under Package). -->
-            <ProgId Id="VadadeeBerry.Project" Description="Vadadee Berry Project">
-              <Extension Id="vadadee-berry.json" ContentType="application/x-vadadee-project">
-                <Verb Id="open" Command="Open with Vadadee Berry" TargetFile="VadadeeBerryExe" Argument="&quot;%1&quot;" />
-              </Extension>
-            </ProgId>
-          </Component>
-          <Component Id="McpExe" Guid="ad65058f-9ca4-5218-ba5d-ee03a66e8b84">
-            <File Id="McpExeFile" Source="$(var.BinDir)/vadadee-mcp-stdio.exe" KeyPath="yes" />
-          </Component>
-          <Component Id="AppIcon" Guid="288c53bf-dd3b-58ff-b937-80bb12a7d80f">
-            <File Id="AppIconFile" Source="vadadee-berry.ico" KeyPath="yes" />
-          </Component>
-        </Directory>
-      </Directory>
+    <!-- Shortcut icon source (build input only — never installed as a file).
+         Shortcut/@Icon must reference an Icon id, not a File id (WIX0094). -->
+    <Icon Id="AppIcon" SourceFile="vadadee-berry.ico" />
 
-      <Directory Id="ProgramMenuFolder">
-        <Directory Id="StartMenuDir" Name="Vadadee Berry">
-          <Component Id="StartMenuShortcuts" Guid="61be8350-0a78-5978-9a17-5c9e34979559">
-            <Shortcut Id="StartMenuApp"
-                      Name="Vadadee Berry"
-                      Target="[INSTALLDIR]vadadee-berry.exe"
-                      Icon="AppIconFile"
-                      WorkingDirectory="INSTALLDIR" />
-            <RemoveFolder Id="StartMenuDir" On="uninstall" />
-            <RegistryValue Root="HKCU"
-                           Key="Software\CosmoBunny\VadadeeBerry"
-                           Name="installed"
-                           Value="1"
-                           Type="integer"
-                           KeyPath="yes" />
-          </Component>
-        </Directory>
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="INSTALLDIR" Name="Vadadee Berry">
+        <Component Id="StudioExe" Guid="d92456d1-b176-5db5-ac91-84da20937a2f">
+          <File Id="VadadeeBerryExe" Source="$(var.BinDir)/vadadee-berry.exe" KeyPath="yes" />
+          <!-- File association: compound project extension only (.json untouched).
+               ProgId must hang off a Component in the v4/v5 schema (WIX0005
+               under Package). -->
+          <ProgId Id="VadadeeBerry.Project" Description="Vadadee Berry Project">
+            <Extension Id="vadadee-berry.json" ContentType="application/x-vadadee-project">
+              <Verb Id="open" Command="Open with Vadadee Berry" TargetFile="VadadeeBerryExe" Argument="&quot;%1&quot;" />
+            </Extension>
+          </ProgId>
+        </Component>
+        <Component Id="McpExe" Guid="ad65058f-9ca4-5218-ba5d-ee03a66e8b84">
+          <File Id="McpExeFile" Source="$(var.BinDir)/vadadee-mcp-stdio.exe" KeyPath="yes" />
+        </Component>
       </Directory>
+    </StandardDirectory>
 
-      <Directory Id="DesktopFolder">
-        <Component Id="DesktopShortcut" Guid="28d5c165-40d8-5b6e-a28f-905d1e2dfed9" Transitive="yes">
-          <!-- Install gated by the DesktopShortcutFeature Level element below:
-               WiX v4/v5 forbids Condition directly under Component (WIX0005). -->
-          <Shortcut Id="DesktopApp"
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="StartMenuDir" Name="Vadadee Berry">
+        <Component Id="StartMenuShortcuts" Guid="61be8350-0a78-5978-9a17-5c9e34979559">
+          <Shortcut Id="StartMenuApp"
                     Name="Vadadee Berry"
                     Target="[INSTALLDIR]vadadee-berry.exe"
-                    Icon="AppIconFile"
+                    Icon="AppIcon"
                     WorkingDirectory="INSTALLDIR" />
+          <RemoveFolder Id="StartMenuDir" On="uninstall" />
           <RegistryValue Root="HKCU"
                          Key="Software\CosmoBunny\VadadeeBerry"
-                         Name="desktop"
+                         Name="installed"
                          Value="1"
                          Type="integer"
                          KeyPath="yes" />
         </Component>
       </Directory>
-    </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="28d5c165-40d8-5b6e-a28f-905d1e2dfed9" Transitive="yes">
+        <!-- Install gated by the DesktopShortcutFeature Level element below:
+             WiX v4/v5 forbids Condition directly under Component (WIX0005). -->
+        <Shortcut Id="DesktopApp"
+                  Name="Vadadee Berry"
+                  Target="[INSTALLDIR]vadadee-berry.exe"
+                  Icon="AppIcon"
+                  WorkingDirectory="INSTALLDIR" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\CosmoBunny\VadadeeBerry"
+                       Name="desktop"
+                       Value="1"
+                       Type="integer"
+                       KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
 
     <Feature Id="Main">
       <ComponentRef Id="StudioExe" />
       <ComponentRef Id="McpExe" />
-      <ComponentRef Id="AppIcon" />
       <ComponentRef Id="StartMenuShortcuts" />
     </Feature>
 

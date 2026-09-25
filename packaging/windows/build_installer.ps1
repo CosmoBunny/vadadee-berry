@@ -77,6 +77,10 @@ if (Test-Path $outPath) { Remove-Item $outPath -Force }
 # Build from the packaging dir so the relative icon source resolves.
 # NOTE: -d takes its value as the NEXT token (attached -dName= form is
 # rejected: WIX0118).
+# Output type note: `-o *-setup.exe` against a <Package> source intentionally
+# targets the MSI-semantics .exe package output (not a Burn bundle). The
+# WIX1109 entry-point note the build emits is informational; do not "fix" it
+# by converting to a Bundle.
 Push-Location (Join-Path $PSScriptRoot '.')
 try {
     & $wix build VadadeeBerry.wxs `
