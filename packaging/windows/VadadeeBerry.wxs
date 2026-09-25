@@ -34,6 +34,14 @@
         <Directory Id="INSTALLDIR" Name="Vadadee Berry">
           <Component Id="StudioExe" Guid="d92456d1-b176-5db5-ac91-84da20937a2f">
             <File Id="VadadeeBerryExe" Source="$(var.BinDir)/vadadee-berry.exe" KeyPath="yes" />
+            <!-- File association: compound project extension only (.json untouched).
+                 ProgId must hang off a Component in the v4/v5 schema (WIX0005
+                 under Package). -->
+            <ProgId Id="VadadeeBerry.Project" Description="Vadadee Berry Project">
+              <Extension Id="vadadee-berry.json" ContentType="application/x-vadadee-project">
+                <Verb Id="open" Command="Open with Vadadee Berry" TargetFile="VadadeeBerryExe" Argument="&quot;%1&quot;" />
+              </Extension>
+            </ProgId>
           </Component>
           <Component Id="McpExe" Guid="ad65058f-9ca4-5218-ba5d-ee03a66e8b84">
             <File Id="McpExeFile" Source="$(var.BinDir)/vadadee-mcp-stdio.exe" KeyPath="yes" />
@@ -65,7 +73,8 @@
 
       <Directory Id="DesktopFolder">
         <Component Id="DesktopShortcut" Guid="28d5c165-40d8-5b6e-a28f-905d1e2dfed9" Transitive="yes">
-          <Condition>DESKTOP_SHORTCUT = 1</Condition>
+          <!-- Install gated by the DesktopShortcutFeature Level element below:
+               WiX v4/v5 forbids Condition directly under Component (WIX0005). -->
           <Shortcut Id="DesktopApp"
                     Name="Vadadee Berry"
                     Target="[INSTALLDIR]vadadee-berry.exe"
@@ -86,15 +95,14 @@
       <ComponentRef Id="McpExe" />
       <ComponentRef Id="AppIcon" />
       <ComponentRef Id="StartMenuShortcuts" />
-      <ComponentRef Id="DesktopShortcut" />
     </Feature>
 
-    <!-- File association: compound project extension only (.json untouched). -->
-    <ProgId Id="VadadeeBerry.Project" Description="Vadadee Berry Project">
-      <Extension Id="vadadee-berry.json" ContentType="application/x-vadadee-project">
-        <Verb Id="open" Command="Open with Vadadee Berry" TargetFile="VadadeeBerryExe" Argument="&quot;%1&quot;" />
-      </Extension>
-    </ProgId>
+    <!-- Optional desktop shortcut (DESKTOP_SHORTCUT=1, on by default via the
+         Property below; override on the msiexec command line to opt out). -->
+    <Feature Id="DesktopShortcutFeature" Level="0">
+      <ComponentRef Id="DesktopShortcut" />
+      <Level Value="1" Condition="DESKTOP_SHORTCUT = 1" />
+    </Feature>
 
     <Property Id="DESKTOP_SHORTCUT" Value="1" />
   </Package>
