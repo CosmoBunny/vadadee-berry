@@ -43,6 +43,12 @@ pub fn classify_device(viewport: egui::Vec2) -> UiDeviceClass {
 
 /// What the OS / device offers. One instance per process from
 /// [`super::current_capabilities`]; UI branches on fields, not on `cfg`.
+///
+/// Every field describes *implemented runtime behavior*, not planned
+/// functionality: a field is true only when calling into that platform
+/// API works today. In particular `native_text_input` / `file_picker`
+/// stay false on platforms whose bridge is still a stub (see
+/// `text_input::IosTextInput`, `file_service::IosFileService`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlatformCapabilities {
     /// Finger/stylus touch input produces touch events.
@@ -87,7 +93,9 @@ impl PlatformCapabilities {
             keyboard: false,
             filesystem: false,
             native_text_input: true,
-            file_picker: true,
+            // No system picker wired up yet (rfd is desktop-only and there
+            // is no JNI picker); file flows go through share/import UX.
+            file_picker: false,
             screen_capture: false,
             external_files: true,
             share_sheet: true,
@@ -100,8 +108,11 @@ impl PlatformCapabilities {
             stylus: true,
             keyboard: false,
             filesystem: false,
-            native_text_input: true,
-            file_picker: true,
+            // No UIKit bridge exists yet: IosTextInput is a no-op stub and
+            // egui stays in charge of text. Flip when UITextInput lands.
+            native_text_input: false,
+            // No UIDocumentPicker wiring yet.
+            file_picker: false,
             screen_capture: false,
             external_files: true,
             share_sheet: true,
@@ -333,7 +344,11 @@ mod tests {
         assert!(d.keyboard && d.filesystem && !d.touch && !d.share_sheet);
         let a = PlatformCapabilities::android();
         assert!(a.touch && a.share_sheet && a.external_files && !a.filesystem);
+        // Android has a real IME bridge but no picker wiring yet.
+        assert!(a.native_text_input && !a.file_picker);
         let i = PlatformCapabilities::ios();
-        assert!(i.touch && i.share_sheet && i.native_text_input && !i.keyboard);
+        assert!(i.touch && i.share_sheet && !i.keyboard);
+        // iOS bridges are stubs: egui owns text, no picker/filesystem.
+        assert!(!i.native_text_input && !i.file_picker && !i.filesystem);
     }
 }

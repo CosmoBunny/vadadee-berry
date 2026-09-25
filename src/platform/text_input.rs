@@ -87,10 +87,18 @@ impl NativeTextInput for AndroidTextInput {
     }
 }
 
-/// iOS stub: no `UIKit` bridge exists in this codebase yet, so this is a
-/// no-op placeholder with the same shape as Android. Implementing it means
-/// filling in these four methods against `UITextInput` — no widget or
-/// Document changes required.
+/// iOS: NOT IMPLEMENTED. No `UIKit` bridge exists yet, so this is a
+/// no-op placeholder with the same shape as Android. `native_text()` always
+/// returns `None`, which makes [`reconcile_text`] a no-op and keeps egui
+/// unconditionally in charge of editor text — the app must never rewrite
+/// document text from a native source that does not exist.
+///
+/// First-stable-iOS contract: compilation must succeed, text editing stays
+/// in the egui fallback and fails gracefully (plain in-canvas editing, no
+/// soft-keyboard integration). Implementing the bridge means filling in
+/// these four methods against `UITextInput` — no widget or Document changes
+/// required. Flip `PlatformCapabilities::ios().native_text_input` only when
+/// that lands.
 #[derive(Debug, Default)]
 pub struct IosTextInput;
 
@@ -244,6 +252,26 @@ mod tests {
             patched += 1
         });
         assert_eq!(last, "x");
+        assert_eq!((pushed, patched), (0, 0));
+    }
+
+    /// iOS stub contract: unimplemented bridge behaves exactly like no
+    /// bridge — egui text is never rewritten from a native source.
+    #[test]
+    fn ios_stub_never_rewrites_text() {
+        let input = IosTextInput;
+        assert_eq!(input.native_text(), None);
+        let mut last = "editor".to_string();
+        let mut pushed = 0;
+        let mut patched = 0;
+        reconcile_text(
+            &input,
+            "editor edit",
+            &mut last,
+            &mut |_| pushed += 1,
+            &mut |_| patched += 1,
+        );
+        assert_eq!(last, "editor");
         assert_eq!((pushed, patched), (0, 0));
     }
 }

@@ -12,7 +12,7 @@ pub mod text_input;
 pub use capabilities::{
     PlatformCapabilities, SafeAreaInsets, UiDeviceClass, UiLayout, UiMetrics, classify_device,
 };
-pub use file_service::FileService;
+pub use file_service::{FileService, FileServiceError};
 pub use text_input::{NativeTextInput, TextInputState};
 
 /// Capabilities of the platform this binary was built for.

@@ -6,6 +6,26 @@
 
 use std::path::PathBuf;
 
+/// File-boundary errors. Mobile stubs must return [`FileServiceError::Unsupported`]
+/// for flows with no platform wiring yet — never silently fall back to
+/// desktop `std::fs` semantics (content URIs and security-scoped URLs are
+/// not raw paths). The eventual iOS implementation routes through
+/// `UIDocumentPicker` / security-scoped URLs / share sheet with
+/// temporary-cache copies; Android through the document picker + JNI.
+#[derive(Debug)]
+pub enum FileServiceError {
+    /// No platform implementation exists yet for this operation.
+    Unsupported(&'static str),
+    /// The platform call was attempted and the OS returned an I/O error.
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for FileServiceError {
+    fn from(err: std::io::Error) -> Self {
+        FileServiceError::Io(err)
+    }
+}
+
 /// Narrow file boundary. Desktop uses real paths; mobile normalizes platform
 /// handles (content URIs, scoped URLs) before the editor ever sees them.
 pub trait FileService: Send {
@@ -16,7 +36,7 @@ pub trait FileService: Send {
     fn direct_save(&self) -> bool;
     /// Normalize an inbound platform handle into bytes + suggested name.
     /// Default: read the path straight off disk (desktop).
-    fn import_bytes(&self, path: &PathBuf) -> std::io::Result<(Vec<u8>, String)> {
+    fn import_bytes(&self, path: &PathBuf) -> Result<(Vec<u8>, String), FileServiceError> {
         let bytes = std::fs::read(path)?;
         let name = path
             .file_name()
@@ -53,6 +73,13 @@ impl FileService for AndroidFileService {
     fn direct_save(&self) -> bool {
         false
     }
+    fn import_bytes(&self, _path: &PathBuf) -> Result<(Vec<u8>, String), FileServiceError> {
+        // Content URIs are not filesystem paths: refuse explicitly instead
+        // of inheriting the desktop std::fs::read default.
+        Err(FileServiceError::Unsupported(
+            "Android document picker not wired yet",
+        ))
+    }
 }
 
 /// iOS stub: picker + share sheet + security-scoped URLs, same rules.
@@ -65,6 +92,13 @@ impl FileService for IosFileService {
     }
     fn direct_save(&self) -> bool {
         false
+    }
+    fn import_bytes(&self, _path: &PathBuf) -> Result<(Vec<u8>, String), FileServiceError> {
+        // Security-scoped URLs need UIDocumentPicker resolution first:
+        // refuse explicitly instead of inheriting desktop std::fs::read.
+        Err(FileServiceError::Unsupported(
+            "iOS document picker not wired yet",
+        ))
     }
 }
 
@@ -98,6 +132,19 @@ mod tests {
     fn mobile_services_require_picker_flow() {
         assert!(!AndroidFileService.direct_save());
         assert!(!IosFileService.direct_save());
+    }
+
+    #[test]
+    fn mobile_import_refuses_explicitly() {
+        let p = PathBuf::from("/tmp/whatever.bin");
+        assert!(matches!(
+            AndroidFileService.import_bytes(&p),
+            Err(FileServiceError::Unsupported(_))
+        ));
+        assert!(matches!(
+            IosFileService.import_bytes(&p),
+            Err(FileServiceError::Unsupported(_))
+        ));
     }
 
     #[test]

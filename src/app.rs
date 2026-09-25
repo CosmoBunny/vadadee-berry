@@ -1,27 +1,25 @@
-use eframe::egui;
-use egui::{Context, Event, Key, Pos2, Sense, Ui};
-use kurbo::Shape;
 use crate::animation::UiAnimation;
 use crate::canvas::Viewport;
-use crate::fonts::FontRegistry;
-use crate::document::{
-    default_gradient_stops, default_loft_gap_for_node, effect_placements, find_effect_for_pair,
-    loft_sweep_node,
-    build_path_effect_form_node, has_effect_for_objects, node_at_placement,
-    node_uses_extended_pick_bounds, path_effect_form_node_ids,
-    path_effect_move_bundle, sync_path_effect_form_geometry, BezierHandleMode, Document,
-    FaceRenderable, Fill, FillKind,
-    GradientStop, Node, NodeId, NodeKind, ObjectOnPathEffect, OnPathMode, Paint, PathData, PathMagic, PathPlacement, TilingEffect, CircularCloneEffect, CircularRotateMode,
-    BooleanEffect, BooleanOpKind, ClipMaskEffect, is_booleanable_shape, is_raster_image,
-    compute_boolean_bez,
-    PathEditTarget, ProjectFile, Stroke, TextStyle, text_display_name,
-};
 use crate::commands::{CommandContext, CommandDispatcher, DocumentChanged, EditorCommand};
-use crate::history::{snapshot_document, snapshot_project, History, ProjectEdit};
+use crate::document::{
+    BezierHandleMode, BooleanEffect, BooleanOpKind, CircularCloneEffect, CircularRotateMode,
+    ClipMaskEffect, Document, FaceRenderable, Fill, FillKind, GradientStop, Node, NodeId, NodeKind,
+    ObjectOnPathEffect, OnPathMode, Paint, PathData, PathEditTarget, PathMagic, PathPlacement,
+    ProjectFile, Stroke, TextStyle, TilingEffect, build_path_effect_form_node, compute_boolean_bez,
+    default_gradient_stops, default_loft_gap_for_node, effect_placements, find_effect_for_pair,
+    has_effect_for_objects, is_booleanable_shape, is_raster_image, loft_sweep_node,
+    node_at_placement, node_uses_extended_pick_bounds, path_effect_form_node_ids,
+    path_effect_move_bundle, sync_path_effect_form_geometry, text_display_name,
+};
+use crate::fonts::FontRegistry;
+use crate::history::{History, ProjectEdit, snapshot_document, snapshot_project};
 use crate::io;
 use crate::render;
 use crate::theme;
 use crate::tools::{self, DragNewShape, MarqueeSelect, SelectDrag, ToolKind, ToolState};
+use eframe::egui;
+use egui::{Context, Event, Key, Pos2, Sense, Ui};
+use kurbo::Shape;
 
 pub use crate::audio_extract::AudioExtractStatus;
 
@@ -85,8 +83,10 @@ struct PasteProgress {
     task: PasteTask,
 }
 
+pub use crate::document::{
+    AnimationTimeline, InterpolationMode, Keyframe, KeyframeTrack, NodeAnimation,
+};
 use serde::{Deserialize, Serialize};
-pub use crate::document::{InterpolationMode, Keyframe, KeyframeTrack, NodeAnimation, AnimationTimeline};
 
 #[derive(Debug, Clone)]
 pub struct AnimAppliedState {
@@ -191,7 +191,8 @@ pub struct VadadeeBerryApp {
     pub video_layers: std::collections::HashMap<uuid::Uuid, VideoLayerState>,
     pub clip_mask_signatures: std::collections::HashMap<uuid::Uuid, String>,
     /// Cached full-layer rasters for dense vector content (Inkscape-style).
-    layer_raster_cache: std::collections::HashMap<uuid::Uuid, crate::layer_cache::LayerRasterCacheEntry>,
+    layer_raster_cache:
+        std::collections::HashMap<uuid::Uuid, crate::layer_cache::LayerRasterCacheEntry>,
     layer_cache_pending: std::collections::HashSet<uuid::Uuid>,
     layer_cache_result_tx: std::sync::mpsc::Sender<crate::layer_cache::LayerCacheResult>,
     layer_cache_result_rx: std::sync::mpsc::Receiver<crate::layer_cache::LayerCacheResult>,
@@ -209,15 +210,19 @@ pub struct VadadeeBerryApp {
     /// Do not retry rodio open/decode for these layers until playback stops.
     audio_layers_skip: std::collections::HashSet<uuid::Uuid>,
     /// MP4/MOV/… → one-shot symphonia PCM wav for rodio.
-    pub audio_extract_status: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
+    pub audio_extract_status:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
     /// Decoded PCM for extracted WAVs (avoids re-reading disk on seek).
     pub audio_pcm_cache: crate::audio_extract::AudioPcmCache,
     /// Background audio decode → main thread attaches rodio players.
-    audio_prepare_rx:
-        std::collections::HashMap<uuid::Uuid, std::sync::mpsc::Receiver<Option<crate::audio_extract::AudioPrepareResult>>>,
+    audio_prepare_rx: std::collections::HashMap<
+        uuid::Uuid,
+        std::sync::mpsc::Receiver<Option<crate::audio_extract::AudioPrepareResult>>,
+    >,
     /// Active OS screen captures (Screen Record layers) — desktop only.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    pub screen_captures: std::collections::HashMap<uuid::Uuid, crate::screen_capture::ScreenCaptureSession>,
+    pub screen_captures:
+        std::collections::HashMap<uuid::Uuid, crate::screen_capture::ScreenCaptureSession>,
 
     pub project: ProjectFile,
     pub viewport: Viewport,
@@ -363,7 +368,10 @@ pub struct VadadeeBerryApp {
     pub eyedropper_t: f32,
     pub eyedropper_target_pos: Option<(f64, f64)>,
     /// Tracks Ctrl+V for paste fallback when egui-winit swallows the hotkey (image-only clipboard).
-    #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        not(any(target_os = "android", target_os = "ios"))
+    ))]
     paste_hotkey_was_down: bool,
     /// Multi-frame paste shown on the 2nd status-bar label ("Pasting…").
     paste_progress: Option<PasteProgress>,
@@ -497,9 +505,10 @@ pub struct VideoLayerState {
     pub object_link_rev: Option<u64>,
 }
 
-
 // Re-exported from crate::export_types (canonical home; kept here for compatibility).
-pub use crate::export_types::{ExportFxQuality, ExportPowerLevel, VideoBackend, VideoFormat, VideoExportState};
+pub use crate::export_types::{
+    ExportFxQuality, ExportPowerLevel, VideoBackend, VideoExportState, VideoFormat,
+};
 
 fn collab_wire_hash(json: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -513,7 +522,7 @@ impl VadadeeBerryApp {
         theme::apply(&cc.egui_ctx);
         let fonts = FontRegistry::new();
         let default_font = fonts.default_family();
-        
+
         let mut initial_project = Document::new_default_project();
         let mut initial_status = "Idle".to_string();
         let mut initial_save_path: Option<std::path::PathBuf> = None;
@@ -616,8 +625,12 @@ impl VadadeeBerryApp {
             audio_player_playback_rate: std::collections::HashMap::new(),
             audio_player_media_path: std::collections::HashMap::new(),
             audio_layers_skip: std::collections::HashSet::new(),
-            audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             audio_prepare_rx: std::collections::HashMap::new(),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             screen_captures: std::collections::HashMap::new(),
@@ -771,7 +784,10 @@ impl VadadeeBerryApp {
             eyedropper_releasing: false,
             eyedropper_t: 0.0,
             eyedropper_target_pos: None,
-            #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
+            #[cfg(all(
+                not(target_arch = "wasm32"),
+                not(any(target_os = "android", target_os = "ios"))
+            ))]
             paste_hotkey_was_down: false,
             paste_progress: None,
             toolbar_expanded: false,
@@ -965,10 +981,12 @@ impl VadadeeBerryApp {
         }
         if let Some(ref slug) = state.action_tab {
             if let Some(tab) = crate::action_tab::ActionTab::from_collab_slug(slug) {
-                if matches!(tab, crate::action_tab::ActionTab::Layer | crate::action_tab::ActionTab::Objects)
-                    && self.action_tab != tab
+                if matches!(
+                    tab,
+                    crate::action_tab::ActionTab::Layer | crate::action_tab::ActionTab::Objects
+                ) && self.action_tab != tab
                 {
-                    self.promote_action_tab_at( tab, 0);
+                    self.promote_action_tab_at(tab, 0);
                 }
             }
         }
@@ -997,10 +1015,8 @@ impl VadadeeBerryApp {
                         loaded,
                         &mut self.collab_asset_cache,
                     );
-                    let stripped = crate::collab::strip_for_wire(
-                        &self.project,
-                        &mut self.collab_asset_cache,
-                    );
+                    let stripped =
+                        crate::collab::strip_for_wire(&self.project, &mut self.collab_asset_cache);
                     if let Ok(merged_json) = serde_json::to_string(&stripped) {
                         let hash = collab_wire_hash(&merged_json);
                         self.collab_last_wire_hash = hash;
@@ -1062,18 +1078,11 @@ impl VadadeeBerryApp {
                 .collab_last_cursor_sent
                 .as_ref()
                 .map(|(px, py, prev_b, prev_tool)| {
-                    (px - cx).hypot(py - cy) > doc_eps
-                        || prev_b != &bubble
-                        || prev_tool != &tool
+                    (px - cx).hypot(py - cy) > doc_eps || prev_b != &bubble || prev_tool != &tool
                 })
                 .unwrap_or(true);
             if changed {
-                self.collab_last_cursor_sent = Some((
-                    cx,
-                    cy,
-                    bubble.clone(),
-                    tool.clone(),
-                ));
+                self.collab_last_cursor_sent = Some((cx, cy, bubble.clone(), tool.clone()));
                 self.collab.send_cursor(cx, cy, tool, bubble);
                 ctx.request_repaint();
             }
@@ -1083,8 +1092,8 @@ impl VadadeeBerryApp {
         }
 
         self.collab_canvas_sync_accum += dt;
-        let dragging_objects = !self.tools.select.drag_snapshot.is_empty()
-            || self.tools.drag_shape.is_some();
+        let dragging_objects =
+            !self.tools.select.drag_snapshot.is_empty() || self.tools.drag_shape.is_some();
         let canvas_interval: f32 = if dragging_objects { 0.08 } else { 0.35 };
         let force_push = self.collab.take_canvas_push_requested();
         let due = force_push || self.collab_canvas_sync_accum >= canvas_interval;
@@ -1098,10 +1107,8 @@ impl VadadeeBerryApp {
                 if self.collab.canvas_outbound_enabled()
                     && (force_push || self.project.nodes.map.len() <= COLLAB_CANVAS_MAX_NODES)
                 {
-                    let stripped = crate::collab::strip_for_wire(
-                        &self.project,
-                        &mut self.collab_asset_cache,
-                    );
+                    let stripped =
+                        crate::collab::strip_for_wire(&self.project, &mut self.collab_asset_cache);
                     if let Ok(json) = serde_json::to_string(&stripped) {
                         let wire_hash = collab_wire_hash(&json);
                         if force_push || wire_hash != self.collab_last_wire_hash {
@@ -1237,18 +1244,19 @@ impl VadadeeBerryApp {
     /// Re-probe stale video/audio layers without pushing undo history (video editor UI).
     pub fn sync_stale_media_layer_durations(&mut self) {
         for layer in &mut self.project.document.layers {
-            if layer.kind != crate::document::LayerKind::AV
-            {
+            if layer.kind != crate::document::LayerKind::AV {
                 continue;
             }
             if layer.video_path.is_empty() {
                 continue;
             }
-            let needs_probe = layer.video_play_length >= 3599.0 || layer.media_source_duration.is_none();
+            let needs_probe =
+                layer.video_play_length >= 3599.0 || layer.media_source_duration.is_none();
             if !needs_probe {
                 continue;
             }
-            let Some(dur) = crate::video_decode::probe_media_duration_secs(&layer.video_path) else {
+            let Some(dur) = crate::video_decode::probe_media_duration_secs(&layer.video_path)
+            else {
                 continue;
             };
             Self::apply_probed_media_duration(layer, dur);
@@ -1261,14 +1269,14 @@ impl VadadeeBerryApp {
         let mut after = before.clone();
         let mut changed = false;
         for layer in &mut after.layers {
-            if layer.kind != crate::document::LayerKind::AV
-            {
+            if layer.kind != crate::document::LayerKind::AV {
                 continue;
             }
             if layer.video_path.is_empty() {
                 continue;
             }
-            let Some(dur) = crate::video_decode::probe_media_duration_secs(&layer.video_path) else {
+            let Some(dur) = crate::video_decode::probe_media_duration_secs(&layer.video_path)
+            else {
                 log::warn!("Could not probe media duration for {}", layer.video_path);
                 continue;
             };
@@ -1347,11 +1355,7 @@ impl VadadeeBerryApp {
     }
 
     /// `position` is a zero-based index in the tab strip (clamped to the list length).
-    pub fn promote_action_tab_at(
-        &mut self,
-        tab: crate::action_tab::ActionTab,
-        position: usize,
-    ) {
+    pub fn promote_action_tab_at(&mut self, tab: crate::action_tab::ActionTab, position: usize) {
         if self.action_tab != tab {
             self.ui_anim.on_tab_change();
         }
@@ -1478,8 +1482,7 @@ impl VadadeeBerryApp {
                 self.ui_fill_line_x1 = lx1;
                 self.ui_fill_line_y1 = ly1;
                 if n.style.fill.kind() == FillKind::LinearGradient {
-                    let line_angle =
-                        crate::document::linear_angle_from_line(lx0, ly0, lx1, ly1);
+                    let line_angle = crate::document::linear_angle_from_line(lx0, ly0, lx1, ly1);
                     let len = (lx1 - lx0).hypot(ly1 - ly0);
                     if len < 0.2
                         || (line_angle - self.ui_gradient_angle).abs() > 2.0
@@ -1506,15 +1509,13 @@ impl VadadeeBerryApp {
                 self.ui_stroke_line_x1 = sx1;
                 self.ui_stroke_line_y1 = sy1;
                 if n.style.stroke.style.kind() == FillKind::LinearGradient {
-                    let line_angle =
-                        crate::document::linear_angle_from_line(sx0, sy0, sx1, sy1);
+                    let line_angle = crate::document::linear_angle_from_line(sx0, sy0, sx1, sy1);
                     let len = (sx1 - sx0).hypot(sy1 - sy0);
                     if len < 0.2
                         || (line_angle - self.ui_stroke_angle).abs() > 2.0
                             && (sx0 - 0.5).hypot(sy0 - 0.5) < 0.05
                     {
-                        let span =
-                            crate::document::linear_line_spanning_bbox(self.ui_stroke_angle);
+                        let span = crate::document::linear_line_spanning_bbox(self.ui_stroke_angle);
                         self.ui_stroke_line_x0 = span.0;
                         self.ui_stroke_line_y0 = span.1;
                         self.ui_stroke_line_x1 = span.2;
@@ -1846,15 +1847,7 @@ impl VadadeeBerryApp {
         );
     }
 
-    pub fn set_rect_geometry(
-        &mut self,
-        id: NodeId,
-        x: f64,
-        y: f64,
-        w: f64,
-        h: f64,
-        rx: f64,
-    ) {
+    pub fn set_rect_geometry(&mut self, id: NodeId, x: f64, y: f64, w: f64, h: f64, rx: f64) {
         let Some(before) = self.project.nodes.get(id).cloned() else {
             return;
         };
@@ -1880,14 +1873,7 @@ impl VadadeeBerryApp {
         self.sync_anim_transform_from_node(id);
     }
 
-    pub fn set_ellipse_geometry(
-        &mut self,
-        id: NodeId,
-        cx: f64,
-        cy: f64,
-        rx: f64,
-        ry: f64,
-    ) {
+    pub fn set_ellipse_geometry(&mut self, id: NodeId, cx: f64, cy: f64, rx: f64, ry: f64) {
         let Some(before) = self.project.nodes.get(id).cloned() else {
             return;
         };
@@ -1911,14 +1897,7 @@ impl VadadeeBerryApp {
         self.sync_anim_transform_from_node(id);
     }
 
-    pub fn set_line_geometry(
-        &mut self,
-        id: NodeId,
-        x0: f64,
-        y0: f64,
-        x1: f64,
-        y1: f64,
-    ) {
+    pub fn set_line_geometry(&mut self, id: NodeId, x0: f64, y0: f64, x1: f64, y1: f64) {
         let Some(before) = self.project.nodes.get(id).cloned() else {
             return;
         };
@@ -2241,7 +2220,8 @@ impl VadadeeBerryApp {
         self.cached_project = Some(crate::history::snapshot_project(&self.project));
         self.cached_project_label = Some(label);
         let cache_path = std::env::temp_dir().join(".vadadee-berry-open-cache.vadadee-berry.json");
-        if let Err(e) = crate::io::save_project(&cache_path, self.cached_project.as_ref().unwrap()) {
+        if let Err(e) = crate::io::save_project(&cache_path, self.cached_project.as_ref().unwrap())
+        {
             log::warn!("Could not write project open cache: {e}");
         }
     }
@@ -2345,7 +2325,8 @@ impl VadadeeBerryApp {
                     .get(node_id)
                     .map(|n| n.get_geom_floats())
                     .unwrap_or_default();
-                let mut g_vals = Vec::with_capacity(track.geom_tracks.len().max(current_geom.len()));
+                let mut g_vals =
+                    Vec::with_capacity(track.geom_tracks.len().max(current_geom.len()));
                 let n = track.geom_tracks.len().max(current_geom.len());
                 for idx in 0..n {
                     let def_val = current_geom.get(idx).copied().unwrap_or(0.0);
@@ -2360,7 +2341,17 @@ impl VadadeeBerryApp {
             } else {
                 None
             };
-            updates.push((node_id, x, y, rot, opacity, color, stroke_w, stroke_color, geom));
+            updates.push((
+                node_id,
+                x,
+                y,
+                rot,
+                opacity,
+                color,
+                stroke_w,
+                stroke_color,
+                geom,
+            ));
         }
 
         for (
@@ -2383,22 +2374,26 @@ impl VadadeeBerryApp {
                 if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
                     node.translate(dx, dy);
                 }
-                
+
                 // Apply rotation
                 if let Some(rot) = target_rot {
                     node.set_rotation(rot);
                 }
-                
+
                 // Apply opacity
                 if let Some(op) = target_op {
                     node.set_opacity(op);
                 }
-                
+
                 // Apply fill color
                 if let Some(color) = target_color {
-                    let mut base_fill = self.project.anim_timeline.nodes.get(&node_id)
+                    let mut base_fill = self
+                        .project
+                        .anim_timeline
+                        .nodes
+                        .get(&node_id)
                         .and_then(|track| track.base_fill.clone());
-                    
+
                     if base_fill.is_none() {
                         base_fill = Some(node.style.fill.clone());
                         if let Some(track) = self.project.anim_timeline.nodes.get_mut(&node_id) {
@@ -2412,8 +2407,8 @@ impl VadadeeBerryApp {
                                 paint.rgba = color;
                                 node.style.fill = Fill::Solid(*paint);
                             }
-                            Fill::LinearGradient { stops, .. } |
-                            Fill::RadialGradient { stops, .. } => {
+                            Fill::LinearGradient { stops, .. }
+                            | Fill::RadialGradient { stops, .. } => {
                                 for stop in stops {
                                     stop.color.rgba = [
                                         stop.color.rgba[0] * color[0],
@@ -2481,7 +2476,13 @@ impl VadadeeBerryApp {
                 if let Some(geom) = target_geom {
                     self.set_node_geom_floats(node_id, &geom);
                 }
-            } else if let Some(layer) = self.project.document.layers.iter_mut().find(|l| l.id == node_id && l.kind == crate::document::LayerKind::AV) {
+            } else if let Some(layer) = self
+                .project
+                .document
+                .layers
+                .iter_mut()
+                .find(|l| l.id == node_id && l.kind == crate::document::LayerKind::AV)
+            {
                 if let Some(x) = target_x {
                     layer.x = x as f32;
                 }
@@ -2514,7 +2515,14 @@ impl VadadeeBerryApp {
             };
             // Collect (param_id, component, value) samples without holding graph mut.
             let mut samples: Vec<(uuid::Uuid, Option<usize>, f64)> = Vec::new();
-            let param_meta: Vec<(uuid::Uuid, crate::document::GraphParamKind, f64, f64, f64, f64)> = {
+            let param_meta: Vec<(
+                uuid::Uuid,
+                crate::document::GraphParamKind,
+                f64,
+                f64,
+                f64,
+                f64,
+            )> = {
                 let Some(layer) = self
                     .project
                     .document
@@ -2551,7 +2559,10 @@ impl VadadeeBerryApp {
                 for (lbl, comp, def) in labels {
                     if let Some(v) = anim.sample(&lbl, frame) {
                         samples.push((pid, comp, v));
-                    } else if anim.get_track(&lbl).is_some_and(|t| !t.keyframes.is_empty()) {
+                    } else if anim
+                        .get_track(&lbl)
+                        .is_some_and(|t| !t.keyframes.is_empty())
+                    {
                         // sample returned None only if empty; keep default
                         let _ = def;
                     }
@@ -2594,7 +2605,13 @@ impl VadadeeBerryApp {
             return Vec::new();
         };
 
-        if let Some(tiling) = self.project.document.tiling_effects.values().find(|e| e.source_id == id) {
+        if let Some(tiling) = self
+            .project
+            .document
+            .tiling_effects
+            .values()
+            .find(|e| e.source_id == id)
+        {
             v.push(tiling.gap_x);
             v.push(tiling.gap_y);
             v.push(tiling.count_x as f64);
@@ -2607,7 +2624,13 @@ impl VadadeeBerryApp {
             v.push(tiling.col_scale);
         }
 
-        if let Some(circ) = self.project.document.circular_effects.values().find(|e| e.source_id == id) {
+        if let Some(circ) = self
+            .project
+            .document
+            .circular_effects
+            .values()
+            .find(|e| e.source_id == id)
+        {
             v.push(circ.origin_x);
             v.push(circ.origin_y);
             v.push(circ.radius);
@@ -2617,7 +2640,13 @@ impl VadadeeBerryApp {
             v.push(circ.base_y);
         }
 
-        if let Some(oop) = self.project.document.path_effects.values().find(|e| e.source_id == id) {
+        if let Some(oop) = self
+            .project
+            .document
+            .path_effects
+            .values()
+            .find(|e| e.source_id == id)
+        {
             v.push(oop.gap);
             v.push(oop.count as f64);
             v.push(oop.start_offset);
@@ -2644,7 +2673,11 @@ impl VadadeeBerryApp {
         let mut idx = base_len;
 
         let mut has_tiling = false;
-        if let Some(tiling_id) = self.project.document.tiling_effects.values()
+        if let Some(tiling_id) = self
+            .project
+            .document
+            .tiling_effects
+            .values()
             .find(|e| e.source_id == id)
             .map(|e| e.id)
         {
@@ -2667,7 +2700,11 @@ impl VadadeeBerryApp {
         }
 
         let mut has_circular = false;
-        if let Some(circ_id) = self.project.document.circular_effects.values()
+        if let Some(circ_id) = self
+            .project
+            .document
+            .circular_effects
+            .values()
             .find(|e| e.source_id == id)
             .map(|e| e.id)
         {
@@ -2687,7 +2724,11 @@ impl VadadeeBerryApp {
         }
 
         let mut has_oop = false;
-        if let Some(oop_id) = self.project.document.path_effects.values()
+        if let Some(oop_id) = self
+            .project
+            .document
+            .path_effects
+            .values()
             .find(|e| e.source_id == id)
             .map(|e| e.id)
         {
@@ -2719,19 +2760,14 @@ impl VadadeeBerryApp {
         let Some(node) = self.project.nodes.get_mut(id) else {
             return;
         };
-        
+
         let (x, y, w, h) = match &node.kind {
             NodeKind::Rect { x, y, w, h, .. } => (*x, *y, *w, *h),
             _ => return, // Not a rect
         };
-        
+
         // Convert the NodeKind to Path
-        let corners = [
-            (x, y),
-            (x + w, y),
-            (x + w, y + h),
-            (x, y + h),
-        ];
+        let corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)];
         let path = crate::document::PathData::from_anchor_data(
             &corners,
             &[],
@@ -2740,7 +2776,7 @@ impl VadadeeBerryApp {
             true,
         );
         node.kind = NodeKind::Path { path };
-        
+
         // Now convert its timeline tracks in self.anim_timeline
         if let Some(entry) = self.project.anim_timeline.nodes.get_mut(&id) {
             // We need to convert geom_tracks from Rect (3 tracks) to Path (24 tracks)
@@ -2750,22 +2786,30 @@ impl VadadeeBerryApp {
                     frames.insert(kf.frame);
                 }
             }
-            
+
             // Create 24 empty tracks for Path geometry
             let mut new_geom_tracks = vec![KeyframeTrack::default(); 24];
-            
+
             // For each keyframe frame, calculate the 24 path geometry values from the interpolated rect values at that frame
             for f in frames {
-                let w_val = entry.geom_tracks.get(0).and_then(|t| t.interpolate(f)).unwrap_or(w);
-                let h_val = entry.geom_tracks.get(1).and_then(|t| t.interpolate(f)).unwrap_or(h);
-                
+                let w_val = entry
+                    .geom_tracks
+                    .get(0)
+                    .and_then(|t| t.interpolate(f))
+                    .unwrap_or(w);
+                let h_val = entry
+                    .geom_tracks
+                    .get(1)
+                    .and_then(|t| t.interpolate(f))
+                    .unwrap_or(h);
+
                 let c = [
                     (x, y),
                     (x + w_val, y),
                     (x + w_val, y + h_val),
                     (x, y + h_val),
                 ];
-                
+
                 for i in 0..4 {
                     let base = i * 6;
                     new_geom_tracks[base].insert(f, c[i].0);
@@ -2776,10 +2820,10 @@ impl VadadeeBerryApp {
                     new_geom_tracks[base + 5].insert(f, 0.0);
                 }
             }
-            
+
             entry.geom_tracks = new_geom_tracks;
         }
-        
+
         // Also update anim_last_applied_states if it exists, to match the new geom_floats format/length
         if let Some(last) = self.anim_last_applied_states.get_mut(&id) {
             let gf = node.get_geom_floats();
@@ -2877,7 +2921,7 @@ impl VadadeeBerryApp {
             self.selection = vec![proxy.unwrap_or(lid)];
             self.node_editor_ui.open(lid);
             // Geometry: Output is a canvas object (order/transform), not a graph Parameter.
-            self.promote_action_tab( crate::action_tab::ActionTab::Geometry);
+            self.promote_action_tab(crate::action_tab::ActionTab::Geometry);
             self.action_tab = crate::action_tab::ActionTab::Geometry;
         }
         self.status_message = "Node Editor layer created".into();
@@ -2895,8 +2939,7 @@ impl VadadeeBerryApp {
         if let Some(layer) = self.project.document.layers.get(idx) {
             self.selection = vec![layer.id];
         }
-        self.status_message =
-            "Screen Record layer — press Record (needs ffmpeg + DISPLAY)".into();
+        self.status_message = "Screen Record layer — press Record (needs ffmpeg + DISPLAY)".into();
     }
 
     /// Start OS screen capture for a Screen Record layer.
@@ -2928,8 +2971,7 @@ impl VadadeeBerryApp {
         } else {
             String::new()
         };
-        let sepscrr =
-            crate::screen_capture::resolve_sepscrr_for_record(&dir_hint, &layer.name);
+        let sepscrr = crate::screen_capture::resolve_sepscrr_for_record(&dir_hint, &layer.name);
         match crate::screen_capture::ScreenCaptureSession::start(
             crate::screen_capture::ScreenCaptureStart {
                 layer_id: layer.id,
@@ -2993,7 +3035,9 @@ impl VadadeeBerryApp {
                 self.status_message = status_one_line(&format!(
                     "Saved {:.1}s · {n} mouse → {}",
                     elapsed,
-                    path.file_name().and_then(|s| s.to_str()).unwrap_or("sepscrr")
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("sepscrr")
                 ));
             }
             Err(e) => {
@@ -3125,10 +3169,7 @@ impl VadadeeBerryApp {
         crate::shading::probe_compile_shading_wgsl(self.wgpu_render.as_ref(), src)?;
         let before = snapshot_document(&self.project.document);
         let mut after = before.clone();
-        let layer = after
-            .layers
-            .get_mut(layer_index)
-            .ok_or("Layer not found")?;
+        let layer = after.layers.get_mut(layer_index).ok_or("Layer not found")?;
         if layer.kind != crate::document::LayerKind::Shading {
             return Err("Layer is not a shading layer".into());
         }
@@ -3212,8 +3253,9 @@ impl VadadeeBerryApp {
     ) -> Result<String, String> {
         use crate::document::{AvClip, AvRole, LayerKind};
         let Some(role) = Self::av_role_for_media_path(&media_path) else {
-            return Err("Unsupported media type (use video/image for Video layer, audio for Audio)"
-                .into());
+            return Err(
+                "Unsupported media type (use video/image for Video layer, audio for Audio)".into(),
+            );
         };
         let default_name = match role {
             AvRole::Audio => "Audio",
@@ -3232,13 +3274,11 @@ impl VadadeeBerryApp {
             }
             if active.av_role != role {
                 return Err(match active.av_role {
-                    AvRole::Video => {
-                        "This is a Video layer — add audio on an Audio layer".into()
-                    }
+                    AvRole::Video => "This is a Video layer — add audio on an Audio layer".into(),
                     AvRole::Audio => {
                         "This is an Audio layer — add video/image on a Video layer".into()
                     }
-                    AvRole::Daw => "This is a DAW layer — use Video/Audio layers for media".into()
+                    AvRole::Daw => "This is a DAW layer — use Video/Audio layers for media".into(),
                 });
             }
         }
@@ -3280,8 +3320,7 @@ impl VadadeeBerryApp {
                     layer.name = clip_name.clone();
                 }
             }
-            let mut clip =
-                AvClip::new_from_media(clip_name, media_path.clone(), timeline_start);
+            let mut clip = AvClip::new_from_media(clip_name, media_path.clone(), timeline_start);
             if empty {
                 clip.id = layer.id;
             }
@@ -3294,9 +3333,7 @@ impl VadadeeBerryApp {
                     layer.media_source_duration = Some(5.0);
                     layer.video_play_length = 5.0;
                 }
-            } else if let Some(dur) =
-                crate::video_decode::probe_media_duration_secs(&media_path)
-            {
+            } else if let Some(dur) = crate::video_decode::probe_media_duration_secs(&media_path) {
                 clip.media_source_duration = Some(dur);
                 clip.video_play_length = dur;
                 if empty {
@@ -3350,7 +3387,10 @@ impl VadadeeBerryApp {
         let source_ids: Vec<uuid::Uuid> = self.selection.clone();
         let tmp_dir = std::env::temp_dir().join("vadadee-berry-av");
         std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
-        let staging = tmp_dir.join(format!("obj_stage_{}.png", uuid::Uuid::new_v4().as_simple()));
+        let staging = tmp_dir.join(format!(
+            "obj_stage_{}.png",
+            uuid::Uuid::new_v4().as_simple()
+        ));
 
         self.rasterize_nodes_to_png(&source_ids, &staging)?;
 
@@ -3456,7 +3496,13 @@ impl VadadeeBerryApp {
             py.to_bits().hash(&mut h);
             node.get_rotation().to_bits().hash(&mut h);
             node.get_opacity().to_bits().hash(&mut h);
-            if let crate::document::NodeKind::Image { bytes, width, height, .. } = &node.kind {
+            if let crate::document::NodeKind::Image {
+                bytes,
+                width,
+                height,
+                ..
+            } = &node.kind
+            {
                 width.to_bits().hash(&mut h);
                 height.to_bits().hash(&mut h);
                 bytes.len().hash(&mut h);
@@ -3563,13 +3609,7 @@ impl VadadeeBerryApp {
                     .map(|r| r != sig)
                     .unwrap_or(true);
                 if stale {
-                    jobs.push((
-                        li,
-                        clip.id,
-                        living,
-                        clip.media_path.clone(),
-                        sig,
-                    ));
+                    jobs.push((li, clip.id, living, clip.media_path.clone(), sig));
                 }
             }
         }
@@ -3692,7 +3732,6 @@ impl VadadeeBerryApp {
         self.add_av_layer(name, audio_path)
     }
 
-
     pub fn set_active_layer(&mut self, index: usize) {
         if index >= self.project.document.layers.len() {
             return;
@@ -3787,7 +3826,9 @@ impl VadadeeBerryApp {
                 }
                 SelectDrag::Resize(_) => "Resizing".into(),
                 SelectDrag::Rotate => "Rotating".into(),
-                SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_) => "Editing effect".into(),
+                SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_) => {
+                    "Editing effect".into()
+                }
             });
         }
         if self.tools.select.marquee.is_some() {
@@ -3924,20 +3965,20 @@ impl VadadeeBerryApp {
         let Some(bounds) = self.selection_bounds() else {
             return;
         };
-        
+
         let before = snapshot_project(&self.project);
-        
+
         // Translate all nodes
         let dx = -bounds.x0;
         let dy = -bounds.y0;
         for node in self.project.nodes.map.values_mut() {
             node.translate(dx, dy);
         }
-        
+
         // Resize document
         self.project.document.width = bounds.width().round();
         self.project.document.height = bounds.height().round();
-        
+
         let after = snapshot_project(&self.project);
         self.history.push(
             &mut self.project,
@@ -3947,7 +3988,7 @@ impl VadadeeBerryApp {
         // Adjust viewport pan so that coordinates visually stay in the same place
         self.viewport.pan.x -= dx as f32 * self.viewport.zoom;
         self.viewport.pan.y -= dy as f32 * self.viewport.zoom;
-        
+
         self.status_message = format!(
             "Resized canvas to selected bounds: {}x{}",
             self.project.document.width, self.project.document.height
@@ -3982,10 +4023,7 @@ impl VadadeeBerryApp {
                     } else {
                         self.status_message = format!(
                             "Copied selection PNG {}×{} @ {:.0} DPI (scale {:.2}×)",
-                            w,
-                            h,
-                            self.export_dpi,
-                            dpi_scale
+                            w, h, self.export_dpi, dpi_scale
                         );
                     }
                 }
@@ -4001,7 +4039,10 @@ impl VadadeeBerryApp {
     }
 
     pub fn request_video_export(&mut self, ctx: egui::Context) {
-        #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            not(any(target_os = "android", target_os = "ios"))
+        ))]
         {
             let ext = self.video_export.format.extension();
             if let Some(path) = rfd::FileDialog::new()
@@ -4033,8 +4074,10 @@ impl VadadeeBerryApp {
             anim_fps,
             export_fps,
         );
-        let temp =
-            std::env::temp_dir().join(format!("vadadee_video_{}", uuid::Uuid::new_v4().as_simple()));
+        let temp = std::env::temp_dir().join(format!(
+            "vadadee_video_{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
         let _ = std::fs::create_dir_all(&temp);
         let restore = self.playback.frame;
 
@@ -4132,9 +4175,7 @@ impl VadadeeBerryApp {
             match ev {
                 crate::export_worker::ExportWorkerEvent::Phase(phase) => {
                     self.video_export.status_msg = match phase {
-                        crate::export_worker::ExportPhase::Preparing => {
-                            "Preparing export…".into()
-                        }
+                        crate::export_worker::ExportPhase::Preparing => "Preparing export…".into(),
                         crate::export_worker::ExportPhase::Encoding => {
                             format!(
                                 "Encoding {} frames @ {} fps…",
@@ -4230,7 +4271,10 @@ impl VadadeeBerryApp {
     }
 
     pub fn copy_selection(&mut self) {
-        log::info!("CLIPBOARD: copy_selection called, selection.len()={}", self.selection.len());
+        log::info!(
+            "CLIPBOARD: copy_selection called, selection.len()={}",
+            self.selection.len()
+        );
         if self.selection.is_empty() {
             log::info!("CLIPBOARD: copy skipped, empty selection");
             return;
@@ -4250,7 +4294,10 @@ impl VadadeeBerryApp {
     }
 
     pub fn cut_selection(&mut self) {
-        log::info!("CLIPBOARD: cut_selection called, selection.len()={}", self.selection.len());
+        log::info!(
+            "CLIPBOARD: cut_selection called, selection.len()={}",
+            self.selection.len()
+        );
         if self.selection.is_empty() {
             log::info!("CLIPBOARD: cut skipped, empty selection");
             return;
@@ -4462,10 +4509,7 @@ impl VadadeeBerryApp {
                     };
                     let mut out = Vec::new();
                     let ok = rgba_img
-                        .write_to(
-                            &mut std::io::Cursor::new(&mut out),
-                            image::ImageFormat::Png,
-                        )
+                        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
                         .is_ok()
                         && !out.is_empty();
                     if !ok {
@@ -4538,7 +4582,10 @@ impl VadadeeBerryApp {
         self.paste_progress.is_some()
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        not(any(target_os = "android", target_os = "ios"))
+    ))]
     fn system_clipboard_has_image(&self) -> bool {
         arboard::Clipboard::new()
             .ok()
@@ -4629,10 +4676,8 @@ impl VadadeeBerryApp {
         group.transform.rotation_rad = 0.0;
         let gid = group.id;
         if !patches.is_empty() {
-            self.history.push(
-                &mut self.project,
-                ProjectEdit::PatchNodes { patches },
-            );
+            self.history
+                .push(&mut self.project, ProjectEdit::PatchNodes { patches });
         }
         self.history
             .push(&mut self.project, ProjectEdit::InsertNode { node: group });
@@ -4784,8 +4829,7 @@ impl VadadeeBerryApp {
         let mut changed = false;
         for id in self.selection.clone() {
             if let Some(pos) = after.iter().position(|n| *n == id) {
-                let new_pos =
-                    (pos as isize + delta).clamp(0, after.len() as isize - 1) as usize;
+                let new_pos = (pos as isize + delta).clamp(0, after.len() as isize - 1) as usize;
                 if new_pos != pos {
                     let item = after.remove(pos);
                     after.insert(new_pos, item);
@@ -4911,11 +4955,7 @@ impl VadadeeBerryApp {
             }
             self.history.push(
                 &mut self.project,
-                ProjectEdit::PatchNode {
-                    id,
-                    before,
-                    after,
-                },
+                ProjectEdit::PatchNode { id, before, after },
             );
         }
         self.status_message = if horizontal {
@@ -4926,7 +4966,6 @@ impl VadadeeBerryApp {
     }
 
     fn layer_editable(&self) -> bool {
-
         self.project
             .document
             .active_layer()
@@ -5102,7 +5141,8 @@ impl VadadeeBerryApp {
     fn object_clipboard_blocked(&self, ctx: &Context) -> bool {
         self.on_page_text_edit.is_some()
             || ctx.text_edit_focused()
-            || (self.show_shader_editor_window.is_some() && ctx.memory(|mem| mem.has_focus(egui::Id::new("shader_editor_text"))))
+            || (self.show_shader_editor_window.is_some()
+                && ctx.memory(|mem| mem.has_focus(egui::Id::new("shader_editor_text"))))
             || ctx.memory(|mem| mem.has_focus(egui::Id::new("sidebar_shader_editor_text")))
     }
 
@@ -5120,7 +5160,12 @@ impl VadadeeBerryApp {
 
             let mut paste_pressed = false;
             for event in &i.events {
-                if let egui::Event::Key { key: egui::Key::V, pressed: true, .. } = event {
+                if let egui::Event::Key {
+                    key: egui::Key::V,
+                    pressed: true,
+                    ..
+                } = event
+                {
                     if has_cmd {
                         paste_pressed = true;
                         break;
@@ -5240,23 +5285,13 @@ impl VadadeeBerryApp {
                 (copy, copy_png, cut, paste, flip_h, flip_v)
             });
 
-        if !(want_copy
-            || want_copy_png
-            || want_cut
-            || want_paste
-            || want_flip_h
-            || want_flip_v)
-        {
+        if !(want_copy || want_copy_png || want_cut || want_paste || want_flip_h || want_flip_v) {
             return false;
         }
 
         ctx.input_mut(|i| {
-            i.events.retain(|event| {
-                !matches!(
-                    event,
-                    Event::Copy | Event::Cut | Event::Paste(_)
-                )
-            });
+            i.events
+                .retain(|event| !matches!(event, Event::Copy | Event::Cut | Event::Paste(_)));
             if want_copy {
                 let _ = i.consume_key(egui::Modifiers::COMMAND, Key::C);
                 let _ = i.consume_key(egui::Modifiers::CTRL, Key::C);
@@ -5341,7 +5376,10 @@ impl VadadeeBerryApp {
 
     /// egui-winit drops Ctrl+V when the clipboard has only image/png (no text), so no
     /// Event::Paste or Key::V reaches egui. Poll the physical hotkey as a fallback.
-    #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        not(any(target_os = "android", target_os = "ios"))
+    ))]
     fn handle_paste_hotkey_fallback(&mut self, ctx: &Context, events_handled_paste: bool) {
         if !ctx.input(|i| i.focused) {
             return;
@@ -5406,7 +5444,8 @@ impl VadadeeBerryApp {
             let cmd = i.modifiers.command || i.modifiers.ctrl;
             if cmd {
                 if i.modifiers.shift && i.key_pressed(Key::R) && !text_focused {
-                    let _ = i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::R);
+                    let _ =
+                        i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::R);
                     let _ = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::R);
                     self.resize_to_selection();
                 }
@@ -5422,10 +5461,7 @@ impl VadadeeBerryApp {
                         self.status_message = if self.tools.pen.is_empty() {
                             "Polyline cleared — Esc to exit pen".into()
                         } else {
-                            format!(
-                                "Removed point ({} remaining)",
-                                self.tools.pen.len()
-                            )
+                            format!("Removed point ({} remaining)", self.tools.pen.len())
                         };
                     } else {
                         self.do_undo();
@@ -5458,18 +5494,14 @@ impl VadadeeBerryApp {
                 }
                 // Flip: Ctrl+Shift+H / Ctrl+Shift+V (not Ctrl+V paste — requires Shift).
                 if i.modifiers.shift && i.key_pressed(Key::H) && !text_focused {
-                    let _ = i.consume_key(
-                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                        Key::H,
-                    );
+                    let _ =
+                        i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::H);
                     let _ = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::H);
                     self.flip_selection(true);
                 }
                 if i.modifiers.shift && i.key_pressed(Key::V) && !text_focused {
-                    let _ = i.consume_key(
-                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                        Key::V,
-                    );
+                    let _ =
+                        i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::V);
                     let _ = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::V);
                     self.flip_selection(false);
                 }
@@ -5521,17 +5553,16 @@ impl VadadeeBerryApp {
                 self.status_message = if self.tools.pen.is_empty() {
                     "Polyline cleared — Esc to exit pen".into()
                 } else {
-                    format!(
-                        "Removed point ({} remaining)",
-                        self.tools.pen.len()
-                    )
+                    format!("Removed point ({} remaining)", self.tools.pen.len())
                 };
             } else if (i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) && !text_focused
             {
                 // Node Editor dialog handles Delete/Backspace for graph nodes itself.
                 if self.node_editor_ui.open_layer_id.is_some() {
                     // leave key for node_editor_ui
-                } else if let Some((node_id, track_lbl, frame)) = self.anim_selected_keyframe.clone() {
+                } else if let Some((node_id, track_lbl, frame)) =
+                    self.anim_selected_keyframe.clone()
+                {
                     self.delete_keyframe(node_id, &track_lbl, frame);
                 } else if self.tools.active == ToolKind::Node
                     && !self.tools.select.selected_path_points.is_empty()
@@ -5559,7 +5590,7 @@ impl VadadeeBerryApp {
                     }
                     let _ = i.consume_key(egui::Modifiers::NONE, Key::Space);
                 }
-                
+
                 // Back to start on Ctrl + Left Arrow
                 if cmd && i.key_pressed(Key::ArrowLeft) {
                     self.playback.frame = 0;
@@ -5587,7 +5618,7 @@ impl VadadeeBerryApp {
                 let mut nudge_dx: f64 = 0.0;
                 let mut nudge_dy: f64 = 0.0;
                 let step = if i.modifiers.shift { 10.0 } else { 1.0 };
-                
+
                 if i.key_pressed(Key::ArrowLeft) && !cmd {
                     nudge_dx = -step;
                     let _ = i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft);
@@ -5610,7 +5641,9 @@ impl VadadeeBerryApp {
                 }
 
                 if nudge_dx.abs() > 1e-5 || nudge_dy.abs() > 1e-5 {
-                    if self.tools.active == ToolKind::Node && !self.tools.select.selected_path_points.is_empty() {
+                    if self.tools.active == ToolKind::Node
+                        && !self.tools.select.selected_path_points.is_empty()
+                    {
                         // Nudge selected path points
                         for (id, pi) in self.tools.select.selected_path_points.clone() {
                             if let Some(before) = self.project.nodes.get(id).cloned() {
@@ -5641,16 +5674,22 @@ impl VadadeeBerryApp {
                                 };
                                 if let Some(kids) = child_ids {
                                     for cid in kids {
-                                        if let Some(c_before) = self.project.nodes.get(cid).cloned() {
+                                        if let Some(c_before) = self.project.nodes.get(cid).cloned()
+                                        {
                                             let mut c_after = c_before.clone();
                                             c_after.translate(nudge_dx, nudge_dy);
                                             if c_before != c_after {
-                                                if let Some(c_mut) = self.project.nodes.get_mut(cid) {
+                                                if let Some(c_mut) = self.project.nodes.get_mut(cid)
+                                                {
                                                     *c_mut = c_after.clone();
                                                 }
                                                 self.history.push(
                                                     &mut self.project,
-                                                    ProjectEdit::PatchNode { id: cid, before: c_before, after: c_after },
+                                                    ProjectEdit::PatchNode {
+                                                        id: cid,
+                                                        before: c_before,
+                                                        after: c_after,
+                                                    },
                                                 );
                                             }
                                         }
@@ -5737,7 +5776,9 @@ impl VadadeeBerryApp {
         if let Some(anim) = self.project.anim_timeline.nodes.get_mut(&node_id) {
             if let Some(track) = anim.get_track_mut(track_lbl) {
                 track.keyframes.retain(|kf| kf.frame != frame);
-                if let Some((sel_node_id, ref sel_track_lbl, sel_frame)) = self.anim_selected_keyframe {
+                if let Some((sel_node_id, ref sel_track_lbl, sel_frame)) =
+                    self.anim_selected_keyframe
+                {
                     if sel_node_id == node_id && sel_track_lbl == track_lbl && sel_frame == frame {
                         self.anim_selected_keyframe = None;
                     }
@@ -5750,7 +5791,10 @@ impl VadadeeBerryApp {
             let after_timeline = self.project.anim_timeline.clone();
             self.history.push(
                 &mut self.project,
-                ProjectEdit::PatchTimeline { before: before_timeline, after: after_timeline },
+                ProjectEdit::PatchTimeline {
+                    before: before_timeline,
+                    after: after_timeline,
+                },
             );
         }
     }
@@ -5891,7 +5935,9 @@ impl VadadeeBerryApp {
             }
 
             let initial_music_len = layer.music_clips.len();
-            layer.music_clips.retain(|c| !self.selection.contains(&c.id));
+            layer
+                .music_clips
+                .retain(|c| !self.selection.contains(&c.id));
             if layer.music_clips.len() != initial_music_len {
                 clip_removed = true;
             }
@@ -5982,8 +6028,12 @@ impl VadadeeBerryApp {
         if nodes.is_empty() {
             return;
         }
-        self.history
-            .push(&mut self.project, ProjectEdit::InsertNodes { nodes: nodes.clone() });
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::InsertNodes {
+                nodes: nodes.clone(),
+            },
+        );
         // Select the last one (consistent with single insert behavior)
         if let Some(last) = nodes.last() {
             self.selection = vec![last.id];
@@ -6135,10 +6185,8 @@ impl VadadeeBerryApp {
         }
         if !patches.is_empty() {
             let ids: Vec<NodeId> = patches.iter().map(|(id, _, _)| *id).collect();
-            self.history.push(
-                &mut self.project,
-                ProjectEdit::PatchNodes { patches },
-            );
+            self.history
+                .push(&mut self.project, ProjectEdit::PatchNodes { patches });
             for id in ids {
                 self.sync_anim_transform_from_node(id);
             }
@@ -6200,13 +6248,24 @@ impl VadadeeBerryApp {
         let n = after
             .layers
             .iter()
-            .filter(|l| l.kind == crate::document::LayerKind::AV && l.av_role == crate::document::AvRole::Daw)
+            .filter(|l| {
+                l.kind == crate::document::LayerKind::AV
+                    && l.av_role == crate::document::AvRole::Daw
+            })
             .map(|l| l.music_clips.len())
             .sum::<usize>()
             + 1;
         let idx = after.ensure_av_role_layer(
             crate::document::AvRole::Daw,
-            &format!("DAW {}", after.layers.iter().filter(|l| l.av_role == crate::document::AvRole::Daw).count().max(1)),
+            &format!(
+                "DAW {}",
+                after
+                    .layers
+                    .iter()
+                    .filter(|l| l.av_role == crate::document::AvRole::Daw)
+                    .count()
+                    .max(1)
+            ),
         );
         let Some(layer) = after.layers.get_mut(idx) else {
             return;
@@ -6215,8 +6274,7 @@ impl VadadeeBerryApp {
         layer.ensure_av_clips();
         // Append to end of DAW queue (after last media/DAW on this layer).
         let start = crate::av_ui::queue_append_start_sec(layer).max(play_sec);
-        let mut clip =
-            crate::document::MusicClip::new_empty(format!("DAW {n}"), start, 1.0);
+        let mut clip = crate::document::MusicClip::new_empty(format!("DAW {n}"), start, 1.0);
         clip.track_row = 0;
         let id = clip.id;
         layer.music_clips.push(clip);
@@ -6238,15 +6296,19 @@ impl VadadeeBerryApp {
         self.tools.select.select_rotation_mode = false;
         self.hit_pick_menu = None;
         self.sync_inspector_from_selection();
-        self.status_message =
-            "Object selected (sticky — Esc or empty click to deselect)".into();
+        self.status_message = "Object selected (sticky — Esc or empty click to deselect)".into();
     }
 
     fn pick_node_at(&self, doc: (f64, f64), slop: f64) -> Option<NodeId> {
         self.pick_node_at_opts(doc, slop, false)
     }
 
-    fn pick_node_at_opts(&self, doc: (f64, f64), slop: f64, include_ghosts: bool) -> Option<NodeId> {
+    fn pick_node_at_opts(
+        &self,
+        doc: (f64, f64),
+        slop: f64,
+        include_ghosts: bool,
+    ) -> Option<NodeId> {
         // Normal pick: treat visible clip composites as selectable (source is hidden ghost).
         if !include_ghosts {
             if let Some((source, _mask)) = self.pick_clip_mask_at(doc, slop) {
@@ -6317,12 +6379,7 @@ impl VadadeeBerryApp {
     }
 
     /// All nodes under the pointer (topmost first). Used for multi-object hit picker.
-    fn pick_all_nodes_at(
-        &self,
-        doc: (f64, f64),
-        slop: f64,
-        include_ghosts: bool,
-    ) -> Vec<NodeId> {
+    fn pick_all_nodes_at(&self, doc: (f64, f64), slop: f64, include_ghosts: bool) -> Vec<NodeId> {
         let hidden = if include_ghosts {
             std::collections::HashSet::new()
         } else {
@@ -6364,7 +6421,8 @@ impl VadadeeBerryApp {
             let rgba = dyn_img.to_rgba8();
             let (w, h) = rgba.dimensions();
             let pixels = rgba.into_raw();
-            let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+            let color_image =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
             let handle = ctx.load_texture(
                 format!("vadadee-berry-img-{}", id),
                 color_image.clone(),
@@ -6585,9 +6643,13 @@ impl VadadeeBerryApp {
         // Ensure pixel mask: rasterize geometric into a **region** buffer only.
         if !has_pixel {
             let polys = self.raster_poly_masks_px(ix, iy, iw, ih, irot, pw, ph);
-            let rect = self.tools.raster.sticky_mask_doc.and_then(|(x0, y0, x1, y1)| {
-                self.doc_aabb_to_image_clip(ix, iy, iw, ih, irot, pw, ph, x0, y0, x1, y1)
-            });
+            let rect = self
+                .tools
+                .raster
+                .sticky_mask_doc
+                .and_then(|(x0, y0, x1, y1)| {
+                    self.doc_aabb_to_image_clip(ix, iy, iw, ih, irot, pw, ph, x0, y0, x1, y1)
+                });
             // Tight scan bounds from rect + poly AABB (never full frame).
             let mut rx0 = pw as i32;
             let mut ry0 = ph as i32;
@@ -6794,8 +6856,7 @@ impl VadadeeBerryApp {
                 // Source-over
                 let a = sa as f32 / 255.0;
                 let inv = 1.0 - a;
-                dest.rgba[di] =
-                    (fl.rgba[si] as f32 * a + dest.rgba[di] as f32 * inv).round() as u8;
+                dest.rgba[di] = (fl.rgba[si] as f32 * a + dest.rgba[di] as f32 * inv).round() as u8;
                 dest.rgba[di + 1] =
                     (fl.rgba[si + 1] as f32 * a + dest.rgba[di + 1] as f32 * inv).round() as u8;
                 dest.rgba[di + 2] =
@@ -6935,13 +6996,12 @@ impl VadadeeBerryApp {
             .get(&id)
             .map(|c| (c.size[0] as u32, c.size[1] as u32))
             .unwrap_or((1, 1));
-        let (px, py) = if let Some((u, v)) =
-            crate::document::image_doc_to_uv(x, y, w, h, rot, doc.0, doc.1)
-        {
-            ((u * pw as f64) as f32, (v * ph as f64) as f32)
-        } else {
-            return true; // still consume while floating
-        };
+        let (px, py) =
+            if let Some((u, v)) = crate::document::image_doc_to_uv(x, y, w, h, rot, doc.0, doc.1) {
+                ((u * pw as f64) as f32, (v * ph as f64) as f32)
+            } else {
+                return true; // still consume while floating
+            };
         if pressed {
             if let Some(fl) = self.tools.raster.floating.as_mut() {
                 fl.dragging = true;
@@ -7052,11 +7112,7 @@ impl VadadeeBerryApp {
                     raw.push(p.b());
                     raw.push(p.a());
                 }
-                (
-                    ci.size[0] as u32,
-                    ci.size[1] as u32,
-                    raw,
-                )
+                (ci.size[0] as u32, ci.size[1] as u32, raw)
             } else if let Some(buf) = crate::raster::RasterBuffer::from_png_bytes(&bytes) {
                 (buf.width, buf.height, buf.rgba)
             } else {
@@ -7182,13 +7238,7 @@ impl VadadeeBerryApp {
         let spacing = (base_radius * self.tools.raster.spacing.max(0.04)).max(0.25);
         let hardness = self.tools.raster.hardness;
         let flow = self.tools.raster.flow.clamp(0.0, 1.0);
-        let opacity = self.tools.raster.opacity
-            * flow
-            * if erase {
-                1.0
-            } else {
-                press
-            };
+        let opacity = self.tools.raster.opacity * flow * if erase { 1.0 } else { press };
         let color = self.raster_paint_rgba();
         let force = force_first || self.tools.raster.sample_hist.len() <= 1;
         let (stamps, carry) = crate::raster::stamps_for_new_sample(
@@ -7221,8 +7271,7 @@ impl VadadeeBerryApp {
         let (ox, oy) = self.raster_sym_origin_px(id, x, y, width, height, rot, pw, ph);
         let divs = self.tools.raster.sym_divisions.max(1);
         let off = self.tools.raster.sym_offset_deg.to_radians();
-        let all_stamps =
-            crate::raster::expand_circular_symmetry(&stamps, (ox, oy), divs, off);
+        let all_stamps = crate::raster::expand_circular_symmetry(&stamps, (ox, oy), divs, off);
         let scatter = self.tools.raster.scatter.clamp(0.0, 1.0);
         let size_jit = self.tools.raster.size_jitter.clamp(0.0, 1.0);
         let aspect = self.tools.raster.aspect.clamp(0.15, 1.0);
@@ -7292,9 +7341,8 @@ impl VadadeeBerryApp {
                         let r_mul = 1.0 + (n2 * 2.0 - 1.0) * size_jit;
                         let tip_r = (base_radius * r_mul).max(0.5);
                         let ang = base_angle + (n3 * 2.0 - 1.0) * ang_jit * std::f32::consts::PI;
-                        let pix_region = pix_mask.map(|m| {
-                            (m.ox, m.oy, m.width, m.height, m.mask.as_slice())
-                        });
+                        let pix_region =
+                            pix_mask.map(|m| (m.ox, m.oy, m.width, m.height, m.mask.as_slice()));
                         buf.stamp_tip_masked(
                             sx + jx,
                             sy + jy,
@@ -7322,9 +7370,7 @@ impl VadadeeBerryApp {
         // Throttled full-texture upload (pro apps update dirty tiles; we update whole
         // layer ~20×/s — cheap once PNG clone-per-frame is gone).
         let now = ctx.input(|i| i.time);
-        if self.tools.raster.tex_dirty
-            && now - self.tools.raster.last_tex_upload >= (1.0 / 20.0)
-        {
+        if self.tools.raster.tex_dirty && now - self.tools.raster.last_tex_upload >= (1.0 / 20.0) {
             self.flush_raster_texture(ctx, false);
         }
         ctx.request_repaint();
@@ -7429,7 +7475,10 @@ impl VadadeeBerryApp {
             painter.circle_stroke(
                 tip,
                 r_screen,
-                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 140)),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 140),
+                ),
             );
         }
     }
@@ -7513,11 +7562,7 @@ impl VadadeeBerryApp {
         }
         self.history.push(
             &mut self.project,
-            ProjectEdit::PatchNode {
-                id,
-                before,
-                after,
-            },
+            ProjectEdit::PatchNode { id, before, after },
         );
         self.status_message = if self.tools.active == ToolKind::Smudge {
             "Smudged".into()
@@ -7599,8 +7644,7 @@ impl VadadeeBerryApp {
         if pw == 0 || ph == 0 {
             return;
         }
-        let Some((u, v)) =
-            crate::document::image_doc_to_uv(x, y, width, height, rot, doc.0, doc.1)
+        let Some((u, v)) = crate::document::image_doc_to_uv(x, y, width, height, rot, doc.0, doc.1)
         else {
             self.status_message = "Click inside the image to fill".into();
             return;
@@ -7787,19 +7831,8 @@ impl VadadeeBerryApp {
             }
         }
         if let Some((x0, y0, x1, y1)) = self.tools.raster.sticky_mask_doc {
-            return self.doc_aabb_to_image_clip(
-                img_x,
-                img_y,
-                img_w,
-                img_h,
-                rot,
-                pw,
-                ph,
-                x0,
-                y0,
-                x1,
-                y1,
-            );
+            return self
+                .doc_aabb_to_image_clip(img_x, img_y, img_w, img_h, rot, pw, ph, x0, y0, x1, y1);
         }
         self.raster_selection_clip_px(target_id, img_x, img_y, img_w, img_h, rot, pw, ph)
     }
@@ -7995,17 +8028,7 @@ impl VadadeeBerryApp {
             return None;
         }
         self.doc_aabb_to_image_clip(
-            img_x,
-            img_y,
-            img_w,
-            img_h,
-            rot,
-            pw,
-            ph,
-            b.x0,
-            b.y0,
-            b.x1,
-            b.y1,
+            img_x, img_y, img_w, img_h, rot, pw, ph, b.x0, b.y0, b.x1, b.y1,
         )
     }
 
@@ -8087,22 +8110,28 @@ impl VadadeeBerryApp {
         let ph = ci.size[1] as u32;
         // Rasterize geometric mask into a region buffer, then invert **within that region**.
         let polys = self.raster_poly_masks_px(ix, iy, iw, ih, rot, pw, ph);
-        let rect = self.tools.raster.sticky_mask_doc.and_then(|(x0, y0, x1, y1)| {
-            self.doc_aabb_to_image_clip(ix, iy, iw, ih, rot, pw, ph, x0, y0, x1, y1)
-        });
+        let rect = self
+            .tools
+            .raster
+            .sticky_mask_doc
+            .and_then(|(x0, y0, x1, y1)| {
+                self.doc_aabb_to_image_clip(ix, iy, iw, ih, rot, pw, ph, x0, y0, x1, y1)
+            });
         let has_geo = rect.is_some() || !polys.is_empty();
         if !has_geo {
             // No mask → select all via geometric full image (no multi-megabyte bitmap).
             if let Some(node) = self.project.nodes.get(id) {
                 if let NodeKind::Image {
-                    x, y, width, height, ..
+                    x,
+                    y,
+                    width,
+                    height,
+                    ..
                 } = &node.kind
                 {
-                    self.tools.raster.sticky_mask_doc =
-                        Some((*x, *y, *x + *width, *y + *height));
+                    self.tools.raster.sticky_mask_doc = Some((*x, *y, *x + *width, *y + *height));
                     self.tools.raster.sticky_pixel_mask = None;
-                    self.status_message =
-                        format!("Selected all (geometric {}×{})", pw, ph);
+                    self.status_message = format!("Selected all (geometric {}×{})", pw, ph);
                     return;
                 }
             }
@@ -8231,7 +8260,11 @@ impl VadadeeBerryApp {
         // Geometric full-image mask — no multi-megabyte pixel buffer.
         let snap = self.project.nodes.get(id).and_then(|n| {
             if let NodeKind::Image {
-                x, y, width, height, ..
+                x,
+                y,
+                width,
+                height,
+                ..
             } = &n.kind
             {
                 Some((*x, *y, *width, *height))
@@ -8312,12 +8345,7 @@ impl VadadeeBerryApp {
 
     /// Magnetic / eyedrop: flood similar **connected** pixels → pixel mask (not AABB).
     /// Holes of a different color inside the seed region are **not** selected.
-    fn raster_select_color_region(
-        &mut self,
-        doc: (f64, f64),
-        ctx: &Context,
-        glow: bool,
-    ) {
+    fn raster_select_color_region(&mut self, doc: (f64, f64), ctx: &Context, glow: bool) {
         use crate::tools::StickyPixelMask;
         let Some(id) = self.selection.first().copied().filter(|&id| {
             self.project
@@ -8359,8 +8387,7 @@ impl VadadeeBerryApp {
         };
         let pw = ci.size[0] as u32;
         let ph = ci.size[1] as u32;
-        let Some((u, v)) =
-            crate::document::image_doc_to_uv(ix, iy, iw, ih, rot, doc.0, doc.1)
+        let Some((u, v)) = crate::document::image_doc_to_uv(ix, iy, iw, ih, rot, doc.0, doc.1)
         else {
             self.status_message = "Click on the Image".into();
             return;
@@ -8377,15 +8404,7 @@ impl VadadeeBerryApp {
         // Flood only connected matching pixels (tolerance 0 ⇒ exact color, no leak into holes).
         let mut work = raw.clone();
         let tol = self.tools.raster_select.tolerance;
-        let n = crate::raster::flood_fill(
-            &mut work,
-            pw,
-            ph,
-            sx,
-            sy,
-            [1, 2, 3, 255],
-            tol,
-        );
+        let n = crate::raster::flood_fill(&mut work, pw, ph, sx, sy, [1, 2, 3, 255], tol);
         if n == 0 {
             self.status_message = "Nothing selected".into();
             return;
@@ -8412,8 +8431,7 @@ impl VadadeeBerryApp {
                 crate::raster::dilate_mask(&mut full_mask, pw, ph, glow_px);
             }
         }
-        let Some(pixel) =
-            StickyPixelMask::from_full_frame(id, pw, ph, &full_mask, glow_px.max(1))
+        let Some(pixel) = StickyPixelMask::from_full_frame(id, pw, ph, &full_mask, glow_px.max(1))
         else {
             self.status_message = "Nothing selected".into();
             return;
@@ -8422,10 +8440,7 @@ impl VadadeeBerryApp {
         let union = self.tools.raster_select.union_mask;
         if union {
             if let Some(existing) = self.tools.raster.sticky_pixel_mask.as_mut() {
-                if existing.node_id == id
-                    && existing.full_w == pw
-                    && existing.full_h == ph
-                {
+                if existing.node_id == id && existing.full_w == pw && existing.full_h == ph {
                     existing.or_with(&pixel);
                 } else {
                     *existing = pixel;
@@ -8653,14 +8668,8 @@ impl VadadeeBerryApp {
                     let p0 = Pos2::new(a.x + ux * t, a.y + uy * t);
                     let p1 = Pos2::new(a.x + ux * (t + step), a.y + uy * (t + step));
                     // Double stroke: black under / yellow on top for contrast on any bg.
-                    painter.line_segment(
-                        [p0, p1],
-                        egui::Stroke::new(3.0, color_b),
-                    );
-                    painter.line_segment(
-                        [p0, p1],
-                        egui::Stroke::new(1.6, color_a),
-                    );
+                    painter.line_segment([p0, p1], egui::Stroke::new(3.0, color_b));
+                    painter.line_segment([p0, p1], egui::Stroke::new(1.6, color_a));
                 }
                 t += step;
                 dist_along = (dist_along + step).rem_euclid(period);
@@ -8810,10 +8819,7 @@ impl VadadeeBerryApp {
                     }
                 }
             }
-            let img = egui::ColorImage::from_rgba_unmultiplied(
-                [tw as usize, th as usize],
-                &rgba,
-            );
+            let img = egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &rgba);
             let tex = painter.ctx().load_texture(
                 "raster_pixel_mask_shade",
                 img,
@@ -8924,11 +8930,7 @@ impl VadadeeBerryApp {
             let mut dist = (phase + i as f32 * 0.7).rem_euclid(period);
             while t < len {
                 let in_dash = dist < dash;
-                let remain = if in_dash {
-                    dash - dist
-                } else {
-                    period - dist
-                };
+                let remain = if in_dash { dash - dist } else { period - dist };
                 let step = remain.min(len - t);
                 if in_dash {
                     let p0 = Pos2::new(a.x + ux * t, a.y + uy * t);
@@ -9030,11 +9032,7 @@ impl VadadeeBerryApp {
         }
         self.history.push(
             &mut self.project,
-            ProjectEdit::PatchNode {
-                id,
-                before,
-                after,
-            },
+            ProjectEdit::PatchNode { id, before, after },
         );
         self.tools.raster.live_rgba = None;
         self.image_textures.remove(&id);
@@ -9060,7 +9058,14 @@ impl VadadeeBerryApp {
             // Default to active image center if available.
             if let Some(&id) = self.selection.first().or(self.tools.raster.target.as_ref()) {
                 if let Some(n) = self.project.nodes.get(id) {
-                    if let NodeKind::Image { x, y, width, height, .. } = &n.kind {
+                    if let NodeKind::Image {
+                        x,
+                        y,
+                        width,
+                        height,
+                        ..
+                    } = &n.kind
+                    {
                         return (*x + *width * 0.5, *y + *height * 0.5);
                     }
                 }
@@ -9104,7 +9109,14 @@ impl VadadeeBerryApp {
         let origin_doc = self.tools.raster.sym_origin_doc.unwrap_or_else(|| {
             if let Some(&id) = self.selection.first().or(self.tools.raster.target.as_ref()) {
                 if let Some(nd) = self.project.nodes.get(id) {
-                    if let NodeKind::Image { x, y, width, height, .. } = &nd.kind {
+                    if let NodeKind::Image {
+                        x,
+                        y,
+                        width,
+                        height,
+                        ..
+                    } = &nd.kind
+                    {
                         return (*x + *width * 0.5, *y + *height * 0.5);
                     }
                 }
@@ -9124,10 +9136,7 @@ impl VadadeeBerryApp {
             let dir = egui::vec2(a.cos(), a.sin());
             let p0 = center - dir * ray;
             let p1 = center + dir * ray;
-            painter.line_segment(
-                [p0, p1],
-                egui::Stroke::new(1.25, color),
-            );
+            painter.line_segment([p0, p1], egui::Stroke::new(1.25, color));
         }
         // Origin handle: circle + plus
         let r = if locked { 7.0 } else { 9.0 };
@@ -9160,14 +9169,14 @@ impl VadadeeBerryApp {
         let g = color.g() as f32 / 255.0;
         let b = color.b() as f32 / 255.0;
         let a = color.a() as f32 / 255.0;
-        let paint = crate::document::Paint {
-            rgba: [r, g, b, a],
-        };
+        let paint = crate::document::Paint { rgba: [r, g, b, a] };
         if let Some(stop) = self.ui_fill_stops.first_mut() {
             stop.color = paint;
         } else {
-            self.ui_fill_stops
-                .push(crate::document::GradientStop { pos: 0.0, color: paint });
+            self.ui_fill_stops.push(crate::document::GradientStop {
+                pos: 0.0,
+                color: paint,
+            });
         }
         self.ui_fill_kind = crate::document::FillKind::Solid;
         self.fill_enabled = true;
@@ -9180,7 +9189,11 @@ impl VadadeeBerryApp {
     }
 
     /// Load a filesystem image (or video frame when `video_time_sec` is set) for NE paths.
-    pub fn ensure_graph_path_texture(&mut self, path: &str, ctx: &Context) -> Option<egui::TextureHandle> {
+    pub fn ensure_graph_path_texture(
+        &mut self,
+        path: &str,
+        ctx: &Context,
+    ) -> Option<egui::TextureHandle> {
         let busy = self.ne_audio_extract_busy(path);
         let fps = self.playback.fps as f32;
         self.graph_preview_textures
@@ -9320,15 +9333,16 @@ impl VadadeeBerryApp {
             rgba
         };
 
-        let gpu_key = if animating { live_key.clone() } else { key.clone() };
+        let gpu_key = if animating {
+            live_key.clone()
+        } else {
+            key.clone()
+        };
 
         if let Some(rs) = self.wgpu_render.clone() {
             if let Some((tex, view, w, h)) =
                 crate::shading::graph_blur::GraphBlurEngine::blur_to_texture(
-                    &rs.device,
-                    &rs.queue,
-                    &rgba,
-                    br,
+                    &rs.device, &rs.queue, &rgba, br,
                 )
             {
                 let existing = self.graph_gpu_fx.get(&gpu_key).map(|e| e.id);
@@ -9466,69 +9480,70 @@ impl VadadeeBerryApp {
         if let Some(t) = self.graph_preview_textures.map.get(&key) {
             return Some((t.id(), t.size()));
         }
-        self.graph_preview_textures.map
+        self.graph_preview_textures
+            .map
             .get(&media_key)
             .map(|t| (t.id(), t.size()))
     }
 
-fn run_video_decode_thread(
-    rx_cmd: std::sync::mpsc::Receiver<VideoCommand>,
-    tx_frame: std::sync::mpsc::Sender<(usize, usize, u32, u32, Vec<u8>)>,
-) {
-    let mut current_path: Option<String> = None;
-    let mut libav_stream: Option<crate::video_decode::VideoStream> = None;
+    fn run_video_decode_thread(
+        rx_cmd: std::sync::mpsc::Receiver<VideoCommand>,
+        tx_frame: std::sync::mpsc::Sender<(usize, usize, u32, u32, Vec<u8>)>,
+    ) {
+        let mut current_path: Option<String> = None;
+        let mut libav_stream: Option<crate::video_decode::VideoStream> = None;
 
-    while let Ok(cmd) = rx_cmd.recv() {
-        let mut latest_cmd = cmd;
-        while let Ok(next_cmd) = rx_cmd.try_recv() {
-            if matches!(next_cmd, VideoCommand::Stop) {
-                latest_cmd = next_cmd;
-                break;
-            }
-            latest_cmd = next_cmd;
-        }
-
-        match latest_cmd {
-            VideoCommand::Stop => break,
-            VideoCommand::StopStream => {
-                libav_stream = None;
-            }
-            VideoCommand::GetFrame {
-                timeline_frame,
-                source_frame,
-                fps,
-                path,
-                sequential: _,
-            } => {
-                if !crate::video_decode::is_libav_available() {
-                    continue;
+        while let Ok(cmd) = rx_cmd.recv() {
+            let mut latest_cmd = cmd;
+            while let Ok(next_cmd) = rx_cmd.try_recv() {
+                if matches!(next_cmd, VideoCommand::Stop) {
+                    latest_cmd = next_cmd;
+                    break;
                 }
-                let path_changed = current_path.as_ref() != Some(&path);
-                if path_changed {
-                    current_path = Some(path.clone());
+                latest_cmd = next_cmd;
+            }
+
+            match latest_cmd {
+                VideoCommand::Stop => break,
+                VideoCommand::StopStream => {
                     libav_stream = None;
                 }
-                if libav_stream.is_none() {
-                    libav_stream = crate::video_decode::VideoStream::open(&path);
-                }
-                let decoded = if let Some(ref mut stream) = libav_stream {
-                    stream
-                        .get_frame(source_frame, fps)
-                        .map(|(w, h, rgba)| (w, h, rgba))
-                } else {
-                    None
-                };
-                if let Some((w, h, rgba)) = decoded {
-                    let _ = tx_frame.send((timeline_frame, source_frame, w, h, rgba));
-                } else if let Some((w, h, rgba)) =
-                    crate::video_decode::decode_frame(&path, source_frame, fps)
-                {
-                    let _ = tx_frame.send((timeline_frame, source_frame, w, h, rgba));
+                VideoCommand::GetFrame {
+                    timeline_frame,
+                    source_frame,
+                    fps,
+                    path,
+                    sequential: _,
+                } => {
+                    if !crate::video_decode::is_libav_available() {
+                        continue;
+                    }
+                    let path_changed = current_path.as_ref() != Some(&path);
+                    if path_changed {
+                        current_path = Some(path.clone());
+                        libav_stream = None;
+                    }
+                    if libav_stream.is_none() {
+                        libav_stream = crate::video_decode::VideoStream::open(&path);
+                    }
+                    let decoded = if let Some(ref mut stream) = libav_stream {
+                        stream
+                            .get_frame(source_frame, fps)
+                            .map(|(w, h, rgba)| (w, h, rgba))
+                    } else {
+                        None
+                    };
+                    if let Some((w, h, rgba)) = decoded {
+                        let _ = tx_frame.send((timeline_frame, source_frame, w, h, rgba));
+                    } else if let Some((w, h, rgba)) =
+                        crate::video_decode::decode_frame(&path, source_frame, fps)
+                    {
+                        let _ = tx_frame.send((timeline_frame, source_frame, w, h, rgba));
+                    }
                 }
             }
         }
     }
-}
 
     pub fn stop_all_video_streams(&mut self) {
         for state in self.video_layers.values_mut() {
@@ -9586,7 +9601,8 @@ fn run_video_decode_thread(
         }
 
         // Clean up deleted/inactive video layers to terminate their channels and background processes
-        let active_ids: std::collections::HashSet<uuid::Uuid> = layers_info.iter().map(|info| info.0).collect();
+        let active_ids: std::collections::HashSet<uuid::Uuid> =
+            layers_info.iter().map(|info| info.0).collect();
         self.video_layers.retain(|id, _| active_ids.contains(id));
 
         for (
@@ -9921,12 +9937,10 @@ fn run_video_decode_thread(
         }
     }
 
-
-
     pub fn insert_image(&mut self, x: f64, y: f64, width: f64, height: f64, bytes: Vec<u8>) {
         let node = self.styled_shape_node(Node::image(x, y, width, height, bytes));
         self.insert_node(node);
-        self.promote_action_tab( crate::action_tab::ActionTab::ColorStroke);
+        self.promote_action_tab(crate::action_tab::ActionTab::ColorStroke);
     }
 
     fn finish_pen_path(&mut self, close: bool) {
@@ -9999,8 +10013,7 @@ fn run_video_decode_thread(
     }
 
     pub fn canvas_ui(&mut self, ui: &mut Ui) -> egui::Response {
-        let (rect, response) =
-            ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let origin = rect.min;
         self.canvas_screen_rect = Some(rect);
         self.canvas_origin = origin;
@@ -10020,7 +10033,9 @@ fn run_video_decode_thread(
             } else {
                 vec![]
             };
-            if bytes.is_empty() { continue; }
+            if bytes.is_empty() {
+                continue;
+            }
             let name = f.name.to_lowercase();
             if name.ends_with(".vadadee-berry.json") {
                 let path_to_load = f.path.clone();
@@ -10050,14 +10065,28 @@ fn run_video_decode_thread(
                 }
                 continue;
             }
-            if name.ends_with(".png") || name.ends_with(".jpg") || name.ends_with(".jpeg")
-                || bytes.starts_with(b"\x89PNG") || bytes.starts_with(b"\xFF\xD8")
+            if name.ends_with(".png")
+                || name.ends_with(".jpg")
+                || name.ends_with(".jpeg")
+                || bytes.starts_with(b"\x89PNG")
+                || bytes.starts_with(b"\xFF\xD8")
             {
                 let pos = rect.center();
-                let doc = tools::doc_point_from_screen(pos, origin, self.viewport.pan, self.viewport.zoom);
+                let doc = tools::doc_point_from_screen(
+                    pos,
+                    origin,
+                    self.viewport.pan,
+                    self.viewport.zoom,
+                );
                 let disp_w = 320.0;
                 let disp_h = 240.0;
-                self.insert_image(doc.0 - disp_w / 2.0, doc.1 - disp_h / 2.0, disp_w, disp_h, bytes);
+                self.insert_image(
+                    doc.0 - disp_w / 2.0,
+                    doc.1 - disp_h / 2.0,
+                    disp_w,
+                    disp_h,
+                    bytes,
+                );
             }
         }
 
@@ -10081,14 +10110,20 @@ fn run_video_decode_thread(
                 while x < page.max.x as f64 {
                     let p1 = self.viewport.doc_to_screen((x, page.min.y as f64), origin);
                     let p2 = self.viewport.doc_to_screen((x, page.max.y as f64), origin);
-                    painter.line_segment([p1, p2], egui::Stroke::new(0.5, egui::Color32::from_rgb(80, 80, 80)));
+                    painter.line_segment(
+                        [p1, p2],
+                        egui::Stroke::new(0.5, egui::Color32::from_rgb(80, 80, 80)),
+                    );
                     x += cell;
                 }
                 let mut y = (page.min.y as f64 / cell).floor() * cell;
                 while y < page.max.y as f64 {
                     let p1 = self.viewport.doc_to_screen((page.min.x as f64, y), origin);
                     let p2 = self.viewport.doc_to_screen((page.max.x as f64, y), origin);
-                    painter.line_segment([p1, p2], egui::Stroke::new(0.5, egui::Color32::from_rgb(80, 80, 80)));
+                    painter.line_segment(
+                        [p1, p2],
+                        egui::Stroke::new(0.5, egui::Color32::from_rgb(80, 80, 80)),
+                    );
                     y += cell;
                 }
             }
@@ -10110,8 +10145,7 @@ fn run_video_decode_thread(
                     }
                 }
             }
-            self.fonts
-                .ensure_loaded(&ctx, &self.ui_text_font_family);
+            self.fonts.ensure_loaded(&ctx, &self.ui_text_font_family);
             // Ensure textures for any Image nodes (decode from embedded bytes if needed).
             // CRITICAL: never clone PNG bytes when texture already warm — that was multi-MB/frame lag.
             let image_ids: Vec<_> = order
@@ -10191,9 +10225,7 @@ fn run_video_decode_thread(
                 .filter_map(|g| {
                     let eval = g.resolve_output_image();
                     match &eval.image {
-                        crate::document::GraphImageSource::FilePath(p) => {
-                            Some((p.clone(), eval))
-                        }
+                        crate::document::GraphImageSource::FilePath(p) => Some((p.clone(), eval)),
                         crate::document::GraphImageSource::BakedCache { key } => {
                             graph_bake_keys.push(key.clone());
                             None
@@ -10271,7 +10303,11 @@ fn run_video_decode_thread(
             let dragging_objects = !self.tools.select.drag_snapshot.is_empty();
             let revision = self.history.revision();
             let anim_frame = self.playback.frame;
-            let loft_paths: std::collections::HashSet<NodeId> = self.project.document.path_effects.values()
+            let loft_paths: std::collections::HashSet<NodeId> = self
+                .project
+                .document
+                .path_effects
+                .values()
                 .filter(|e| e.mode == OnPathMode::Loft)
                 .map(|e| e.path_id)
                 .collect();
@@ -10296,12 +10332,9 @@ fn run_video_decode_thread(
                                 self.playback.playing,
                                 self.mcp_bulk_active(),
                             )
-                            && self
-                                .layer_raster_cache
-                                .get(&layer.id)
-                                .is_some_and(|e| {
-                                    crate::layer_cache::cache_entry_valid(e, revision, anim_frame)
-                                });
+                            && self.layer_raster_cache.get(&layer.id).is_some_and(|e| {
+                                crate::layer_cache::cache_entry_valid(e, revision, anim_frame)
+                            });
 
                         if use_raster_cache {
                             if let Some(entry) = self.layer_raster_cache.get(&layer.id) {
@@ -10313,7 +10346,10 @@ fn run_video_decode_thread(
                                 painter.image(
                                     entry.texture.id(),
                                     page,
-                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
                                     egui::Color32::WHITE,
                                 );
                             }
@@ -10392,12 +10428,20 @@ fn run_video_decode_thread(
                                     .map(|c| c.id)
                             })
                             .unwrap_or(layer.id);
-                        let tex = self.video_layers.get(&primary_id)
+                        let tex = self
+                            .video_layers
+                            .get(&primary_id)
                             .and_then(|s| s.texture.as_ref())
                             .cloned()
-                            .or_else(|| self.video_layers.get(&layer.id).and_then(|s| s.texture.as_ref()).cloned())
                             .or_else(|| {
-                                self.video_frame_cache.as_ref()
+                                self.video_layers
+                                    .get(&layer.id)
+                                    .and_then(|s| s.texture.as_ref())
+                                    .cloned()
+                            })
+                            .or_else(|| {
+                                self.video_frame_cache
+                                    .as_ref()
                                     .filter(|c| c.layer_id == primary_id || c.layer_id == layer.id)
                                     .map(|c| c.texture.clone())
                             });
@@ -10420,11 +10464,11 @@ fn run_video_decode_thread(
                                     rot = r;
                                 }
                             }
-                            
+
                             let tex_w = texture.size()[0] as f32;
                             let tex_h = texture.size()[1] as f32;
                             let aspect = if tex_h > 0.0 { tex_w / tex_h } else { 1.0 };
-                            
+
                             let mut w = layer.width;
                             let mut h = layer.height;
                             if layer.aspect_ratio_locked {
@@ -10434,25 +10478,20 @@ fn run_video_decode_thread(
                                     h = w / aspect;
                                 }
                             }
-                            
+
                             let tl = self.viewport.doc_to_screen((dx, dy), origin);
-                            let br = self.viewport.doc_to_screen(
-                                (dx + w as f64, dy + h as f64),
-                                origin
-                            );
+                            let br = self
+                                .viewport
+                                .doc_to_screen((dx + w as f64, dy + h as f64), origin);
                             let rect = egui::Rect::from_min_max(tl, br);
                             let rot_rad = (rot as f32).to_radians();
-                            
-                            paint_rotated_image(
-                                &painter,
-                                texture.id(),
-                                rect,
-                                rot_rad,
-                                opacity,
-                            );
-                            
+
+                            paint_rotated_image(&painter, texture.id(), rect, rot_rad, opacity);
+
                             // Selection highlight outline
-                            if self.selection.contains(&layer.id) || self.selection.contains(&primary_id) {
+                            if self.selection.contains(&layer.id)
+                                || self.selection.contains(&primary_id)
+                            {
                                 let mut points = [
                                     rect.left_top(),
                                     rect.right_top(),
@@ -10470,7 +10509,8 @@ fn run_video_decode_thread(
                                         *pt = center + egui::vec2(rx, ry);
                                     }
                                 }
-                                let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 215));
+                                let stroke =
+                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 215));
                                 painter.line_segment([points[0], points[1]], stroke);
                                 painter.line_segment([points[1], points[2]], stroke);
                                 painter.line_segment([points[2], points[3]], stroke);
@@ -10487,7 +10527,10 @@ fn run_video_decode_thread(
                             self.project.document.height as f32,
                         );
                         let shade_time = ctx.input(|i| i.time) as f32;
-                        let gpu = self.gpu_shading.then(|| self.wgpu_render.as_ref()).flatten();
+                        let gpu = self
+                            .gpu_shading
+                            .then(|| self.wgpu_render.as_ref())
+                            .flatten();
                         if let Some(rs) = gpu {
                             if crate::shading::shading_passes_need_input(&layer.shading_passes) {
                                 let view = io::default_document_view(&self.project);
@@ -10600,8 +10643,9 @@ fn run_video_decode_thread(
                                                     eval.hue_shift,
                                                     eval.blur_px
                                                 );
-                                                let pos =
-                                                    self.viewport.doc_to_screen((12.0, 28.0), origin);
+                                                let pos = self
+                                                    .viewport
+                                                    .doc_to_screen((12.0, 28.0), origin);
                                                 painter.text(
                                                     pos,
                                                     egui::Align2::LEFT_TOP,
@@ -10615,11 +10659,11 @@ fn run_video_decode_thread(
                                 }
                                 crate::document::GraphImageSource::BakedCache { key } => {
                                     // Spatial FX bake (CV materialize). Warmed via ensure_graph_bake_texture.
-                                    if let Some(tex_id) = self.graph_preview_textures.texture_id(key) {
-                                        let (dx, dy, w, h, rot_rad) = layer.ne_output_paint_geom(
-                                            &self.project.nodes,
-                                            &eval,
-                                        );
+                                    if let Some(tex_id) =
+                                        self.graph_preview_textures.texture_id(key)
+                                    {
+                                        let (dx, dy, w, h, rot_rad) =
+                                            layer.ne_output_paint_geom(&self.project.nodes, &eval);
                                         let mut layer_opacity = layer
                                             .ne_output_proxy
                                             .and_then(|pid| self.project.nodes.get(pid))
@@ -10629,19 +10673,16 @@ fn run_video_decode_thread(
                                             if let Some(track) =
                                                 self.project.anim_timeline.nodes.get(&pid)
                                             {
-                                                if let Some(o) = track
-                                                    .opacity
-                                                    .interpolate(self.playback.frame)
+                                                if let Some(o) =
+                                                    track.opacity.interpolate(self.playback.frame)
                                                 {
                                                     layer_opacity = o as f32;
                                                 }
                                             }
                                         }
                                         let tl = self.viewport.doc_to_screen((dx, dy), origin);
-                                        let br = self.viewport.doc_to_screen(
-                                            (dx + w, dy + h),
-                                            origin,
-                                        );
+                                        let br =
+                                            self.viewport.doc_to_screen((dx + w, dy + h), origin);
                                         let rect = egui::Rect::from_min_max(tl, br);
                                         let mirror = eval.geo_mirror.round() as i32;
                                         let mul = layer_opacity.clamp(0.0, 1.0);
@@ -10674,10 +10715,8 @@ fn run_video_decode_thread(
                                     {
                                         // P6b: paint exactly the Output Object rect (user-resizable).
                                         // Full-frame UV unless a Zoom node is in the graph chain.
-                                        let (dx, dy, w, h, rot_rad) = layer.ne_output_paint_geom(
-                                            &self.project.nodes,
-                                            &eval,
-                                        );
+                                        let (dx, dy, w, h, rot_rad) =
+                                            layer.ne_output_paint_geom(&self.project.nodes, &eval);
                                         let mut layer_opacity = layer
                                             .ne_output_proxy
                                             .and_then(|pid| self.project.nodes.get(pid))
@@ -10688,19 +10727,16 @@ fn run_video_decode_thread(
                                             if let Some(track) =
                                                 self.project.anim_timeline.nodes.get(&pid)
                                             {
-                                                if let Some(o) = track
-                                                    .opacity
-                                                    .interpolate(self.playback.frame)
+                                                if let Some(o) =
+                                                    track.opacity.interpolate(self.playback.frame)
                                                 {
                                                     layer_opacity = o as f32;
                                                 }
                                             }
                                         }
                                         let tl = self.viewport.doc_to_screen((dx, dy), origin);
-                                        let br = self.viewport.doc_to_screen(
-                                            (dx + w, dy + h),
-                                            origin,
-                                        );
+                                        let br =
+                                            self.viewport.doc_to_screen((dx + w, dy + h), origin);
                                         let rect = egui::Rect::from_min_max(tl, br);
                                         let mirror = eval.geo_mirror.round() as i32;
                                         // Brightness-only: free vertex tint (Param anim does not rebake).
@@ -10930,15 +10966,21 @@ fn run_video_decode_thread(
                                 if l.kind == crate::document::LayerKind::AV {
                                     let mut dx = l.x as f64;
                                     let mut dy = l.y as f64;
-                                    if let Some(track) = self.project.anim_timeline.nodes.get(&l.id) {
-                                        if let Some(x) = track.pos_x.interpolate(self.playback.frame) {
+                                    if let Some(track) = self.project.anim_timeline.nodes.get(&l.id)
+                                    {
+                                        if let Some(x) =
+                                            track.pos_x.interpolate(self.playback.frame)
+                                        {
                                             dx = x;
                                         }
-                                        if let Some(y) = track.pos_y.interpolate(self.playback.frame) {
+                                        if let Some(y) =
+                                            track.pos_y.interpolate(self.playback.frame)
+                                        {
                                             dy = y;
                                         }
                                     }
-                                    let t_sec = self.playback.frame as f32 / self.playback.fps as f32;
+                                    let t_sec =
+                                        self.playback.frame as f32 / self.playback.fps as f32;
                                     let mut l_clips = l.clone();
                                     l_clips.ensure_av_clips();
                                     let primary_id = l
@@ -10953,21 +10995,34 @@ fn run_video_decode_thread(
                                         })
                                         .unwrap_or(l.id);
 
-                                    let aspect = self.video_layers.get(&primary_id)
+                                    let aspect = self
+                                        .video_layers
+                                        .get(&primary_id)
                                         .or_else(|| self.video_layers.get(&l.id))
                                         .and_then(|s| s.texture.as_ref())
                                         .map(|tex| {
                                             let tex_w = tex.size()[0] as f32;
                                             let tex_h = tex.size()[1] as f32;
-                                            if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                            if tex_h > 0.0 {
+                                                (tex_w / tex_h) as f64
+                                            } else {
+                                                1.0
+                                            }
                                         })
                                         .or_else(|| {
-                                            self.video_frame_cache.as_ref()
-                                                .filter(|c| c.layer_id == primary_id || c.layer_id == l.id)
+                                            self.video_frame_cache
+                                                .as_ref()
+                                                .filter(|c| {
+                                                    c.layer_id == primary_id || c.layer_id == l.id
+                                                })
                                                 .map(|c| {
                                                     let tex_w = c.texture.size()[0] as f32;
                                                     let tex_h = c.texture.size()[1] as f32;
-                                                    if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                                    if tex_h > 0.0 {
+                                                        (tex_w / tex_h) as f64
+                                                    } else {
+                                                        1.0
+                                                    }
                                                 })
                                         })
                                         .unwrap_or(1.0);
@@ -10983,7 +11038,11 @@ fn run_video_decode_thread(
                                     let tl = self.viewport.doc_to_screen((dx, dy), origin);
                                     let br = self.viewport.doc_to_screen((dx + w, dy + h), origin);
                                     let sr = egui::Rect::from_min_max(tl, br);
-                                    render::draw_transform_handles(&painter, sr, self.tools.select.select_rotation_mode);
+                                    render::draw_transform_handles(
+                                        &painter,
+                                        sr,
+                                        self.tools.select.select_rotation_mode,
+                                    );
                                 }
                             }
                         }
@@ -11040,16 +11099,23 @@ fn run_video_decode_thread(
                 }
             }
 
-            let is_flowchart_layer = self.project.document.layers
+            let is_flowchart_layer = self
+                .project
+                .document
+                .layers
                 .get(self.project.document.active_layer_index)
                 .map_or(false, |l| l.kind == crate::document::LayerKind::Flowchart);
 
-            if is_flowchart_layer && (
-                self.tools.active == ToolKind::Line
-                || self.tools.active == ToolKind::Node
-                || self.tools.drag_shape.as_ref().map_or(false, |d| d.kind == Some(ToolKind::Line))
-                || self.tools.select.node_drag_active
-            ) {
+            if is_flowchart_layer
+                && (self.tools.active == ToolKind::Line
+                    || self.tools.active == ToolKind::Node
+                    || self
+                        .tools
+                        .drag_shape
+                        .as_ref()
+                        .map_or(false, |d| d.kind == Some(ToolKind::Line))
+                    || self.tools.select.node_drag_active)
+            {
                 let active_idx = self.project.document.active_layer_index;
                 if let Some(layer) = self.project.document.layers.get(active_idx) {
                     let store = &self.project.nodes;
@@ -11057,12 +11123,30 @@ fn run_video_decode_thread(
                     let fill_color = egui::Color32::from_rgb(220, 240, 255);
                     for &nid in &layer.nodes {
                         if let Some(nd) = store.get(nid) {
-                            if let Some(geom) = crate::document::flowchart::node_as_flowchart_geom(&nd.kind) {
+                            if let Some(geom) =
+                                crate::document::flowchart::node_as_flowchart_geom(&nd.kind)
+                            {
                                 let sides = [
-                                    crate::document::flowchart::FlowchartAnchor::edge(crate::document::flowchart::FlowchartEdgeSide::Top, 0, 1),
-                                    crate::document::flowchart::FlowchartAnchor::edge(crate::document::flowchart::FlowchartEdgeSide::Bottom, 0, 1),
-                                    crate::document::flowchart::FlowchartAnchor::edge(crate::document::flowchart::FlowchartEdgeSide::Left, 0, 1),
-                                    crate::document::flowchart::FlowchartAnchor::edge(crate::document::flowchart::FlowchartEdgeSide::Right, 0, 1),
+                                    crate::document::flowchart::FlowchartAnchor::edge(
+                                        crate::document::flowchart::FlowchartEdgeSide::Top,
+                                        0,
+                                        1,
+                                    ),
+                                    crate::document::flowchart::FlowchartAnchor::edge(
+                                        crate::document::flowchart::FlowchartEdgeSide::Bottom,
+                                        0,
+                                        1,
+                                    ),
+                                    crate::document::flowchart::FlowchartAnchor::edge(
+                                        crate::document::flowchart::FlowchartEdgeSide::Left,
+                                        0,
+                                        1,
+                                    ),
+                                    crate::document::flowchart::FlowchartAnchor::edge(
+                                        crate::document::flowchart::FlowchartEdgeSide::Right,
+                                        0,
+                                        1,
+                                    ),
                                 ];
                                 for anc in sides {
                                     let doc_pos = geom.anchor_position(anc);
@@ -11075,7 +11159,9 @@ fn run_video_decode_thread(
                 }
             }
 
-            if self.action_tab == crate::action_tab::ActionTab::ColorStroke && self.selection.len() == 1 {
+            if self.action_tab == crate::action_tab::ActionTab::ColorStroke
+                && self.selection.len() == 1
+            {
                 if let Some(id) = self.selection.first() {
                     if let Some(node) = self.project.nodes.get(*id) {
                         let bounds = node.bounds();
@@ -11135,32 +11221,44 @@ fn run_video_decode_thread(
                 let ctrl_angle = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command);
                 match drag.kind {
                     Some(ToolKind::Rectangle) | Some(ToolKind::Plotter) => {
-                        let (x, y, w, h) =
-                            tools::normalize_rect(drag.origin_doc, drag.current_doc);
+                        let (x, y, w, h) = tools::normalize_rect(drag.origin_doc, drag.current_doc);
                         render::draw_preview_rect(&painter, &self.viewport, origin, x, y, w, h);
                     }
                     Some(ToolKind::Circle) => {
-                        let (x, y, w, h) =
-                            tools::normalize_rect(drag.origin_doc, drag.current_doc);
+                        let (x, y, w, h) = tools::normalize_rect(drag.origin_doc, drag.current_doc);
                         let side = w.min(h);
                         let cx = x + w / 2.0;
                         let cy = y + h / 2.0;
                         let r = side / 2.0;
                         render::draw_preview_ellipse(
-                            &painter, &self.viewport, origin, cx, cy, r, r,
+                            &painter,
+                            &self.viewport,
+                            origin,
+                            cx,
+                            cy,
+                            r,
+                            r,
                         );
                     }
                     Some(ToolKind::Ellipse) | Some(ToolKind::Arc) => {
-                        let (x, y, w, h) =
-                            tools::normalize_rect(drag.origin_doc, drag.current_doc);
+                        let (x, y, w, h) = tools::normalize_rect(drag.origin_doc, drag.current_doc);
                         let cx = x + w / 2.0;
                         let cy = y + h / 2.0;
                         render::draw_preview_ellipse(
-                            &painter, &self.viewport, origin, cx, cy, w / 2.0, h / 2.0,
+                            &painter,
+                            &self.viewport,
+                            origin,
+                            cx,
+                            cy,
+                            w / 2.0,
+                            h / 2.0,
                         );
                     }
                     Some(ToolKind::Line) => {
-                        let is_flowchart = self.project.document.layers
+                        let is_flowchart = self
+                            .project
+                            .document
+                            .layers
                             .get(self.project.document.active_layer_index)
                             .map_or(false, |l| l.kind == crate::document::LayerKind::Flowchart);
                         if is_flowchart {
@@ -11184,11 +11282,19 @@ fn run_video_decode_thread(
 
                                 for &nid in &layer.nodes {
                                     if let Some(nd) = store.get(nid) {
-                                        if let Some(geom) = crate::document::flowchart::node_as_flowchart_geom(&nd.kind) {
+                                        if let Some(geom) =
+                                            crate::document::flowchart::node_as_flowchart_geom(
+                                                &nd.kind,
+                                            )
+                                        {
                                             // For start
-                                            let anc_s = crate::document::flowchart::snap_anchor_for_point(&geom, origin_pt);
+                                            let anc_s =
+                                                crate::document::flowchart::snap_anchor_for_point(
+                                                    &geom, origin_pt,
+                                                );
                                             let ap_s = geom.anchor_position(anc_s);
-                                            let ds = (ap_s.0 - origin_pt.0).hypot(ap_s.1 - origin_pt.1);
+                                            let ds =
+                                                (ap_s.0 - origin_pt.0).hypot(ap_s.1 - origin_pt.1);
                                             if ds < best_start_d {
                                                 start_node = Some(nid);
                                                 start_anchor = Some(anc_s);
@@ -11197,9 +11303,13 @@ fn run_video_decode_thread(
                                             }
 
                                             // For end
-                                            let anc_e = crate::document::flowchart::snap_anchor_for_point(&geom, current_pt);
+                                            let anc_e =
+                                                crate::document::flowchart::snap_anchor_for_point(
+                                                    &geom, current_pt,
+                                                );
                                             let ap_e = geom.anchor_position(anc_e);
-                                            let de = (ap_e.0 - current_pt.0).hypot(ap_e.1 - current_pt.1);
+                                            let de = (ap_e.0 - current_pt.0)
+                                                .hypot(ap_e.1 - current_pt.1);
                                             if de < best_end_d {
                                                 end_node = Some(nid);
                                                 end_anchor = Some(anc_e);
@@ -11220,11 +11330,26 @@ fn run_video_decode_thread(
                                     corner_radius: 12.0,
                                 };
 
-                                let exclude: Vec<_> = [path_data.start_node, path_data.end_node].iter().filter_map(|x| *x).collect();
-                                let obstacles = crate::document::flowchart::flowchart_routing_obstacles(store, &layer.nodes, &exclude);
-                                crate::document::flowchart::sync_flowchart_path_endpoints(&mut path_data, store, &obstacles);
+                                let exclude: Vec<_> = [path_data.start_node, path_data.end_node]
+                                    .iter()
+                                    .filter_map(|x| *x)
+                                    .collect();
+                                let obstacles =
+                                    crate::document::flowchart::flowchart_routing_obstacles(
+                                        store,
+                                        &layer.nodes,
+                                        &exclude,
+                                    );
+                                crate::document::flowchart::sync_flowchart_path_endpoints(
+                                    &mut path_data,
+                                    store,
+                                    &obstacles,
+                                );
 
-                                let bez = crate::document::flowchart::rounded_orthogonal_bez(&path_data.points, path_data.corner_radius);
+                                let bez = crate::document::flowchart::rounded_orthogonal_bez(
+                                    &path_data.points,
+                                    path_data.corner_radius,
+                                );
                                 render::draw_preview_bezier(&painter, &self.viewport, origin, &bez);
                             }
                         } else {
@@ -11243,8 +11368,7 @@ fn run_video_decode_thread(
                         }
                     }
                     Some(ToolKind::Polygon) => {
-                        let (x, y, w, h) =
-                            tools::normalize_rect(drag.origin_doc, drag.current_doc);
+                        let (x, y, w, h) = tools::normalize_rect(drag.origin_doc, drag.current_doc);
                         let side = w.min(h);
                         let cx = x + w / 2.0;
                         let cy = y + h / 2.0;
@@ -11311,8 +11435,7 @@ fn run_video_decode_thread(
                 } else {
                     match &self.build_brush_fill() {
                         Fill::Solid(p) => p.to_egui(),
-                        Fill::LinearGradient { stops, .. }
-                        | Fill::RadialGradient { stops, .. } => {
+                        Fill::LinearGradient { stops, .. } | Fill::RadialGradient { stops, .. } => {
                             if let Some(s) = stops.first() {
                                 s.color.to_egui()
                             } else {
@@ -11375,12 +11498,7 @@ fn run_video_decode_thread(
 
             // Weight flow brush cursor (path sculpt)
             if self.tools.weight_flow.enabled {
-                if let Some(doc) = self
-                    .tools
-                    .weight_flow
-                    .cursor_doc
-                    .or(self.cursor_doc)
-                {
+                if let Some(doc) = self.tools.weight_flow.cursor_doc.or(self.cursor_doc) {
                     render::draw_weight_flow_cursor(
                         &painter,
                         &self.viewport,
@@ -11400,7 +11518,7 @@ fn run_video_decode_thread(
             let x = rect.center().x;
             let y = rect.max.y - 80.0;
             let overlay_pos = egui::pos2(x, y);
-            
+
             egui::Area::new(egui::Id::new("path_drawing_overlay"))
                 .fixed_pos(overlay_pos)
                 .pivot(egui::Align2::CENTER_CENTER)
@@ -11417,9 +11535,9 @@ fn run_video_decode_thread(
                                         egui::RichText::new("✔")
                                             .color(egui::Color32::from_rgb(0, 230, 118))
                                             .strong()
-                                            .size(20.0)
+                                            .size(20.0),
                                     )
-                                    .frame(false)
+                                    .frame(false),
                                 );
                                 if tick_btn.clicked() {
                                     pen_finished = true;
@@ -11433,9 +11551,9 @@ fn run_video_decode_thread(
                                         egui::RichText::new("✖")
                                             .color(egui::Color32::from_rgb(255, 23, 68))
                                             .strong()
-                                            .size(20.0)
+                                            .size(20.0),
                                     )
-                                    .frame(false)
+                                    .frame(false),
                                 );
                                 if cross_btn.clicked() {
                                     pen_cancelled = true;
@@ -11461,15 +11579,22 @@ fn run_video_decode_thread(
     }
 
     fn handle_canvas_input(&mut self, response: &egui::Response, origin: Pos2) {
-        if self.tools.active == ToolKind::Eyedropper || self.eyedropper_holding || self.eyedropper_releasing {
+        if self.tools.active == ToolKind::Eyedropper
+            || self.eyedropper_holding
+            || self.eyedropper_releasing
+        {
             let hover_pos = response.ctx.input(|i| i.pointer.hover_pos());
-            let primary_pressed = response.ctx.input(|i| {
-                i.pointer.button_pressed(egui::PointerButton::Primary)
-            }) && response.contains_pointer();
-            let primary_down = response.is_pointer_button_down_on() || response.ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-            let primary_released_anywhere = response.ctx.input(|i| {
-                i.pointer.button_released(egui::PointerButton::Primary)
-            });
+            let primary_pressed = response
+                .ctx
+                .input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+                && response.contains_pointer();
+            let primary_down = response.is_pointer_button_down_on()
+                || response
+                    .ctx
+                    .input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            let primary_released_anywhere = response
+                .ctx
+                .input(|i| i.pointer.button_released(egui::PointerButton::Primary));
 
             let doc_pos = if let Some(hpos) = hover_pos {
                 let mut d = self.viewport.screen_to_doc(hpos, origin);
@@ -11527,15 +11652,17 @@ fn run_video_decode_thread(
         self.update_cursor_doc_from_pointer(&response.ctx, response);
         self.live_snap_guides.clear();
         let primary_down = response.is_pointer_button_down_on();
-        let primary_pressed = response.ctx.input(|i| {
-            i.pointer.button_pressed(egui::PointerButton::Primary)
-        }) && response.contains_pointer();
-        let primary_released = response.ctx.input(|i| {
-            i.pointer.button_released(egui::PointerButton::Primary)
-        }) && response.contains_pointer();
-        let primary_released_anywhere = response.ctx.input(|i| {
-            i.pointer.button_released(egui::PointerButton::Primary)
-        });
+        let primary_pressed = response
+            .ctx
+            .input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+            && response.contains_pointer();
+        let primary_released = response
+            .ctx
+            .input(|i| i.pointer.button_released(egui::PointerButton::Primary))
+            && response.contains_pointer();
+        let primary_released_anywhere = response
+            .ctx
+            .input(|i| i.pointer.button_released(egui::PointerButton::Primary));
         let double_clicked = response.double_clicked()
             || (response.contains_pointer()
                 && response.ctx.input(|i| {
@@ -11635,7 +11762,9 @@ fn run_video_decode_thread(
             | ToolKind::Polygon
             | ToolKind::Arc
             | ToolKind::Plotter => {
-                let ctrl = response.ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                let ctrl = response
+                    .ctx
+                    .input(|i| i.modifiers.ctrl || i.modifiers.command);
                 self.tool_drag_shape(doc_snapped, primary_down, primary_released, ctrl);
             }
             ToolKind::Pen => {
@@ -11786,7 +11915,8 @@ fn run_video_decode_thread(
             if let Some(target) = self.tools.select.node_edit_target {
                 if let Some(&(id, _)) = self.tools.select.drag_snapshot.first() {
                     if self.tools.select.selected_path_points.len() <= 1 {
-                        self.tools.select
+                        self.tools
+                            .select
                             .set_single_path_point(id, target.anchor_index());
                     }
                 }
@@ -11848,7 +11978,9 @@ fn run_video_decode_thread(
                     None
                 };
                 if let Some(mut p) = path_data {
-                    crate::document::flowchart::sync_flowchart_path_endpoints(&mut p, store, &obstacles);
+                    crate::document::flowchart::sync_flowchart_path_endpoints(
+                        &mut p, store, &obstacles,
+                    );
                     if let Some(node) = store.get_mut(nid) {
                         if let crate::document::NodeKind::FlowchartPath { path } = &mut node.kind {
                             *path = p;
@@ -12162,12 +12294,11 @@ fn run_video_decode_thread(
         let mut reset_audio_reason: Option<String> = None;
 
         // Drain any legacy prepare threads (no longer started for NE stream path).
-        self.audio_prepare_rx.retain(|clip_id, rx| {
-            match rx.try_recv() {
+        self.audio_prepare_rx
+            .retain(|clip_id, rx| match rx.try_recv() {
                 Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
                 Err(std::sync::mpsc::TryRecvError::Empty) => active_clip_ids.contains(clip_id),
-            }
-        });
+            });
 
         for &clip_id in &active_clip_ids {
             let Some(&(ref media_path, start, start_offset, volume, _bass, play_rate)) =
@@ -12234,8 +12365,8 @@ fn run_video_decode_thread(
                     player.set_volume(volume);
                     player.play();
                     // Advance tracked pos with wall clock estimate so small skips don't seek.
-                    let est = last_pos
-                        + (1.0 / self.playback.fps.max(1) as f32) * play_rate.max(0.05);
+                    let est =
+                        last_pos + (1.0 / self.playback.fps.max(1) as f32) * play_rate.max(0.05);
                     // Blend toward desired file_pos gently.
                     let blended = est * 0.7 + file_pos * 0.3;
                     self.audio_player_last_file_pos.insert(clip_id, blended);
@@ -12325,15 +12456,12 @@ fn run_video_decode_thread(
                     if let Ok(map) = self.audio_extract_status.lock() {
                         match map.get(media_path) {
                             Some(AudioExtractStatus::Extracting { progress }) => {
-                                self.status_message = format!(
-                                    "Extracting video audio… {:.0}%",
-                                    progress * 100.0
-                                );
+                                self.status_message =
+                                    format!("Extracting video audio… {:.0}%", progress * 100.0);
                             }
                             Some(AudioExtractStatus::Failed) => {
                                 self.status_message =
-                                    "Audio extract failed (no track or FFmpeg/libav issue)"
-                                        .into();
+                                    "Audio extract failed (no track or FFmpeg/libav issue)".into();
                             }
                             Some(AudioExtractStatus::Ready(p)) if !p.is_file() => {
                                 // Stale Ready — clear so extract can run again.
@@ -12343,8 +12471,7 @@ fn run_video_decode_thread(
                                 }
                             }
                             _ => {
-                                self.status_message =
-                                    "Preparing audio…".into();
+                                self.status_message = "Preparing audio…".into();
                             }
                         }
                     }
@@ -12436,11 +12563,23 @@ fn run_video_decode_thread(
             }
             let p = anchors[corner_idx];
             // prev leg
-            let prev = if corner_idx > 0 { corner_idx - 1 } else if path.is_closed() && n > 2 { n-1 } else { return };
+            let prev = if corner_idx > 0 {
+                corner_idx - 1
+            } else if path.is_closed() && n > 2 {
+                n - 1
+            } else {
+                return;
+            };
             let pa = anchors[prev];
             let len_prev = ((p.0 - pa.0).powi(2) + (p.1 - pa.1).powi(2)).sqrt();
             // next leg
-            let next = if corner_idx + 1 < n { corner_idx + 1 } else if path.is_closed() && n > 2 { 0 } else { return };
+            let next = if corner_idx + 1 < n {
+                corner_idx + 1
+            } else if path.is_closed() && n > 2 {
+                0
+            } else {
+                return;
+            };
             let pb = anchors[next];
             let len_next = ((p.0 - pb.0).powi(2) + (p.1 - pb.1).powi(2)).sqrt();
             let d = 0.10 * len_prev.min(len_next).max(1.0);
@@ -12461,10 +12600,13 @@ fn run_video_decode_thread(
             ProjectEdit::PatchNode { id, before, after },
         );
         self.tools.select.selected_path_points.clear();
-        self.tools.select.selected_path_points.push((id, corner_idx));
+        self.tools
+            .select
+            .selected_path_points
+            .push((id, corner_idx));
         self.tools.select.selected_path_segment = None;
         self.tools.select.node_edit_target = Some(PathEditTarget::Anchor(corner_idx));
-        self.promote_action_tab( crate::action_tab::ActionTab::Geometry);
+        self.promote_action_tab(crate::action_tab::ActionTab::Geometry);
         self.status_message = "Corner curve enabled (two yellow points on legs)".into();
     }
 
@@ -12621,7 +12763,13 @@ fn run_video_decode_thread(
     }
 
     fn get_tiling_gizmo_points(&self, id: NodeId) -> Option<[(f64, f64); 3]> {
-        if let Some(e) = self.project.document.tiling_effects.values().find(|e| e.source_id == id) {
+        if let Some(e) = self
+            .project
+            .document
+            .tiling_effects
+            .values()
+            .find(|e| e.source_id == id)
+        {
             if let Some(node) = self.project.nodes.get(id) {
                 let b = node.bounds();
                 let p0 = (b.x0 + e.offset_x, b.y0 + e.offset_y);
@@ -12634,7 +12782,13 @@ fn run_video_decode_thread(
     }
 
     fn get_circular_gizmo_points(&self, id: NodeId) -> Option<[(f64, f64); 3]> {
-        if let Some(e) = self.project.document.circular_effects.values().find(|e| e.source_id == id) {
+        if let Some(e) = self
+            .project
+            .document
+            .circular_effects
+            .values()
+            .find(|e| e.source_id == id)
+        {
             // 0 = base (first instance on ring), 1 = origin (center), 2 = angle tip (next copy).
             let p0 = (e.base_x, e.base_y);
             let p1 = (e.origin_x, e.origin_y);
@@ -12646,12 +12800,7 @@ fn run_video_decode_thread(
 
     /// Hit circular gizmo in **screen space** (handles stay easy to grab at any zoom).
     /// Returns handle index: 0 base, 1 origin, 2 angle tip; or None.
-    fn hit_circular_gizmo(
-        &self,
-        id: NodeId,
-        screen: Pos2,
-        origin: Pos2,
-    ) -> Option<usize> {
+    fn hit_circular_gizmo(&self, id: NodeId, screen: Pos2, origin: Pos2) -> Option<usize> {
         let pts = self.get_circular_gizmo_points(id)?;
         let slop = 14.0_f32; // px
         // Prefer points over lines (check closest point first).
@@ -12732,14 +12881,20 @@ fn run_video_decode_thread(
             e.base_y += dy;
             e.origin_x += dx;
             e.origin_y += dy;
-            e.radius = (e.base_x - e.origin_x).hypot(e.base_y - e.origin_y).max(1.0);
+            e.radius = (e.base_x - e.origin_x)
+                .hypot(e.base_y - e.origin_y)
+                .max(1.0);
         }
     }
 
-    fn build_on_path_effect(&self, effect_id: uuid::Uuid, source_id: NodeId, path_id: NodeId) -> ObjectOnPathEffect {
+    fn build_on_path_effect(
+        &self,
+        effect_id: uuid::Uuid,
+        source_id: NodeId,
+        path_id: NodeId,
+    ) -> ObjectOnPathEffect {
         let gap = if self.ui_on_path_mode == OnPathMode::Loft {
-            self
-                .project
+            self.project
                 .nodes
                 .get(source_id)
                 .map(default_loft_gap_for_node)
@@ -12937,7 +13092,11 @@ fn run_video_decode_thread(
     }
 
     fn node_has_tiling_or_circular(&self, id: NodeId) -> bool {
-        self.project.document.tiling_effects.values().any(|e| e.source_id == id)
+        self.project
+            .document
+            .tiling_effects
+            .values()
+            .any(|e| e.source_id == id)
             || self
                 .project
                 .document
@@ -12951,13 +13110,7 @@ fn run_video_decode_thread(
     }
 
     /// Hit-test including circular/tiling placement footprints (not only source bbox).
-    fn hit_test_node_for_pick(
-        &self,
-        id: NodeId,
-        node: &Node,
-        doc: (f64, f64),
-        slop: f64,
-    ) -> bool {
+    fn hit_test_node_for_pick(&self, id: NodeId, node: &Node, doc: (f64, f64), slop: f64) -> bool {
         if let Some(e) = self
             .project
             .document
@@ -12979,13 +13132,7 @@ fn run_video_decode_thread(
         node.hit_test_with_store(&self.project.nodes, doc.0, doc.1, slop)
     }
 
-    fn precise_hit_for_pick(
-        &self,
-        id: NodeId,
-        node: &Node,
-        doc: (f64, f64),
-        slop: f64,
-    ) -> bool {
+    fn precise_hit_for_pick(&self, id: NodeId, node: &Node, doc: (f64, f64), slop: f64) -> bool {
         if self
             .project
             .document
@@ -13040,9 +13187,10 @@ fn run_video_decode_thread(
             }
             let effect_id = uuid::Uuid::new_v4();
             let mut effect = self.build_on_path_effect(effect_id, *source_id, path_id);
-            let form_node = self.project.nodes.get(*source_id).and_then(|source| {
-                build_path_effect_form_node(source, &effect, &path_data, tol)
-            });
+            let form_node =
+                self.project.nodes.get(*source_id).and_then(|source| {
+                    build_path_effect_form_node(source, &effect, &path_data, tol)
+                });
             if let Some(ref form) = form_node {
                 effect.form_node_id = Some(form.id);
             }
@@ -13159,18 +13307,10 @@ fn run_video_decode_thread(
                 .document
                 .path_effects
                 .insert(existing.id, effect.clone());
-            if let (Some(fid), Some(source)) = (
-                form_id,
-                self.project.nodes.get(source_id).cloned(),
-            ) {
+            if let (Some(fid), Some(source)) = (form_id, self.project.nodes.get(source_id).cloned())
+            {
                 if let Some(form) = self.project.nodes.get_mut(fid) {
-                    sync_path_effect_form_geometry(
-                        form,
-                        &source,
-                        &effect,
-                        &path_data,
-                        tol,
-                    );
+                    sync_path_effect_form_geometry(form, &source, &effect, &path_data, tol);
                 }
             }
         }
@@ -13179,7 +13319,14 @@ fn run_video_decode_thread(
     pub fn update_tiling_effects_live(&mut self) {
         let objs = self.selection_tiling_circular_sources();
         for oid in objs {
-            if let Some(existing) = self.project.document.tiling_effects.values().find(|e| e.source_id == oid).cloned() {
+            if let Some(existing) = self
+                .project
+                .document
+                .tiling_effects
+                .values()
+                .find(|e| e.source_id == oid)
+                .cloned()
+            {
                 let mut effect = existing;
                 effect.count_y = self.ui_tiling_rows;
                 effect.count_x = self.ui_tiling_cols;
@@ -13191,7 +13338,10 @@ fn run_video_decode_thread(
                 effect.col_scale = self.ui_tiling_col_scale;
                 effect.gap_x = self.ui_tiling_gap_x;
                 effect.gap_y = self.ui_tiling_gap_y;
-                self.project.document.tiling_effects.insert(effect.id, effect);
+                self.project
+                    .document
+                    .tiling_effects
+                    .insert(effect.id, effect);
             }
         }
     }
@@ -13199,14 +13349,24 @@ fn run_video_decode_thread(
     pub fn update_circular_effects_live(&mut self) {
         let objs = self.selection_tiling_circular_sources();
         for oid in objs {
-            if let Some(existing) = self.project.document.circular_effects.values().find(|e| e.source_id == oid).cloned() {
+            if let Some(existing) = self
+                .project
+                .document
+                .circular_effects
+                .values()
+                .find(|e| e.source_id == oid)
+                .cloned()
+            {
                 let mut effect = existing;
                 effect.copies = self.ui_circular_copies;
                 effect.angle_offset = self.ui_circular_angle_offset;
                 effect.origin_x = self.ui_circular_origin_x;
                 effect.origin_y = self.ui_circular_origin_y;
                 effect.rotate_mode = self.ui_circular_rotate_mode;
-                self.project.document.circular_effects.insert(effect.id, effect);
+                self.project
+                    .document
+                    .circular_effects
+                    .insert(effect.id, effect);
             }
         }
     }
@@ -13350,27 +13510,29 @@ fn run_video_decode_thread(
         self.history
             .push(&mut self.project, ProjectEdit::InsertNode { node: group });
         self.selection = vec![group_id];
-        self.status_message = format!(
-            "Baked {} instance(s) into group",
-            child_ids.len()
-        );
+        self.status_message = format!("Baked {} instance(s) into group", child_ids.len());
     }
 
     pub fn apply_tiling_magic(&mut self) {
         let objects = self.selection_tiling_circular_sources();
         if objects.is_empty() {
-            self.status_message =
-                "Select path/circle/rect/ellipse/chord/… to apply Tiling".into();
+            self.status_message = "Select path/circle/rect/ellipse/chord/… to apply Tiling".into();
             return;
         }
         let before_doc = snapshot_document(&self.project.document);
         let mut after_doc = before_doc.clone();
         let mut created = vec![];
         for &source_id in &objects {
-            if after_doc.tiling_effects.values().any(|e| e.source_id == source_id) {
+            if after_doc
+                .tiling_effects
+                .values()
+                .any(|e| e.source_id == source_id)
+            {
                 continue;
             }
-            let Some(source) = self.project.nodes.get(source_id) else { continue; };
+            let Some(source) = self.project.nodes.get(source_id) else {
+                continue;
+            };
             let b = source.bounds();
             let w = (b.x1 - b.x0).abs().max(1.0);
             let h = (b.y1 - b.y0).abs().max(1.0);
@@ -13382,7 +13544,7 @@ fn run_video_decode_thread(
                 gap_y: h,
                 count_x: 3,
                 count_y: 3,
-                offset_x: 0.0,  // top-left offset for first
+                offset_x: 0.0, // top-left offset for first
                 offset_y: 0.0,
                 row_rotation: 0.0,
                 col_rotation: 0.0,
@@ -13410,9 +13572,15 @@ fn run_video_decode_thread(
         }
         self.history.push(
             &mut self.project,
-            ProjectEdit::PatchDocument { before: before_doc, after: after_doc },
+            ProjectEdit::PatchDocument {
+                before: before_doc,
+                after: after_doc,
+            },
         );
-        self.status_message = format!("Enabled Tiling for {} object(s). Use container to bake.", created.len());
+        self.status_message = format!(
+            "Enabled Tiling for {} object(s). Use container to bake.",
+            created.len()
+        );
     }
 
     pub fn apply_circular_clone_magic(&mut self) {
@@ -13426,10 +13594,16 @@ fn run_video_decode_thread(
         let mut after_doc = before_doc.clone();
         let mut created = vec![];
         for &source_id in &objects {
-            if after_doc.circular_effects.values().any(|e| e.source_id == source_id) {
+            if after_doc
+                .circular_effects
+                .values()
+                .any(|e| e.source_id == source_id)
+            {
                 continue;
             }
-            let Some(source) = self.project.nodes.get(source_id) else { continue; };
+            let Some(source) = self.project.nodes.get(source_id) else {
+                continue;
+            };
             let b = source.bounds();
             let ref_x = (b.x0 + b.x1) * 0.5;
             let ref_y = (b.y0 + b.y1) * 0.5;
@@ -13458,46 +13632,94 @@ fn run_video_decode_thread(
         }
         self.history.push(
             &mut self.project,
-            ProjectEdit::PatchDocument { before: before_doc, after: after_doc },
+            ProjectEdit::PatchDocument {
+                before: before_doc,
+                after: after_doc,
+            },
         );
-        self.status_message = format!("Enabled CircularClone for {} object(s). Use container to bake.", created.len());
+        self.status_message = format!(
+            "Enabled CircularClone for {} object(s). Use container to bake.",
+            created.len()
+        );
     }
 
     pub fn remove_tiling_effect(&mut self) {
-        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
+        let objs: Vec<NodeId> = self
+            .selection
+            .iter()
+            .filter(|&&id| {
+                self.project
+                    .nodes
+                    .get(id)
+                    .map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+            })
+            .cloned()
+            .collect();
         let before_doc = snapshot_document(&self.project.document);
         let mut after_doc = before_doc.clone();
         let mut removed = false;
         for oid in &objs {
-            let keys: Vec<_> = after_doc.tiling_effects.iter().filter(|(_, e)| e.source_id == *oid).map(|(k, _)| *k).collect();
+            let keys: Vec<_> = after_doc
+                .tiling_effects
+                .iter()
+                .filter(|(_, e)| e.source_id == *oid)
+                .map(|(k, _)| *k)
+                .collect();
             for k in keys {
                 after_doc.tiling_effects.swap_remove(&k);
                 removed = true;
             }
         }
-        if !removed { return; }
-        self.history.push(&mut self.project, ProjectEdit::PatchDocument { before: before_doc, after: after_doc });
+        if !removed {
+            return;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument {
+                before: before_doc,
+                after: after_doc,
+            },
+        );
         self.status_message = "Removed Tiling effect(s)".into();
     }
 
     pub fn remove_circular_effect(&mut self) {
-        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
+        let objs: Vec<NodeId> = self
+            .selection
+            .iter()
+            .filter(|&&id| {
+                self.project
+                    .nodes
+                    .get(id)
+                    .map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+            })
+            .cloned()
+            .collect();
         let before_doc = snapshot_document(&self.project.document);
         let mut after_doc = before_doc.clone();
         let mut removed = false;
         for oid in &objs {
-            let keys: Vec<_> = after_doc.circular_effects.iter().filter(|(_, e)| e.source_id == *oid).map(|(k, _)| *k).collect();
+            let keys: Vec<_> = after_doc
+                .circular_effects
+                .iter()
+                .filter(|(_, e)| e.source_id == *oid)
+                .map(|(k, _)| *k)
+                .collect();
             for k in keys {
                 after_doc.circular_effects.swap_remove(&k);
                 removed = true;
             }
         }
-        if !removed { return; }
-        self.history.push(&mut self.project, ProjectEdit::PatchDocument { before: before_doc, after: after_doc });
+        if !removed {
+            return;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument {
+                before: before_doc,
+                after: after_doc,
+            },
+        );
         self.status_message = "Removed CircularClone effect(s)".into();
     }
 
@@ -13526,9 +13748,7 @@ fn run_video_decode_thread(
     /// Classify pair for Path Magic: vector boolean vs image clip.
     /// When 3+ vector shapes are selected, still returns VectorBoolean for the first pair
     /// so the panel opens; multi-ops use [`Self::selection_booleanable_shapes`].
-    pub fn selection_boolean_mode(
-        &self,
-    ) -> Option<BooleanPairMode> {
+    pub fn selection_boolean_mode(&self) -> Option<BooleanPairMode> {
         let shapes = self.selection_booleanable_shapes();
         if shapes.len() >= 2 {
             return Some(BooleanPairMode::VectorBoolean {
@@ -13547,27 +13767,21 @@ fn run_video_decode_thread(
             return Some(BooleanPairMode::VectorBoolean { a, b });
         }
         if a_img && b_shape {
-            return Some(BooleanPairMode::ImageClip {
-                source: a,
-                mask: b,
-            });
+            return Some(BooleanPairMode::ImageClip { source: a, mask: b });
         }
         if b_img && a_shape {
-            return Some(BooleanPairMode::ImageClip {
-                source: b,
-                mask: a,
-            });
+            return Some(BooleanPairMode::ImageClip { source: b, mask: a });
         }
         None
     }
 
     pub fn selection_has_boolean_effect(&self) -> bool {
         self.selection.iter().any(|&id| {
-            self.project.document.boolean_effects.values().any(|e| {
-                e.a_id == id
-                    || e.b_id == id
-                    || e.result_node_id == Some(id)
-            })
+            self.project
+                .document
+                .boolean_effects
+                .values()
+                .any(|e| e.a_id == id || e.b_id == id || e.result_node_id == Some(id))
         })
     }
 
@@ -13617,16 +13831,23 @@ fn run_video_decode_thread(
         }
         let a = shapes[0];
         let b = shapes[1];
-        if self.project.document.boolean_effects.values().any(|e| {
-            (e.a_id == a && e.b_id == b) || (e.a_id == b && e.b_id == a)
-        }) {
+        if self
+            .project
+            .document
+            .boolean_effects
+            .values()
+            .any(|e| (e.a_id == a && e.b_id == b) || (e.a_id == b && e.b_id == a))
+        {
             return;
         }
-        let Some(na) = self.project.nodes.get(a).cloned() else { return };
-        let Some(nb) = self.project.nodes.get(b).cloned() else { return };
+        let Some(na) = self.project.nodes.get(a).cloned() else {
+            return;
+        };
+        let Some(nb) = self.project.nodes.get(b).cloned() else {
+            return;
+        };
         let Some(bez) = compute_boolean_bez(&na, &nb, self.ui_boolean_op, 0.75) else {
-            self.status_message =
-                "Boolean failed (could not convert shapes to polygons)".into();
+            self.status_message = "Boolean failed (could not convert shapes to polygons)".into();
             return;
         };
         let empty = bez.elements().is_empty();
@@ -13642,7 +13863,12 @@ fn run_video_decode_thread(
                     p.close_path();
                     p
                 },
-                format!("{} {} {} (empty)", na.name, self.ui_boolean_op.label(), nb.name),
+                format!(
+                    "{} {} {} (empty)",
+                    na.name,
+                    self.ui_boolean_op.label(),
+                    nb.name
+                ),
             )
         } else {
             Node::path_from_bez(
@@ -13659,7 +13885,11 @@ fn run_video_decode_thread(
         let mut after = before.clone();
         let result_id = after.nodes.insert(result);
         // Put result on active layer
-        if let Some(layer) = after.document.layers.get_mut(after.document.active_layer_index) {
+        if let Some(layer) = after
+            .document
+            .layers
+            .get_mut(after.document.active_layer_index)
+        {
             if !layer.nodes.contains(&result_id) {
                 layer.nodes.push(result_id);
             }
@@ -13679,11 +13909,7 @@ fn run_video_decode_thread(
             ProjectEdit::SetDocument { before, after },
         );
         // Select operands when empty (result is invisible); else select result.
-        self.selection = if empty {
-            vec![a, b]
-        } else {
-            vec![result_id]
-        };
+        self.selection = if empty { vec![a, b] } else { vec![result_id] };
         self.status_message = if empty {
             format!(
                 "Boolean {} applied (empty — move A/B so they overlap)",
@@ -13734,7 +13960,11 @@ fn run_video_decode_thread(
         let before = snapshot_project(&self.project);
         let mut after = before.clone();
         let result_id = after.nodes.insert(acc);
-        if let Some(layer) = after.document.layers.get_mut(after.document.active_layer_index) {
+        if let Some(layer) = after
+            .document
+            .layers
+            .get_mut(after.document.active_layer_index)
+        {
             if !layer.nodes.contains(&result_id) {
                 layer.nodes.push(result_id);
             }
@@ -13809,12 +14039,26 @@ fn run_video_decode_thread(
         if !self.tools.select.drag_snapshot.is_empty() {
             return;
         }
-        let effects: Vec<_> = self.project.document.boolean_effects.values().cloned().collect();
+        let effects: Vec<_> = self
+            .project
+            .document
+            .boolean_effects
+            .values()
+            .cloned()
+            .collect();
         for e in effects {
-            let Some(na) = self.project.nodes.get(e.a_id).cloned() else { continue };
-            let Some(nb) = self.project.nodes.get(e.b_id).cloned() else { continue };
-            let Some(bez) = compute_boolean_bez(&na, &nb, e.op, 0.75) else { continue };
-            let Some(rid) = e.result_node_id else { continue };
+            let Some(na) = self.project.nodes.get(e.a_id).cloned() else {
+                continue;
+            };
+            let Some(nb) = self.project.nodes.get(e.b_id).cloned() else {
+                continue;
+            };
+            let Some(bez) = compute_boolean_bez(&na, &nb, e.op, 0.75) else {
+                continue;
+            };
+            let Some(rid) = e.result_node_id else {
+                continue;
+            };
             if let Some(node) = self.project.nodes.get_mut(rid) {
                 if let NodeKind::Path { path } = &mut node.kind {
                     if bez.elements().is_empty() {
@@ -13852,10 +14096,14 @@ fn run_video_decode_thread(
 
     /// Bake: drop live effect, keep result path as normal object; unhide operands.
     pub fn bake_boolean_effect(&mut self) {
-        let Some(eid) = self.find_boolean_effect_for_selection() else { return };
+        let Some(eid) = self.find_boolean_effect_for_selection() else {
+            return;
+        };
         let before = snapshot_project(&self.project);
         let mut after = before.clone();
-        let Some(effect) = after.document.boolean_effects.swap_remove(&eid) else { return };
+        let Some(effect) = after.document.boolean_effects.swap_remove(&eid) else {
+            return;
+        };
         // Result stays in nodes/layers; operands remain (visible again).
         let _ = effect;
         self.history.push(
@@ -13866,10 +14114,14 @@ fn run_video_decode_thread(
     }
 
     pub fn remove_boolean_effect(&mut self) {
-        let Some(eid) = self.find_boolean_effect_for_selection() else { return };
+        let Some(eid) = self.find_boolean_effect_for_selection() else {
+            return;
+        };
         let before = snapshot_project(&self.project);
         let mut after = before.clone();
-        let Some(effect) = after.document.boolean_effects.swap_remove(&eid) else { return };
+        let Some(effect) = after.document.boolean_effects.swap_remove(&eid) else {
+            return;
+        };
         if let Some(rid) = effect.result_node_id {
             after.nodes.remove(rid);
             after.anim_timeline.nodes.remove(&rid);
@@ -13886,7 +14138,8 @@ fn run_video_decode_thread(
 
     /// Apply clip mask only for raster image + solid-face shape.
     pub fn apply_clip_mask(&mut self) {
-        let Some(BooleanPairMode::ImageClip { source, mask }) = self.selection_boolean_mode() else {
+        let Some(BooleanPairMode::ImageClip { source, mask }) = self.selection_boolean_mode()
+        else {
             self.status_message =
                 "Clip Mask needs a raster image + a solid shape (path/rect/circle/arc/polygon)"
                     .into();
@@ -13984,20 +14237,17 @@ fn run_video_decode_thread(
         // as preview (clip_image_mesh), cropped to the mask bounds. No SVG
         // intermediate, so bake == preview pixels by construction.
         let scale = 2.0f32;
-        let Some((pixel_w, pixel_h, rgba)) =
-            crate::export_render::render_selection_rgba(
-                &self.project,
-                &[cm.source_id, cm.mask_id],
-                mask_bounds,
-                scale,
-            )
-        else {
+        let Some((pixel_w, pixel_h, rgba)) = crate::export_render::render_selection_rgba(
+            &self.project,
+            &[cm.source_id, cm.mask_id],
+            mask_bounds,
+            scale,
+        ) else {
             self.status_message = "Clip bake failed (rasterize)".into();
             return;
         };
         if !rgba.chunks(4).any(|px| px[3] > 8) {
-            self.status_message =
-                "Clip bake empty — image and mask may not overlap".into();
+            self.status_message = "Clip bake empty — image and mask may not overlap".into();
             return;
         }
         // Encode PNG
@@ -14007,12 +14257,7 @@ fn run_video_decode_thread(
             let enc = image::codecs::png::PngEncoder::new(&mut cursor);
             use image::ImageEncoder;
             if enc
-                .write_image(
-                    &rgba,
-                    pixel_w,
-                    pixel_h,
-                    image::ExtendedColorType::Rgba8,
-                )
+                .write_image(&rgba, pixel_w, pixel_h, image::ExtendedColorType::Rgba8)
                 .is_err()
             {
                 self.status_message = "Clip bake PNG encode failed".into();
@@ -14031,7 +14276,11 @@ fn run_video_decode_thread(
         let mut node = Node::image(mask_bounds.x0, mask_bounds.y0, w, h, png_bytes);
         node.name = name;
         let new_id = after.nodes.insert(node);
-        if let Some(layer) = after.document.layers.get_mut(after.document.active_layer_index) {
+        if let Some(layer) = after
+            .document
+            .layers
+            .get_mut(after.document.active_layer_index)
+        {
             layer.nodes.push(new_id);
         }
         after.document.clip_masks.swap_remove(&cm.id);
@@ -14061,7 +14310,12 @@ fn run_video_decode_thread(
             // Only swap if both remain valid roles after swap (image as source, shape as mask).
             let s = cm.source_id;
             let m = cm.mask_id;
-            let ok = self.project.nodes.get(m).map(is_raster_image).unwrap_or(false)
+            let ok = self
+                .project
+                .nodes
+                .get(m)
+                .map(is_raster_image)
+                .unwrap_or(false)
                 && self
                     .project
                     .nodes
@@ -14088,12 +14342,27 @@ fn run_video_decode_thread(
     }
 
     pub fn bake_tiling(&mut self) {
-        let objs: Vec<NodeId> = self.selection.iter().filter(|&&id| {
-            self.project.nodes.get(id).map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
-        }).cloned().collect();
+        let objs: Vec<NodeId> = self
+            .selection
+            .iter()
+            .filter(|&&id| {
+                self.project
+                    .nodes
+                    .get(id)
+                    .map_or(false, |n| !matches!(&n.kind, NodeKind::Path { .. }))
+            })
+            .cloned()
+            .collect();
         let mut child_ids = Vec::new();
         for &oid in &objs {
-            if let Some(effect) = self.project.document.tiling_effects.values().find(|e| e.source_id == oid).cloned() {
+            if let Some(effect) = self
+                .project
+                .document
+                .tiling_effects
+                .values()
+                .find(|e| e.source_id == oid)
+                .cloned()
+            {
                 if let Some(source) = self.project.nodes.get(oid).cloned() {
                     let src_face: &dyn FaceRenderable = &source;
                     let b = source.bounds();
@@ -14107,13 +14376,23 @@ fn run_video_decode_thread(
                             let top = first_top + iy as f64 * effect.gap_y;
                             let cx = left + w / 2.0;
                             let cy = top + h / 2.0;
-                            let rot = (ix as f64 * effect.row_rotation + iy as f64 * effect.col_rotation).to_radians();
-                            let sc = 1.0 + (ix as f64 * effect.row_scale + iy as f64 * effect.col_scale);
-                            let pl = PathPlacement { x: cx, y: cy, angle_rad: rot, scale: sc as f32, opacity_mul: 1.0 };
+                            let rot = (ix as f64 * effect.row_rotation
+                                + iy as f64 * effect.col_rotation)
+                                .to_radians();
+                            let sc =
+                                1.0 + (ix as f64 * effect.row_scale + iy as f64 * effect.col_scale);
+                            let pl = PathPlacement {
+                                x: cx,
+                                y: cy,
+                                angle_rad: rot,
+                                scale: sc as f32,
+                                opacity_mul: 1.0,
+                            };
                             let mut node = node_at_placement(src_face, &pl);
                             node.name = format!("{} #t{}_{}", source.name, ix, iy);
                             let id = node.id;
-                            self.history.push(&mut self.project, ProjectEdit::InsertNode { node });
+                            self.history
+                                .push(&mut self.project, ProjectEdit::InsertNode { node });
                             child_ids.push(id);
                         }
                     }
@@ -14123,7 +14402,8 @@ fn run_video_decode_thread(
         if !child_ids.is_empty() {
             let group = Node::group(child_ids.clone(), "Tiled group".to_string());
             let gid = group.id;
-            self.history.push(&mut self.project, ProjectEdit::InsertNode { node: group });
+            self.history
+                .push(&mut self.project, ProjectEdit::InsertNode { node: group });
             self.selection = vec![gid];
             self.status_message = format!("Baked {} tiles", child_ids.len());
         }
@@ -14141,10 +14421,7 @@ fn run_video_decode_thread(
     }
 
     /// Collect placed circular copies for one source (path nodes, unique ids).
-    fn circular_bake_instances(
-        source: &Node,
-        effect: &CircularCloneEffect,
-    ) -> Vec<Node> {
+    fn circular_bake_instances(source: &Node, effect: &CircularCloneEffect) -> Vec<Node> {
         let n = effect.copies.max(3);
         (0..n)
             .map(|i| {
@@ -14210,10 +14487,7 @@ fn run_video_decode_thread(
                 child_ids.push(id);
                 all_child_ids.push(id);
             }
-            let group = Node::group(
-                child_ids,
-                format!("{} circular", source.name),
-            );
+            let group = Node::group(child_ids, format!("{} circular", source.name));
             let gid = group.id;
             after.nodes.insert(group);
             after.document.append_to_active_layer(gid);
@@ -14285,9 +14559,7 @@ fn run_video_decode_thread(
             // Fold union: path0 ∪ path1 ∪ … (shutter / overlapping chords stay clean multi-contour)
             let mut acc = instances[0].clone();
             for other in instances.iter().skip(1) {
-                let Some(bez) =
-                    compute_boolean_bez(&acc, other, BooleanOpKind::Union, 0.5)
-                else {
+                let Some(bez) = compute_boolean_bez(&acc, other, BooleanOpKind::Union, 0.5) else {
                     self.status_message =
                         "Bake as path failed (boolean union could not convert shapes)".into();
                     return;
@@ -14393,9 +14665,9 @@ fn run_video_decode_thread(
             .selection
             .iter()
             .filter(|id| {
-                self.project.nodes.get(**id).is_some_and(|n| {
-                    matches!(&n.kind, NodeKind::Path { path } if !path.is_closed())
-                })
+                self.project.nodes.get(**id).is_some_and(
+                    |n| matches!(&n.kind, NodeKind::Path { path } if !path.is_closed()),
+                )
             })
             .copied()
             .collect();
@@ -14409,16 +14681,16 @@ fn run_video_decode_thread(
     }
 
     pub fn open_closed_paths_in_selection(&mut self) {
-        let ids: Vec<_> = self
-            .selection
-            .iter()
-            .filter(|id| {
-                self.project.nodes.get(**id).is_some_and(|n| {
-                    matches!(&n.kind, NodeKind::Path { path } if path.is_closed())
+        let ids: Vec<_> =
+            self.selection
+                .iter()
+                .filter(|id| {
+                    self.project.nodes.get(**id).is_some_and(
+                        |n| matches!(&n.kind, NodeKind::Path { path } if path.is_closed()),
+                    )
                 })
-            })
-            .copied()
-            .collect();
+                .copied()
+                .collect();
         let count = ids.len();
         for id in ids {
             self.set_path_closed(id, false);
@@ -14590,10 +14862,8 @@ fn run_video_decode_thread(
             // Commit: the node is live; to record without dup layer entry, re-insert via history.
             self.project.nodes.remove(id);
             self.project.document.remove_from_layers(id);
-            self.history.push(
-                &mut self.project,
-                ProjectEdit::InsertNode { node: after },
-            );
+            self.history
+                .push(&mut self.project, ProjectEdit::InsertNode { node: after });
             self.selection = vec![id];
             self.sync_inspector_from_selection();
             return;
@@ -14620,8 +14890,7 @@ fn run_video_decode_thread(
                 continue;
             }
             out.push(id);
-            if let Some(NodeKind::Group { children }) =
-                self.project.nodes.get(id).map(|n| &n.kind)
+            if let Some(NodeKind::Group { children }) = self.project.nodes.get(id).map(|n| &n.kind)
             {
                 for &c in children {
                     stack.push(c);
@@ -14666,7 +14935,13 @@ fn run_video_decode_thread(
         }
         let mut layer_deleted = false;
         for id in ids {
-            if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == *id) {
+            if let Some(pos) = self
+                .project
+                .document
+                .layers
+                .iter()
+                .position(|l| l.id == *id)
+            {
                 self.delete_layer(pos);
                 layer_deleted = true;
             }
@@ -14739,7 +15014,7 @@ fn run_video_decode_thread(
             }
         }
         self.on_page_text_focus_pending = false;
-        
+
         let newly = self.on_page_text_newly_created;
         self.on_page_text_newly_created = false;
         self.on_page_text_before = None;
@@ -14781,14 +15056,23 @@ fn run_video_decode_thread(
     }
 
     pub fn apply_fill_style_to_active(&mut self, fill: &crate::document::Fill) {
-        if self.tools.active == ToolKind::Brush || (self.tools.active == ToolKind::Eyedropper && self.tools.last_active_tool == ToolKind::Brush) {
+        if self.tools.active == ToolKind::Brush
+            || (self.tools.active == ToolKind::Eyedropper
+                && self.tools.last_active_tool == ToolKind::Brush)
+        {
             match fill {
                 crate::document::Fill::None => {}
                 crate::document::Fill::Solid(paint) => {
                     self.tools.brush.fill_kind = crate::document::FillKind::Solid;
                     self.tools.brush.fill_stops = vec![
-                        crate::document::GradientStop { pos: 0.0, color: *paint },
-                        crate::document::GradientStop { pos: 1.0, color: *paint },
+                        crate::document::GradientStop {
+                            pos: 0.0,
+                            color: *paint,
+                        },
+                        crate::document::GradientStop {
+                            pos: 1.0,
+                            color: *paint,
+                        },
                     ];
                 }
                 crate::document::Fill::LinearGradient {
@@ -14826,15 +15110,27 @@ fn run_video_decode_thread(
             crate::document::Fill::Solid(paint) => {
                 self.ui_fill_kind = crate::document::FillKind::Solid;
                 self.ui_fill_stops = vec![
-                    crate::document::GradientStop { pos: 0.0, color: *paint },
-                    crate::document::GradientStop { pos: 1.0, color: *paint },
+                    crate::document::GradientStop {
+                        pos: 0.0,
+                        color: *paint,
+                    },
+                    crate::document::GradientStop {
+                        pos: 1.0,
+                        color: *paint,
+                    },
                 ];
                 self.fill_enabled = true;
 
                 self.ui_stroke_kind = crate::document::FillKind::Solid;
                 self.ui_stroke_stops = vec![
-                    crate::document::GradientStop { pos: 0.0, color: *paint },
-                    crate::document::GradientStop { pos: 1.0, color: *paint },
+                    crate::document::GradientStop {
+                        pos: 0.0,
+                        color: *paint,
+                    },
+                    crate::document::GradientStop {
+                        pos: 1.0,
+                        color: *paint,
+                    },
                 ];
                 self.stroke_enabled = true;
             }
@@ -14887,8 +15183,19 @@ fn run_video_decode_thread(
     }
 
     /// Sample the pixel color from an Image node at a document position.
-    fn sample_image_color(&self, node: &crate::document::Node, doc: (f64, f64)) -> Option<egui::Color32> {
-        if let NodeKind::Image { x, y, width, height, .. } = node.kind {
+    fn sample_image_color(
+        &self,
+        node: &crate::document::Node,
+        doc: (f64, f64),
+    ) -> Option<egui::Color32> {
+        if let NodeKind::Image {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } = node.kind
+        {
             if width <= 0.0 || height <= 0.0 {
                 return None;
             }
@@ -14937,21 +15244,20 @@ fn run_video_decode_thread(
                     return egui::Color32::WHITE;
                 }
                 let fill_to_copy = match &node.style.fill {
-                    crate::document::Fill::None => {
-                        match &node.style.stroke.style {
-                            crate::document::Fill::None => None,
-                            other => Some(other),
-                        }
-                    }
+                    crate::document::Fill::None => match &node.style.stroke.style {
+                        crate::document::Fill::None => None,
+                        other => Some(other),
+                    },
                     other => Some(other),
                 };
                 if let Some(fill) = fill_to_copy {
                     return match fill {
                         crate::document::Fill::Solid(color) => color.to_egui(),
                         crate::document::Fill::LinearGradient { stops, .. }
-                        | crate::document::Fill::RadialGradient { stops, .. } => {
-                            stops.first().map(|s| s.color.to_egui()).unwrap_or(egui::Color32::WHITE)
-                        }
+                        | crate::document::Fill::RadialGradient { stops, .. } => stops
+                            .first()
+                            .map(|s| s.color.to_egui())
+                            .unwrap_or(egui::Color32::WHITE),
                         crate::document::Fill::None => egui::Color32::WHITE,
                     };
                 }
@@ -15030,12 +15336,10 @@ fn run_video_decode_thread(
                     }
                 } else {
                     let fill_to_copy = match &node.style.fill {
-                        crate::document::Fill::None => {
-                            match &node.style.stroke.style {
-                                crate::document::Fill::None => None,
-                                other => Some(other),
-                            }
-                        }
+                        crate::document::Fill::None => match &node.style.stroke.style {
+                            crate::document::Fill::None => None,
+                            other => Some(other),
+                        },
                         other => Some(other),
                     };
                     if let Some(fill) = fill_to_copy {
@@ -15044,7 +15348,7 @@ fn run_video_decode_thread(
                 }
             }
         }
-        
+
         if let Some(fill) = picked_fill {
             self.apply_fill_style_to_active(&fill);
             self.status_message = format!("Picked color from '{}'", node_name);
@@ -15107,8 +15411,7 @@ fn run_video_decode_thread(
         let Some(entry) = self.project.anim_timeline.nodes.get_mut(&id) else {
             return;
         };
-        if entry.geom_tracks.is_empty()
-            || entry.geom_tracks.iter().all(|t| t.keyframes.is_empty())
+        if entry.geom_tracks.is_empty() || entry.geom_tracks.iter().all(|t| t.keyframes.is_empty())
         {
             return;
         }
@@ -15190,7 +15493,7 @@ fn run_video_decode_thread(
         dt: f32,
     ) -> bool {
         use crate::path_physics::PathPhysicsSim;
-        use crate::tools::{WeightFlowStroke, WeightFlowMode};
+        use crate::tools::{WeightFlowMode, WeightFlowStroke};
         use glam::Vec2;
 
         self.tools.weight_flow.cursor_doc = Some(doc);
@@ -15338,7 +15641,7 @@ fn run_video_decode_thread(
                     } else if !matches!(node.kind, NodeKind::Group { .. }) {
                         self.selection = vec![id];
                         self.tools.active = ToolKind::Node;
-                        self.promote_action_tab( crate::action_tab::ActionTab::Geometry);
+                        self.promote_action_tab(crate::action_tab::ActionTab::Geometry);
                         self.sync_inspector_from_selection();
                         return;
                     }
@@ -15408,10 +15711,9 @@ fn run_video_decode_thread(
                                     }
                                 })
                                 .or_else(|| {
-                                    self.video_frame_cache.as_ref()
-                                        .filter(|c| {
-                                            c.layer_id == primary_id || c.layer_id == l.id
-                                        })
+                                    self.video_frame_cache
+                                        .as_ref()
+                                        .filter(|c| c.layer_id == primary_id || c.layer_id == l.id)
                                         .map(|c| {
                                             let tex_w = c.texture.size()[0] as f32;
                                             let tex_h = c.texture.size()[1] as f32;
@@ -15439,27 +15741,40 @@ fn run_video_decode_thread(
                         let tl = self.viewport.doc_to_screen((r.x0, r.y0), origin);
                         let br = self.viewport.doc_to_screen((r.x1, r.y1), origin);
                         let sr = egui::Rect::from_min_max(tl, br);
-                        if let Some(handle) = render::hit_resize_handle(sr, screen, self.viewport.zoom) {
+                        if let Some(handle) =
+                            render::hit_resize_handle(sr, screen, self.viewport.zoom)
+                        {
                             if self.tools.select.select_rotation_mode {
-                                if matches!(handle, tools::ResizeHandle::Nw | tools::ResizeHandle::Ne | tools::ResizeHandle::Se | tools::ResizeHandle::Sw) {
+                                if matches!(
+                                    handle,
+                                    tools::ResizeHandle::Nw
+                                        | tools::ResizeHandle::Ne
+                                        | tools::ResizeHandle::Se
+                                        | tools::ResizeHandle::Sw
+                                ) {
                                     self.tools.select.drag_mode = Some(SelectDrag::Rotate);
                                     let cx = (r.x0 + r.x1) * 0.5;
                                     let cy = (r.y0 + r.y1) * 0.5;
                                     self.tools.select.rotate_center = Some((cx, cy));
-                                    self.tools.select.rotate_start_angle = (doc.1 - cy).atan2(doc.0 - cx);
+                                    self.tools.select.rotate_start_angle =
+                                        (doc.1 - cy).atan2(doc.0 - cx);
                                     let mut layer_pos = None;
-                                    for (pos, l) in self.project.document.layers.iter().enumerate() {
-                                        if l.id == id || (l.kind == crate::document::LayerKind::AV && {
-                                            let mut lc = l.clone();
-                                            lc.ensure_av_clips();
-                                            lc.av_clips.iter().any(|c| c.id == id)
-                                        }) {
+                                    for (pos, l) in self.project.document.layers.iter().enumerate()
+                                    {
+                                        if l.id == id
+                                            || (l.kind == crate::document::LayerKind::AV && {
+                                                let mut lc = l.clone();
+                                                lc.ensure_av_clips();
+                                                lc.av_clips.iter().any(|c| c.id == id)
+                                            })
+                                        {
                                             layer_pos = Some(pos);
                                             break;
                                         }
                                     }
                                     if let Some(pos) = layer_pos {
-                                        self.tools.select.rotate_start_layer_rotation = self.project.document.layers[pos].rotation;
+                                        self.tools.select.rotate_start_layer_rotation =
+                                            self.project.document.layers[pos].rotation;
                                     }
                                     self.tools.select.last_doc = doc;
                                     self.sync_inspector_from_selection();
@@ -15492,7 +15807,13 @@ fn run_video_decode_thread(
                                 render::hit_resize_handle(sr, screen, self.viewport.zoom)
                             {
                                 if self.tools.select.select_rotation_mode {
-                                    if matches!(handle, tools::ResizeHandle::Nw | tools::ResizeHandle::Ne | tools::ResizeHandle::Se | tools::ResizeHandle::Sw) {
+                                    if matches!(
+                                        handle,
+                                        tools::ResizeHandle::Nw
+                                            | tools::ResizeHandle::Ne
+                                            | tools::ResizeHandle::Se
+                                            | tools::ResizeHandle::Sw
+                                    ) {
                                         self.convert_rect_to_path(id);
                                         if let Some(node) = self.project.nodes.get(id) {
                                             self.tools.select.drag_mode = Some(SelectDrag::Rotate);
@@ -15500,8 +15821,10 @@ fn run_video_decode_thread(
                                             let cx = (b.x0 + b.x1) * 0.5;
                                             let cy = (b.y0 + b.y1) * 0.5;
                                             self.tools.select.rotate_center = Some((cx, cy));
-                                            self.tools.select.rotate_start_angle = (doc.1 - cy).atan2(doc.0 - cx);
-                                            self.tools.select.drag_snapshot = vec![(id, node.clone())];
+                                            self.tools.select.rotate_start_angle =
+                                                (doc.1 - cy).atan2(doc.0 - cx);
+                                            self.tools.select.drag_snapshot =
+                                                vec![(id, node.clone())];
                                             self.tools.select.last_doc = doc;
                                             self.sync_inspector_from_selection();
                                             return;
@@ -15522,8 +15845,7 @@ fn run_video_decode_thread(
                                         }
                                         self.tools.select.drag_snapshot = snap;
                                     } else {
-                                        self.tools.select.drag_snapshot =
-                                            vec![(id, node.clone())];
+                                        self.tools.select.drag_snapshot = vec![(id, node.clone())];
                                     }
                                     self.tools.select.last_doc = doc;
                                     self.sync_inspector_from_selection();
@@ -15541,7 +15863,9 @@ fn run_video_decode_thread(
                     let slop = 10.0 / (self.viewport.zoom as f64).max(0.1);
                     if let Some(pts) = self.get_tiling_gizmo_points(id) {
                         for (i, &(px, py)) in pts.iter().enumerate() {
-                            if i == 0 { continue; } // Skip offset handle
+                            if i == 0 {
+                                continue;
+                            } // Skip offset handle
                             if (px - doc.0).hypot(py - doc.1) < slop {
                                 self.tools.select.effect_drag_doc_before =
                                     Some(self.project.document.clone());
@@ -15579,7 +15903,7 @@ fn run_video_decode_thread(
                 }
                 self.tools.select.set_path_segment(id, from, to);
                 self.tools.active = ToolKind::Node;
-                self.promote_action_tab( crate::action_tab::ActionTab::Geometry);
+                self.promote_action_tab(crate::action_tab::ActionTab::Geometry);
                 self.sync_inspector_from_selection();
                 return;
             }
@@ -15703,20 +16027,17 @@ fn run_video_decode_thread(
 
             // Sticky selection: with an active selection, ignore clicks on other objects
             // until Esc / empty space deselects (shift still allows multi-select).
-            if self.selection_sticky
-                && !self.selection.is_empty()
-                && !shift
-                && !ghost_pick
-            {
+            if self.selection_sticky && !self.selection.is_empty() && !shift && !ghost_pick {
                 if let Some(id) = hit {
                     if !self.selection.contains(&id) {
                         // Clicked something else — keep current selection (allow drag of current).
                         // If pointer is on current selection, proceed to move.
                         // If not on selection at all, block switch.
                         let on_current = self.selection.iter().any(|&sid| {
-                            self.project.nodes.get(sid).is_some_and(|n| {
-                                self.hit_test_node_for_pick(sid, n, doc, slop)
-                            })
+                            self.project
+                                .nodes
+                                .get(sid)
+                                .is_some_and(|n| self.hit_test_node_for_pick(sid, n, doc, slop))
                         });
                         if !on_current {
                             self.tools.select.last_doc = doc;
@@ -15822,13 +16143,10 @@ fn run_video_decode_thread(
                                 .values()
                                 .find(|e| e.source_id == sid)
                             {
-                                self.tools.select.circular_ring_drag_start.push((
-                                    sid,
-                                    e.base_x,
-                                    e.base_y,
-                                    e.origin_x,
-                                    e.origin_y,
-                                ));
+                                self.tools
+                                    .select
+                                    .circular_ring_drag_start
+                                    .push((sid, e.base_x, e.base_y, e.origin_x, e.origin_y));
                             }
                         }
                     }
@@ -15882,7 +16200,8 @@ fn run_video_decode_thread(
                         if screen_dist > tools::SELECT_MOVE_THRESHOLD_PX {
                             self.tools.select.move_drag_engaged = true;
                             let selection_ids = self.selection.clone();
-                            let (snapped_dx, snapped_dy) = self.apply_snapping((total_dx, total_dy), &selection_ids);
+                            let (snapped_dx, snapped_dy) =
+                                self.apply_snapping((total_dx, total_dy), &selection_ids);
 
                             for &sid in &selection_ids {
                                 let mut layer_pos = None;
@@ -15891,19 +16210,23 @@ fn run_video_decode_thread(
                                     if l.kind == crate::document::LayerKind::Shading {
                                         continue;
                                     }
-                                    if l.id == sid || (l.kind == crate::document::LayerKind::AV && {
-                                        let mut lc = l.clone();
-                                        lc.ensure_av_clips();
-                                        lc.av_clips.iter().any(|c| c.id == sid)
-                                    }) {
+                                    if l.id == sid
+                                        || (l.kind == crate::document::LayerKind::AV && {
+                                            let mut lc = l.clone();
+                                            lc.ensure_av_clips();
+                                            lc.av_clips.iter().any(|c| c.id == sid)
+                                        })
+                                    {
                                         layer_pos = Some(pos);
                                         break;
                                     }
                                 }
                                 if let Some(pos) = layer_pos {
                                     let layer = &mut self.project.document.layers[pos];
-                                    layer.x = (self.tools.select.resize_anchor.x0 + snapped_dx) as f32;
-                                    layer.y = (self.tools.select.resize_anchor.y0 + snapped_dy) as f32;
+                                    layer.x =
+                                        (self.tools.select.resize_anchor.x0 + snapped_dx) as f32;
+                                    layer.y =
+                                        (self.tools.select.resize_anchor.y0 + snapped_dy) as f32;
                                 }
                             }
 
@@ -15945,7 +16268,8 @@ fn run_video_decode_thread(
                                     }
                                 }
                                 // Circular ring rides with the source (rigid) so bbox size stays stable.
-                                let ring_starts = self.tools.select.circular_ring_drag_start.clone();
+                                let ring_starts =
+                                    self.tools.select.circular_ring_drag_start.clone();
                                 for &(sid, bx, by, ox, oy) in &ring_starts {
                                     if let Some((_, e)) = self
                                         .project
@@ -15983,11 +16307,13 @@ fn run_video_decode_thread(
                                 if l.kind == crate::document::LayerKind::Shading {
                                     continue;
                                 }
-                                if l.id == id || (l.kind == crate::document::LayerKind::AV && {
-                                    let mut lc = l.clone();
-                                    lc.ensure_av_clips();
-                                    lc.av_clips.iter().any(|c| c.id == id)
-                                }) {
+                                if l.id == id
+                                    || (l.kind == crate::document::LayerKind::AV && {
+                                        let mut lc = l.clone();
+                                        lc.ensure_av_clips();
+                                        lc.av_clips.iter().any(|c| c.id == id)
+                                    })
+                                {
                                     layer_pos = Some(pos);
                                     break;
                                 }
@@ -16008,11 +16334,24 @@ fn run_video_decode_thread(
                         let dy = doc.1 - self.tools.select.last_doc.1;
                         self.tools.select.last_doc = doc;
                         if let Some(id) = self.selection.first().copied() {
-                            if let Some((_, e)) = self.project.document.tiling_effects.iter_mut().find(|(_, e)| e.source_id == id) {
+                            if let Some((_, e)) = self
+                                .project
+                                .document
+                                .tiling_effects
+                                .iter_mut()
+                                .find(|(_, e)| e.source_id == id)
+                            {
                                 match pt_idx {
-                                    0 => { e.offset_x += dx; e.offset_y += dy; }
-                                    1 => { e.gap_x += dx; }
-                                    2 => { e.gap_y += dy; }
+                                    0 => {
+                                        e.offset_x += dx;
+                                        e.offset_y += dy;
+                                    }
+                                    1 => {
+                                        e.gap_x += dx;
+                                    }
+                                    2 => {
+                                        e.gap_y += dy;
+                                    }
                                     _ => {}
                                 }
                             }
@@ -16057,8 +16396,7 @@ fn run_video_decode_thread(
                                         let oy = e.origin_y;
                                         let r = e.ring_radius();
                                         let base_ang = e.base_angle_rad();
-                                        let pointer_ang =
-                                            (snapped.1 - oy).atan2(snapped.0 - ox);
+                                        let pointer_ang = (snapped.1 - oy).atan2(snapped.0 - ox);
                                         let n = e.copies.max(3) as f64;
                                         let step = std::f64::consts::TAU / n;
                                         e.angle_offset =
@@ -16080,11 +16418,15 @@ fn run_video_decode_thread(
                                 let dx = doc.0 - center.0;
                                 let dy = doc.1 - center.1;
                                 let current_angle = dy.atan2(dx);
-                                let delta_angle = current_angle - self.tools.select.rotate_start_angle;
-                                
-                                if let Some(pos) = self.project.document.layers.iter().position(|l| l.id == id) {
+                                let delta_angle =
+                                    current_angle - self.tools.select.rotate_start_angle;
+
+                                if let Some(pos) =
+                                    self.project.document.layers.iter().position(|l| l.id == id)
+                                {
                                     let layer = &mut self.project.document.layers[pos];
-                                    let new_rot = self.tools.select.rotate_start_layer_rotation + delta_angle.to_degrees() as f32;
+                                    let new_rot = self.tools.select.rotate_start_layer_rotation
+                                        + delta_angle.to_degrees() as f32;
                                     layer.rotation = new_rot;
                                 } else if matches!(
                                     self.project.nodes.get(id).map(|n| &n.kind),
@@ -16140,7 +16482,8 @@ fn run_video_decode_thread(
                     // Marquee never picks ghosts (boolean/clip hidden sources).
                     let hidden = self.hidden_canvas_sources();
                     let picked: Vec<NodeId> = if self.spatial_index.is_enabled() {
-                        self.spatial_index.nodes_in_marquee(&self.project, &hidden, rect)
+                        self.spatial_index
+                            .nodes_in_marquee(&self.project, &hidden, rect)
                     } else {
                         self.project
                             .document
@@ -16189,7 +16532,10 @@ fn run_video_decode_thread(
                 }
                 self.sync_inspector_if_needed();
             } else if let Some(mode) = self.tools.select.drag_mode.take() {
-                if matches!(mode, SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_)) {
+                if matches!(
+                    mode,
+                    SelectDrag::TilingGizmo(_) | SelectDrag::CircularGizmo(_)
+                ) {
                     // Commit circular/tiling gizmo edits so undo works.
                     if let Some(before) = self.tools.select.effect_drag_doc_before.take() {
                         let after = self.project.document.clone();
@@ -16212,8 +16558,7 @@ fn run_video_decode_thread(
                             .unwrap_or(self.tools.select.last_doc);
                         let total_dx = doc.0 - drag_start.0;
                         let total_dy = doc.1 - drag_start.1;
-                        let screen_dist =
-                            total_dx.hypot(total_dy) * self.viewport.zoom as f64;
+                        let screen_dist = total_dx.hypot(total_dy) * self.viewport.zoom as f64;
                         let was_click = !self.tools.select.move_drag_engaged
                             || screen_dist < tools::SELECT_MOVE_THRESHOLD_PX;
                         if was_click {
@@ -16294,8 +16639,15 @@ fn run_video_decode_thread(
         pts.push((b.x1, cy));
 
         match &node.kind {
-            NodeKind::Polygon { cx, cy, r, sides, rotation_rad } => {
-                let verts = crate::document::regular_polygon_vertices(*cx, *cy, *r, *sides, *rotation_rad);
+            NodeKind::Polygon {
+                cx,
+                cy,
+                r,
+                sides,
+                rotation_rad,
+            } => {
+                let verts =
+                    crate::document::regular_polygon_vertices(*cx, *cy, *r, *sides, *rotation_rad);
                 pts.extend(verts.clone());
                 let n = verts.len();
                 if n >= 3 {
@@ -16326,7 +16678,13 @@ fn run_video_decode_thread(
                     pts.push((p[0], p[1]));
                 }
             }
-            NodeKind::Image { x, y, width, height, .. } => {
+            NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => {
                 let w = *width;
                 let h = *height;
                 // Explicit 9-box (matches transform handles)
@@ -16399,17 +16757,19 @@ fn run_video_decode_thread(
             let a = target_pts[i];
             for j in (i + 1)..n {
                 let b = target_pts[j];
-                
+
                 // Horizontal spacing (aligned on Y)
                 if (a.1 - b.1).abs() < 1.0 {
                     let d = (a.0 - b.0).abs();
                     if d > 5.0 {
                         let left_x = a.0.min(b.0);
                         let right_x = a.0.max(b.0);
-                        
+
                         // Check right side
                         let target_right = right_x + d;
-                        if (proposed.1 - a.1).abs() < threshold && (proposed.0 - target_right).abs() < threshold {
+                        if (proposed.1 - a.1).abs() < threshold
+                            && (proposed.0 - target_right).abs() < threshold
+                        {
                             let mut guides = Vec::new();
                             guides.push(SnapGuide {
                                 start: (left_x, a.1),
@@ -16423,10 +16783,12 @@ fn run_video_decode_thread(
                             });
                             return Some(((target_right, a.1), guides));
                         }
-                        
+
                         // Check left side
                         let target_left = left_x - d;
-                        if (proposed.1 - a.1).abs() < threshold && (proposed.0 - target_left).abs() < threshold {
+                        if (proposed.1 - a.1).abs() < threshold
+                            && (proposed.0 - target_left).abs() < threshold
+                        {
                             let mut guides = Vec::new();
                             guides.push(SnapGuide {
                                 start: (target_left, a.1),
@@ -16442,17 +16804,19 @@ fn run_video_decode_thread(
                         }
                     }
                 }
-                
+
                 // Vertical spacing (aligned on X)
                 if (a.0 - b.0).abs() < 1.0 {
                     let d = (a.1 - b.1).abs();
                     if d > 5.0 {
                         let top_y = a.1.min(b.1);
                         let bottom_y = a.1.max(b.1);
-                        
+
                         // Check bottom side
                         let target_bottom = bottom_y + d;
-                        if (proposed.0 - a.0).abs() < threshold && (proposed.1 - target_bottom).abs() < threshold {
+                        if (proposed.0 - a.0).abs() < threshold
+                            && (proposed.1 - target_bottom).abs() < threshold
+                        {
                             let mut guides = Vec::new();
                             guides.push(SnapGuide {
                                 start: (a.0, top_y),
@@ -16466,10 +16830,12 @@ fn run_video_decode_thread(
                             });
                             return Some(((a.0, target_bottom), guides));
                         }
-                        
+
                         // Check top side
                         let target_top = top_y - d;
-                        if (proposed.0 - a.0).abs() < threshold && (proposed.1 - target_top).abs() < threshold {
+                        if (proposed.0 - a.0).abs() < threshold
+                            && (proposed.1 - target_top).abs() < threshold
+                        {
                             let mut guides = Vec::new();
                             guides.push(SnapGuide {
                                 start: (a.0, target_top),
@@ -16509,7 +16875,9 @@ fn run_video_decode_thread(
         }
 
         // Try equal spacing snap first
-        if let Some((eq_snapped, eq_guides)) = self.try_equal_spacing_snap(doc, &target_pts, threshold) {
+        if let Some((eq_snapped, eq_guides)) =
+            self.try_equal_spacing_snap(doc, &target_pts, threshold)
+        {
             self.live_snap_guides = eq_guides;
             return eq_snapped;
         }
@@ -16567,10 +16935,10 @@ fn run_video_decode_thread(
         if !self.snap_magnet {
             return proposed_translation;
         }
-        
+
         let mut original_pts = Vec::new();
         let mut dragged_circles = Vec::new();
-        
+
         // Check if there is a selected Video layer
         let mut video_selection = Vec::new();
         for &id in selection {
@@ -16598,7 +16966,7 @@ fn run_video_decode_thread(
             }
             let pts = self.get_node_snap_points(node);
             target_pts.extend(pts);
-            
+
             if node.is_circle() {
                 if let NodeKind::Ellipse { cx, cy, rx, .. } = &node.kind {
                     target_circles.push(((*cx, *cy), *rx));
@@ -16621,20 +16989,31 @@ fn run_video_decode_thread(
                         dy = y;
                     }
                 }
-                let aspect = self.video_layers.get(&layer.id)
+                let aspect = self
+                    .video_layers
+                    .get(&layer.id)
                     .and_then(|s| s.texture.as_ref())
                     .map(|tex| {
                         let tex_w = tex.size()[0] as f32;
                         let tex_h = tex.size()[1] as f32;
-                        if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                        if tex_h > 0.0 {
+                            (tex_w / tex_h) as f64
+                        } else {
+                            1.0
+                        }
                     })
                     .or_else(|| {
-                        self.video_frame_cache.as_ref()
+                        self.video_frame_cache
+                            .as_ref()
                             .filter(|c| c.layer_id == layer.id)
                             .map(|c| {
                                 let tex_w = c.texture.size()[0] as f32;
                                 let tex_h = c.texture.size()[1] as f32;
-                                if tex_h > 0.0 { (tex_w / tex_h) as f64 } else { 1.0 }
+                                if tex_h > 0.0 {
+                                    (tex_w / tex_h) as f64
+                                } else {
+                                    1.0
+                                }
                             })
                     })
                     .unwrap_or(1.0);
@@ -16666,7 +17045,7 @@ fn run_video_decode_thread(
         for (_, orig_node) in &self.tools.select.drag_snapshot {
             let pts = self.get_node_snap_points(orig_node);
             original_pts.extend(pts);
-            
+
             if orig_node.is_circle() {
                 if let NodeKind::Ellipse { cx, cy, rx, .. } = &orig_node.kind {
                     dragged_circles.push(((*cx, *cy), *rx));
@@ -16691,12 +17070,20 @@ fn run_video_decode_thread(
 
         // Try equal spacing snap first
         for &opt in &original_pts {
-            let ppt = (opt.0 + proposed_translation.0, opt.1 + proposed_translation.1);
-            if let Some((eq_snapped, eq_guides)) = self.try_equal_spacing_snap(ppt, &target_pts, threshold) {
+            let ppt = (
+                opt.0 + proposed_translation.0,
+                opt.1 + proposed_translation.1,
+            );
+            if let Some((eq_snapped, eq_guides)) =
+                self.try_equal_spacing_snap(ppt, &target_pts, threshold)
+            {
                 let snap_dx = eq_snapped.0 - ppt.0;
                 let snap_dy = eq_snapped.1 - ppt.1;
                 self.live_snap_guides = eq_guides;
-                return (proposed_translation.0 + snap_dx, proposed_translation.1 + snap_dy);
+                return (
+                    proposed_translation.0 + snap_dx,
+                    proposed_translation.1 + snap_dy,
+                );
             }
         }
 
@@ -16707,7 +17094,10 @@ fn run_video_decode_thread(
         let mut best_tangent_snap = None;
 
         for &(dc_orig, dr) in &dragged_circles {
-            let dc_prop = (dc_orig.0 + proposed_translation.0, dc_orig.1 + proposed_translation.1);
+            let dc_prop = (
+                dc_orig.0 + proposed_translation.0,
+                dc_orig.1 + proposed_translation.1,
+            );
             for &(tc, tr) in &target_circles {
                 let dist = (dc_prop.0 - tc.0).hypot(dc_prop.1 - tc.1);
                 let d_ideal = dr + tr;
@@ -16745,11 +17135,14 @@ fn run_video_decode_thread(
             let mut snap_pt_y = None;
 
             for &opt in &original_pts {
-                let ppt = (opt.0 + proposed_translation.0, opt.1 + proposed_translation.1);
+                let ppt = (
+                    opt.0 + proposed_translation.0,
+                    opt.1 + proposed_translation.1,
+                );
                 for &tpt in &target_pts {
                     let dx = tpt.0 - ppt.0;
                     let dy = tpt.1 - ppt.1;
-                    
+
                     if dx.abs() < best_dx.abs() {
                         best_dx = dx;
                         snap_pt_x = Some((tpt, ppt));
@@ -16799,7 +17192,7 @@ fn run_video_decode_thread(
                     let grid_y = (ppt.1 / g).round() * g;
                     let dx = grid_x - ppt.0;
                     let dy = grid_y - ppt.1;
-                    
+
                     if dx.abs() < best_grid_dx.abs() {
                         best_grid_dx = dx;
                         grid_snap_x = dx;
@@ -16811,7 +17204,7 @@ fn run_video_decode_thread(
                         snapped_any_y = true;
                     }
                 }
-                
+
                 if snapped_any_x {
                     final_translation.0 += grid_snap_x;
                 }
@@ -16824,8 +17217,14 @@ fn run_video_decode_thread(
         // Correct guide lines end positions to match final snapped coordinate
         for guide in &mut self.live_snap_guides {
             if !guide.is_tangent {
-                let end_ppt_orig = (guide.end.0 - proposed_translation.0, guide.end.1 - proposed_translation.1);
-                guide.end = (end_ppt_orig.0 + final_translation.0, end_ppt_orig.1 + final_translation.1);
+                let end_ppt_orig = (
+                    guide.end.0 - proposed_translation.0,
+                    guide.end.1 - proposed_translation.1,
+                );
+                guide.end = (
+                    end_ppt_orig.0 + final_translation.0,
+                    end_ppt_orig.1 + final_translation.1,
+                );
             }
         }
 
@@ -16852,8 +17251,7 @@ fn run_video_decode_thread(
             if ctrl {
                 if let Some(drag) = &self.tools.drag_shape {
                     if drag.kind == Some(ToolKind::Line) {
-                        snapped_current =
-                            tools::snap_angle_15deg(drag.origin_doc, snapped_current);
+                        snapped_current = tools::snap_angle_15deg(drag.origin_doc, snapped_current);
                     }
                 }
             }
@@ -16873,7 +17271,10 @@ fn run_video_decode_thread(
                     return;
                 };
 
-                let is_flowchart = self.project.document.layers
+                let is_flowchart = self
+                    .project
+                    .document
+                    .layers
                     .get(self.project.document.active_layer_index)
                     .map_or(false, |l| l.kind == crate::document::LayerKind::Flowchart);
 
@@ -16905,13 +17306,7 @@ fn run_video_decode_thread(
                             n.style.stroke = self.build_ui_stroke();
                             n
                         } else {
-                            self.styled_shape_node(Node::rect(
-                                x,
-                                y,
-                                w,
-                                h,
-                                self.build_ui_fill(),
-                            ))
+                            self.styled_shape_node(Node::rect(x, y, w, h, self.build_ui_fill()))
                         }
                     }
                     ToolKind::Circle => {
@@ -16968,7 +17363,9 @@ fn run_video_decode_thread(
                             stroke.style = Fill::Solid(Paint::from_hex(0x1a1f2e, 1.0));
                         }
                         if is_flowchart {
-                            let mut n = crate::document::flowchart::new_flowchart_path(vec![origin, current]);
+                            let mut n = crate::document::flowchart::new_flowchart_path(vec![
+                                origin, current,
+                            ]);
                             // Snap endpoints to nearest flowchart nodes + anchors (using dist to the anchor itself),
                             // then route orthogonally. This makes "click near a node edge" attach reliably.
                             if let crate::document::NodeKind::FlowchartPath { path } = &mut n.kind {
@@ -16982,11 +17379,16 @@ fn run_video_decode_thread(
 
                                     for &nid in &layer.nodes {
                                         if let Some(nd) = store.get(nid) {
-                                            if let Some(geom) = crate::document::flowchart::node_as_flowchart_geom(&nd.kind) {
+                                            if let Some(geom) =
+                                                crate::document::flowchart::node_as_flowchart_geom(
+                                                    &nd.kind,
+                                                )
+                                            {
                                                 // For start
                                                 let anc_s = crate::document::flowchart::snap_anchor_for_point(&geom, origin);
                                                 let ap_s = geom.anchor_position(anc_s);
-                                                let ds = (ap_s.0 - origin.0).hypot(ap_s.1 - origin.1);
+                                                let ds =
+                                                    (ap_s.0 - origin.0).hypot(ap_s.1 - origin.1);
                                                 if ds < best_start_d {
                                                     path.start_node = Some(nid);
                                                     path.start_anchor = Some(anc_s);
@@ -16999,7 +17401,8 @@ fn run_video_decode_thread(
                                                 // For end
                                                 let anc_e = crate::document::flowchart::snap_anchor_for_point(&geom, current);
                                                 let ap_e = geom.anchor_position(anc_e);
-                                                let de = (ap_e.0 - current.0).hypot(ap_e.1 - current.1);
+                                                let de =
+                                                    (ap_e.0 - current.0).hypot(ap_e.1 - current.1);
                                                 if de < best_end_d {
                                                     path.end_node = Some(nid);
                                                     path.end_anchor = Some(anc_e);
@@ -17011,9 +17414,19 @@ fn run_video_decode_thread(
                                             }
                                         }
                                     }
-                                    let exclude: Vec<_> = [path.start_node, path.end_node].iter().filter_map(|x| *x).collect();
-                                    let obstacles = crate::document::flowchart::flowchart_routing_obstacles(store, &layer.nodes, &exclude);
-                                    crate::document::flowchart::sync_flowchart_path_endpoints(path, store, &obstacles);
+                                    let exclude: Vec<_> = [path.start_node, path.end_node]
+                                        .iter()
+                                        .filter_map(|x| *x)
+                                        .collect();
+                                    let obstacles =
+                                        crate::document::flowchart::flowchart_routing_obstacles(
+                                            store,
+                                            &layer.nodes,
+                                            &exclude,
+                                        );
+                                    crate::document::flowchart::sync_flowchart_path_endpoints(
+                                        path, store, &obstacles,
+                                    );
                                 }
                             }
                             n.style.stroke = stroke;
@@ -17103,14 +17516,7 @@ fn run_video_decode_thread(
         }
     }
 
-    fn tool_pen(
-        &mut self,
-        doc: (f64, f64),
-        pressed: bool,
-        down: bool,
-        released: bool,
-        ctrl: bool,
-    ) {
+    fn tool_pen(&mut self, doc: (f64, f64), pressed: bool, down: bool, released: bool, ctrl: bool) {
         let endpoint_thresh = 8.0 / self.viewport.zoom as f64;
 
         if pressed {
@@ -17125,9 +17531,10 @@ fn run_video_decode_thread(
             }
 
             if let Some(_) = self.tools.pen.continue_node {
-                if let (Some(first), Some(last)) =
-                    (self.tools.pen.anchors.first(), self.tools.pen.anchors.last())
-                {
+                if let (Some(first), Some(last)) = (
+                    self.tools.pen.anchors.first(),
+                    self.tools.pen.anchors.last(),
+                ) {
                     let near_start = (first.0 - doc.0).hypot(first.1 - doc.1) < endpoint_thresh;
                     let near_end = (last.0 - doc.0).hypot(last.1 - doc.1) < endpoint_thresh;
                     if near_start {
@@ -17170,7 +17577,8 @@ fn run_video_decode_thread(
                     };
                     let offset = [doc.0 - ax, doc.1 - ay];
                     self.tools.pen.handle_out_offset.insert(idx, offset);
-                    self.tools.pen
+                    self.tools
+                        .pen
                         .handle_in_offset
                         .insert(idx, [-offset[0], -offset[1]]);
                 }
@@ -17193,7 +17601,8 @@ fn run_video_decode_thread(
     ) -> bool {
         use crate::document::{linear_angle_from_line, translate_linear_line};
 
-        if self.action_tab != crate::action_tab::ActionTab::ColorStroke || self.selection.len() != 1 {
+        if self.action_tab != crate::action_tab::ActionTab::ColorStroke || self.selection.len() != 1
+        {
             self.gradient_flow_drag = None;
             return false;
         }
@@ -17324,10 +17733,8 @@ fn run_video_decode_thread(
                             line.3 = ny;
                         }
                         crate::gradient_ui::GradientLineHandle::LinearMid => {
-                            let dx = nx
-                                - ((drag.doc_at_press.0 - bounds.x0) / w) as f32;
-                            let dy = ny
-                                - ((drag.doc_at_press.1 - bounds.y0) / h) as f32;
+                            let dx = nx - ((drag.doc_at_press.0 - bounds.x0) / w) as f32;
+                            let dy = ny - ((drag.doc_at_press.1 - bounds.y0) / h) as f32;
                             line = drag.line_at_press;
                             translate_linear_line(&mut line, dx, dy);
                         }
@@ -17337,8 +17744,7 @@ fn run_video_decode_thread(
                     self.ui_fill_line_y0 = line.1;
                     self.ui_fill_line_x1 = line.2;
                     self.ui_fill_line_y1 = line.3;
-                    self.ui_gradient_angle =
-                        linear_angle_from_line(line.0, line.1, line.2, line.3);
+                    self.ui_gradient_angle = linear_angle_from_line(line.0, line.1, line.2, line.3);
                     self.apply_fill_to_selection();
                 }
                 FillKind::RadialGradient => {
@@ -17369,10 +17775,8 @@ fn run_video_decode_thread(
                             line.3 = ny;
                         }
                         crate::gradient_ui::GradientLineHandle::LinearMid => {
-                            let dx = nx
-                                - ((drag.doc_at_press.0 - bounds.x0) / w) as f32;
-                            let dy = ny
-                                - ((drag.doc_at_press.1 - bounds.y0) / h) as f32;
+                            let dx = nx - ((drag.doc_at_press.0 - bounds.x0) / w) as f32;
+                            let dy = ny - ((drag.doc_at_press.1 - bounds.y0) / h) as f32;
                             line = drag.line_at_press;
                             translate_linear_line(&mut line, dx, dy);
                         }
@@ -17382,8 +17786,7 @@ fn run_video_decode_thread(
                     self.ui_stroke_line_y0 = line.1;
                     self.ui_stroke_line_x1 = line.2;
                     self.ui_stroke_line_y1 = line.3;
-                    self.ui_stroke_angle =
-                        linear_angle_from_line(line.0, line.1, line.2, line.3);
+                    self.ui_stroke_angle = linear_angle_from_line(line.0, line.1, line.2, line.3);
                     self.apply_stroke_to_selection();
                 }
                 FillKind::RadialGradient => {
@@ -17408,7 +17811,11 @@ fn run_video_decode_thread(
         if let Some(multi_touch) = ctx.input(|i| i.multi_touch()) {
             if canvas_rect.contains(multi_touch.center_pos) {
                 if (multi_touch.zoom_delta - 1.0).abs() > 1e-4 {
-                    self.viewport.zoom_at(multi_touch.center_pos, self.canvas_origin, multi_touch.zoom_delta);
+                    self.viewport.zoom_at(
+                        multi_touch.center_pos,
+                        self.canvas_origin,
+                        multi_touch.zoom_delta,
+                    );
                 }
                 self.viewport.pan += multi_touch.translation_delta;
                 return;
@@ -17491,7 +17898,11 @@ fn run_video_decode_thread(
             } else {
                 let size = self.tools.brush.size;
                 let initial_w = if self.tools.brush.brush_type == crate::tools::BrushType::Pen {
-                    let v = if let Some(p) = pressure { p as f64 } else { 1.0 };
+                    let v = if let Some(p) = pressure {
+                        p as f64
+                    } else {
+                        1.0
+                    };
                     let max_r = size as f64 / 2.0;
                     let y = (1.0 - v) * max_r;
                     let r = (max_r * max_r - y * y).max(0.0).sqrt();
@@ -17499,23 +17910,21 @@ fn run_video_decode_thread(
                 } else {
                     size
                 };
-                self.tools.brush.points.push(([doc.0, doc.1], time, initial_w));
+                self.tools
+                    .brush
+                    .points
+                    .push(([doc.0, doc.1], time, initial_w));
             }
         } else if down {
             if erase {
                 self.pixel_erase_at(doc, time);
             } else if pixel && line_mode {
                 // Straight line preview: only stamps from anchor → cursor.
-                let anchor = self
-                    .tools
-                    .brush
-                    .pixel_line_anchor
-                    .unwrap_or(doc);
+                let anchor = self.tools.brush.pixel_line_anchor.unwrap_or(doc);
                 let gx = self.viewport.step_x();
                 let gy = self.viewport.step_y();
                 let cells = self.tools.brush.pixel_cells;
-                let stamps =
-                    crate::tools::pixel_stamps_along(anchor, doc, gx, gy, cells);
+                let stamps = crate::tools::pixel_stamps_along(anchor, doc, gx, gy, cells);
                 self.tools.brush.points.clear();
                 for (cx, cy, w, _h) in stamps {
                     self.tools.brush.points.push(([cx, cy], time, w as f32));
@@ -17528,12 +17937,14 @@ fn run_video_decode_thread(
                 let gy = self.viewport.step_y();
                 let cells = self.tools.brush.pixel_cells;
                 let prev_doc = self.tools.brush.pixel_last_doc.unwrap_or(doc);
-                let stamps =
-                    crate::tools::pixel_stamps_along(prev_doc, doc, gx, gy, cells);
+                let stamps = crate::tools::pixel_stamps_along(prev_doc, doc, gx, gy, cells);
                 for (cx, cy, w, _h) in stamps {
-                    let dup = self.tools.brush.points.iter().any(|&(p, _, _)| {
-                        (p[0] - cx).abs() < 1e-6 && (p[1] - cy).abs() < 1e-6
-                    });
+                    let dup = self
+                        .tools
+                        .brush
+                        .points
+                        .iter()
+                        .any(|&(p, _, _)| (p[0] - cx).abs() < 1e-6 && (p[1] - cy).abs() < 1e-6);
                     if !dup {
                         self.tools.brush.points.push(([cx, cy], time, w as f32));
                     }
@@ -17612,8 +18023,8 @@ fn run_video_decode_thread(
                     // If the frame jumped a long way, add a few mid-points (cap 4) so
                     // release densify has anchors — without bloating live preview.
                     if dist > (size as f64 * 0.5).max(4.0) {
-                        let n = ((dist / ((size as f64 * 0.35).max(3.0))).ceil() as usize)
-                            .clamp(2, 4);
+                        let n =
+                            ((dist / ((size as f64 * 0.35).max(3.0))).ceil() as usize).clamp(2, 4);
                         // Replace the single push with subdivided path (rewrite last).
                         self.tools.brush.points.pop();
                         for i in 1..=n {
@@ -17647,11 +18058,11 @@ fn run_video_decode_thread(
                 crate::tools::BrushType::Standard | crate::tools::BrushType::Calligraphy
             ) && pts.len() >= 3
             {
-                pts = densify_brush_centerline(&pts, (self.tools.brush.size as f64 * 0.15).max(1.0));
+                pts =
+                    densify_brush_centerline(&pts, (self.tools.brush.size as f64 * 0.15).max(1.0));
             }
             if !pts.is_empty()
-                && (self.tools.brush.brush_type == crate::tools::BrushType::Pixel
-                    || pts.len() >= 2)
+                && (self.tools.brush.brush_type == crate::tools::BrushType::Pixel || pts.len() >= 2)
             {
                 if self.tools.brush.brush_type != crate::tools::BrushType::Calligraphy
                     && self.tools.brush.brush_type != crate::tools::BrushType::Pixel
@@ -17674,7 +18085,10 @@ fn run_video_decode_thread(
                     Node::path_from_bez(bez, name)
                 } else if self.tools.brush.brush_type == crate::tools::BrushType::Pen {
                     let pen_pts = if pts.len() >= 3 {
-                        densify_brush_centerline(&pts, (self.tools.brush.size as f64 * 0.12).max(0.8))
+                        densify_brush_centerline(
+                            &pts,
+                            (self.tools.brush.size as f64 * 0.12).max(0.8),
+                        )
                     } else {
                         pts.clone()
                     };
@@ -17724,10 +18138,7 @@ fn run_video_decode_thread(
         for id in ids {
             if let Some(n) = self.project.nodes.get(id) {
                 if matches!(n.kind, NodeKind::Path { .. }) {
-                    self.tools
-                        .brush
-                        .pixel_erase_before
-                        .push((id, n.clone()));
+                    self.tools.brush.pixel_erase_before.push((id, n.clone()));
                 }
             }
         }
@@ -17748,14 +18159,14 @@ fn run_video_decode_thread(
         self.tools.brush.pixel_last_doc = Some(doc);
         // Track for red erase preview.
         for (cx, cy, w, _h) in &stamps {
-            let dup = self.tools.brush.points.iter().any(|&(p, _, _)| {
-                (p[0] - cx).abs() < 1e-6 && (p[1] - cy).abs() < 1e-6
-            });
+            let dup = self
+                .tools
+                .brush
+                .points
+                .iter()
+                .any(|&(p, _, _)| (p[0] - cx).abs() < 1e-6 && (p[1] - cy).abs() < 1e-6);
             if !dup {
-                self.tools
-                    .brush
-                    .points
-                    .push(([*cx, *cy], time, *w as f32));
+                self.tools.brush.points.push(([*cx, *cy], time, *w as f32));
             }
         }
 
@@ -17890,9 +18301,7 @@ fn run_video_decode_thread(
             let NodeKind::Path { path } = &node.kind else {
                 continue;
             };
-            let Some((from, to, px, py)) =
-                path.hit_segment(doc.0, doc.1, threshold_doc)
-            else {
+            let Some((from, to, px, py)) = path.hit_segment(doc.0, doc.1, threshold_doc) else {
                 continue;
             };
             let hit_screen = self.viewport.doc_to_screen((px, py), origin);
@@ -17906,11 +18315,7 @@ fn run_video_decode_thread(
             .map(|(id, from, to, px, py, _)| (id, from, to, px, py))
     }
 
-    fn hit_node_edit(
-        &self,
-        screen: Pos2,
-        origin: Pos2,
-    ) -> Option<(NodeId, PathEditTarget)> {
+    fn hit_node_edit(&self, screen: Pos2, origin: Pos2) -> Option<(NodeId, PathEditTarget)> {
         let anchor_threshold = 7.0; // tighter selection to prevent picking left/nearby objects when mouse shifted
         let handle_threshold = 9.0;
         let mut best: Option<(NodeId, PathEditTarget, f32)> = None;
@@ -17926,9 +18331,7 @@ fn run_video_decode_thread(
             for (target, p) in node.path_edit_targets() {
                 let threshold = match target {
                     PathEditTarget::Anchor(_) => anchor_threshold,
-                    PathEditTarget::HandleOut(_) | PathEditTarget::HandleIn(_) => {
-                        handle_threshold
-                    }
+                    PathEditTarget::HandleOut(_) | PathEditTarget::HandleIn(_) => handle_threshold,
                     PathEditTarget::MidCtrl1(_) | PathEditTarget::MidCtrl2(_) => 15.0, // easier to hit the yellow tangent points; zoom-robust screen px
                 };
                 let ps = self.viewport.doc_to_screen(p, origin);
@@ -17936,7 +18339,10 @@ fn run_video_decode_thread(
                 if d < threshold {
                     let prefer = matches!(
                         target,
-                        PathEditTarget::HandleOut(_) | PathEditTarget::HandleIn(_) | PathEditTarget::MidCtrl1(_) | PathEditTarget::MidCtrl2(_)
+                        PathEditTarget::HandleOut(_)
+                            | PathEditTarget::HandleIn(_)
+                            | PathEditTarget::MidCtrl1(_)
+                            | PathEditTarget::MidCtrl2(_)
                     );
                     let replace = best.as_ref().map_or(true, |(_, bt, bd)| {
                         if prefer && !matches!(bt, PathEditTarget::Anchor(_)) {
@@ -18030,27 +18436,30 @@ fn run_video_decode_thread(
                         ProjectEdit::PatchNode { id, before, after },
                     );
                     self.tools.select.set_path_segment(id, from, new_idx);
-                    self.promote_action_tab( crate::action_tab::ActionTab::Geometry);
+                    self.promote_action_tab(crate::action_tab::ActionTab::Geometry);
                     self.status_message = "Added point on path".into();
                 }
                 return;
             }
             if let Some((id, PathEditTarget::Anchor(pi))) = self.hit_node_edit(screen, origin) {
-                if self.project.nodes.get(id).is_some_and(|n| matches!(n.kind, NodeKind::Path { .. })) {
+                if self
+                    .project
+                    .nodes
+                    .get(id)
+                    .is_some_and(|n| matches!(n.kind, NodeKind::Path { .. }))
+                {
                     self.set_path_anchor_smooth(id, pi, {
                         self.project
                             .nodes
                             .get(id)
                             .and_then(|n| match &n.kind {
-                                NodeKind::Path { path } => {
-                                    Some(!path.is_anchor_smooth(pi))
-                                }
+                                NodeKind::Path { path } => Some(!path.is_anchor_smooth(pi)),
                                 _ => None,
                             })
                             .unwrap_or(true)
                     });
                     self.tools.select.set_single_path_point(id, pi);
-                    self.promote_action_tab( crate::action_tab::ActionTab::Geometry);
+                    self.promote_action_tab(crate::action_tab::ActionTab::Geometry);
                 }
             }
             return;
@@ -18074,7 +18483,12 @@ fn run_video_decode_thread(
                     .is_some_and(|n| matches!(n.kind, NodeKind::Path { .. }))
                 {
                     if matches!(target, PathEditTarget::Anchor(_)) {
-                        let is_already_selected = self.tools.select.selected_path_points.iter().any(|&(sid, idx)| sid == id && idx == pi);
+                        let is_already_selected = self
+                            .tools
+                            .select
+                            .selected_path_points
+                            .iter()
+                            .any(|&(sid, idx)| sid == id && idx == pi);
                         if !is_already_selected || ctrl || shift {
                             self.tools.select.toggle_path_point(id, pi, ctrl || shift);
                         }
@@ -18084,7 +18498,7 @@ fn run_video_decode_thread(
                 } else {
                     self.tools.select.clear_path_point_selection();
                 }
-                self.promote_action_tab( crate::action_tab::ActionTab::Geometry);
+                self.promote_action_tab(crate::action_tab::ActionTab::Geometry);
                 let Some(node) = self.project.nodes.get(id) else {
                     return;
                 };
@@ -18107,7 +18521,7 @@ fn run_video_decode_thread(
                     self.sync_inspector_from_selection();
                 }
                 self.tools.select.set_path_segment(id, from, to);
-                self.promote_action_tab( crate::action_tab::ActionTab::Geometry);
+                self.promote_action_tab(crate::action_tab::ActionTab::Geometry);
                 return;
             }
 
@@ -18168,19 +18582,24 @@ fn run_video_decode_thread(
                     let mut use_doc = doc;
                     // Apply grid snap for bezier handle / anchor interaction.
                     // Skip snap for yellow fillet points (MidCtrl) to allow precise radius adjust, esp. when zoomed in.
-                    let is_yellow = matches!(target, PathEditTarget::MidCtrl1(_) | PathEditTarget::MidCtrl2(_));
+                    let is_yellow = matches!(
+                        target,
+                        PathEditTarget::MidCtrl1(_) | PathEditTarget::MidCtrl2(_)
+                    );
                     if self.viewport.snap_grid && !is_yellow {
                         let g = self.viewport.grid_step as f64;
                         if g > 0.0 {
-                            use_doc = (
-                                (doc.0 / g).round() * g,
-                                (doc.1 / g).round() * g,
-                            );
+                            use_doc = ((doc.0 / g).round() * g, (doc.1 / g).round() * g);
                         }
                     }
                     // Extend magnetic (object/canvas) snap to edit mode (esp. path anchors/handles)
                     if self.snap_magnet && !is_yellow {
-                        if matches!(target, PathEditTarget::Anchor(_) | PathEditTarget::HandleIn(_) | PathEditTarget::HandleOut(_)) {
+                        if matches!(
+                            target,
+                            PathEditTarget::Anchor(_)
+                                | PathEditTarget::HandleIn(_)
+                                | PathEditTarget::HandleOut(_)
+                        ) {
                             use_doc = self.snap_cursor(use_doc);
                         }
                     }
@@ -18220,28 +18639,34 @@ fn run_video_decode_thread(
                         self.tools.select.last_doc = use_doc;
                     }
 
-                    let is_flowchart_path = self.project.nodes.get(id).map_or(false, |n| matches!(n.kind, NodeKind::FlowchartPath { .. }));
+                    let is_flowchart_path = self
+                        .project
+                        .nodes
+                        .get(id)
+                        .map_or(false, |n| matches!(n.kind, NodeKind::FlowchartPath { .. }));
                     if is_flowchart_path {
                         let active_idx = self.project.document.active_layer_index;
                         if let Some(layer) = self.project.document.layers.get(active_idx) {
                             let mut snap_start_node = None;
                             let mut snap_start_anchor = None;
                             let mut snap_start_pt = None;
-                            
+
                             let mut snap_end_node = None;
                             let mut snap_end_anchor = None;
                             let mut snap_end_pt = None;
-                            
+
                             if let Some(node) = self.project.nodes.get(id) {
                                 if let NodeKind::FlowchartPath { path } = &node.kind {
                                     if let PathEditTarget::Anchor(idx) = target {
                                         let store = &self.project.nodes;
                                         let anchor_slop = 24.0f64;
-                                        
+
                                         if idx == 0 {
                                             let mut best_start_d = anchor_slop;
                                             for &nid in &layer.nodes {
-                                                if nid == id { continue; }
+                                                if nid == id {
+                                                    continue;
+                                                }
                                                 if let Some(nd) = store.get(nid) {
                                                     if let Some(geom) = crate::document::flowchart::node_as_flowchart_geom(&nd.kind) {
                                                         let anc_s = crate::document::flowchart::snap_anchor_for_point(&geom, path.points[0]);
@@ -18259,7 +18684,9 @@ fn run_video_decode_thread(
                                         } else if idx == path.points.len() - 1 {
                                             let mut best_end_d = anchor_slop;
                                             for &nid in &layer.nodes {
-                                                if nid == id { continue; }
+                                                if nid == id {
+                                                    continue;
+                                                }
                                                 if let Some(nd) = store.get(nid) {
                                                     if let Some(geom) = crate::document::flowchart::node_as_flowchart_geom(&nd.kind) {
                                                         let anc_e = crate::document::flowchart::snap_anchor_for_point(&geom, path.points[idx]);
@@ -18278,7 +18705,7 @@ fn run_video_decode_thread(
                                     }
                                 }
                             }
-                            
+
                             if let Some(node) = self.project.nodes.get_mut(id) {
                                 if let NodeKind::FlowchartPath { path } = &mut node.kind {
                                     if let PathEditTarget::Anchor(idx) = target {
@@ -18323,7 +18750,6 @@ fn run_video_decode_thread(
         }
     }
 
-
     fn mcp_paint_hex(node: &crate::document::Node) -> Option<String> {
         use crate::document::Fill;
         if let Fill::Solid(p) = node.style.fill {
@@ -18357,12 +18783,17 @@ fn run_video_decode_thread(
     fn mcp_list_all_objects_json(&self) -> Result<String, String> {
         let mut items = Vec::new();
         for (layer_idx, layer) in self.project.document.layers.iter().enumerate() {
-            if !layer.visible || !layer.is_renderer || layer.kind != crate::document::LayerKind::Image {
+            if !layer.visible
+                || !layer.is_renderer
+                || layer.kind != crate::document::LayerKind::Image
+            {
                 continue;
             }
             let layer_editable = !layer.locked;
             for id in &layer.nodes {
-                let Some(node) = self.project.nodes.get(*id) else { continue };
+                let Some(node) = self.project.nodes.get(*id) else {
+                    continue;
+                };
                 let b = node.bounds();
                 items.push(serde_json::json!({
                     "id": id.to_string(),
@@ -18432,14 +18863,10 @@ fn run_video_decode_thread(
             io::write_image_file(&p, io::ExportImageFormat::Png, pw, ph, &rgba)
                 .map_err(|e| e.to_string())?;
         }
-        let png = image::RgbaImage::from_raw(pw, ph, rgba.clone())
-            .ok_or("Invalid RGBA buffer")?;
+        let png = image::RgbaImage::from_raw(pw, ph, rgba.clone()).ok_or("Invalid RGBA buffer")?;
         let mut buf = Vec::new();
-        png.write_to(
-            &mut std::io::Cursor::new(&mut buf),
-            image::ImageFormat::Png,
-        )
-        .map_err(|e| e.to_string())?;
+        png.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .map_err(|e| e.to_string())?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
         self.mcp_preview.rgba = rgba;
         self.mcp_preview.width = pw;
@@ -18539,7 +18966,6 @@ fn run_video_decode_thread(
         serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
     }
 
-
     fn mcp_ensure_editable(&self) -> Result<(), String> {
         if !self.layer_editable() {
             return Err("Active layer is locked or hidden".into());
@@ -18547,7 +18973,11 @@ fn run_video_decode_thread(
         Ok(())
     }
 
-    fn mcp_finish_node(&mut self, mut node: crate::document::Node, style: &crate::mcp::drawing::McpShapeStyle) {
+    fn mcp_finish_node(
+        &mut self,
+        mut node: crate::document::Node,
+        style: &crate::mcp::drawing::McpShapeStyle,
+    ) {
         if let Some(n) = style.name.clone() {
             node.name = n;
         }
@@ -18593,9 +19023,7 @@ fn run_video_decode_thread(
             .layers
             .iter()
             .position(|l| l.kind == crate::document::LayerKind::NodeEditor)
-            .ok_or_else(|| {
-                "No Node Editor layer — use add_node_editor_layer first".into()
-            })
+            .ok_or_else(|| "No Node Editor layer — use add_node_editor_layer first".into())
     }
 
     fn mcp_with_node_graph_mut<R>(
@@ -18606,19 +19034,13 @@ fn run_video_decode_thread(
         let idx = self.mcp_resolve_ne_layer_idx(args)?;
         let before = snapshot_document(&self.project.document);
         let mut after = before.clone();
-        let layer = after
-            .layers
-            .get_mut(idx)
-            .ok_or("Layer missing")?;
+        let layer = after.layers.get_mut(idx).ok_or("Layer missing")?;
         if layer.kind != crate::document::LayerKind::NodeEditor {
             return Err("Layer is not a Node Editor layer".into());
         }
         layer.ensure_node_graph();
         let layer_id = layer.id;
-        let g = layer
-            .node_graph
-            .as_mut()
-            .ok_or("Node graph missing")?;
+        let g = layer.node_graph.as_mut().ok_or("Node graph missing")?;
         let result = f(g, idx, layer_id)?;
         self.history.push(
             &mut self.project,
@@ -18678,10 +19100,7 @@ fn run_video_decode_thread(
                     .layers
                     .get(idx)
                     .ok_or("Layer missing")?;
-                let g = layer
-                    .node_graph
-                    .as_ref()
-                    .ok_or("No node graph on layer")?;
+                let g = layer.node_graph.as_ref().ok_or("No node graph on layer")?;
                 let nodes: Vec<_> = g
                     .nodes
                     .values()
@@ -18717,10 +19136,7 @@ fn run_video_decode_thread(
                     .layers
                     .get(idx)
                     .ok_or("Layer missing")?;
-                let g = layer
-                    .node_graph
-                    .as_ref()
-                    .ok_or("No node graph on layer")?;
+                let g = layer.node_graph.as_ref().ok_or("No node graph on layer")?;
                 let links: Vec<_> = g
                     .links
                     .iter()
@@ -18749,10 +19165,7 @@ fn run_video_decode_thread(
                     .layers
                     .get(idx)
                     .ok_or("Layer missing")?;
-                let g = layer
-                    .node_graph
-                    .as_ref()
-                    .ok_or("No node graph on layer")?;
+                let g = layer.node_graph.as_ref().ok_or("No node graph on layer")?;
                 let eval = g.resolve_output_image();
                 let image = match &eval.image {
                     crate::document::GraphImageSource::Empty => {
@@ -18820,12 +19233,9 @@ fn run_video_decode_thread(
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 let id = self.mcp_with_node_graph_mut(args, |g, _idx, _lid| {
-                    let nx = x.unwrap_or_else(|| {
-                        40.0 + (g.nodes.len() as f32 % 5.0) * 180.0
-                    });
-                    let ny = y.unwrap_or_else(|| {
-                        40.0 + (g.nodes.len() as f32 / 5.0).floor() * 100.0
-                    });
+                    let nx = x.unwrap_or_else(|| 40.0 + (g.nodes.len() as f32 % 5.0) * 180.0);
+                    let ny =
+                        y.unwrap_or_else(|| 40.0 + (g.nodes.len() as f32 / 5.0).floor() * 100.0);
                     if let Some(p) = param {
                         g.parameters.push(p);
                     }
@@ -18837,9 +19247,7 @@ fn run_video_decode_thread(
                     }
                     Ok(nid)
                 })?;
-                Ok(format!(
-                    "Added graph node {id} kind={kind_str}"
-                ))
+                Ok(format!("Added graph node {id} kind={kind_str}"))
             }
             "edit_graph_node" => {
                 let node_id = args
@@ -18962,9 +19370,7 @@ fn run_video_decode_thread(
                     g.try_add_link(from_id, &from_port, to_id, &to_port)?;
                     Ok((from_port, to_port))
                 })?;
-                Ok(format!(
-                    "Connected {from}:{from_port} → {to}:{to_port}"
-                ))
+                Ok(format!("Connected {from}:{from_port} → {to}:{to_port}"))
             }
             "disconnect_graph_link" => {
                 let link_id = args
@@ -18985,8 +19391,7 @@ fn run_video_decode_thread(
                         g.links.retain(|l| l.id != lid);
                     } else if let Some(tn) = to_node {
                         if let Some(tp) = to_port {
-                            g.links
-                                .retain(|l| !(l.to_node == tn && l.to_port == tp));
+                            g.links.retain(|l| !(l.to_node == tn && l.to_port == tp));
                         } else {
                             g.links.retain(|l| l.to_node != tn);
                         }
@@ -19014,10 +19419,7 @@ fn run_video_decode_thread(
             .and_then(|v| v.as_str())
             .unwrap_or("pixel")
             .to_ascii_lowercase();
-        let erase = args
-            .get("erase")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let erase = args.get("erase").and_then(|v| v.as_bool()).unwrap_or(false);
         let cells = args
             .get("cells")
             .and_then(|v| v.as_u64())
@@ -19059,14 +19461,8 @@ fn run_video_decode_thread(
 
         // --- pattern (2D pixel art) ---
         if let Some(rows) = args.get("pattern").and_then(|v| v.as_array()) {
-            let ox = args
-                .get("origin_x")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let oy = args
-                .get("origin_y")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+            let ox = args.get("origin_x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let oy = args.get("origin_y").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let (base_i, base_j) = crate::tools::pixel_cell_index((ox, oy), gx, gy);
             for (row_i, row) in rows.iter().enumerate() {
                 let Some(cols) = row.as_array() else {
@@ -19151,9 +19547,7 @@ fn run_video_decode_thread(
         }
 
         if freehand.is_empty() && colored_stamps.is_empty() {
-            return Err(
-                "brush needs points, stamps, pattern, x/y, or x0,y0,x1,y1".into(),
-            );
+            return Err("brush needs points, stamps, pattern, x/y, or x0,y0,x1,y1".into());
         }
 
         // Expand freehand into pixel stamps when mode=pixel and no pattern/stamps colors yet
@@ -19166,8 +19560,7 @@ fn run_video_decode_thread(
                 path_pts.push(path_pts[0]);
             }
             for w in path_pts.windows(2) {
-                let stamps =
-                    crate::tools::pixel_stamps_along(w[0], w[1], gx, gy, cells);
+                let stamps = crate::tools::pixel_stamps_along(w[0], w[1], gx, gy, cells);
                 for (cx, cy, w, h) in stamps {
                     colored_stamps.push((cx, cy, w, h, default_rgb, default_alpha));
                 }
@@ -19189,10 +19582,7 @@ fn run_video_decode_thread(
             // Batch all unique erase rects then strip once per node for speed.
             let mut erase_rects: Vec<(f64, f64, f64, f64)> = Vec::new();
             for &(cx, cy, w, h, _, _) in &colored_stamps {
-                let key = (
-                    (cx * 1000.0).round() as i64,
-                    (cy * 1000.0).round() as i64,
-                );
+                let key = ((cx * 1000.0).round() as i64, (cy * 1000.0).round() as i64);
                 if !seen.insert(key) {
                     continue;
                 }
@@ -19237,9 +19627,7 @@ fn run_video_decode_thread(
             self.pixel_erase_commit();
             self.tools.brush.pixel_cells = prev_cells;
             self.tools.brush.points.clear();
-            return Ok(format!(
-                "Erased pixel stamps under {erased_cells} cells"
-            ));
+            return Ok(format!("Erased pixel stamps under {erased_cells} cells"));
         }
 
         // --- soft / pen modes ---
@@ -19298,7 +19686,10 @@ fn run_video_decode_thread(
             }
             let id = node.id;
             self.insert_node(node);
-            return Ok(format!("Created {mode} stroke {id} ({} pts)", freehand.len()));
+            return Ok(format!(
+                "Created {mode} stroke {id} ({} pts)",
+                freehand.len()
+            ));
         }
 
         // --- pixel paint: group by color → path of rects ---
@@ -19331,16 +19722,13 @@ fn run_video_decode_thread(
         for ((rgb, a_key), pts) in by_color {
             let a = a_key as f32 / 1000.0;
             let bez = pixel_stamps_to_path(&pts, aspect);
-            let name = style
-                .name
-                .clone()
-                .unwrap_or_else(|| {
-                    if multi {
-                        format!("Pixel Brush #{rgb:06x}")
-                    } else {
-                        "Pixel Brush".into()
-                    }
-                });
+            let name = style.name.clone().unwrap_or_else(|| {
+                if multi {
+                    format!("Pixel Brush #{rgb:06x}")
+                } else {
+                    "Pixel Brush".into()
+                }
+            });
             let mut node = Node::path_from_bez(bez, &name);
             node.style.fill = Fill::Solid(Paint::from_hex(rgb, a));
             node.style.stroke = Stroke {
@@ -19371,7 +19759,9 @@ fn run_video_decode_thread(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_drawing_tool(&mut self, name: &str, args: serde_json::Value) -> Result<String, String> {
         use crate::document::{ArcJoin, Fill, Node, NodeKind, TextStyle};
-        use crate::mcp::drawing::{fill_from_style, parse_arc_join, style_from_args, stroke_from_style};
+        use crate::mcp::drawing::{
+            fill_from_style, parse_arc_join, stroke_from_style, style_from_args,
+        };
         if crate::mcp::node_editor::is_node_editor_tool(name) {
             return self.mcp_node_editor_tool(name, &args);
         }
@@ -19385,7 +19775,11 @@ fn run_video_decode_thread(
                 let y = args.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let w = args.get("w").and_then(|v| v.as_f64()).unwrap_or(100.0);
                 let h = args.get("h").and_then(|v| v.as_f64()).unwrap_or(80.0);
-                let rx = args.get("rx").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+                let rx = args
+                    .get("rx")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0)
+                    .max(0.0);
                 let mut node = Node::rect(x, y, w.max(1.0), h.max(1.0), fill_from_style(&style));
                 if let NodeKind::Rect { rx: ref mut r, .. } = node.kind {
                     *r = rx;
@@ -19432,7 +19826,10 @@ fn run_video_decode_thread(
                 ))
             }
             "create_rectangles" => {
-                let rects = args.get("rects").and_then(|v| v.as_array()).ok_or("rects array required")?;
+                let rects = args
+                    .get("rects")
+                    .and_then(|v| v.as_array())
+                    .ok_or("rects array required")?;
                 let mut batch: Vec<crate::document::Node> = Vec::with_capacity(rects.len());
                 for r in rects {
                     let x = r.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -19453,13 +19850,20 @@ fn run_video_decode_thread(
                     // Large pixel-art batches (e.g. blackhole/galaxy) are spread over frames.
                     self.pending_mcp_bulk_rects.push(batch);
                 }
-                Ok(format!("Created {} rectangles (queued for smooth creation)", n))
+                Ok(format!(
+                    "Created {} rectangles (queued for smooth creation)",
+                    n
+                ))
             }
             "brush" | "brush_stroke" | "paint_brush" => self.mcp_brush(&args, &style),
             "create_circle" => {
                 let cx = args.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let cy = args.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let r = args.get("r").and_then(|v| v.as_f64()).unwrap_or(50.0).max(0.5);
+                let r = args
+                    .get("r")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(50.0)
+                    .max(0.5);
                 let mut node = Node::ellipse(cx, cy, r, r, fill_from_style(&style));
                 node.name = "Circle".into();
                 let id = node.id;
@@ -19469,8 +19873,16 @@ fn run_video_decode_thread(
             "create_ellipse" => {
                 let cx = args.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let cy = args.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let rx = args.get("rx").and_then(|v| v.as_f64()).unwrap_or(60.0).max(0.5);
-                let ry = args.get("ry").and_then(|v| v.as_f64()).unwrap_or(40.0).max(0.5);
+                let rx = args
+                    .get("rx")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(60.0)
+                    .max(0.5);
+                let ry = args
+                    .get("ry")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(40.0)
+                    .max(0.5);
                 let node = Node::ellipse(cx, cy, rx, ry, fill_from_style(&style));
                 let id = node.id;
                 self.mcp_finish_node(node, &style);
@@ -19489,7 +19901,11 @@ fn run_video_decode_thread(
             "create_polygon" => {
                 let cx = args.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let cy = args.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let r = args.get("r").and_then(|v| v.as_f64()).unwrap_or(50.0).max(0.5);
+                let r = args
+                    .get("r")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(50.0)
+                    .max(0.5);
                 let sides = args.get("sides").and_then(|v| v.as_u64()).unwrap_or(6) as u32;
                 let rot = args
                     .get("rotation_deg")
@@ -19507,7 +19923,11 @@ fn run_video_decode_thread(
             "create_arc" => {
                 let cx = args.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let cy = args.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let radius = args.get("radius").and_then(|v| v.as_f64()).unwrap_or(50.0).max(0.5);
+                let radius = args
+                    .get("radius")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(50.0)
+                    .max(0.5);
                 let start = args
                     .get("start_angle_deg")
                     .and_then(|v| v.as_f64())
@@ -19574,32 +19994,63 @@ fn run_video_decode_thread(
                 if let Some(arr) = args.get("ids").and_then(|v| v.as_array()) {
                     self.mcp_set_objects_style_from_args(arr, &args)
                 } else {
-                    let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                    let id_str = args
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or("id required")?;
                     self.mcp_patch_node(id_str, &args)
                 }
             }
             "set_objects_style" => {
-                let arr = args.get("ids").and_then(|v| v.as_array()).ok_or("ids array required")?;
+                let arr = args
+                    .get("ids")
+                    .and_then(|v| v.as_array())
+                    .ok_or("ids array required")?;
                 self.mcp_set_objects_style_from_args(arr, &args)
             }
             "set_object_transform" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
                 let patch = args.clone();
                 self.mcp_patch_node(id_str, &patch)
             }
             "set_object_geometry" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
-                let geom = args.get("geometry").cloned().unwrap_or(serde_json::json!({}));
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
+                let geom = args
+                    .get("geometry")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
                 self.mcp_patch_node(id_str, &geom)
             }
 
             // === Animation tools ===
             "set_keyframe" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
-                let property = args.get("property").and_then(|v| v.as_str()).ok_or("property required")?.to_string();
-                let frame = args.get("frame").and_then(|v| v.as_u64()).ok_or("frame required")? as usize;
-                let value = args.get("value").and_then(|v| v.as_f64()).ok_or("value required")?;
-                let interp_str = args.get("interpolation").and_then(|v| v.as_str()).unwrap_or("linear");
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
+                let property = args
+                    .get("property")
+                    .and_then(|v| v.as_str())
+                    .ok_or("property required")?
+                    .to_string();
+                let frame = args
+                    .get("frame")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("frame required")? as usize;
+                let value = args
+                    .get("value")
+                    .and_then(|v| v.as_f64())
+                    .ok_or("value required")?;
+                let interp_str = args
+                    .get("interpolation")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("linear");
                 let mode = match interp_str.to_lowercase().as_str() {
                     "bezier" | "cubic" => crate::document::InterpolationMode::Bezier,
                     _ => crate::document::InterpolationMode::Linear,
@@ -19607,54 +20058,109 @@ fn run_video_decode_thread(
                 self.mcp_set_keyframe(id_str, &property, frame, value, mode)
             }
             "remove_keyframe" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
-                let property = args.get("property").and_then(|v| v.as_str()).ok_or("property required")?.to_string();
-                let frame = args.get("frame").and_then(|v| v.as_u64()).ok_or("frame required")? as usize;
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
+                let property = args
+                    .get("property")
+                    .and_then(|v| v.as_str())
+                    .ok_or("property required")?
+                    .to_string();
+                let frame = args
+                    .get("frame")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("frame required")? as usize;
                 self.mcp_remove_keyframe(id_str, &property, frame)
             }
             "get_keyframes" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
-                let property = args.get("property").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
+                let property = args
+                    .get("property")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 self.mcp_get_keyframes(id_str, property.as_deref())
             }
             "set_keyframe_interpolation" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
-                let property = args.get("property").and_then(|v| v.as_str()).ok_or("property required")?.to_string();
-                let frame = args.get("frame").and_then(|v| v.as_u64()).ok_or("frame required")? as usize;
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
+                let property = args
+                    .get("property")
+                    .and_then(|v| v.as_str())
+                    .ok_or("property required")?
+                    .to_string();
+                let frame = args
+                    .get("frame")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("frame required")? as usize;
                 let interp_str = args.get("interpolation").and_then(|v| v.as_str());
                 let handle_left = args.get("handle_left").and_then(|v| v.as_array()).map(|a| {
-                    (a.get(0).and_then(|x| x.as_f64()).unwrap_or(-5.0),
-                     a.get(1).and_then(|y| y.as_f64()).unwrap_or(0.0))
+                    (
+                        a.get(0).and_then(|x| x.as_f64()).unwrap_or(-5.0),
+                        a.get(1).and_then(|y| y.as_f64()).unwrap_or(0.0),
+                    )
                 });
-                let handle_right = args.get("handle_right").and_then(|v| v.as_array()).map(|a| {
-                    (a.get(0).and_then(|x| x.as_f64()).unwrap_or(5.0),
-                     a.get(1).and_then(|y| y.as_f64()).unwrap_or(0.0))
-                });
+                let handle_right = args
+                    .get("handle_right")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        (
+                            a.get(0).and_then(|x| x.as_f64()).unwrap_or(5.0),
+                            a.get(1).and_then(|y| y.as_f64()).unwrap_or(0.0),
+                        )
+                    });
                 let handle_mode_str = args.get("handle_mode").and_then(|v| v.as_str());
-                self.mcp_set_keyframe_interpolation(id_str, &property, frame, interp_str, handle_left, handle_right, handle_mode_str)
+                self.mcp_set_keyframe_interpolation(
+                    id_str,
+                    &property,
+                    frame,
+                    interp_str,
+                    handle_left,
+                    handle_right,
+                    handle_mode_str,
+                )
             }
             "set_current_anim_frame" => {
-                let frame = args.get("frame").and_then(|v| v.as_u64()).ok_or("frame required")? as usize;
+                let frame = args
+                    .get("frame")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("frame required")? as usize;
                 self.playback.frame = frame;
                 self.apply_animation_for_frame(frame);
                 Ok(format!("Current frame set to {}", frame))
             }
-            "get_current_anim_frame" => {
-                Ok(format!("{}", self.playback.frame))
-            }
+            "get_current_anim_frame" => Ok(format!("{}", self.playback.frame)),
             "set_keyframes" => {
-                let kfs = args.get("keyframes").and_then(|v| v.as_array()).ok_or("keyframes array required")?;
+                let kfs = args
+                    .get("keyframes")
+                    .and_then(|v| v.as_array())
+                    .ok_or("keyframes array required")?;
                 self.mcp_set_keyframes(kfs)
             }
             "clear_animation_track" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
-                let property = args.get("property").and_then(|v| v.as_str()).ok_or("property required")?.to_string();
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
+                let property = args
+                    .get("property")
+                    .and_then(|v| v.as_str())
+                    .ok_or("property required")?
+                    .to_string();
                 self.mcp_clear_animation_track(id_str, &property)
             }
             "add_stack_animation" => self.mcp_add_stack_animation(&args),
             "edit_stack_animation" => self.mcp_edit_stack_animation(&args),
             "remove_stack_animation" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
                 let stack_id = args
                     .get("stack_id")
                     .and_then(|v| v.as_str())
@@ -19682,10 +20188,7 @@ fn run_video_decode_thread(
                 Ok(format!("Created path {id}"))
             }
             "add_layer" => {
-                let name = args
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Layer");
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Layer");
                 self.add_layer(name);
                 Ok(format!("Added layer \"{name}\""))
             }
@@ -19710,7 +20213,8 @@ fn run_video_decode_thread(
                 // Default: edit the active / targeted shading layer in place (no stack spam).
                 // Pass `"new": true` to always create a fresh layer.
                 let force_new = args.get("new").and_then(|v| v.as_bool()).unwrap_or(false);
-                let has_target = args.get("layer_id").is_some() || args.get("layer_index").is_some();
+                let has_target =
+                    args.get("layer_id").is_some() || args.get("layer_index").is_some();
                 let active_is_shading = self
                     .project
                     .document
@@ -19724,28 +20228,27 @@ fn run_video_decode_thread(
                     .iter()
                     .any(|l| l.kind == crate::document::LayerKind::Shading);
                 if !force_new && (has_target || active_is_shading || any_shading) {
-                    let layer_index = if let Some(i) =
-                        args.get("layer_index").and_then(|v| v.as_u64())
-                    {
-                        i as usize
-                    } else if let Some(id) = args.get("layer_id").and_then(|v| v.as_str()) {
-                        let uid = uuid::Uuid::parse_str(id).map_err(|_| "bad layer_id")?;
-                        self.project
-                            .document
-                            .layers
-                            .iter()
-                            .position(|l| l.id == uid)
-                            .ok_or("layer_id not found")?
-                    } else if active_is_shading {
-                        self.project.document.active_layer_index
-                    } else {
-                        self.project
-                            .document
-                            .layers
-                            .iter()
-                            .position(|l| l.kind == crate::document::LayerKind::Shading)
-                            .ok_or("no shading layer")?
-                    };
+                    let layer_index =
+                        if let Some(i) = args.get("layer_index").and_then(|v| v.as_u64()) {
+                            i as usize
+                        } else if let Some(id) = args.get("layer_id").and_then(|v| v.as_str()) {
+                            let uid = uuid::Uuid::parse_str(id).map_err(|_| "bad layer_id")?;
+                            self.project
+                                .document
+                                .layers
+                                .iter()
+                                .position(|l| l.id == uid)
+                                .ok_or("layer_id not found")?
+                        } else if active_is_shading {
+                            self.project.document.active_layer_index
+                        } else {
+                            self.project
+                                .document
+                                .layers
+                                .iter()
+                                .position(|l| l.kind == crate::document::LayerKind::Shading)
+                                .ok_or("no shading layer")?
+                        };
                     self.set_shading_wgsl(layer_index, wgsl, Some(pass_name), uniforms)?;
                     // Optionally rename the layer when editing in place.
                     if let Some(l) = self.project.document.layers.get_mut(layer_index) {
@@ -19768,7 +20271,8 @@ fn run_video_decode_thread(
                     .get("wgsl")
                     .and_then(|v| v.as_str())
                     .ok_or("set_shading_wgsl requires \"wgsl\"")?;
-                let layer_index = if let Some(i) = args.get("layer_index").and_then(|v| v.as_u64()) {
+                let layer_index = if let Some(i) = args.get("layer_index").and_then(|v| v.as_u64())
+                {
                     i as usize
                 } else if let Some(id) = args.get("layer_id").and_then(|v| v.as_str()) {
                     let uid = uuid::Uuid::parse_str(id).map_err(|_| "bad layer_id")?;
@@ -19807,7 +20311,10 @@ fn run_video_decode_thread(
                 ))
             }
             "list_animatable_properties" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
                 self.mcp_list_animatable_properties(id_str)
             }
             "list_animation_tracks" => {
@@ -19837,20 +20344,33 @@ fn run_video_decode_thread(
                 })
             }
             "get_object_properties" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
                 self.mcp_get_object_properties(id_str)
             }
-            "set_selection" => {
-                self.mcp_set_selection(&args)
-            }
+            "set_selection" => self.mcp_set_selection(&args),
             "duplicate_object" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
-                let ox = args.get("offset_x").and_then(|v| v.as_f64()).unwrap_or(20.0);
-                let oy = args.get("offset_y").and_then(|v| v.as_f64()).unwrap_or(20.0);
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
+                let ox = args
+                    .get("offset_x")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(20.0);
+                let oy = args
+                    .get("offset_y")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(20.0);
                 self.mcp_duplicate_object(id_str, ox, oy)
             }
             "reorder_object" => {
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("id required")?;
                 let action = args
                     .get("action")
                     .and_then(|v| v.as_str())
@@ -19867,7 +20387,10 @@ fn run_video_decode_thread(
                     self.project.document.active_layer_index = i;
                     return Ok(format!("Active layer index {i}"));
                 }
-                let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("index or id required")?;
+                let id_str = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("index or id required")?;
                 let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
                 let pos = self
                     .project
@@ -19883,7 +20406,10 @@ fn run_video_decode_thread(
         }
     }
 
-    fn mcp_patch_nodes(&mut self, patches: Vec<(uuid::Uuid, crate::document::Node, crate::document::Node)>) -> Result<String, String> {
+    fn mcp_patch_nodes(
+        &mut self,
+        patches: Vec<(uuid::Uuid, crate::document::Node, crate::document::Node)>,
+    ) -> Result<String, String> {
         if patches.is_empty() {
             return Ok("No changes".into());
         }
@@ -19895,9 +20421,7 @@ fn run_video_decode_thread(
                     project: &mut self.project,
                     history: &mut self.history,
                 },
-                EditorCommand::Edit(crate::history::ProjectEdit::PatchNodes {
-                    patches: real,
-                }),
+                EditorCommand::Edit(crate::history::ProjectEdit::PatchNodes { patches: real }),
             );
             // MCP style patches previously skipped UI/texture sync entirely.
             self.apply_document_changes(changes);
@@ -19905,7 +20429,11 @@ fn run_video_decode_thread(
         Ok(format!("Updated style on {} object(s)", count))
     }
 
-    fn mcp_set_objects_style_from_args(&mut self, id_values: &[serde_json::Value], args: &serde_json::Value) -> Result<String, String> {
+    fn mcp_set_objects_style_from_args(
+        &mut self,
+        id_values: &[serde_json::Value],
+        args: &serde_json::Value,
+    ) -> Result<String, String> {
         use crate::mcp::drawing::apply_style_patch;
         let mut patches = Vec::new();
         for idv in id_values {
@@ -19956,7 +20484,10 @@ fn run_video_decode_thread(
     }
 
     fn mcp_add_stack_animation(&mut self, args: &serde_json::Value) -> Result<String, String> {
-        let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+        let id_str = args
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or("id required")?;
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         if self.project.nodes.get(id).is_none() {
             return Err(format!("Object not found: {id_str}"));
@@ -20041,12 +20572,14 @@ fn run_video_decode_thread(
             }
         }
         let stack_id = uuid::Uuid::new_v4();
-        entry.stack_functions.push(crate::document::StackAnimationFunction {
-            id: stack_id,
-            start_frame,
-            duration_frames,
-            channels,
-        });
+        entry
+            .stack_functions
+            .push(crate::document::StackAnimationFunction {
+                id: stack_id,
+                start_frame,
+                duration_frames,
+                channels,
+            });
         entry.ensure_stack_start_keyframes();
         entry.ensure_stack_end_keyframes();
         let after = self.project.anim_timeline.clone();
@@ -20061,7 +20594,10 @@ fn run_video_decode_thread(
     }
 
     fn mcp_edit_stack_animation(&mut self, args: &serde_json::Value) -> Result<String, String> {
-        let id_str = args.get("id").and_then(|v| v.as_str()).ok_or("id required")?;
+        let id_str = args
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or("id required")?;
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         let stack_id = args
             .get("stack_id")
@@ -20105,8 +20641,7 @@ fn run_video_decode_thread(
         let starts = args.get("starts");
         if starts.is_some() {
             for ch in sf.channels.iter_mut() {
-                ch.start_value =
-                    Self::mcp_resolve_start_const(starts, &ch.track, ch.start_value);
+                ch.start_value = Self::mcp_resolve_start_const(starts, &ch.track, ch.start_value);
             }
         }
         let labels: Vec<String> = sf.channels.iter().map(|c| c.track.clone()).collect();
@@ -20275,7 +20810,9 @@ fn run_video_decode_thread(
                 .get(*nid)
                 .map(|n| n.name.clone())
                 .unwrap_or_else(|| nid.to_string());
-            let push_track = |prop: &str, track: &crate::document::KeyframeTrack, tracks: &mut Vec<serde_json::Value>| {
+            let push_track = |prop: &str,
+                              track: &crate::document::KeyframeTrack,
+                              tracks: &mut Vec<serde_json::Value>| {
                 if track.keyframes.is_empty() {
                     return;
                 }
@@ -20341,7 +20878,9 @@ fn run_video_decode_thread(
                     (p.rgba[0]*255.0) as u8, (p.rgba[1]*255.0) as u8, (p.rgba[2]*255.0) as u8),
             }),
             crate::document::Fill::None => serde_json::json!({ "kind": "none" }),
-            other => serde_json::json!({ "kind": format!("{:?}", other).split_whitespace().next().unwrap_or("other") }),
+            other => {
+                serde_json::json!({ "kind": format!("{:?}", other).split_whitespace().next().unwrap_or("other") })
+            }
         };
         let stroke = serde_json::json!({
             "width": node.style.stroke.width,
@@ -20444,8 +20983,10 @@ fn run_video_decode_thread(
         let mut dup = src.duplicate();
         dup.translate(ox, oy);
         let new_id = dup.id;
-        self.history
-            .push(&mut self.project, crate::history::ProjectEdit::InsertNode { node: dup });
+        self.history.push(
+            &mut self.project,
+            crate::history::ProjectEdit::InsertNode { node: dup },
+        );
         self.selection = vec![new_id];
         Ok(format!("Duplicated {id_str} → {new_id}"))
     }
@@ -20472,11 +21013,7 @@ fn run_video_decode_thread(
                 }
                 return Ok(format!("Sent {id_str} toward back"));
             }
-            _ => {
-                return Err(
-                    "action must be raise|lower|bring_to_front|send_to_back".into(),
-                )
-            }
+            _ => return Err("action must be raise|lower|bring_to_front|send_to_back".into()),
         };
         self.nudge_z_order(delta);
         Ok(format!("Reordered {id_str} ({action})"))
@@ -20504,11 +21041,20 @@ fn run_video_decode_thread(
                 })
             })
             .collect();
-        Ok(serde_json::to_string_pretty(&serde_json::json!({ "layers": layers }))
-            .unwrap_or_default())
+        Ok(
+            serde_json::to_string_pretty(&serde_json::json!({ "layers": layers }))
+                .unwrap_or_default(),
+        )
     }
 
-    fn mcp_set_keyframe(&mut self, id_str: &str, property: &str, frame: usize, value: f64, mode: crate::document::InterpolationMode) -> Result<String, String> {
+    fn mcp_set_keyframe(
+        &mut self,
+        id_str: &str,
+        property: &str,
+        frame: usize,
+        value: f64,
+        mode: crate::document::InterpolationMode,
+    ) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         let before = self.project.anim_timeline.clone();
         let entry = self.project.anim_timeline.nodes.entry(id).or_default();
@@ -20537,20 +21083,32 @@ fn run_video_decode_thread(
             }
             self.apply_animation_for_frame(self.playback.frame);
             let after = self.project.anim_timeline.clone();
-            self.history.push(&mut self.project, crate::history::ProjectEdit::PatchTimeline { before, after });
+            self.history.push(
+                &mut self.project,
+                crate::history::ProjectEdit::PatchTimeline { before, after },
+            );
             Ok(format!("Set keyframe {}@{} = {}", property, frame, value))
         } else {
             Err(format!("Unknown animation property '{}'", property))
         }
     }
 
-    fn mcp_remove_keyframe(&mut self, id_str: &str, property: &str, frame: usize) -> Result<String, String> {
+    fn mcp_remove_keyframe(
+        &mut self,
+        id_str: &str,
+        property: &str,
+        frame: usize,
+    ) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         self.delete_keyframe(id, property, frame);
         Ok(format!("Removed keyframe {}@{}", property, frame))
     }
 
-    fn mcp_get_keyframes(&mut self, id_str: &str, property: Option<&str>) -> Result<String, String> {
+    fn mcp_get_keyframes(
+        &mut self,
+        id_str: &str,
+        property: Option<&str>,
+    ) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         let anim = match self.project.anim_timeline.nodes.get(&id) {
             Some(a) => a,
@@ -20578,22 +21136,30 @@ fn run_video_decode_thread(
         };
         for prop in &props {
             if let Some(track) = anim.get_track(prop) {
-                let kfs: Vec<_> = track.keyframes.iter().map(|kf| {
-                    serde_json::json!({
-                        "frame": kf.frame,
-                        "value": kf.value,
-                        "interpolation": match kf.interpolation {
-                            crate::document::InterpolationMode::Linear => "linear",
-                            crate::document::InterpolationMode::Bezier => "bezier",
-                        }
+                let kfs: Vec<_> = track
+                    .keyframes
+                    .iter()
+                    .map(|kf| {
+                        serde_json::json!({
+                            "frame": kf.frame,
+                            "value": kf.value,
+                            "interpolation": match kf.interpolation {
+                                crate::document::InterpolationMode::Linear => "linear",
+                                crate::document::InterpolationMode::Bezier => "bezier",
+                            }
+                        })
                     })
-                }).collect();
+                    .collect();
                 out.insert(prop.clone(), serde_json::json!(kfs));
             }
             // also handle geom_ if requested
             if prop.starts_with("geom_") {
                 if let Some(track) = anim.get_track(prop) {
-                    let kfs: Vec<_> = track.keyframes.iter().map(|kf| serde_json::json!({"frame": kf.frame, "value": kf.value})).collect();
+                    let kfs: Vec<_> = track
+                        .keyframes
+                        .iter()
+                        .map(|kf| serde_json::json!({"frame": kf.frame, "value": kf.value}))
+                        .collect();
                     out.insert(prop.clone(), serde_json::json!(kfs));
                 }
             }
@@ -20603,7 +21169,11 @@ fn run_video_decode_thread(
             for (i, track) in anim.geom_tracks.iter().enumerate() {
                 if !track.keyframes.is_empty() {
                     let name = format!("geom_{}", i);
-                    let kfs: Vec<_> = track.keyframes.iter().map(|kf| serde_json::json!({"frame": kf.frame, "value": kf.value})).collect();
+                    let kfs: Vec<_> = track
+                        .keyframes
+                        .iter()
+                        .map(|kf| serde_json::json!({"frame": kf.frame, "value": kf.value}))
+                        .collect();
                     out.insert(name, serde_json::json!(kfs));
                 }
             }
@@ -20611,7 +21181,16 @@ fn run_video_decode_thread(
         Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
     }
 
-    fn mcp_set_keyframe_interpolation(&mut self, id_str: &str, property: &str, frame: usize, interp: Option<&str>, handle_left: Option<(f64,f64)>, handle_right: Option<(f64,f64)>, handle_mode: Option<&str>) -> Result<String, String> {
+    fn mcp_set_keyframe_interpolation(
+        &mut self,
+        id_str: &str,
+        property: &str,
+        frame: usize,
+        interp: Option<&str>,
+        handle_left: Option<(f64, f64)>,
+        handle_right: Option<(f64, f64)>,
+        handle_mode: Option<&str>,
+    ) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         let before = self.project.anim_timeline.clone();
         let changed = if let Some(anim) = self.project.anim_timeline.nodes.get_mut(&id) {
@@ -20634,18 +21213,29 @@ fn run_video_decode_thread(
                             "left" | "leftonly" => crate::document::BezierHandleMode::LeftOnly,
                             "right" | "rightonly" => crate::document::BezierHandleMode::RightOnly,
                             "asymmetric" => crate::document::BezierHandleMode::Asymmetric,
-                            "equal" | "equallength" => crate::document::BezierHandleMode::EqualLength,
+                            "equal" | "equallength" => {
+                                crate::document::BezierHandleMode::EqualLength
+                            }
                             "sym" | "symmetric" => crate::document::BezierHandleMode::Symmetric,
                             _ => crate::document::BezierHandleMode::Both,
                         };
                     }
                     true
-                } else { false }
-            } else { false }
-        } else { false };
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         if changed {
             let after = self.project.anim_timeline.clone();
-            self.history.push(&mut self.project, crate::history::ProjectEdit::PatchTimeline { before, after });
+            self.history.push(
+                &mut self.project,
+                crate::history::ProjectEdit::PatchTimeline { before, after },
+            );
             self.apply_animation_for_frame(self.playback.frame);
             Ok(format!("Updated interpolation for {}@{}", property, frame))
         } else {
@@ -20653,7 +21243,11 @@ fn run_video_decode_thread(
         }
     }
 
-    fn mcp_clear_animation_track(&mut self, id_str: &str, property: &str) -> Result<String, String> {
+    fn mcp_clear_animation_track(
+        &mut self,
+        id_str: &str,
+        property: &str,
+    ) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         let before = self.project.anim_timeline.clone();
         let mut changed = false;
@@ -20667,7 +21261,10 @@ fn run_video_decode_thread(
         }
         if changed {
             let after = self.project.anim_timeline.clone();
-            self.history.push(&mut self.project, crate::history::ProjectEdit::PatchTimeline { before, after });
+            self.history.push(
+                &mut self.project,
+                crate::history::ProjectEdit::PatchTimeline { before, after },
+            );
             self.apply_animation_for_frame(self.playback.frame);
             Ok(format!("Cleared track {}", property))
         } else {
@@ -20682,11 +21279,26 @@ fn run_video_decode_thread(
         let before = self.project.anim_timeline.clone();
         let mut count = 0usize;
         for kf in kfs {
-            let id_str = kf.get("id").and_then(|v| v.as_str()).ok_or("id required in keyframe")?;
-            let property = kf.get("property").and_then(|v| v.as_str()).ok_or("property required")?;
-            let frame = kf.get("frame").and_then(|v| v.as_u64()).ok_or("frame required")? as usize;
-            let value = kf.get("value").and_then(|v| v.as_f64()).ok_or("value required")?;
-            let interp_str = kf.get("interpolation").and_then(|v| v.as_str()).unwrap_or("linear");
+            let id_str = kf
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or("id required in keyframe")?;
+            let property = kf
+                .get("property")
+                .and_then(|v| v.as_str())
+                .ok_or("property required")?;
+            let frame = kf
+                .get("frame")
+                .and_then(|v| v.as_u64())
+                .ok_or("frame required")? as usize;
+            let value = kf
+                .get("value")
+                .and_then(|v| v.as_f64())
+                .ok_or("value required")?;
+            let interp_str = kf
+                .get("interpolation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("linear");
             let mode = match interp_str.to_lowercase().as_str() {
                 "bezier" | "cubic" => crate::document::InterpolationMode::Bezier,
                 _ => crate::document::InterpolationMode::Linear,
@@ -20708,12 +21320,19 @@ fn run_video_decode_thread(
         self.apply_animation_for_frame(self.playback.frame);
         let after = self.project.anim_timeline.clone();
         if before != after {
-            self.history.push(&mut self.project, crate::history::ProjectEdit::PatchTimeline { before, after });
+            self.history.push(
+                &mut self.project,
+                crate::history::ProjectEdit::PatchTimeline { before, after },
+            );
         }
         Ok(format!("Set {} keyframes (batched)", count))
     }
 
-    fn mcp_patch_node(&mut self, id_str: &str, patch: &serde_json::Value) -> Result<String, String> {
+    fn mcp_patch_node(
+        &mut self,
+        id_str: &str,
+        patch: &serde_json::Value,
+    ) -> Result<String, String> {
         use crate::document::NodeKind;
         use crate::mcp::drawing::apply_style_patch;
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
@@ -20754,7 +21373,10 @@ fn run_video_decode_thread(
         Ok(format!("Updated object {id_str}"))
     }
 
-    fn mcp_apply_geometry_patch(node: &mut crate::document::Node, patch: &serde_json::Value) -> Result<(), String> {
+    fn mcp_apply_geometry_patch(
+        node: &mut crate::document::Node,
+        patch: &serde_json::Value,
+    ) -> Result<(), String> {
         use crate::document::{ArcJoin, NodeKind, PathData};
         use crate::mcp::drawing::parse_arc_join;
         match &mut node.kind {
@@ -20927,7 +21549,6 @@ fn run_video_decode_thread(
         Ok(())
     }
 
-
     fn mcp_update_object(&mut self, id_str: &str, patch: serde_json::Value) -> Result<(), String> {
         self.mcp_patch_node(id_str, &patch).map(|_| ())
     }
@@ -20944,7 +21565,9 @@ fn run_video_decode_thread(
 
     fn process_pending_mcp_bulk_rects(&mut self) {
         #[cfg(any(target_os = "android", target_os = "ios"))]
-        { return; }
+        {
+            return;
+        }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             const MAX_PER_FRAME: usize = 64;
@@ -20975,9 +21598,7 @@ fn run_video_decode_thread(
                         project: &mut self.project,
                         history: &mut self.history,
                     },
-                    EditorCommand::EditApplied(
-                        ProjectEdit::InsertNodesApplied { nodes },
-                    ),
+                    EditorCommand::EditApplied(ProjectEdit::InsertNodesApplied { nodes }),
                 );
                 if let Some(id) = last_id {
                     self.selection = vec![id];
@@ -21104,8 +21725,8 @@ fn run_video_decode_thread(
         req: crate::mcp::McpHostRequest,
     ) -> crate::mcp::McpHostResponse {
         match req {
-            crate::mcp::McpHostRequest::Snapshot => crate::mcp::McpHostResponse::Snapshot(
-                crate::mcp::McpAppSnapshot {
+            crate::mcp::McpHostRequest::Snapshot => {
+                crate::mcp::McpHostResponse::Snapshot(crate::mcp::McpAppSnapshot {
                     title: self.project.document.title.clone(),
                     project_path: self
                         .project_save_path
@@ -21116,8 +21737,8 @@ fn run_video_decode_thread(
                     anim_frame: self.playback.frame,
                     anim_playing: self.playback.playing,
                     ui_fps: self.ui_fps,
-                },
-            ),
+                })
+            }
             crate::mcp::McpHostRequest::SaveProject { path } => {
                 if let Some(p) = path.as_deref().map(std::path::Path::new) {
                     match self.save_project_to_path(p) {
@@ -21170,35 +21791,22 @@ fn run_video_decode_thread(
                 w,
                 h,
                 save_path,
-            } => match self.mcp_capture_canvas_raster(
-                resolution_percent,
-                x,
-                y,
-                w,
-                h,
-                save_path,
-            ) {
+            } => match self.mcp_capture_canvas_raster(resolution_percent, x, y, w, h, save_path) {
                 Ok(resp) => resp,
                 Err(e) => crate::mcp::McpHostResponse::Err { message: e },
             },
-            crate::mcp::McpHostRequest::ListAllObjects => {
-                match self.mcp_list_all_objects_json() {
-                    Ok(j) => crate::mcp::McpHostResponse::Text(j),
-                    Err(e) => crate::mcp::McpHostResponse::Err { message: e },
-                }
-            }
-            crate::mcp::McpHostRequest::ListObjects => {
-                match self.mcp_list_objects_json() {
-                    Ok(j) => crate::mcp::McpHostResponse::Text(j),
-                    Err(e) => crate::mcp::McpHostResponse::Err { message: e },
-                }
-            }
-            crate::mcp::McpHostRequest::GetObject { id } => {
-                match self.mcp_get_object_json(&id) {
-                    Ok(j) => crate::mcp::McpHostResponse::Text(j),
-                    Err(e) => crate::mcp::McpHostResponse::Err { message: e },
-                }
-            }
+            crate::mcp::McpHostRequest::ListAllObjects => match self.mcp_list_all_objects_json() {
+                Ok(j) => crate::mcp::McpHostResponse::Text(j),
+                Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+            },
+            crate::mcp::McpHostRequest::ListObjects => match self.mcp_list_objects_json() {
+                Ok(j) => crate::mcp::McpHostResponse::Text(j),
+                Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+            },
+            crate::mcp::McpHostRequest::GetObject { id } => match self.mcp_get_object_json(&id) {
+                Ok(j) => crate::mcp::McpHostResponse::Text(j),
+                Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+            },
             crate::mcp::McpHostRequest::DrawingTool { name, args } => {
                 match self.mcp_drawing_tool(&name, args) {
                     Ok(msg) => crate::mcp::McpHostResponse::Ok { message: msg },
@@ -21213,14 +21821,12 @@ fn run_video_decode_thread(
                     Err(e) => crate::mcp::McpHostResponse::Err { message: e },
                 }
             }
-            crate::mcp::McpHostRequest::DeleteObject { id } => {
-                match self.mcp_delete_object(&id) {
-                    Ok(()) => crate::mcp::McpHostResponse::Ok {
-                        message: format!("Deleted {id}"),
-                    },
-                    Err(e) => crate::mcp::McpHostResponse::Err { message: e },
-                }
-            }
+            crate::mcp::McpHostRequest::DeleteObject { id } => match self.mcp_delete_object(&id) {
+                Ok(()) => crate::mcp::McpHostResponse::Ok {
+                    message: format!("Deleted {id}"),
+                },
+                Err(e) => crate::mcp::McpHostResponse::Err { message: e },
+            },
             crate::mcp::McpHostRequest::UiHealth => {
                 // Count by kind for diagnosis — never materialize full text content.
                 let mut kind_counts: std::collections::HashMap<String, usize> =
@@ -21325,7 +21931,9 @@ fn run_video_decode_thread(
                     "history_revision": self.history.revision(),
                     "suggestion_for_low_fps": suggestion,
                 });
-                crate::mcp::McpHostResponse::Text(serde_json::to_string_pretty(&health).unwrap_or_default())
+                crate::mcp::McpHostResponse::Text(
+                    serde_json::to_string_pretty(&health).unwrap_or_default(),
+                )
             }
         }
     }
@@ -21377,7 +21985,9 @@ impl eframe::App for VadadeeBerryApp {
         }
         // Graph editor transition animation tick
         let dt = ctx.input(|i| i.stable_dt);
-        let target_t = if self.anim_graph_editor_track.is_some() && self.anim_graph_editor_target_track.is_none() {
+        let target_t = if self.anim_graph_editor_track.is_some()
+            && self.anim_graph_editor_target_track.is_none()
+        {
             1.0
         } else {
             0.0
@@ -21399,7 +22009,11 @@ impl eframe::App for VadadeeBerryApp {
             }
         }
 
-        let piano_target = if self.piano_roll_clip.is_some() { 1.0 } else { 0.0 };
+        let piano_target = if self.piano_roll_clip.is_some() {
+            1.0
+        } else {
+            0.0
+        };
         if (self.piano_roll_t - piano_target).abs() > 0.001 {
             let speed = 6.0;
             if self.piano_roll_t < piano_target {
@@ -21445,7 +22059,10 @@ impl eframe::App for VadadeeBerryApp {
             let fps = (self.playback.fps as f32).max(1.0);
             let max_frame = self.get_content_max_animation_frame();
             let span = max_frame.saturating_add(1).max(1);
-            let elapsed = now.duration_since(origin_t).as_secs_f32().clamp(0.0, 3600.0);
+            let elapsed = now
+                .duration_since(origin_t)
+                .as_secs_f32()
+                .clamp(0.0, 3600.0);
             let ideal = (origin_f.saturating_add((elapsed * fps).floor() as usize)) % span;
             let cur = self.playback.frame % span;
 
@@ -21494,16 +22111,19 @@ impl eframe::App for VadadeeBerryApp {
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
                     let gf = self.get_node_geom_floats(*id);
-                    self.anim_last_applied_states.insert(*id, AnimAppliedState {
-                        pos: node.get_pos(),
-                        rotation: node.get_rotation(),
-                        opacity: node.get_opacity(),
-                        color: node.get_color(),
-                        stroke_width: node.get_stroke_width(),
-                        stroke_color: node.get_stroke_color(),
-                        geom_floats: gf,
-                        fill: node.style.fill.clone(),
-                    });
+                    self.anim_last_applied_states.insert(
+                        *id,
+                        AnimAppliedState {
+                            pos: node.get_pos(),
+                            rotation: node.get_rotation(),
+                            opacity: node.get_opacity(),
+                            color: node.get_color(),
+                            stroke_width: node.get_stroke_width(),
+                            stroke_color: node.get_stroke_color(),
+                            geom_floats: gf,
+                            fill: node.style.fill.clone(),
+                        },
+                    );
                 }
             }
         }
@@ -21517,27 +22137,37 @@ impl eframe::App for VadadeeBerryApp {
             for id in &self.selection {
                 if let Some(node) = self.project.nodes.get(*id) {
                     let gf = self.get_node_geom_floats(*id);
-                    self.anim_last_applied_states.entry(*id).or_insert_with(|| AnimAppliedState {
-                        pos: node.get_pos(),
-                        rotation: node.get_rotation(),
-                        opacity: node.get_opacity(),
-                        color: node.get_color(),
-                        stroke_width: node.get_stroke_width(),
-                        stroke_color: node.get_stroke_color(),
-                        geom_floats: gf,
-                        fill: node.style.fill.clone(),
-                    });
-                } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::AV) {
-                    self.anim_last_applied_states.entry(*id).or_insert_with(|| AnimAppliedState {
-                        pos: (layer.x as f64, layer.y as f64),
-                        rotation: layer.rotation as f64,
-                        opacity: 1.0,
-                        color: [1.0, 1.0, 1.0, 1.0],
-                        stroke_width: 0.0,
-                        stroke_color: [0.0, 0.0, 0.0, 0.0],
-                        geom_floats: vec![],
-                        fill: Fill::default(),
-                    });
+                    self.anim_last_applied_states
+                        .entry(*id)
+                        .or_insert_with(|| AnimAppliedState {
+                            pos: node.get_pos(),
+                            rotation: node.get_rotation(),
+                            opacity: node.get_opacity(),
+                            color: node.get_color(),
+                            stroke_width: node.get_stroke_width(),
+                            stroke_color: node.get_stroke_color(),
+                            geom_floats: gf,
+                            fill: node.style.fill.clone(),
+                        });
+                } else if let Some(layer) = self
+                    .project
+                    .document
+                    .layers
+                    .iter()
+                    .find(|l| l.id == *id && l.kind == crate::document::LayerKind::AV)
+                {
+                    self.anim_last_applied_states
+                        .entry(*id)
+                        .or_insert_with(|| AnimAppliedState {
+                            pos: (layer.x as f64, layer.y as f64),
+                            rotation: layer.rotation as f64,
+                            opacity: 1.0,
+                            color: [1.0, 1.0, 1.0, 1.0],
+                            stroke_width: 0.0,
+                            stroke_color: [0.0, 0.0, 0.0, 0.0],
+                            geom_floats: vec![],
+                            fill: Fill::default(),
+                        });
                 }
             }
 
@@ -21552,7 +22182,7 @@ impl eframe::App for VadadeeBerryApp {
                     let stroke_w = node.get_stroke_width();
                     let stroke_col = node.get_stroke_color();
                     let geom = self.get_node_geom_floats(*id);
-                    
+
                     let last_state = self.anim_last_applied_states.get(id);
                     if let Some(last) = last_state {
                         let mut changed_pos = false;
@@ -21562,26 +22192,26 @@ impl eframe::App for VadadeeBerryApp {
                         let mut changed_stroke_w = false;
                         let mut changed_stroke_col = false;
                         let mut changed_geom = false;
-                        
+
                         let mut temp_node = node.clone();
                         temp_node.set_rotation(last.rotation);
                         let unrot_pos = temp_node.get_pos();
-                        
+
                         let dx = unrot_pos.0 - last.pos.0;
                         let dy = unrot_pos.1 - last.pos.1;
                         if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
                             changed_pos = true;
                             temp_node.translate(-dx, -dy);
                         }
-                        
+
                         if (rot - last.rotation).abs() > 1e-9 {
                             changed_rot = true;
                         }
-                        
+
                         if (op - last.opacity).abs() > 1e-6 {
                             changed_op = true;
                         }
-                        
+
                         for i in 0..4 {
                             if (color[i] - last.color[i]).abs() > 1e-6 {
                                 changed_col = true;
@@ -21595,7 +22225,7 @@ impl eframe::App for VadadeeBerryApp {
                                 changed_stroke_col = true;
                             }
                         }
-                        
+
                         // Compare live geom (path anchors / handles) directly — do not use
                         // temp_node after un-translate (that shifts all path points and hides edits).
                         let mut geom_really_changed = false;
@@ -21612,7 +22242,7 @@ impl eframe::App for VadadeeBerryApp {
                         if geom_really_changed {
                             changed_geom = true;
                         }
-                        
+
                         if changed_pos
                             || changed_rot
                             || changed_op
@@ -21623,7 +22253,7 @@ impl eframe::App for VadadeeBerryApp {
                         {
                             let before_timeline = self.project.anim_timeline.clone();
                             let entry = self.project.anim_timeline.nodes.entry(*id).or_default();
-                            
+
                             if changed_pos {
                                 // Seed a baseline only when recording a later frame (not frame 0),
                                 // so the first edit at the beginning is the single keyframe.
@@ -21667,17 +22297,14 @@ impl eframe::App for VadadeeBerryApp {
                                 if entry.stroke_width.keyframes.is_empty()
                                     && self.playback.frame > 0
                                 {
-                                    entry
-                                        .stroke_width
-                                        .insert(0, last.stroke_width as f64);
+                                    entry.stroke_width.insert(0, last.stroke_width as f64);
                                 }
                                 entry
                                     .stroke_width
                                     .insert(self.playback.frame, stroke_w as f64);
                             }
                             if changed_stroke_col {
-                                if entry.stroke_r.keyframes.is_empty() && self.playback.frame > 0
-                                {
+                                if entry.stroke_r.keyframes.is_empty() && self.playback.frame > 0 {
                                     entry.stroke_r.insert(0, last.stroke_color[0] as f64);
                                     entry.stroke_g.insert(0, last.stroke_color[1] as f64);
                                     entry.stroke_b.insert(0, last.stroke_color[2] as f64);
@@ -21701,8 +22328,14 @@ impl eframe::App for VadadeeBerryApp {
                                     entry.geom_tracks.push(KeyframeTrack::default());
                                 }
                                 for i in 0..geom.len() {
-                                    let baseline = if i < last.geom_floats.len() { last.geom_floats[i] } else { geom[i] };
-                                    if entry.geom_tracks[i].keyframes.is_empty() && self.playback.frame > 0 {
+                                    let baseline = if i < last.geom_floats.len() {
+                                        last.geom_floats[i]
+                                    } else {
+                                        geom[i]
+                                    };
+                                    if entry.geom_tracks[i].keyframes.is_empty()
+                                        && self.playback.frame > 0
+                                    {
                                         entry.geom_tracks[i].insert(0, baseline);
                                     }
                                     entry.geom_tracks[i].insert(self.playback.frame, geom[i]);
@@ -21712,20 +22345,29 @@ impl eframe::App for VadadeeBerryApp {
                             let after_timeline = self.project.anim_timeline.clone();
                             self.history.push(
                                 &mut self.project,
-                                ProjectEdit::PatchTimeline { before: before_timeline, after: after_timeline },
+                                ProjectEdit::PatchTimeline {
+                                    before: before_timeline,
+                                    after: after_timeline,
+                                },
                             );
-                            
+
                             keyframes_updated = true;
                         }
                     }
-                } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::AV) {
+                } else if let Some(layer) = self
+                    .project
+                    .document
+                    .layers
+                    .iter()
+                    .find(|l| l.id == *id && l.kind == crate::document::LayerKind::AV)
+                {
                     let pos = (layer.x as f64, layer.y as f64);
                     let rot = layer.rotation as f64;
                     let last_state = self.anim_last_applied_states.get(id);
                     if let Some(last) = last_state {
                         let mut changed_pos = false;
                         let mut changed_rot = false;
-                        
+
                         let dx = pos.0 - last.pos.0;
                         let dy = pos.1 - last.pos.1;
                         if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
@@ -21734,7 +22376,7 @@ impl eframe::App for VadadeeBerryApp {
                         if (rot - last.rotation).abs() > 1e-9 {
                             changed_rot = true;
                         }
-                        
+
                         if changed_pos || changed_rot {
                             let before_timeline = self.project.anim_timeline.clone();
                             let entry = self.project.anim_timeline.nodes.entry(*id).or_default();
@@ -21775,41 +22417,57 @@ impl eframe::App for VadadeeBerryApp {
                 for id in &self.selection {
                     if let Some(node) = self.project.nodes.get(*id) {
                         let gf = self.get_node_geom_floats(*id);
-                        self.anim_last_applied_states.insert(*id, AnimAppliedState {
-                            pos: node.get_pos(),
-                            rotation: node.get_rotation(),
-                            opacity: node.get_opacity(),
-                            color: node.get_color(),
-                            stroke_width: node.get_stroke_width(),
-                            stroke_color: node.get_stroke_color(),
-                            geom_floats: gf,
-                            fill: node.style.fill.clone(),
-                        });
-                    } else if let Some(layer) = self.project.document.layers.iter().find(|l| l.id == *id && l.kind == crate::document::LayerKind::AV) {
-                        self.anim_last_applied_states.insert(*id, AnimAppliedState {
-                            pos: (layer.x as f64, layer.y as f64),
-                            rotation: layer.rotation as f64,
-                            opacity: 1.0,
-                            color: [1.0, 1.0, 1.0, 1.0],
-                            stroke_width: 0.0,
-                            stroke_color: [0.0, 0.0, 0.0, 0.0],
-                            geom_floats: vec![],
-                            fill: Fill::default(),
-                        });
+                        self.anim_last_applied_states.insert(
+                            *id,
+                            AnimAppliedState {
+                                pos: node.get_pos(),
+                                rotation: node.get_rotation(),
+                                opacity: node.get_opacity(),
+                                color: node.get_color(),
+                                stroke_width: node.get_stroke_width(),
+                                stroke_color: node.get_stroke_color(),
+                                geom_floats: gf,
+                                fill: node.style.fill.clone(),
+                            },
+                        );
+                    } else if let Some(layer) = self
+                        .project
+                        .document
+                        .layers
+                        .iter()
+                        .find(|l| l.id == *id && l.kind == crate::document::LayerKind::AV)
+                    {
+                        self.anim_last_applied_states.insert(
+                            *id,
+                            AnimAppliedState {
+                                pos: (layer.x as f64, layer.y as f64),
+                                rotation: layer.rotation as f64,
+                                opacity: 1.0,
+                                color: [1.0, 1.0, 1.0, 1.0],
+                                stroke_width: 0.0,
+                                stroke_color: [0.0, 0.0, 0.0, 0.0],
+                                geom_floats: vec![],
+                                fill: Fill::default(),
+                            },
+                        );
                     }
                 }
             }
         }
 
         // Manage Animation action tab availability dynamically
-        let has_anim_tab = self.action_tab_order.contains(&crate::action_tab::ActionTab::Animation);
+        let has_anim_tab = self
+            .action_tab_order
+            .contains(&crate::action_tab::ActionTab::Animation);
         if self.anim_show_timeline_window {
             if !has_anim_tab {
-                self.action_tab_order.push(crate::action_tab::ActionTab::Animation);
+                self.action_tab_order
+                    .push(crate::action_tab::ActionTab::Animation);
             }
         } else {
             if has_anim_tab {
-                self.action_tab_order.retain(|t| *t != crate::action_tab::ActionTab::Animation);
+                self.action_tab_order
+                    .retain(|t| *t != crate::action_tab::ActionTab::Animation);
                 if self.action_tab == crate::action_tab::ActionTab::Animation {
                     self.action_tab = crate::action_tab::ActionTab::Layer; // Fallback
                 }
@@ -21817,9 +22475,12 @@ impl eframe::App for VadadeeBerryApp {
         }
 
         // Native text sync through the platform bridge (Android IME ↔
-        // editor text). Desktop reports no native text, so this is a no-op
-        // there and egui stays in charge.
-        if self.on_page_text_edit.is_some() {
+        // editor text). Only platforms with an implemented bridge take
+        // part; everywhere else (desktop, iOS stub) egui stays in charge
+        // and document text is never rewritten from a native source.
+        if self.on_page_text_edit.is_some()
+            && crate::platform::current_capabilities().native_text_input
+        {
             let mut patched: Option<String> = None;
             let mut push: Option<crate::platform::TextInputState> = None;
             {
@@ -21855,9 +22516,15 @@ impl eframe::App for VadadeeBerryApp {
             self.advance_paste_operation(ctx);
         }
         let paste_from_events = self.handle_object_clipboard_shortcuts(ctx);
-        #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            not(any(target_os = "android", target_os = "ios"))
+        ))]
         self.handle_paste_hotkey_fallback(ctx, paste_from_events);
-        #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            not(any(target_os = "android", target_os = "ios"))
+        ))]
         self.handle_text_paste_fallback(ctx);
         if self.ui_anim.needs_repaint() || self.paste_progress.is_some() {
             ctx.request_repaint();
@@ -21889,8 +22556,7 @@ impl eframe::App for VadadeeBerryApp {
         // Presentation shell dispatch (§27): viewport-driven, never OS-driven.
         // Compact/medium widths get the mobile shell; large widths keep the
         // desktop chrome byte-for-byte identical.
-        let device =
-            crate::platform::classify_device(ui.ctx().content_rect().size());
+        let device = crate::platform::classify_device(ui.ctx().content_rect().size());
         match device {
             crate::platform::UiDeviceClass::Desktop => ui::chrome(self, ui),
             crate::platform::UiDeviceClass::Phone | crate::platform::UiDeviceClass::Tablet => {
@@ -21942,8 +22608,7 @@ fn strip_pixel_rects_from_bez(
         let cx = (min_x + max_x) * 0.5;
         let cy = (min_y + max_y) * 0.5;
         erase.iter().any(|&(ex, ey, ew, eh)| {
-            (cx - ex).abs() <= (w + ew) * 0.5 + 1e-3
-                && (cy - ey).abs() <= (h + eh) * 0.5 + 1e-3
+            (cx - ex).abs() <= (w + ew) * 0.5 + 1e-3 && (cy - ey).abs() <= (h + eh) * 0.5 + 1e-3
         })
     };
 
@@ -22144,11 +22809,7 @@ fn densify_brush_centerline(
             out.push(([x, y], tm, w));
         }
     }
-    if out.len() < 2 {
-        points.to_vec()
-    } else {
-        out
-    }
+    if out.len() < 2 { points.to_vec() } else { out }
 }
 
 fn generate_brush_outline(
@@ -22293,7 +22954,7 @@ mod tests {
             std::collections::HashMap::new(),
             true,
         );
-        
+
         let mut node = Node {
             id: uuid::Uuid::new_v4(),
             name: "Test Path".to_string(),
@@ -22318,10 +22979,16 @@ mod tests {
         temp_node.translate(dx_un, dy_un);
 
         let temp_geom = temp_node.get_geom_floats();
-        
+
         assert_eq!(temp_geom.len(), last_geom_floats.len());
         for i in 0..temp_geom.len() {
-            assert!((temp_geom[i] - last_geom_floats[i]).abs() < 1e-6, "Index {} differs: {} vs {}", i, temp_geom[i], last_geom_floats[i]);
+            assert!(
+                (temp_geom[i] - last_geom_floats[i]).abs() < 1e-6,
+                "Index {} differs: {} vs {}",
+                i,
+                temp_geom[i],
+                last_geom_floats[i]
+            );
         }
     }
 
@@ -22332,8 +22999,8 @@ mod tests {
             Self {
                 live_snap_guides: Vec::new(),
                 snap_magnet: true,
-            pixel_art_mode: false,
-            pixel_cell_size: 1.0,
+                pixel_art_mode: false,
+                pixel_cell_size: 1.0,
                 playback: crate::state::PlaybackState::default(),
                 anim_keyframing_mode: false,
                 anim_show_timeline_window: false,
@@ -22378,8 +23045,8 @@ mod tests {
                 anim_graph_view_val_max: 1.0,
                 ui_fps: 60.0,
                 enable_layer_raster_cache: false,
-            gpu_shading: true,
-            wgpu_render: None,
+                gpu_shading: true,
+                wgpu_render: None,
                 video_frame_cache: None,
                 video_layers: std::collections::HashMap::new(),
                 clip_mask_signatures: std::collections::HashMap::new(),
@@ -22400,11 +23067,15 @@ mod tests {
                 audio_player_playback_rate: std::collections::HashMap::new(),
                 audio_player_media_path: std::collections::HashMap::new(),
                 audio_layers_skip: std::collections::HashSet::new(),
-                audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-                audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                audio_extract_status: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
+                audio_pcm_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
                 audio_prepare_rx: std::collections::HashMap::new(),
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            screen_captures: std::collections::HashMap::new(),
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                screen_captures: std::collections::HashMap::new(),
 
                 project: Document::new_default_project(),
                 viewport: Viewport::default(),
@@ -22519,8 +23190,8 @@ mod tests {
                 canvas_origin: Pos2::ZERO,
                 pending_open_svg: false,
                 pending_open_project: false,
-            cached_project: None,
-            cached_project_label: None,
+                cached_project: None,
+                cached_project_label: None,
                 pending_save_project: false,
                 pending_export_svg: false,
                 pending_export_image: false,
@@ -22531,7 +23202,10 @@ mod tests {
                 eyedropper_releasing: false,
                 eyedropper_t: 0.0,
                 eyedropper_target_pos: None,
-                #[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios"))))]
+                #[cfg(all(
+                    not(target_arch = "wasm32"),
+                    not(any(target_os = "android", target_os = "ios"))
+                ))]
                 paste_hotkey_was_down: false,
                 paste_progress: None,
                 toolbar_expanded: false,
@@ -22551,13 +23225,13 @@ mod tests {
                 collab: crate::collab::CollabSession::new(),
                 collab_last_cursor_sent: None,
 
-            collab_canvas_sync_accum: 0.0,
-            collab_last_ui_sync: (crate::action_tab::ActionTab::default(), 0),
-            collab_last_wire_hash: 0,
-            collab_asset_cache: std::collections::HashMap::new(),
-            cursor_bubble_edit: false,
-            cursor_bubble_focus_pending: false,
-            cursor_bubble_text: String::new(),
+                collab_canvas_sync_accum: 0.0,
+                collab_last_ui_sync: (crate::action_tab::ActionTab::default(), 0),
+                collab_last_wire_hash: 0,
+                collab_asset_cache: std::collections::HashMap::new(),
+                cursor_bubble_edit: false,
+                cursor_bubble_focus_pending: false,
+                cursor_bubble_text: String::new(),
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 mcp_bridge: None,
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -22590,12 +23264,22 @@ mod tests {
     fn test_gradient_color_animation() {
         let mut app = VadadeeBerryApp::new_for_test();
         let node_id = uuid::Uuid::new_v4();
-        
+
         let initial_stops = vec![
-            GradientStop::new(0.0, Paint { rgba: [1.0, 0.0, 0.0, 1.0] }), // Red
-            GradientStop::new(1.0, Paint { rgba: [0.0, 0.0, 1.0, 1.0] }), // Blue
+            GradientStop::new(
+                0.0,
+                Paint {
+                    rgba: [1.0, 0.0, 0.0, 1.0],
+                },
+            ), // Red
+            GradientStop::new(
+                1.0,
+                Paint {
+                    rgba: [0.0, 0.0, 1.0, 1.0],
+                },
+            ), // Blue
         ];
-        
+
         let fill = Fill::LinearGradient {
             angle_deg: 90.0,
             line_x0: 0.0,
@@ -22604,11 +23288,11 @@ mod tests {
             line_y1: 1.0,
             stops: initial_stops,
         };
-        
+
         let mut node = Node::rect(0.0, 0.0, 100.0, 100.0, fill);
         node.id = node_id;
         app.project.nodes.insert(node);
-        
+
         // Add color animation tracks
         let mut anim = NodeAnimation::default();
         anim.color_r.insert(0, 1.0);
@@ -22620,10 +23304,10 @@ mod tests {
         anim.color_a.insert(0, 1.0);
         anim.color_a.insert(10, 1.0);
         app.project.anim_timeline.nodes.insert(node_id, anim);
-        
+
         // Run apply_animation_for_frame at frame 10
         app.apply_animation_for_frame(10);
-        
+
         // Verify the node's fill
         let updated_node = app.project.nodes.get(node_id).unwrap();
         match &updated_node.style.fill {
@@ -22633,7 +23317,7 @@ mod tests {
                 assert!((stops[0].color.rgba[0] - 0.5).abs() < 1e-5);
                 assert!((stops[0].color.rgba[1] - 0.0).abs() < 1e-5);
                 assert!((stops[0].color.rgba[2] - 0.0).abs() < 1e-5);
-                
+
                 // Blue stop: [0.0, 0.0, 1.0, 1.0] * [0.5, 0.5, 0.5, 1.0] = [0.0, 0.0, 0.5, 1.0]
                 assert!((stops[1].color.rgba[0] - 0.0).abs() < 1e-5);
                 assert!((stops[1].color.rgba[1] - 0.0).abs() < 1e-5);
@@ -22757,10 +23441,7 @@ fn cached_wav_path_for_video(video_path: &str) -> std::path::PathBuf {
 /// Legacy / co-located extract: `movie.mp4` → `movie.vadadee.wav` next to the file.
 fn sidecar_wav_path_for_video(video_path: &str) -> std::path::PathBuf {
     let p = std::path::Path::new(video_path);
-    let stem = p
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("audio");
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
     p.with_file_name(format!("{stem}.vadadee.wav"))
 }
 
@@ -22781,7 +23462,9 @@ fn find_playable_extracted_wav(video_path: &str) -> Option<std::path::PathBuf> {
 /// per process via `ensure_extracted_wav` OnceLock.
 fn spawn_video_audio_extract(
     video_path: &str,
-    status_map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
+    status_map: &std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>,
+    >,
     _pcm_cache: &crate::audio_extract::AudioPcmCache,
 ) {
     if !is_video_container_ext(video_path) {
@@ -22791,10 +23474,7 @@ fn spawn_video_audio_extract(
     // Already good on disk (cache or sidecar) → Ready, zero work.
     if let Some(existing) = find_playable_extracted_wav(video_path) {
         if let Ok(mut map) = status_map.lock() {
-            map.insert(
-                video_path.to_string(),
-                AudioExtractStatus::Ready(existing),
-            );
+            map.insert(video_path.to_string(), AudioExtractStatus::Ready(existing));
         }
         return;
     }
@@ -22863,7 +23543,9 @@ fn dirs_next_audio_cache_dir() -> std::path::PathBuf {
     // Prefer XDG cache, then home, then temp.
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
         if !xdg.is_empty() {
-            return std::path::PathBuf::from(xdg).join("vadadee-berry").join("audio");
+            return std::path::PathBuf::from(xdg)
+                .join("vadadee-berry")
+                .join("audio");
         }
     }
     if let Ok(home) = std::env::var("HOME") {
@@ -23037,7 +23719,9 @@ fn purge_dir_files(
 /// Rodio cannot stream most video containers; use extracted stereo WAV.
 fn resolve_audio_path_for_rodio(
     video_path: &str,
-    status_map: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>>,
+    status_map: &std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, AudioExtractStatus>>,
+    >,
     pcm_cache: &crate::audio_extract::AudioPcmCache,
 ) -> Option<std::path::PathBuf> {
     use crate::document::AvClip;
@@ -23097,28 +23781,34 @@ fn resolve_audio_path_for_rodio(
     }
 }
 
-fn apply_color_controls(img: &mut image::RgbaImage, hue: f32, sat: f32, bright: f32, contrast: f32) {
+fn apply_color_controls(
+    img: &mut image::RgbaImage,
+    hue: f32,
+    sat: f32,
+    bright: f32,
+    contrast: f32,
+) {
     for pixel in img.pixels_mut() {
         let [r, g, b, _a] = pixel.0;
-        
+
         let mut rf = r as f32 / 255.0;
         let mut gf = g as f32 / 255.0;
         let mut bf = b as f32 / 255.0;
-        
+
         // 1. Contrast
         if contrast != 1.0 {
             rf = (rf - 0.5) * contrast + 0.5;
             gf = (gf - 0.5) * contrast + 0.5;
             bf = (bf - 0.5) * contrast + 0.5;
         }
-        
+
         // 2. Brightness
         if bright != 1.0 {
             rf *= bright;
             gf *= bright;
             bf *= bright;
         }
-        
+
         // 3. Saturation (luminance-based grayscale interpolation)
         if sat != 1.0 {
             let lum = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
@@ -23126,12 +23816,12 @@ fn apply_color_controls(img: &mut image::RgbaImage, hue: f32, sat: f32, bright: 
             gf = lum + (gf - lum) * sat;
             bf = lum + (bf - lum) * sat;
         }
-        
+
         pixel.0[0] = (rf * 255.0).clamp(0.0, 255.0) as u8;
         pixel.0[1] = (gf * 255.0).clamp(0.0, 255.0) as u8;
         pixel.0[2] = (bf * 255.0).clamp(0.0, 255.0) as u8;
     }
-    
+
     // 4. Hue rotation
     if hue != 0.0 {
         let mut dyn_img = image::DynamicImage::ImageRgba8(img.clone());
@@ -23140,7 +23830,13 @@ fn apply_color_controls(img: &mut image::RgbaImage, hue: f32, sat: f32, bright: 
     }
 }
 
-fn adjust_frame_color(bytes: &[u8], hue: f32, sat: f32, bright: f32, contrast: f32) -> Option<Vec<u8>> {
+fn adjust_frame_color(
+    bytes: &[u8],
+    hue: f32,
+    sat: f32,
+    bright: f32,
+    contrast: f32,
+) -> Option<Vec<u8>> {
     if let Ok(dyn_img) = image::load_from_memory(bytes) {
         let mut rgba = dyn_img.to_rgba8();
         apply_color_controls(&mut rgba, hue, sat, bright, contrast);
@@ -23153,7 +23849,9 @@ fn adjust_frame_color(bytes: &[u8], hue: f32, sat: f32, bright: f32, contrast: f
             rgba.height(),
             image::ColorType::Rgba8,
             image::ImageFormat::Png,
-        ).is_ok() {
+        )
+        .is_ok()
+        {
             return Some(out_bytes);
         }
     }
@@ -23167,7 +23865,15 @@ fn paint_rotated_image(
     rotation_rad: f32,
     opacity: f32,
 ) {
-    paint_rotated_image_mirrored(painter, texture_id, rect, rotation_rad, opacity, false, false);
+    paint_rotated_image_mirrored(
+        painter,
+        texture_id,
+        rect,
+        rotation_rad,
+        opacity,
+        false,
+        false,
+    );
 }
 
 fn paint_rotated_image_mirrored(
@@ -23180,7 +23886,14 @@ fn paint_rotated_image_mirrored(
     flip_v: bool,
 ) {
     paint_rotated_image_mirrored_tint(
-        painter, texture_id, rect, rotation_rad, opacity, 1.0, flip_h, flip_v,
+        painter,
+        texture_id,
+        rect,
+        rotation_rad,
+        opacity,
+        1.0,
+        flip_h,
+        flip_v,
     );
 }
 
@@ -23280,6 +23993,3 @@ fn paint_rotated_image_mirrored_tint_uv(
 
     painter.add(mesh);
 }
-
-
-
