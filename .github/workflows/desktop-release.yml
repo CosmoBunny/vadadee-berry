@@ -301,7 +301,10 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Get-ChildItem release\*-setup.exe -ErrorAction SilentlyContinue)) {
-              throw "WiX installer was not produced"
+              throw "WiX Burn bundle (-setup.exe) was not produced"
+          }
+          if (-not (Get-ChildItem release\*.msi -ErrorAction SilentlyContinue)) {
+              throw "WiX MSI was not produced"
           }
 
       - name: Upload Windows release artifacts
@@ -312,6 +315,7 @@ jobs:
           path: |
             release/*.tar.gz
             release/*.zip
+            release/*.msi
             release/*-setup.exe
             release/*.sha256
           if-no-files-found: error
@@ -386,6 +390,7 @@ jobs:
             artifacts/*.flatpak
             artifacts/*.deb
             artifacts/*.dmg
+            artifacts/*.msi
             artifacts/*-setup.exe
             artifacts/*.sha256
           fail_on_unmatched_files: false

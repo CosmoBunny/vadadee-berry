@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Build the Vadadee Berry Windows installer (.exe, WiX Toolset v4).
+    Build the Vadadee Berry Windows installer (.msi + -setup.exe Burn bundle, WiX Toolset v5).
 
 .DESCRIPTION
     Uses binaries already built by the desktop release job
@@ -70,9 +70,18 @@ if (-not $wix) {
 & $wix --version
 
 $outName = "vadadee-berry-$version-windows-x86_64-setup.exe"
+$msiName = "vadadee-berry-$version-windows-x86_64.msi"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $outPath = Join-Path $OutDir $outName
+$msiPath = Join-Path $OutDir $msiName
 if (Test-Path $outPath) { Remove-Item $outPath -Force }
+if (Test-Path $msiPath) { Remove-Item $msiPath -Force }
+
+# Two-stage WiX v5 build (output type must match the source entry type):
+#   stage 1  VadadeeBerry.wxs (<Package>)        -> .msi
+#   stage 2  VadadeeBerry.Bundle.wxs (<Bundle>)  -> -setup.exe wrapping the MSI
+# Never rename an MSI to .exe (WIX1109/WIX0341). The -ext flag loads the
+# BootstrapperApplications extension providing WixStdBA.
 
 # Build from the packaging dir so the relative icon source resolves.
 # NOTE: -d takes its value as the NEXT token (attached -dName= form is
@@ -86,16 +95,28 @@ try {
     & $wix build VadadeeBerry.wxs `
         -d "Version=$version" `
         -d "BinDir=$BinDir" `
+        -o "$msiPath"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & $wix build VadadeeBerry.Bundle.wxs `
+        -d "Version=$version" `
+        -d "MsiPath=$msiPath" `
+        -ext WixToolset.BootstrapperApplications.wixext `
         -o "$outPath"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
     Pop-Location
 }
 
+if (-not (Test-Path $msiPath)) {
+    Write-Error 'WiX build produced no MSI.'
+    exit 1
+}
 if (-not (Test-Path $outPath)) {
     Write-Error 'WiX build produced no installer.'
     exit 1
 }
+$msiHash = (Get-FileHash $msiPath -Algorithm SHA256).Hash.ToLower()
+"$msiHash  $msiName" | Out-File -FilePath "$msiPath.sha256" -Encoding ascii -NoNewline
 $hash = (Get-FileHash $outPath -Algorithm SHA256).Hash.ToLower()
 "$hash  $outName" | Out-File -FilePath "$outPath.sha256" -Encoding ascii -NoNewline
-Write-Host "Done: $outPath"
+Write-Host "Done: $outPath + $msiPath"

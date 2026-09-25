@@ -1,0 +1,27 @@
+<!-- Vadadee Berry Burn bootstrapper (WiX Toolset v5, v4 wxs schema).
+     Stage 2 of packaging/windows/build_installer.ps1: wraps the .msi built
+     from VadadeeBerry.wxs (stage 1) in a genuine Burn Bundle, so the
+     shippable -setup.exe output type matches its <Bundle> source entry
+     (building an .exe straight from the MSI <Package> source fails with
+     WIX1109/WIX0341 — never rename an MSI to .exe).
+
+     The MSI remains the real installer (per-user scope, no UAC prompt);
+     this bundle is a thin bootstrapper with the standard WixStdBA wizard
+     UI that chains exactly that MSI. UpgradeCode is stable, committed,
+     and distinct from the MSI package's UpgradeCode; do not regenerate.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle Name="Vadadee Berry"
+          Version="$(var.Version)"
+          Manufacturer="CosmoBunny"
+          UpgradeCode="10c41ef5-6d36-5b59-af87-0d432a2969fd"
+          Compressed="yes">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication LicenseUrl="" Theme="hyperlinkLicense" />
+    </BootstrapperApplication>
+    <Chain>
+      <MsiPackage SourceFile="$(var.MsiPath)" Vital="yes" DisplayName="Vadadee Berry" />
+    </Chain>
+  </Bundle>
+</Wix>

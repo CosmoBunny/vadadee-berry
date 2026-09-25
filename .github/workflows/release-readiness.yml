@@ -116,6 +116,14 @@ jobs:
           check(len(vals) == len(set(vals)) and len(vals) > 0, "wxs GUIDs unique")
           for req in ("VadadeeBerryExe", "vadadee-berry.ico", "$(var.Version)", "$(var.BinDir)"):
               check(req in wxs, f"wxs references {req}")
+          bundle = open("packaging/windows/VadadeeBerry.Bundle.wxs").read()
+          xml.dom.minidom.parse("packaging/windows/VadadeeBerry.Bundle.wxs")
+          check("<Bundle" in bundle and "<MsiPackage" in bundle, "bundle entry + chain")
+          check('SourceFile="$(var.MsiPath)"' in bundle, "bundle wraps stage-1 MSI")
+          check("WixStandardBootstrapperApplication" in bundle, "bundle BA")
+          bcode = re.search(r'UpgradeCode="([^"]+)"', bundle).group(1)
+          uuid.UUID(bcode)
+          check(bcode not in vals, "bundle UpgradeCode distinct from MSI")
           for req in ("vadadee-berry.ico", "vadadee-berry.icns"):
               import os
               check(os.path.isfile(f"packaging/windows/{req}") or os.path.isfile(f"packaging/macos/{req}"),
