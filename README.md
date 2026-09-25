@@ -155,6 +155,46 @@ Workflow: [`.github/workflows/desktop-release.yml`](.github/workflows/desktop-re
 - Default CI build uses `--no-default-features` (no OpenCV); enable OpenCV from the workflow dispatch inputs if needed  
 - Linux CI uses **Ubuntu 24.04** because PipeWire/`libspa` 0.8 needs SPA headers newer than Ubuntu 22.04’s
 
+### Release builds & packaging (local reproduction)
+
+Release binaries are always the minimal feature set (matches tag CI):
+
+```bash
+cargo build --release --no-default-features
+```
+
+Packaging scripts consume the already-built binaries — they never recompile
+Rust. Run each independently; a packager failure never invalidates the build,
+so do not reproduce WiX/AppImage failures by rerunning the whole workflow:
+
+```bash
+./packaging/make_desktop_release.sh --no-default-features   # tar.gz/zip bundle
+./packaging/linux/appimage/build_appimage.sh                # .AppImage (Linux)
+./packaging/linux/build_deb.sh                              # .deb (Linux)
+./packaging/flatpak/build_flatpak.sh --stage-only           # Flatpak stage (Linux)
+./packaging/macos/make_macos_installer.sh --bin-dir target/release  # .dmg (macOS)
+```
+
+Windows (PowerShell, after the release build above):
+
+```powershell
+.\packaging\windows\build_installer.ps1   # -setup.exe (WiX v5 via dotnet)
+```
+
+Lightweight preflight (same checks as CI release-readiness):
+
+```bash
+cargo fmt --check && cargo metadata --no-deps --format-version 1 > /dev/null
+cargo check --lib --no-default-features && cargo test --lib --no-default-features
+```
+
+Mobile compile checks (need the target toolchains installed; CI runs these on tags):
+
+```bash
+cargo check --lib --no-default-features --target aarch64-linux-android
+cargo check --lib --no-default-features --target aarch64-apple-ios
+```
+
 ---
 
 ### macOS
