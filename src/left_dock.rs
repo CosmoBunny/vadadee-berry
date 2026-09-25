@@ -86,9 +86,9 @@ impl Default for LeftDockState {
     }
 }
 
-/// MCP vision-preview frame state (moved out of `app.rs` so the dock owns it).
-/// Ungated (also exists on Android) so view structs stay cfg-free; the app
-/// field itself remains desktop-only.
+/// MCP vision-preview frame state. Desktop-only: the whole MCP stack
+/// (module, bridge, preview, panels) is compiled out on mobile.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Clone, Default)]
 pub struct McpPreviewState {
     pub rgba: Vec<u8>,
@@ -106,7 +106,8 @@ pub struct DockFrameView<'a> {
     pub anim: &'a UiAnimation,
     pub dock: &'a mut LeftDockState,
     pub collab: &'a mut CollabSession,
-    /// Desktop-only preview state (`None` on Android).
+    /// Desktop-only MCP preview state (field absent on mobile).
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub preview: Option<&'a mut McpPreviewState>,
 }
 
@@ -134,10 +135,7 @@ pub fn show(
     }
 
     let DockFrameView {
-        anim,
-        dock,
-        collab,
-        preview,
+        anim, dock, collab, ..
     } = frame;
     let open_t = anim.left_dock_open_t();
     let animating = anim.left_dock_running;
@@ -165,7 +163,14 @@ pub fn show(
             match panel {
                 LeftDockPanel::Chat => chat_body(dock, collab, ui),
                 LeftDockPanel::Collab => {
-                    focus_req = collab_body(dock, collab, preview, ui);
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    {
+                        focus_req = collab_body(dock, collab, frame.preview, ui);
+                    }
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    {
+                        focus_req = collab_body(dock, collab, ui);
+                    }
                 }
             }
         });
@@ -222,7 +227,9 @@ fn chat_body(dock: &mut LeftDockState, collab: &mut CollabSession, ui: &mut Ui) 
 fn collab_body(
     dock: &mut LeftDockState,
     collab: &mut CollabSession,
-    mut preview: Option<&mut McpPreviewState>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))] mut preview: Option<
+        &mut McpPreviewState,
+    >,
     ui: &mut Ui,
 ) -> Option<(f64, f64)> {
     let _ = dock;
@@ -374,6 +381,8 @@ fn mcp_preview_panel(preview: &mut McpPreviewState, ui: &mut Ui, ctx: &Context) 
     }
 }
 
+/// MCP setup hint (desktop-only: names the desktop MCP bridge port).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn mcp_setup_hint(ui: &mut Ui) {
     ui.label(
         RichText::new(format!(

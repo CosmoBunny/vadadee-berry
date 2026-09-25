@@ -18733,6 +18733,7 @@ impl VadadeeBerryApp {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_kind_label(kind: &crate::document::NodeKind) -> &'static str {
         match kind {
             crate::document::NodeKind::Rect { .. } => "rect",
@@ -18750,6 +18751,7 @@ impl VadadeeBerryApp {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_paint_hex(node: &crate::document::Node) -> Option<String> {
         use crate::document::Fill;
         if let Fill::Solid(p) = node.style.fill {
@@ -18761,6 +18763,7 @@ impl VadadeeBerryApp {
         None
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_truncate_str(s: &str, max_chars: usize) -> String {
         // Byte pre-cap avoids scanning multi-megabyte text just to truncate a preview.
         let s = if s.len() > max_chars.saturating_mul(4).max(256) {
@@ -18780,6 +18783,7 @@ impl VadadeeBerryApp {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_list_all_objects_json(&self) -> Result<String, String> {
         let mut items = Vec::new();
         for (layer_idx, layer) in self.project.document.layers.iter().enumerate() {
@@ -18902,6 +18906,7 @@ impl VadadeeBerryApp {
         })
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_list_objects_json(&self) -> Result<String, String> {
         let layer = self
             .project
@@ -18943,6 +18948,7 @@ impl VadadeeBerryApp {
         serde_json::to_string_pretty(&items).map_err(|e| e.to_string())
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_get_object_json(&self, id_str: &str) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         let node = self
@@ -18966,6 +18972,7 @@ impl VadadeeBerryApp {
         serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_ensure_editable(&self) -> Result<(), String> {
         if !self.layer_editable() {
             return Err("Active layer is locked or hidden".into());
@@ -18973,6 +18980,7 @@ impl VadadeeBerryApp {
         Ok(())
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_finish_node(
         &mut self,
         mut node: crate::document::Node,
@@ -18990,6 +18998,7 @@ impl VadadeeBerryApp {
     }
 
     /// Resolve Node Editor layer index from optional layer_id / layer_index.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_resolve_ne_layer_idx(&self, args: &serde_json::Value) -> Result<usize, String> {
         if let Some(id_str) = args.get("layer_id").and_then(|v| v.as_str()) {
             let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
@@ -19026,6 +19035,7 @@ impl VadadeeBerryApp {
             .ok_or_else(|| "No Node Editor layer — use add_node_editor_layer first".into())
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_with_node_graph_mut<R>(
         &mut self,
         args: &serde_json::Value,
@@ -19049,6 +19059,7 @@ impl VadadeeBerryApp {
         Ok(result)
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_node_editor_tool(
         &mut self,
         name: &str,
@@ -19405,6 +19416,7 @@ impl VadadeeBerryApp {
     }
 
     /// MCP brush: pixel grid stamps, pen stroke, or soft brush outline (mirrors in-app brush).
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_brush(
         &mut self,
         args: &serde_json::Value,
@@ -20406,6 +20418,7 @@ impl VadadeeBerryApp {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_patch_nodes(
         &mut self,
         patches: Vec<(uuid::Uuid, crate::document::Node, crate::document::Node)>,
@@ -20429,6 +20442,7 @@ impl VadadeeBerryApp {
         Ok(format!("Updated style on {} object(s)", count))
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_set_objects_style_from_args(
         &mut self,
         id_values: &[serde_json::Value],
@@ -20457,6 +20471,7 @@ impl VadadeeBerryApp {
     }
 
     // === Animation / selection / layer MCP helpers ===
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_resolve_start_const(
         starts: Option<&serde_json::Value>,
         track: &str,
@@ -20483,6 +20498,7 @@ impl VadadeeBerryApp {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_add_stack_animation(&mut self, args: &serde_json::Value) -> Result<String, String> {
         let id_str = args
             .get("id")
@@ -20593,6 +20609,7 @@ impl VadadeeBerryApp {
         ))
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_edit_stack_animation(&mut self, args: &serde_json::Value) -> Result<String, String> {
         let id_str = args
             .get("id")
@@ -20678,6 +20695,7 @@ impl VadadeeBerryApp {
         Ok(format!("Updated stack animation {stack_id}"))
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_remove_stack_animation(
         &mut self,
         id_str: &str,
@@ -20704,6 +20722,7 @@ impl VadadeeBerryApp {
         Ok(format!("Removed stack animation {stack_id_str}"))
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_list_stack_animations(&self, id_filter: Option<&str>) -> Result<String, String> {
         let filter = id_filter
             .map(|s| uuid::Uuid::parse_str(s).map_err(|e| e.to_string()))
@@ -20751,6 +20770,7 @@ impl VadadeeBerryApp {
         Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_list_animatable_properties(&self, id_str: &str) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         let node = self
@@ -20795,6 +20815,7 @@ impl VadadeeBerryApp {
         .unwrap_or_default())
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_list_animation_tracks(&self, id_filter: Option<&str>) -> Result<String, String> {
         let filter = id_filter
             .map(|s| uuid::Uuid::parse_str(s).map_err(|e| e.to_string()))
@@ -20862,6 +20883,7 @@ impl VadadeeBerryApp {
         .unwrap_or_default())
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_get_object_properties(&self, id_str: &str) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         let node = self
@@ -20926,6 +20948,7 @@ impl VadadeeBerryApp {
         .unwrap_or_default())
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_node_kind_name(&self, node: &crate::document::Node) -> &'static str {
         match &node.kind {
             NodeKind::Rect { .. } => "rect",
@@ -20943,6 +20966,7 @@ impl VadadeeBerryApp {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_set_selection(&mut self, args: &serde_json::Value) -> Result<String, String> {
         let mut ids = Vec::new();
         if let Some(arr) = args.get("ids").and_then(|v| v.as_array()) {
@@ -20962,6 +20986,7 @@ impl VadadeeBerryApp {
         Ok(format!("Selection set to {} object(s)", ids.len()))
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_duplicate_object(&mut self, id_str: &str, ox: f64, oy: f64) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         let src = self
@@ -20991,6 +21016,7 @@ impl VadadeeBerryApp {
         Ok(format!("Duplicated {id_str} → {new_id}"))
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_reorder_object(&mut self, id_str: &str, action: &str) -> Result<String, String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         if self.project.nodes.get(id).is_none() {
@@ -21019,6 +21045,7 @@ impl VadadeeBerryApp {
         Ok(format!("Reordered {id_str} ({action})"))
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_list_layers(&self) -> Result<String, String> {
         let layers: Vec<_> = self
             .project
@@ -21047,6 +21074,7 @@ impl VadadeeBerryApp {
         )
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_set_keyframe(
         &mut self,
         id_str: &str,
@@ -21093,6 +21121,7 @@ impl VadadeeBerryApp {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_remove_keyframe(
         &mut self,
         id_str: &str,
@@ -21104,6 +21133,7 @@ impl VadadeeBerryApp {
         Ok(format!("Removed keyframe {}@{}", property, frame))
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_get_keyframes(
         &mut self,
         id_str: &str,
@@ -21181,6 +21211,7 @@ impl VadadeeBerryApp {
         Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_set_keyframe_interpolation(
         &mut self,
         id_str: &str,
@@ -21243,6 +21274,7 @@ impl VadadeeBerryApp {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_clear_animation_track(
         &mut self,
         id_str: &str,
@@ -21272,6 +21304,7 @@ impl VadadeeBerryApp {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_set_keyframes(&mut self, kfs: &[serde_json::Value]) -> Result<String, String> {
         if kfs.is_empty() {
             return Ok("No keyframes provided".into());
@@ -21328,6 +21361,7 @@ impl VadadeeBerryApp {
         Ok(format!("Set {} keyframes (batched)", count))
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_patch_node(
         &mut self,
         id_str: &str,
@@ -21373,6 +21407,7 @@ impl VadadeeBerryApp {
         Ok(format!("Updated object {id_str}"))
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_apply_geometry_patch(
         node: &mut crate::document::Node,
         patch: &serde_json::Value,
@@ -21549,10 +21584,12 @@ impl VadadeeBerryApp {
         Ok(())
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_update_object(&mut self, id_str: &str, patch: serde_json::Value) -> Result<(), String> {
         self.mcp_patch_node(id_str, &patch).map(|_| ())
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn mcp_delete_object(&mut self, id_str: &str) -> Result<(), String> {
         let id = uuid::Uuid::parse_str(id_str).map_err(|e| e.to_string())?;
         if self.project.nodes.get(id).is_none() {
@@ -22655,7 +22692,8 @@ fn strip_pixel_rects_from_bez(
     out
 }
 
-/// Parse brush point: `{x,y}` or `[x,y]`.
+/// MCP brush helpers (desktop-only).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn mcp_brush_xy(v: &serde_json::Value) -> Option<(f64, f64)> {
     if let Some(arr) = v.as_array() {
         if arr.len() >= 2 {
@@ -22668,7 +22706,8 @@ fn mcp_brush_xy(v: &serde_json::Value) -> Option<(f64, f64)> {
     Some((x, y))
 }
 
-/// Pattern cell → Some(rgb, alpha) or None if empty.
+/// MCP brush helpers (desktop-only).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn mcp_brush_cell_color(
     cell: &serde_json::Value,
     default_rgb: u32,

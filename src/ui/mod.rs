@@ -247,17 +247,27 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             floating_action_bar(app, &ctx, canvas_work);
             floating_timeline_window(app, &ctx, floater_work);
             floating_video_editor(app, &ctx, floater_work);
-            // Desktop-only preview state; the dock takes `None` on Android.
+            // Desktop-only MCP preview state (field absent on mobile).
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            let preview = Some(&mut app.mcp_preview);
-            #[cfg(any(target_os = "android", target_os = "ios"))]
-            let preview: Option<&mut crate::left_dock::McpPreviewState> = None;
             if let Some((fx, fy)) = crate::left_dock::show(
                 crate::left_dock::DockFrameView {
                     anim: &app.ui_anim,
                     dock: &mut app.left_dock,
                     collab: &mut app.collab,
-                    preview,
+                    preview: Some(&mut app.mcp_preview),
+                },
+                &ctx,
+                canvas_work,
+                app.toolbar_outer_rect.map(|r| r.max.x),
+            ) {
+                app.focus_viewport_on_peer(fx, fy);
+            }
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            if let Some((fx, fy)) = crate::left_dock::show(
+                crate::left_dock::DockFrameView {
+                    anim: &app.ui_anim,
+                    dock: &mut app.left_dock,
+                    collab: &mut app.collab,
                 },
                 &ctx,
                 canvas_work,

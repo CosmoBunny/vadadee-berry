@@ -22,7 +22,7 @@ pub mod icons;
 pub mod io;
 pub mod layer_cache;
 pub mod left_dock;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod mcp;
 pub mod node_editor_ui;
 pub mod path_physics;
