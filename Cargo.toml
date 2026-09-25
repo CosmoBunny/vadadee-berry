@@ -11,7 +11,9 @@ readme = "README.md"
 
 [lib]
 name = "vadadee_berry"
-crate-type = ["cdylib", "rlib"]
+# cdylib: Android GameActivity host (.so). staticlib: iOS Xcode host (.a).
+# rlib: desktop bins + integration.
+crate-type = ["cdylib", "staticlib", "rlib"]
 path = "src/lib.rs"
 
 [[bin]]
@@ -65,7 +67,7 @@ default = ["opencv"]
 opencv = ["dep:opencv"]
 
 [dependencies.opencv]
-version = "0.93"
+version = "0.100"
 optional = true
 default-features = false
 # clang-runtime: load libclang dynamically (avoids bindgen "not loaded on this thread").
