@@ -27,17 +27,28 @@ jobs:
         with:
           targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
-      - name: Set up Android SDK/NDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-      - name: Install Android NDK (C++ toolchain for cc-rs build scripts)
-        # setup-android alone does NOT install the NDK. Without it, crates
-        # with C++ build scripts (e.g. android-activity via cc-rs) fail with:
+      - name: Install Android SDK/NDK packages (explicit — no obsolete `tools`)
+        # setup-android alone does NOT install the NDK, and must not be
+        # asked for the obsolete `tools` package (sdkmanager: "Failed to
+        # find package 'tools'", exit 1). Install the exact package set
+        # explicitly. Without the NDK, crates with C++ build scripts
+        # (e.g. android-activity via cc-rs) fail with:
         #   failed to find tool "aarch64-linux-android-clang++"
         # cc-rs discovers the toolchain from ANDROID_NDK_HOME.
+        # NOTE: this block is intentionally identical in android-check and
+        # android-package — keep them in sync.
         run: |
           set -euo pipefail
-          sdkmanager --install "ndk;27.0.12077973"
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.0.12077973"
+          yes | sdkmanager --licenses >/dev/null || true
           NDK_DIR="$ANDROID_SDK_ROOT/ndk/27.0.12077973"
+          test -x "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
           test -x "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
           echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
       - name: Check library for Android targets
@@ -62,13 +73,22 @@ jobs:
         with:
           targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
-      - name: Set up Android SDK/NDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-      - name: Install Android NDK (Gradle native builds need it too)
+      - name: Install Android SDK/NDK packages (explicit — no obsolete `tools`)
+        # Same package set as android-check (Gradle native builds need the
+        # NDK too). See the check job for why this list is explicit.
+        # NOTE: intentionally identical in both jobs — keep them in sync.
         run: |
           set -euo pipefail
-          sdkmanager --install "ndk;27.0.12077973"
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.0.12077973"
+          yes | sdkmanager --licenses >/dev/null || true
           NDK_DIR="$ANDROID_SDK_ROOT/ndk/27.0.12077973"
+          test -x "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
           test -x "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
           echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
       - name: Build debug APK

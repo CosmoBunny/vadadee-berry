@@ -549,9 +549,9 @@ impl VadadeeBerryApp {
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let (mcp_preview_update_tx, mcp_preview_update_rx) = std::sync::mpsc::channel();
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        let (_mcp_preview_update_tx, _mcp_preview_update_rx) =
-            std::sync::mpsc::channel::<McpPreviewUpdate>(); // dummy: fields are desktop-only
+        // No mobile dummy: McpPreviewUpdate is a desktop-only type, so
+        // mobile must not name it at all. The struct-literal fields are
+        // cfg'd out on mobile, leaving nothing to initialize.
 
         let (layer_cache_result_tx, layer_cache_result_rx) = std::sync::mpsc::channel();
         let wgpu_render = cc.wgpu_render_state.clone();
