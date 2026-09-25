@@ -1,12 +1,12 @@
 //! Blind WebSocket relay: `GET /ws/{room_id}` → broadcast binary to all peers in the room.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::{accept_hdr_async, tungstenite::Message};
 
@@ -49,7 +49,10 @@ pub async fn run_relay_until_stopped(
     Ok(())
 }
 
-async fn handle_peer(stream: TcpStream, rooms: Arc<Mutex<HashMap<String, Room>>>) -> Result<(), String> {
+async fn handle_peer(
+    stream: TcpStream,
+    rooms: Arc<Mutex<HashMap<String, Room>>>,
+) -> Result<(), String> {
     let room_slot = Arc::new(std::sync::Mutex::new("default".to_string()));
     let room_slot_cb = room_slot.clone();
 
@@ -75,7 +78,9 @@ async fn handle_peer(stream: TcpStream, rooms: Arc<Mutex<HashMap<String, Room>>>
     let my_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
     {
         let mut map = rooms.lock().await;
-        let room = map.entry(rid.clone()).or_insert_with(|| Room { peers: vec![] });
+        let room = map
+            .entry(rid.clone())
+            .or_insert_with(|| Room { peers: vec![] });
         room.peers.push((my_id, tx));
     }
 

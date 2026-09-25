@@ -71,8 +71,7 @@ impl FontRegistry {
             style,
         };
         let id = self.db.query(&query)?;
-        self.db
-            .with_face_data(id, |data, _| data.to_vec())
+        self.db.with_face_data(id, |data, _| data.to_vec())
     }
 
     fn family_bound_in(defs: &FontDefinitions, fam: &FontFamily) -> bool {
@@ -154,8 +153,7 @@ impl FontRegistry {
         if fallback_fonts.is_empty() {
             // Absolute last resort — still bind something non-empty if possible.
             if let Some((name, _)) = defs.font_data.iter().next() {
-                defs.families
-                    .insert(fam, vec![name.clone()]);
+                defs.families.insert(fam, vec![name.clone()]);
             } else {
                 // Leave unbound only if there is literally no font data; callers use
                 // `resolved_family` which falls back to Proportional.
@@ -195,10 +193,7 @@ static USVG_FONTDB: OnceLock<Arc<Database>> = OnceLock::new();
 
 /// Strip quotes sometimes stored in project text styles (breaks usvg font matching).
 pub fn sanitize_svg_font_family(name: &str) -> String {
-    name.trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string()
+    name.trim().trim_matches('"').trim_matches('\'').to_string()
 }
 
 fn register_nerd_font_aliases(db: &mut Database) {

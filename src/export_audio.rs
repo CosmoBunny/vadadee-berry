@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::export_types::VideoFormat;
 use crate::document::{LayerKind, ProjectFile};
+use crate::export_types::VideoFormat;
 
 const EXPORT_SAMPLE_RATE: u32 = 44_100;
 
@@ -29,7 +29,10 @@ pub fn export_mux_with_audio(
     }
 
     let layers = collect_export_audio_layers(project);
-    let supports_audio_mux = matches!(format, VideoFormat::Mp4 | VideoFormat::Mkv | VideoFormat::Mov | VideoFormat::Webm);
+    let supports_audio_mux = matches!(
+        format,
+        VideoFormat::Mp4 | VideoFormat::Mkv | VideoFormat::Mov | VideoFormat::Webm
+    );
 
     if layers.is_empty() || !supports_audio_mux {
         if layers.is_empty() {
@@ -64,7 +67,8 @@ pub fn export_mux_with_audio(
             );
         }
     }
-    let pcm = mix_timeline_audio_stereo_i16(&layers, duration_secs, EXPORT_SAMPLE_RATE, output_path)?;
+    let pcm =
+        mix_timeline_audio_stereo_i16(&layers, duration_secs, EXPORT_SAMPLE_RATE, output_path)?;
     let mix_peak = pcm_peak(&pcm);
     log::info!(
         "export audio: mixed PCM peak {mix_peak} ({} frames @ {} Hz)",
@@ -159,13 +163,11 @@ fn collect_export_audio_layers(project: &ProjectFile) -> Vec<ExportAudioLayer> {
             // Stable track order: sub-row then timeline position.
             let mut clips: Vec<_> = layer_clone.av_clips.iter().collect();
             clips.sort_by(|a, b| {
-                a.track_row
-                    .cmp(&b.track_row)
-                    .then(
-                        a.video_timeline_start
-                            .partial_cmp(&b.video_timeline_start)
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    )
+                a.track_row.cmp(&b.track_row).then(
+                    a.video_timeline_start
+                        .partial_cmp(&b.video_timeline_start)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
             });
             for clip in clips {
                 if clip.media_path.is_empty() {
@@ -212,7 +214,10 @@ fn pcm_has_audible_samples(pcm: &[i16]) -> bool {
 }
 
 fn pcm_peak(pcm: &[i16]) -> i16 {
-    pcm.iter().map(|&s| (s as i32).abs() as i16).max().unwrap_or(0)
+    pcm.iter()
+        .map(|&s| (s as i32).abs() as i16)
+        .max()
+        .unwrap_or(0)
 }
 
 fn layer_overlaps_export(layer: &ExportAudioLayer, export_secs: f32) -> bool {
@@ -317,13 +322,7 @@ fn mix_timeline_audio_stereo_i16(
     Ok(out)
 }
 
-fn lerp_i16_to_f32(
-    src: &[i16],
-    idx0: usize,
-    ch: usize,
-    idx1: usize,
-    frac: f32,
-) -> f32 {
+fn lerp_i16_to_f32(src: &[i16], idx0: usize, ch: usize, idx1: usize, frac: f32) -> f32 {
     let a = src[idx0 * 2 + ch] as f32 / i16::MAX as f32;
     let b = src[idx1 * 2 + ch] as f32 / i16::MAX as f32;
     a + (b - a) * frac
@@ -535,7 +534,11 @@ mod export_audio_tests {
             return;
         }
         let (src, sr) = load_stereo_i16_layer(&path).expect("load mp3");
-        let src_peak = src.iter().map(|&s| (s as i32).abs() as i16).max().unwrap_or(0);
+        let src_peak = src
+            .iter()
+            .map(|&s| (s as i32).abs() as i16)
+            .max()
+            .unwrap_or(0);
         assert!(src_peak > 500, "source peak {src_peak}");
         assert!(sr > 0, "sample_rate");
 
@@ -546,20 +549,41 @@ mod export_audio_tests {
             play_secs: 10.02,
             volume: 1.0,
         }];
-        let pcm = mix_timeline_audio_stereo_i16(&layers, 10.02, EXPORT_SAMPLE_RATE, &path)
-            .expect("mix");
-        let mix_peak = pcm.iter().map(|&s| (s as i32).abs() as i16).max().unwrap_or(0);
+        let pcm =
+            mix_timeline_audio_stereo_i16(&layers, 10.02, EXPORT_SAMPLE_RATE, &path).expect("mix");
+        let mix_peak = pcm
+            .iter()
+            .map(|&s| (s as i32).abs() as i16)
+            .max()
+            .unwrap_or(0);
         assert!(mix_peak > 500, "mix peak {mix_peak}");
 
         if !crate::video_decode::is_libav_available() {
             return;
         }
-        let out = std::env::temp_dir().join(format!("vadadee_export_aac_{}.m4a", std::process::id()));
-        crate::video_decode::write_stereo_i16_as_aac_mp4_libav(&out, &pcm, EXPORT_SAMPLE_RATE, 192, |_| {})
-            .expect("aac encode");
-        let wav = std::env::temp_dir().join(format!("vadadee_export_aac_{}.wav", std::process::id()));
+        let out =
+            std::env::temp_dir().join(format!("vadadee_export_aac_{}.m4a", std::process::id()));
+        crate::video_decode::write_stereo_i16_as_aac_mp4_libav(
+            &out,
+            &pcm,
+            EXPORT_SAMPLE_RATE,
+            192,
+            |_| {},
+        )
+        .expect("aac encode");
+        let wav =
+            std::env::temp_dir().join(format!("vadadee_export_aac_{}.wav", std::process::id()));
         std::process::Command::new("ffmpeg")
-            .args(["-y", "-v", "error", "-i", out.to_str().unwrap(), "-f", "wav", wav.to_str().unwrap()])
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                out.to_str().unwrap(),
+                "-f",
+                "wav",
+                wav.to_str().unwrap(),
+            ])
             .status()
             .expect("ffmpeg");
         let bytes = std::fs::read(&wav).expect("wav");
@@ -578,7 +602,8 @@ mod export_audio_tests {
         };
 
         if let Some(ap) = anim_path {
-            let video_only = std::env::temp_dir().join(format!("vadadee_vonly_{}.mp4", std::process::id()));
+            let video_only =
+                std::env::temp_dir().join(format!("vadadee_vonly_{}.mp4", std::process::id()));
             std::process::Command::new("ffmpeg")
                 .args([
                     "-y",
@@ -593,12 +618,25 @@ mod export_audio_tests {
                 ])
                 .status()
                 .expect("video only");
-            let remuxed = std::env::temp_dir().join(format!("vadadee_remux_{}.mp4", std::process::id()));
+            let remuxed =
+                std::env::temp_dir().join(format!("vadadee_remux_{}.mp4", std::process::id()));
             crate::video_decode::remux_video_and_audio_libav(&video_only, &out, &remuxed)
                 .expect("remux");
-            let remux_wav = std::env::temp_dir().join(format!("vadadee_remux_{}.wav", std::process::id()));
+            let remux_wav =
+                std::env::temp_dir().join(format!("vadadee_remux_{}.wav", std::process::id()));
             std::process::Command::new("ffmpeg")
-                .args(["-y", "-v", "error", "-i", remuxed.to_str().unwrap(), "-map", "0:a:0", "-f", "wav", remux_wav.to_str().unwrap()])
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    remuxed.to_str().unwrap(),
+                    "-map",
+                    "0:a:0",
+                    "-f",
+                    "wav",
+                    remux_wav.to_str().unwrap(),
+                ])
                 .status()
                 .expect("decode remux");
             let bytes = std::fs::read(&remux_wav).expect("remux wav");

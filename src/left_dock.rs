@@ -150,8 +150,7 @@ pub fn show(
     }
 
     let inset = theme::overlay_work_rect(canvas_work);
-    let toolbar_right =
-        toolbar_outer_right.unwrap_or(inset.left() + theme::TOOLBAR_WIDTH);
+    let toolbar_right = toolbar_outer_right.unwrap_or(inset.left() + theme::TOOLBAR_WIDTH);
     let rect = left_dock_panel_rect(canvas_work, PANEL_WIDTH, open_t, toolbar_right);
 
     let mut focus_req = None;
@@ -191,9 +190,7 @@ fn chat_body(dock: &mut LeftDockState, collab: &mut CollabSession, ui: &mut Ui) 
     scroll.show(ui, |ui| {
         ui.set_max_width(ui.available_width());
         for line in collab.chat_log() {
-            ui.label(
-                RichText::new(format!("[{}]: {}", line.username, line.text)).small(),
-            );
+            ui.label(RichText::new(format!("[{}]: {}", line.username, line.text)).small());
         }
     });
     ui.separator();
@@ -257,13 +254,8 @@ fn collab_body(
     ui.label("Username");
     ui.text_edit_singleline(&mut collab.ui_config.username);
     ui.label("Secret");
-    ui.add(
-        egui::TextEdit::singleline(&mut collab.ui_config.secret_key).password(true),
-    );
-    ui.checkbox(
-        &mut collab.ui_config.live_canvas_sync,
-        "Live canvas sync",
-    );
+    ui.add(egui::TextEdit::singleline(&mut collab.ui_config.secret_key).password(true));
+    ui.checkbox(&mut collab.ui_config.live_canvas_sync, "Live canvas sync");
     ui.horizontal(|ui| {
         let start = match collab.ui_config.role {
             crate::collab::CollabRole::Server => "Start server",
@@ -288,9 +280,7 @@ fn collab_body(
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        if collab.ui_config.role == crate::collab::CollabRole::Server
-            && collab.is_connected()
-        {
+        if collab.ui_config.role == crate::collab::CollabRole::Server && collab.is_connected() {
             ui.separator();
             if let Some(p) = preview.as_mut() {
                 server_setup_panel(collab, p, ui);
@@ -301,9 +291,7 @@ fn collab_body(
     let focus_req = peers_panel(collab, ui);
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        if collab.ui_config.role != crate::collab::CollabRole::Server
-            || !collab.is_connected()
-        {
+        if collab.ui_config.role != crate::collab::CollabRole::Server || !collab.is_connected() {
             ui.separator();
             ui.collapsing("AI (MCP)", |ui| {
                 ui.collapsing("Vision preview", |ui| {
@@ -320,11 +308,7 @@ fn collab_body(
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn server_setup_panel(
-    collab: &CollabSession,
-    preview: &mut McpPreviewState,
-    ui: &mut Ui,
-) {
+fn server_setup_panel(collab: &CollabSession, preview: &mut McpPreviewState, ui: &mut Ui) {
     ui.label(RichText::new("Share with clients").strong());
     let cfg = &collab.ui_config;
     let client_text = format!(
@@ -335,7 +319,12 @@ fn server_setup_panel(
         cfg.secret_key,
         cfg.username.trim(),
     );
-    copyable_config_block(ui, "client_connect_cfg", &client_text, "Copy client settings");
+    copyable_config_block(
+        ui,
+        "client_connect_cfg",
+        &client_text,
+        "Copy client settings",
+    );
 
     ui.add_space(6.0);
     ui.label(RichText::new("AI (MCP) setup").strong());
@@ -351,7 +340,11 @@ fn server_setup_panel(
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn mcp_preview_panel(preview: &mut McpPreviewState, ui: &mut Ui, ctx: &Context) {
     if preview.width == 0 || preview.height == 0 || preview.rgba.is_empty() {
-        ui.label(RichText::new("No MCP preview yet — call capture_canvas_raster").small().color(colors::TEXT_MUTED));
+        ui.label(
+            RichText::new("No MCP preview yet — call capture_canvas_raster")
+                .small()
+                .color(colors::TEXT_MUTED),
+        );
         return;
     }
     let w = preview.width;
@@ -447,7 +440,11 @@ fn peers_panel(collab: &CollabSession, ui: &mut Ui) -> Option<(f64, f64)> {
     let peers: Vec<RemotePeer> = collab.peers_sorted();
     let panel_w = ui.available_width().max(120.0);
     if peers.is_empty() {
-        ui.label(RichText::new("No remote peers yet").small().color(colors::TEXT_MUTED));
+        ui.label(
+            RichText::new("No remote peers yet")
+                .small()
+                .color(colors::TEXT_MUTED),
+        );
         return None;
     }
     ScrollArea::vertical()
@@ -471,11 +468,7 @@ fn peers_panel(collab: &CollabSession, ui: &mut Ui) -> Option<(f64, f64)> {
                         ui.label(RichText::new(name).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let lat = peer_latency_label(&peer, collab.connection_latency_ms());
-                            ui.label(
-                                RichText::new(lat)
-                                    .small()
-                                    .color(colors::TEXT_MUTED),
-                            );
+                            ui.label(RichText::new(lat).small().color(colors::TEXT_MUTED));
                         });
                     });
                     ui.horizontal(|ui| {
@@ -512,7 +505,9 @@ fn peer_latency_label(peer: &RemotePeer, room_ms: Option<u32>) -> String {
             return "idle".into();
         }
     }
-    room_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "…".into())
+    room_ms
+        .map(|ms| format!("{ms} ms"))
+        .unwrap_or_else(|| "…".into())
 }
 
 /// Bottom-left chat toasts above the status bar (slide up + fade).
@@ -608,12 +603,7 @@ pub fn draw_local_cursor_bubble(view: CursorBubbleView<'_>, ui: &mut Ui, origin:
     let pos = viewport.doc_to_screen((dx, dy), origin);
     let color = collab_display_color(local_color_rgb);
     if !text.is_empty() {
-        draw_cursor_bubble_label(
-            ui.painter(),
-            pos + egui::vec2(0.0, -30.0),
-            text,
-            color,
-        );
+        draw_cursor_bubble_label(ui.painter(), pos + egui::vec2(0.0, -30.0), text, color);
     }
     if !edit {
         return;
@@ -648,7 +638,12 @@ pub fn draw_local_cursor_bubble(view: CursorBubbleView<'_>, ui: &mut Ui, origin:
     }
 }
 
-pub fn draw_remote_cursors(collab: &CollabSession, viewport: &Viewport, ui: &mut Ui, origin: egui::Pos2) {
+pub fn draw_remote_cursors(
+    collab: &CollabSession,
+    viewport: &Viewport,
+    ui: &mut Ui,
+    origin: egui::Pos2,
+) {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = (collab, ui, origin);
@@ -675,12 +670,7 @@ pub fn draw_remote_cursors(collab: &CollabSession, viewport: &Viewport, ui: &mut
                 .as_deref()
                 .map(collab_tool_icon)
                 .unwrap_or(icons::PEN);
-            draw_outlined_icon(
-                &painter,
-                pos + egui::vec2(8.0, 8.0),
-                icon,
-                color,
-            );
+            draw_outlined_icon(&painter, pos + egui::vec2(8.0, 8.0), icon, color);
         } else {
             draw_pointer_cursor(&painter, pos, color);
         }
@@ -710,15 +700,14 @@ fn draw_cursor_bubble_label(
 ) {
     let font_id = egui::FontId::proportional(12.0);
     let text_color = egui::Color32::from_rgb(18, 22, 32);
-    let galley = painter.layout(
-        text.to_owned(),
-        font_id,
-        text_color,
-        CURSOR_BUBBLE_MAX_W,
-    );
+    let galley = painter.layout(text.to_owned(), font_id, text_color, CURSOR_BUBBLE_MAX_W);
     let pad = egui::vec2(6.0, 4.0);
     let rect = egui::Rect::from_min_size(top_left, galley.size() + pad * 2.0);
-    painter.rect_filled(rect, 6.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 235));
+    painter.rect_filled(
+        rect,
+        6.0,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 235),
+    );
     painter.rect_stroke(
         rect,
         6.0,
@@ -734,11 +723,7 @@ fn draw_pointer_cursor(painter: &egui::Painter, tip: egui::Pos2, color: egui::Co
     let c = tip + egui::vec2(9.0, 10.0);
     let outline = egui::Stroke::new(2.5, egui::Color32::WHITE);
     let stroke = egui::Stroke::new(1.25, egui::Color32::from_black_alpha(200));
-    painter.add(egui::Shape::convex_polygon(
-        vec![a, b, c],
-        color,
-        outline,
-    ));
+    painter.add(egui::Shape::convex_polygon(vec![a, b, c], color, outline));
     painter.add(egui::Shape::convex_polygon(vec![a, b, c], color, stroke));
 }
 

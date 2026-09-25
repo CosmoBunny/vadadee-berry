@@ -52,13 +52,7 @@ pub fn is_hex_chain_wgsl(pass: &ShadingPass) -> bool {
 }
 
 /// Fill `rgba` at native resolution (tight RGBA8). Prefer [`fill_hex_chain_rgba_export`].
-pub fn fill_hex_chain_rgba(
-    rgba: &mut [u8],
-    width: u32,
-    height: u32,
-    time_secs: f32,
-    glow: f32,
-) {
+pub fn fill_hex_chain_rgba(rgba: &mut [u8], width: u32, height: u32, time_secs: f32, glow: f32) {
     let w = width as usize;
     let h = height as usize;
     if w == 0 || h == 0 || rgba.len() < w * h * 4 {

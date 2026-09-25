@@ -223,9 +223,7 @@ pub fn hidden_effect_sources(
     // App objects feeding a visible NodeEditor output are drawn by the NE
     // composite only (canvas P6c) — hide originals so they don't double-draw.
     for layer in &doc.layers {
-        if !layer.visible
-            || layer.kind != crate::document::LayerKind::NodeEditor
-        {
+        if !layer.visible || layer.kind != crate::document::LayerKind::NodeEditor {
             continue;
         }
         let Some(g) = layer.node_graph.as_ref() else {
@@ -300,7 +298,10 @@ fn ne_appobjects_order(project: &crate::document::ProjectFile) -> Vec<crate::doc
 /// `hide.remove`). Groups stay hidden (parent paints them).
 pub fn full_document_paint_plan(
     project: &crate::document::ProjectFile,
-) -> (Vec<crate::document::NodeId>, std::collections::HashSet<crate::document::NodeId>) {
+) -> (
+    Vec<crate::document::NodeId>,
+    std::collections::HashSet<crate::document::NodeId>,
+) {
     use std::collections::HashSet;
     let moved: HashSet<crate::document::NodeId> =
         ne_appobjects_order(project).into_iter().collect();
@@ -312,8 +313,7 @@ pub fn full_document_paint_plan(
         if layer.kind == crate::document::LayerKind::NodeEditor {
             if let Some(g) = layer.node_graph.as_ref() {
                 let eval = g.resolve_output_image();
-                if let crate::document::GraphImageSource::AppObjects(eval_ids) = &eval.image
-                {
+                if let crate::document::GraphImageSource::AppObjects(eval_ids) = &eval.image {
                     if !eval_ids.is_empty() {
                         // Canvas order: draw-order intersection, then missing.
                         let flat = full_order(project);
@@ -370,10 +370,7 @@ pub fn paint_document_effects(
     viewport: &crate::canvas::Viewport,
     origin: egui::Pos2,
     fonts: &crate::fonts::FontRegistry,
-    image_textures: &std::collections::HashMap<
-        crate::document::NodeId,
-        egui::TextureHandle,
-    >,
+    image_textures: &std::collections::HashMap<crate::document::NodeId, egui::TextureHandle>,
 ) {
     use std::collections::HashSet;
     let allow: Option<HashSet<crate::document::NodeId>> =

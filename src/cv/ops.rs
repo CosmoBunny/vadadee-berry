@@ -43,7 +43,11 @@ pub fn chroma_key_mask(
     soft_deg: f32,
 ) -> CvMask {
     let (w, h) = img.dimensions();
-    let (kh, ks, kv) = rgb_to_hsv(key_r.clamp(0.0, 1.0), key_g.clamp(0.0, 1.0), key_b.clamp(0.0, 1.0));
+    let (kh, ks, kv) = rgb_to_hsv(
+        key_r.clamp(0.0, 1.0),
+        key_g.clamp(0.0, 1.0),
+        key_b.clamp(0.0, 1.0),
+    );
     let tol = tol_deg.max(0.0);
     let soft = soft_deg.max(0.0);
     let outer = tol + soft;

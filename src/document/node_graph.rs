@@ -305,14 +305,12 @@ impl GraphNodeKind {
             | Self::ApplyMask
             | Self::BackgroundBlur
             | Self::PrivacyBlur => "Effect",
-            Self::ChromaKey
-            | Self::RegionsFromManual
-            | Self::DetectFace
-            | Self::TrackMotion => "Analyze",
-            Self::UnionImage2
-            | Self::UnionImage3
-            | Self::UnionImage5
-            | Self::UnionImage7 => "Composite",
+            Self::ChromaKey | Self::RegionsFromManual | Self::DetectFace | Self::TrackMotion => {
+                "Analyze"
+            }
+            Self::UnionImage2 | Self::UnionImage3 | Self::UnionImage5 | Self::UnionImage7 => {
+                "Composite"
+            }
             Self::GeoSize
             | Self::GeoPlacement
             | Self::GeoRotate
@@ -1272,7 +1270,12 @@ pub struct GraphLink {
 }
 
 impl GraphLink {
-    pub fn new(from_node: Uuid, from_port: impl Into<String>, to_node: Uuid, to_port: impl Into<String>) -> Self {
+    pub fn new(
+        from_node: Uuid,
+        from_port: impl Into<String>,
+        to_node: Uuid,
+        to_port: impl Into<String>,
+    ) -> Self {
         Self {
             id: Uuid::new_v4(),
             from_node,
@@ -1370,7 +1373,10 @@ impl GraphParam {
             return Some(None);
         }
         let prefix = format!("{base}:");
-        label.strip_prefix(&prefix).and_then(|s| s.parse().ok()).map(Some)
+        label
+            .strip_prefix(&prefix)
+            .and_then(|s| s.parse().ok())
+            .map(Some)
     }
 }
 
@@ -1383,9 +1389,7 @@ pub enum GraphImageSource {
     FilePath(String),
     /// Materialized RGBA in [`crate::cv::global_cv_cache`] (spatial FX / analyze bake).
     /// Key from [`crate::cv::CvAnalyzeContext::cache_key`].
-    BakedCache {
-        key: String,
-    },
+    BakedCache { key: String },
     /// Nothing connected or unresolved.
     Empty,
 }
@@ -1566,11 +1570,7 @@ impl GraphOutputEval {
         };
         format!(
             "{path}{t}{bake}|b{:.3}|c{:.3}|s{:.3}|h{:.2}|bl{:.2}",
-            self.brightness,
-            self.contrast,
-            self.saturation,
-            self.hue_shift,
-            self.blur_px,
+            self.brightness, self.contrast, self.saturation, self.hue_shift, self.blur_px,
         )
     }
 
@@ -1676,7 +1676,9 @@ impl GraphOutputEval {
         e.zoom_cy = ((e.zoom_cy * 1000.0).round() / 1000.0).clamp(0.0, 1.0);
         // Snap video time to ms so texture cache hits while scrubbing without
         // forcing a fixed 30fps grid that fought export/anim fps.
-        e.video_time_sec = e.video_time_sec.map(|t| ((t * 1000.0).floor() / 1000.0).max(0.0));
+        e.video_time_sec = e
+            .video_time_sec
+            .map(|t| ((t * 1000.0).floor() / 1000.0).max(0.0));
         e
     }
 }
@@ -1707,8 +1709,7 @@ pub fn load_graph_media_rgba(
         Ok(img) => Some(img.to_rgba8()),
         Err(_) => {
             // Try frame 0 of a video container (cached stream).
-            let (w, h, rgba) =
-                crate::video_decode::decode_frame_cached(path, 0, fps.max(1.0))?;
+            let (w, h, rgba) = crate::video_decode::decode_frame_cached(path, 0, fps.max(1.0))?;
             image::RgbaImage::from_raw(w, h, rgba)
         }
     }
@@ -2393,7 +2394,12 @@ impl NodeGraph {
     }
 
     /// Resolve a Mask port chain into a concrete matte (computes ChromaKey if needed).
-    pub fn resolve_mask_input(&self, to_node: Uuid, to_port: &str, depth: usize) -> Option<crate::cv::CvMask> {
+    pub fn resolve_mask_input(
+        &self,
+        to_node: Uuid,
+        to_port: &str,
+        depth: usize,
+    ) -> Option<crate::cv::CvMask> {
         if depth > 32 {
             return None;
         }
@@ -2427,7 +2433,11 @@ impl NodeGraph {
         self.regions_for_node(src_id, depth + 1)
     }
 
-    pub fn regions_for_node(&self, node_id: Uuid, depth: usize) -> Option<Vec<crate::cv::CvRegion>> {
+    pub fn regions_for_node(
+        &self,
+        node_id: Uuid,
+        depth: usize,
+    ) -> Option<Vec<crate::cv::CvRegion>> {
         if depth > 32 {
             return None;
         }
@@ -2461,15 +2471,9 @@ impl NodeGraph {
                 }
                 .clamp_norm();
                 let params = crate::cv::hash_params_f64(&[x, y, w, h]);
-                let key = format!(
-                    "cv|regions|manual|n{}|p{:x}",
-                    node_id.as_simple(),
-                    params
-                );
-                crate::cv::global_cv_cache().insert(
-                    key,
-                    crate::cv::CvCacheValue::Regions(vec![region.clone()]),
-                );
+                let key = format!("cv|regions|manual|n{}|p{:x}", node_id.as_simple(), params);
+                crate::cv::global_cv_cache()
+                    .insert(key, crate::cv::CvCacheValue::Regions(vec![region.clone()]));
                 Some(vec![region])
             }
             GraphNodeKind::DetectFace => {
@@ -2565,13 +2569,7 @@ impl NodeGraph {
                 .collect::<Vec<_>>(),
         );
         let params = crate::cv::hash_params_f64(&[strength, pad, mode as f64, reg_hash as f64]);
-        let ctx = inner.cv_analyze_context(
-            crate::cv::CvJob::PRIVACY,
-            node_id,
-            params,
-            0,
-            0,
-        );
+        let ctx = inner.cv_analyze_context(crate::cv::CvJob::PRIVACY, node_id, params, 0, 0);
         // Include preview max-side so full-res export can use a different key later.
         let bake_key = format!("{}|ms{}", ctx.cache_key(), crate::cv::PREVIEW_MAX_SIDE);
         let regions_job = regions.clone();
@@ -2676,8 +2674,15 @@ impl NodeGraph {
                 .copied()
                 .collect::<Vec<_>>(),
         );
-        let params = crate::cv::hash_params_f64(&[if invert { 1.0 } else { 0.0 }, mask_hash as f64]);
-        let ctx = inner.cv_analyze_context(crate::cv::CvJob::MATTE, node_id, params, mask.width, mask.height);
+        let params =
+            crate::cv::hash_params_f64(&[if invert { 1.0 } else { 0.0 }, mask_hash as f64]);
+        let ctx = inner.cv_analyze_context(
+            crate::cv::CvJob::MATTE,
+            node_id,
+            params,
+            mask.width,
+            mask.height,
+        );
         let bake_key = ctx.cache_key();
         let cache = crate::cv::global_cv_cache();
         if cache.contains(&bake_key) {
@@ -2711,8 +2716,13 @@ impl NodeGraph {
                 .collect::<Vec<_>>(),
         );
         let params = crate::cv::hash_params_f64(&[amount, mask_hash as f64]);
-        let ctx =
-            inner.cv_analyze_context(crate::cv::CvJob::BG_BLUR, node_id, params, mask.width, mask.height);
+        let ctx = inner.cv_analyze_context(
+            crate::cv::CvJob::BG_BLUR,
+            node_id,
+            params,
+            mask.width,
+            mask.height,
+        );
         let bake_key = ctx.cache_key();
         let cache = crate::cv::global_cv_cache();
         if cache.contains(&bake_key) {
@@ -2796,8 +2806,7 @@ impl NodeGraph {
 
     pub fn remove_node(&mut self, id: Uuid) {
         self.nodes.shift_remove(&id);
-        self.links
-            .retain(|l| l.from_node != id && l.to_node != id);
+        self.links.retain(|l| l.from_node != id && l.to_node != id);
         if self.output_node_id == Some(id) {
             self.output_node_id = self
                 .nodes
@@ -2934,7 +2943,8 @@ impl NodeGraph {
         if broken {
             // Remove outbound links from broken object nodes.
             self.links.retain(|l| !dead_nodes.contains(&l.from_node));
-            self.root_error = Some("Graph error: missing source object (check Output Object)".into());
+            self.root_error =
+                Some("Graph error: missing source object (check Output Object)".into());
         } else if self.nodes.values().all(|n| n.error.is_none()) {
             self.root_error = None;
         }
@@ -3094,9 +3104,9 @@ impl NodeGraph {
                     .and_then(|id| self.last_real_out(id))
                     .unwrap_or(0.0);
                 if let Some(sp) = septic {
-                    if let Ok(session) =
-                        super::septic::SepticSession::load_path_cached_arc(std::path::Path::new(&sp))
-                    {
+                    if let Ok(session) = super::septic::SepticSession::load_path_cached_arc(
+                        std::path::Path::new(&sp),
+                    ) {
                         let t = session.truth_time(t_req);
                         if let Some(vp) = super::septic::resolve_video_path(
                             std::path::Path::new(&sp),
@@ -3107,8 +3117,7 @@ impl NodeGraph {
                             out.media_time_sec = Some(t);
                             out.playback_rate = 1.0;
                         } else if !session.meta.video_path.is_empty() {
-                            out.sound =
-                                GraphSoundSource::FilePath(session.meta.video_path.clone());
+                            out.sound = GraphSoundSource::FilePath(session.meta.video_path.clone());
                             out.media_time_sec = Some(t);
                             out.playback_rate = 1.0;
                         }
@@ -3503,7 +3512,8 @@ impl NodeGraph {
             h ^= crate::cv::hash_params_f64(&[i as f64, m.width() as f64, m.height() as f64]);
         }
         let key = format!("cv|union|n{}|p{:x}", node_id.as_simple(), h);
-        crate::cv::global_cv_cache().insert(key.clone(), crate::cv::rgba_to_cache_value(&composite));
+        crate::cv::global_cv_cache()
+            .insert(key.clone(), crate::cv::rgba_to_cache_value(&composite));
         GraphOutputEval::default().with_baked_cache(key)
     }
 
@@ -3709,9 +3719,10 @@ impl NodeGraph {
 
     /// Real input on `to_port`, using the source's **from_port** when multi-out.
     pub fn real_input_value(&self, to_node: Uuid, to_port: &str) -> Option<f64> {
-        let link = self.links.iter().find(|l| {
-            l.to_node == to_node && l.to_port == to_port
-        })?;
+        let link = self
+            .links
+            .iter()
+            .find(|l| l.to_node == to_node && l.to_port == to_port)?;
         let ty = self.port_type(link.from_node, &link.from_port)?;
         if ty != PortType::Real {
             return None;
@@ -3727,9 +3738,11 @@ impl NodeGraph {
         default_x: f64,
         default_y: f64,
     ) -> (f64, f64) {
-        let Some(link) = self.links.iter().find(|l| {
-            l.to_node == to_node && l.to_port == to_port
-        }) else {
+        let Some(link) = self
+            .links
+            .iter()
+            .find(|l| l.to_node == to_node && l.to_port == to_port)
+        else {
             return (default_x, default_y);
         };
         let Some(src) = self.nodes.get(&link.from_node) else {
@@ -3840,11 +3853,9 @@ impl NodeGraph {
                     | GraphNodeKind::Time
                     | GraphNodeKind::ParamReal { .. }
             ) {
-                if node
-                    .error
-                    .as_ref()
-                    .is_some_and(|e| e.contains("cycle") || e.contains("Expr") || e.contains("expr"))
-                {
+                if node.error.as_ref().is_some_and(|e| {
+                    e.contains("cycle") || e.contains("Expr") || e.contains("expr")
+                }) {
                     node.error = None;
                 }
             }
@@ -3853,9 +3864,10 @@ impl NodeGraph {
         // Build adjacency for Real wires only (from → to).
         let mut real_nodes: HashSet<Uuid> = HashSet::new();
         for (id, node) in &self.nodes {
-            let produces_real = node.ports().iter().any(|p| {
-                p.dir == PortDir::Output && p.ty == PortType::Real
-            });
+            let produces_real = node
+                .ports()
+                .iter()
+                .any(|p| p.dir == PortDir::Output && p.ty == PortType::Real);
             if produces_real {
                 real_nodes.insert(*id);
             }
@@ -3958,8 +3970,7 @@ impl NodeGraph {
                     let level = if freq > 1.0 {
                         // Narrow-band energy proxy: fundamental + 2nd harmonic, phase-stable.
                         let w = std::f64::consts::TAU * freq * time_sec;
-                        let band = (w.sin().abs() * 0.7 + (w * 2.0).sin().abs() * 0.3)
-                            .powf(1.4);
+                        let band = (w.sin().abs() * 0.7 + (w * 2.0).sin().abs() * 0.3).powf(1.4);
                         // Slight detune shimmer so pure tones don't look flat.
                         let shimmer = ((time_sec * (freq * 0.07 + 3.0)).sin() * 0.5 + 0.5) * 0.15;
                         (band * (0.85 + shimmer)).clamp(0.0, 1.0)
@@ -4058,7 +4069,9 @@ impl NodeGraph {
                         })
                         .or_else(|| self.resolve_septic_path(id, "mouse", 0));
                     let enc = if let Some(p) = path {
-                        match super::septic::SepticSession::load_path_cached_arc(std::path::Path::new(&p)) {
+                        match super::septic::SepticSession::load_path_cached_arc(
+                            std::path::Path::new(&p),
+                        ) {
                             Ok(session) => super::septic::encode_mouse(
                                 &session,
                                 t_req,
@@ -4133,11 +4146,7 @@ impl NodeGraph {
                             let tkey = format!("cv|track|n{}|{}", id.as_simple(), media_key);
                             crate::cv::global_cv_cache()
                                 .insert(tkey, crate::cv::CvCacheValue::Track(sample.clone()));
-                            (
-                                sample.cx as f64,
-                                sample.cy as f64,
-                                sample.confidence as f64,
-                            )
+                            (sample.cx as f64, sample.cy as f64, sample.confidence as f64)
                         } else {
                             (0.5, 0.5, 0.0)
                         };
@@ -4216,12 +4225,8 @@ impl NodeGraph {
         use GraphNodeKind::*;
         let all = vec![
             Value { value: 0.0 },
-            ExprX {
-                expr: "x".into(),
-            },
-            ExprXy {
-                expr: "x+y".into(),
-            },
+            ExprX { expr: "x".into() },
+            ExprXy { expr: "x+y".into() },
             ExprXyz {
                 expr: "x+y+z".into(),
             },
@@ -4273,12 +4278,8 @@ impl NodeGraph {
         use GraphNodeKind::*;
         let all = vec![
             Value { value: 0.0 },
-            ExprX {
-                expr: "x".into(),
-            },
-            ExprXy {
-                expr: "x+y".into(),
-            },
+            ExprX { expr: "x".into() },
+            ExprXy { expr: "x+y".into() },
             ExprXyz {
                 expr: "x+y+z".into(),
             },
@@ -4391,12 +4392,7 @@ impl NodeGraph {
 
     /// Shared timing for VideoPlayer image + sound.
     /// Returns `(media_time_sec, playback_rate, silent)`.
-    fn video_player_time_window(
-        &self,
-        node_id: Uuid,
-        path: &str,
-        speed: f64,
-    ) -> (f64, f64, bool) {
+    fn video_player_time_window(&self, node_id: Uuid, path: &str, speed: f64) -> (f64, f64, bool) {
         let time = self
             .real_input_source(node_id, "time")
             .and_then(|id| self.last_real_out(id))
@@ -4425,9 +4421,7 @@ impl NodeGraph {
         };
 
         // Blank only when clearly past a finite window (or before start).
-        let silent = t < start - 1e-9
-            || (win_end.is_finite() && t >= win_end - 1e-9)
-            || t < 0.0;
+        let silent = t < start - 1e-9 || (win_end.is_finite() && t >= win_end - 1e-9) || t < 0.0;
 
         let timeline = self
             .nodes
@@ -4451,11 +4445,7 @@ impl NodeGraph {
 
     /// Path + timing for VideoPlayer sound out.
     /// Prefer `audio` input path; else demux from video file.
-    fn video_player_media_window(
-        &self,
-        node_id: Uuid,
-        depth: usize,
-    ) -> (String, f64, f64, bool) {
+    fn video_player_media_window(&self, node_id: Uuid, depth: usize) -> (String, f64, f64, bool) {
         let video_inner = self.resolve_image_chain(node_id, "video", depth);
         let video_path = match &video_inner.image {
             GraphImageSource::FilePath(p) if !p.trim().is_empty() => p.clone(),
@@ -4483,8 +4473,7 @@ impl NodeGraph {
         } else {
             path.as_str()
         };
-        let (t, rate, silent) =
-            self.video_player_time_window(node_id, probe, video_inner.speed);
+        let (t, rate, silent) = self.video_player_time_window(node_id, probe, video_inner.speed);
         (path, t, rate, silent)
     }
 }
@@ -4561,23 +4550,23 @@ mod tests {
         eval.blur_px = 4.0;
         let mut base = std::collections::HashMap::new();
         let mut fx = std::collections::HashMap::new();
-        let a = bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx))
-            .unwrap();
+        let a =
+            bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx)).unwrap();
         assert_eq!(base.len(), 1);
         assert_eq!(fx.len(), 1);
-        let b = bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx))
-            .unwrap();
+        let b =
+            bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx)).unwrap();
         assert_eq!(a.as_raw(), b.as_raw());
         // Same quantized blur step → same cache key (4.4 → 4 with step 1).
         eval.blur_px = 4.4;
-        let c = bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx))
-            .unwrap();
+        let c =
+            bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx)).unwrap();
         assert_eq!(fx.len(), 1);
         assert_eq!(a.as_raw(), c.as_raw());
         // Different step bucket → new FX entry.
         eval.blur_px = 6.0;
-        let _d = bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx))
-            .unwrap();
+        let _d =
+            bake_graph_output_rgba(path, &eval, 128, 1.0, Some(&mut base), Some(&mut fx)).unwrap();
         assert_eq!(fx.len(), 2);
     }
 
@@ -4663,20 +4652,8 @@ mod tests {
             last_real_port_values: Default::default(),
             last_cv_keys: Default::default(),
         };
-        let e1 = g.add_node(
-            GraphNodeKind::ExprX {
-                expr: "x".into(),
-            },
-            0.0,
-            0.0,
-        );
-        let e2 = g.add_node(
-            GraphNodeKind::ExprX {
-                expr: "x".into(),
-            },
-            0.0,
-            0.0,
-        );
+        let e1 = g.add_node(GraphNodeKind::ExprX { expr: "x".into() }, 0.0, 0.0);
+        let e2 = g.add_node(GraphNodeKind::ExprX { expr: "x".into() }, 0.0, 0.0);
         g.try_add_link(e1, "out", e2, "x").unwrap();
         // Edit-time guard must refuse to close the loop (Union image chains
         // would otherwise recurse forever).
@@ -4693,13 +4670,18 @@ mod tests {
     #[test]
     fn catalog_accepts_real() {
         let kinds = NodeGraph::catalog_kinds_accepting(PortType::Real);
-        assert!(kinds.iter().any(|k| matches!(k, GraphNodeKind::ExprX { .. } | GraphNodeKind::ExprXy { .. } | GraphNodeKind::ExprXyz { .. })));
-        assert!(kinds
-            .iter()
-            .any(|k| matches!(k, GraphNodeKind::Brightness)));
-        assert!(!kinds
-            .iter()
-            .any(|k| matches!(k, GraphNodeKind::ObjectImage { .. })));
+        assert!(kinds.iter().any(|k| matches!(
+            k,
+            GraphNodeKind::ExprX { .. }
+                | GraphNodeKind::ExprXy { .. }
+                | GraphNodeKind::ExprXyz { .. }
+        )));
+        assert!(kinds.iter().any(|k| matches!(k, GraphNodeKind::Brightness)));
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| matches!(k, GraphNodeKind::ObjectImage { .. }))
+        );
     }
 
     #[test]
@@ -4735,13 +4717,7 @@ mod tests {
             last_cv_keys: Default::default(),
         };
         let f = g.add_node(GraphNodeKind::Frame, 0.0, 0.0);
-        let e = g.add_node(
-            GraphNodeKind::ExprX {
-                expr: "x/2".into(),
-            },
-            100.0,
-            0.0,
-        );
+        let e = g.add_node(GraphNodeKind::ExprX { expr: "x/2".into() }, 100.0, 0.0);
         g.try_add_link(f, "out", e, "x").unwrap();
         g.eval_reals(10, 30.0);
         assert!((g.last_real_out(e).unwrap() - 5.0).abs() < 1e-9);
@@ -4751,10 +4727,16 @@ mod tests {
     fn catalog_producing_real_includes_frame() {
         let kinds = NodeGraph::catalog_kinds_producing(PortType::Real);
         assert!(kinds.iter().any(|k| matches!(k, GraphNodeKind::Frame)));
-        assert!(kinds.iter().any(|k| matches!(k, GraphNodeKind::Value { .. })));
-        assert!(!kinds
-            .iter()
-            .any(|k| matches!(k, GraphNodeKind::ObjectImage { .. })));
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, GraphNodeKind::Value { .. }))
+        );
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| matches!(k, GraphNodeKind::ObjectImage { .. }))
+        );
     }
 
     #[test]
@@ -4770,13 +4752,7 @@ mod tests {
             last_real_port_values: Default::default(),
             last_cv_keys: Default::default(),
         };
-        let e = g.add_node(
-            GraphNodeKind::ExprX {
-                expr: "@@@".into(),
-            },
-            0.0,
-            0.0,
-        );
+        let e = g.add_node(GraphNodeKind::ExprX { expr: "@@@".into() }, 0.0, 0.0);
         g.eval_reals(0, 30.0);
         assert!(g.nodes.get(&e).unwrap().error.is_some());
         assert!(g.last_real_out(e).is_none());
@@ -4971,7 +4947,10 @@ mod tests {
         let center = img.get_pixel(2, 2).0[0];
         let neighbor = img.get_pixel(2, 1).0[0];
         assert!(center < 255, "blur should reduce peak, got {center}");
-        assert!(neighbor > 0, "blur should spread light to neighbors, got {neighbor}");
+        assert!(
+            neighbor > 0,
+            "blur should spread light to neighbors, got {neighbor}"
+        );
     }
 
     #[test]
@@ -4998,10 +4977,7 @@ mod tests {
         );
         g.try_add_link(img, "out", out_id, "image").unwrap();
         let ev = g.resolve_output_image();
-        assert_eq!(
-            ev.image,
-            GraphImageSource::FilePath("/tmp/foo.png".into())
-        );
+        assert_eq!(ev.image, GraphImageSource::FilePath("/tmp/foo.png".into()));
     }
 
     #[test]
@@ -5020,15 +4996,24 @@ mod tests {
         let size = GraphNodeKind::GeoSize.ports();
         assert!(size.iter().any(|p| p.id == "w" && p.ty == PortType::Real));
         assert!(size.iter().any(|p| p.id == "h" && p.ty == PortType::Real));
-        assert!(size.iter().any(|p| p.id == "in" && p.ty == PortType::RawImage));
-        assert!(size.iter().any(|p| p.id == "out" && p.ty == PortType::RawImage));
+        assert!(
+            size.iter()
+                .any(|p| p.id == "in" && p.ty == PortType::RawImage)
+        );
+        assert!(
+            size.iter()
+                .any(|p| p.id == "out" && p.ty == PortType::RawImage)
+        );
 
         let place = GraphNodeKind::GeoPlacement.ports();
         assert!(place.iter().any(|p| p.id == "x"));
         assert!(place.iter().any(|p| p.id == "y"));
 
         let rot = GraphNodeKind::GeoRotate.ports();
-        assert!(rot.iter().any(|p| p.id == "angle" && p.ty == PortType::Real));
+        assert!(
+            rot.iter()
+                .any(|p| p.id == "angle" && p.ty == PortType::Real)
+        );
 
         let add = GraphNodeKind::GeoAdd.ports();
         assert!(add.iter().any(|p| p.id == "a"));
@@ -5055,9 +5040,16 @@ mod tests {
         assert_eq!(g.parameters[0].id, pid2);
 
         // Remove node → param goes away.
-        let nid = *g.nodes.keys().find(|id| {
-            matches!(g.nodes.get(*id).map(|n| &n.kind), Some(GraphNodeKind::ParamReal { .. }))
-        }).unwrap();
+        let nid = *g
+            .nodes
+            .keys()
+            .find(|id| {
+                matches!(
+                    g.nodes.get(*id).map(|n| &n.kind),
+                    Some(GraphNodeKind::ParamReal { .. })
+                )
+            })
+            .unwrap();
         g.remove_node(nid);
         assert!(g.parameters.iter().all(|p| p.id != pid2));
         let _ = pid;
@@ -5285,11 +5277,17 @@ mod tests {
     #[test]
     fn track_motion_takes_union_targets() {
         let ports = GraphNodeKind::TrackMotion.ports();
-        assert!(ports
-            .iter()
-            .any(|p| p.id == "targets" && p.ty == PortType::UnionImage));
+        assert!(
+            ports
+                .iter()
+                .any(|p| p.id == "targets" && p.ty == PortType::UnionImage)
+        );
         assert!(!ports.iter().any(|p| p.id.starts_with("target0")));
-        assert!(ports.iter().any(|p| p.id == "x" && p.dir == PortDir::Output));
+        assert!(
+            ports
+                .iter()
+                .any(|p| p.id == "x" && p.dir == PortDir::Output)
+        );
     }
 
     #[test]
@@ -5372,9 +5370,7 @@ mod tests {
             },
         );
         let img = load_graph_source_rgba(
-            &GraphImageSource::BakedCache {
-                key: key.into(),
-            },
+            &GraphImageSource::BakedCache { key: key.into() },
             None,
             30.0,
         )
@@ -5414,9 +5410,7 @@ mod tests {
     #[test]
     fn fx_cache_key_includes_bake() {
         let eval = GraphOutputEval {
-            image: GraphImageSource::BakedCache {
-                key: "cv|k".into(),
-            },
+            image: GraphImageSource::BakedCache { key: "cv|k".into() },
             brightness: 1.0,
             ..Default::default()
         };

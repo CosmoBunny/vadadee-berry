@@ -42,10 +42,7 @@ impl AsyncBridge {
 
     /// Begin synchronous recording on the caller thread.
     pub fn start_sync(&mut self) -> Result<(), String> {
-        let config = match std::mem::replace(
-            &mut self.mode,
-            BridgeMode::Idle(dummy_config()),
-        ) {
+        let config = match std::mem::replace(&mut self.mode, BridgeMode::Idle(dummy_config())) {
             BridgeMode::Idle(config) => config,
             other => {
                 self.mode = other;

@@ -10,9 +10,7 @@ impl Paint {
         let r = ((rgb >> 16) & 0xff) as f32 / 255.0;
         let g = ((rgb >> 8) & 0xff) as f32 / 255.0;
         let b = (rgb & 0xff) as f32 / 255.0;
-        Self {
-            rgba: [r, g, b, a],
-        }
+        Self { rgba: [r, g, b, a] }
     }
 
     pub fn none() -> Self {
@@ -80,21 +78,19 @@ fn default_line_y1() -> f32 {
 
 /// Default linear gradient axis (left → right through vertical midline).
 pub fn default_linear_line() -> (f32, f32, f32, f32) {
-    (default_line_x0(), default_line_y0(), default_line_x1(), default_line_y1())
+    (
+        default_line_x0(),
+        default_line_y0(),
+        default_line_x1(),
+        default_line_y1(),
+    )
 }
 
 pub fn linear_angle_from_line(x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
     (y1 - y0).atan2(x1 - x0).to_degrees()
 }
 
-pub fn project_onto_linear_line(
-    nx: f32,
-    ny: f32,
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-) -> f32 {
+pub fn project_onto_linear_line(nx: f32, ny: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
     let vx = x1 - x0;
     let vy = y1 - y0;
     let len_sq = vx * vx + vy * vy;
@@ -195,7 +191,11 @@ pub fn sample_stops(stops: &[GradientStop], t: f32) -> Paint {
     // Ensure ascending pos so multi-stop windows cover the full range even if UI
     // drag reordering lagged a frame.
     let mut ordered: Vec<&GradientStop> = stops.iter().collect();
-    ordered.sort_by(|a, b| a.pos.partial_cmp(&b.pos).unwrap_or(std::cmp::Ordering::Equal));
+    ordered.sort_by(|a, b| {
+        a.pos
+            .partial_cmp(&b.pos)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     if t <= ordered[0].pos {
         return ordered[0].color;
     }
@@ -262,9 +262,9 @@ impl Fill {
         match self {
             Self::None => false,
             Self::Solid(p) => p.rgba[3] > 0.01,
-            Self::LinearGradient { stops, .. } | Self::RadialGradient { stops, .. } => stops
-                .iter()
-                .any(|s| s.color.rgba[3] > 0.01),
+            Self::LinearGradient { stops, .. } | Self::RadialGradient { stops, .. } => {
+                stops.iter().any(|s| s.color.rgba[3] > 0.01)
+            }
         }
     }
 
@@ -278,10 +278,7 @@ impl Fill {
 
     pub fn stops(&self) -> Vec<GradientStop> {
         match self {
-            Self::Solid(p) => vec![
-                GradientStop::new(0.0, *p),
-                GradientStop::new(1.0, *p),
-            ],
+            Self::Solid(p) => vec![GradientStop::new(0.0, *p), GradientStop::new(1.0, *p)],
             Self::LinearGradient { stops, .. } | Self::RadialGradient { stops, .. } => {
                 if stops.len() >= 2 {
                     stops.clone()
@@ -294,11 +291,17 @@ impl Fill {
     }
 
     pub fn primary_paint(&self) -> Paint {
-        self.stops().first().map(|s| s.color).unwrap_or(Paint::none())
+        self.stops()
+            .first()
+            .map(|s| s.color)
+            .unwrap_or(Paint::none())
     }
 
     pub fn secondary_paint(&self) -> Paint {
-        self.stops().last().map(|s| s.color).unwrap_or(Paint::none())
+        self.stops()
+            .last()
+            .map(|s| s.color)
+            .unwrap_or(Paint::none())
     }
 
     pub fn linear_angle_deg(&self) -> f32 {
@@ -311,9 +314,7 @@ impl Fill {
     pub fn radial_center(&self) -> (f32, f32) {
         match self {
             Self::RadialGradient {
-                center_x,
-                center_y,
-                ..
+                center_x, center_y, ..
             } => (*center_x, *center_y),
             _ => (0.5, 0.5),
         }
@@ -551,55 +552,57 @@ pub enum BlendMode {
 impl BlendMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Normal      => "Normal",
-            Self::Multiply    => "Multiply",
-            Self::Screen      => "Screen",
-            Self::Overlay     => "Overlay",
-            Self::Darken      => "Darken",
-            Self::Lighten     => "Lighten",
-            Self::ColorDodge  => "Color Dodge",
-            Self::ColorBurn   => "Color Burn",
-            Self::HardLight   => "Hard Light",
-            Self::SoftLight   => "Soft Light",
-            Self::Difference  => "Difference",
-            Self::Exclusion   => "Exclusion",
-            Self::Hue         => "Hue",
-            Self::Saturation  => "Saturation",
-            Self::Color       => "Color",
-            Self::Luminosity  => "Luminosity",
-            Self::Addition    => "Addition",
-            Self::Subtract    => "Subtract",
+            Self::Normal => "Normal",
+            Self::Multiply => "Multiply",
+            Self::Screen => "Screen",
+            Self::Overlay => "Overlay",
+            Self::Darken => "Darken",
+            Self::Lighten => "Lighten",
+            Self::ColorDodge => "Color Dodge",
+            Self::ColorBurn => "Color Burn",
+            Self::HardLight => "Hard Light",
+            Self::SoftLight => "Soft Light",
+            Self::Difference => "Difference",
+            Self::Exclusion => "Exclusion",
+            Self::Hue => "Hue",
+            Self::Saturation => "Saturation",
+            Self::Color => "Color",
+            Self::Luminosity => "Luminosity",
+            Self::Addition => "Addition",
+            Self::Subtract => "Subtract",
         }
     }
 
     pub fn all() -> &'static [BlendMode] {
         use BlendMode::*;
-        &[Normal, Multiply, Screen, Overlay, Darken, Lighten,
-          ColorDodge, ColorBurn, HardLight, SoftLight, Difference,
-          Exclusion, Hue, Saturation, Color, Luminosity, Addition, Subtract]
+        &[
+            Normal, Multiply, Screen, Overlay, Darken, Lighten, ColorDodge, ColorBurn, HardLight,
+            SoftLight, Difference, Exclusion, Hue, Saturation, Color, Luminosity, Addition,
+            Subtract,
+        ]
     }
 
     /// Returns the SVG/CSS string (used when exporting)
     pub fn svg_value(self) -> &'static str {
         match self {
-            Self::Normal      => "normal",
-            Self::Multiply    => "multiply",
-            Self::Screen      => "screen",
-            Self::Overlay     => "overlay",
-            Self::Darken      => "darken",
-            Self::Lighten     => "lighten",
-            Self::ColorDodge  => "color-dodge",
-            Self::ColorBurn   => "color-burn",
-            Self::HardLight   => "hard-light",
-            Self::SoftLight   => "soft-light",
-            Self::Difference  => "difference",
-            Self::Exclusion   => "exclusion",
-            Self::Hue         => "hue",
-            Self::Saturation  => "saturation",
-            Self::Color       => "color",
-            Self::Luminosity  => "luminosity",
-            Self::Addition    => "plus-lighter",
-            Self::Subtract    => "plus-darker",
+            Self::Normal => "normal",
+            Self::Multiply => "multiply",
+            Self::Screen => "screen",
+            Self::Overlay => "overlay",
+            Self::Darken => "darken",
+            Self::Lighten => "lighten",
+            Self::ColorDodge => "color-dodge",
+            Self::ColorBurn => "color-burn",
+            Self::HardLight => "hard-light",
+            Self::SoftLight => "soft-light",
+            Self::Difference => "difference",
+            Self::Exclusion => "exclusion",
+            Self::Hue => "hue",
+            Self::Saturation => "saturation",
+            Self::Color => "color",
+            Self::Luminosity => "luminosity",
+            Self::Addition => "plus-lighter",
+            Self::Subtract => "plus-darker",
         }
     }
 

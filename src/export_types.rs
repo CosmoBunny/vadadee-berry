@@ -98,18 +98,18 @@ pub enum VideoFormat {
 impl VideoFormat {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Mp4  => "MP4 (H.264)",
-            Self::Mkv  => "MKV (H.264)",
+            Self::Mp4 => "MP4 (H.264)",
+            Self::Mkv => "MKV (H.264)",
             Self::Webm => "WebM (VP9)",
-            Self::Mov  => "MOV (ProRes)",
+            Self::Mov => "MOV (ProRes)",
         }
     }
     pub fn extension(self) -> &'static str {
         match self {
-            Self::Mp4  => "mp4",
-            Self::Mkv  => "mkv",
+            Self::Mp4 => "mp4",
+            Self::Mkv => "mkv",
             Self::Webm => "webm",
-            Self::Mov  => "mov",
+            Self::Mov => "mov",
         }
     }
 }
@@ -118,7 +118,7 @@ impl VideoFormat {
 pub struct VideoExportState {
     pub backend: VideoBackend,
     pub fps: u32,
-    pub resolution_pct: u32,  // 25, 50, 75, 100, 150, 200
+    pub resolution_pct: u32, // 25, 50, 75, 100, 150, 200
     pub bitrate_kbps: u32,
     pub format: VideoFormat,
     /// 0.0 – 1.0 while rendering, None when idle.
@@ -142,7 +142,8 @@ pub struct VideoExportState {
     /// P7f: NE Output bake quality (Draft / Normal / High).
     pub fx_quality: ExportFxQuality,
     pub export_start_time: Option<std::time::Instant>,
-    pub(crate) export_rx: Option<std::sync::mpsc::Receiver<crate::export_worker::ExportWorkerEvent>>,
+    pub(crate) export_rx:
+        Option<std::sync::mpsc::Receiver<crate::export_worker::ExportWorkerEvent>>,
     pub(crate) export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub sec_per_frame: f32,
     pub last_frame_time: Option<std::time::Instant>,

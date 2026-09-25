@@ -155,11 +155,7 @@ pub struct GraphPreviewTextures {
 
 impl GraphPreviewTextures {
     /// Upload a CV bake-cache RGBA for node previews.
-    pub fn ensure_bake_texture(
-        &mut self,
-        key: &str,
-        ctx: &Context,
-    ) -> Option<egui::TextureId> {
+    pub fn ensure_bake_texture(&mut self, key: &str, ctx: &Context) -> Option<egui::TextureId> {
         if let Some(t) = self.map.get(key) {
             return Some(t.id());
         }
@@ -169,7 +165,10 @@ impl GraphPreviewTextures {
         let color_image =
             egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
         let handle = ctx.load_texture(
-            format!("vadadee-berry-graph-bake-{}", key.chars().take(48).collect::<String>()),
+            format!(
+                "vadadee-berry-graph-bake-{}",
+                key.chars().take(48).collect::<String>()
+            ),
             color_image,
             egui::TextureOptions::LINEAR,
         );
@@ -229,8 +228,7 @@ impl GraphPreviewTextures {
             egui::TextureOptions::LINEAR,
         );
         self.map.insert(key, handle.clone());
-        self.map
-            .insert(last_key, handle.clone());
+        self.map.insert(last_key, handle.clone());
         // Cap timed-frame cache; never drop `|last` slots (prevents white flashes).
         if self.map.len() > 64 {
             let drop: Vec<String> = self
@@ -335,10 +333,7 @@ pub fn show_node_editor_dialog(view: &mut NodeEditorView<'_>, ctx: &Context) {
 
             // Fixed-height mode strip so Idle/Add/Edit/View never get clipped by canvas.
             const TOOLBAR_H: f32 = 36.0;
-            let toolbar_rect = Rect::from_min_size(
-                outer.min,
-                Vec2::new(outer.width(), TOOLBAR_H),
-            );
+            let toolbar_rect = Rect::from_min_size(outer.min, Vec2::new(outer.width(), TOOLBAR_H));
             // scope_builder (not allocate_new_ui) — avoids "overflow grows parent".
             ui.scope_builder(
                 egui::UiBuilder::new()
@@ -347,20 +342,15 @@ pub fn show_node_editor_dialog(view: &mut NodeEditorView<'_>, ctx: &Context) {
                 |ui| {
                     ui.set_clip_rect(toolbar_rect);
                     ui.set_max_size(toolbar_rect.size());
-                    ui.painter().rect_filled(
-                        toolbar_rect,
-                        0.0,
-                        Color32::from_rgb(40, 44, 58),
-                    );
+                    ui.painter()
+                        .rect_filled(toolbar_rect, 0.0, Color32::from_rgb(40, 44, 58));
                     node_editor_toolbar(view, ui, layer_idx);
                 },
             );
 
             // Canvas = rest of the window under the toolbar.
-            let canvas_rect = Rect::from_min_max(
-                Pos2::new(outer.min.x, toolbar_rect.max.y),
-                outer.max,
-            );
+            let canvas_rect =
+                Rect::from_min_max(Pos2::new(outer.min.x, toolbar_rect.max.y), outer.max);
             if canvas_rect.height() > 8.0 && canvas_rect.width() > 8.0 {
                 ui.scope_builder(
                     egui::UiBuilder::new()
@@ -1077,8 +1067,7 @@ fn spawn_node_centered(view: &mut NodeEditorView<'_>, layer_idx: usize, kind: Gr
     };
     // Place near view center.
     let x = -g.view.pan_x / g.view.zoom + 80.0;
-    let y = -g.view.pan_y / g.view.zoom + 60.0
-        + (g.nodes.len() as f32 % 5.0) * 24.0;
+    let y = -g.view.pan_y / g.view.zoom + 60.0 + (g.nodes.len() as f32 % 5.0) * 24.0;
     let id = g.add_node(kind, x, y);
     view.state.selected = Some(id);
     *view.status = "Node added".into();
@@ -1229,8 +1218,8 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
             let f = if scroll.y > 0.0 { 1.08 } else { 1.0 / 1.08 };
             g.view.zoom = (g.view.zoom * f).clamp(0.15, 8.0);
         }
-        let pan_drag = response.dragged_by(egui::PointerButton::Middle)
-            || (response.dragged() && allow_pan);
+        let pan_drag =
+            response.dragged_by(egui::PointerButton::Middle) || (response.dragged() && allow_pan);
         if pan_drag {
             let d = response.drag_delta();
             g.view.pan_x += d.x;
@@ -1321,8 +1310,7 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
                 continue;
             };
             let link_selected = sel_link == Some(link.id);
-            let endpoint_sel =
-                sel_node == Some(link.from_node) || sel_node == Some(link.to_node);
+            let endpoint_sel = sel_node == Some(link.from_node) || sel_node == Some(link.to_node);
             let ty_col = g
                 .nodes
                 .get(&link.from_node)
@@ -1433,14 +1421,7 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
             // Fully off-canvas: no widgets (would expand the window). Sticky drag still works.
             continue;
         }
-        paint_node_card(
-            &painter,
-            r,
-            &node_clone,
-            selected,
-            live_real,
-            &gview,
-        );
+        paint_node_card(&painter, r, &node_clone, selected, live_real, &gview);
 
         // Title bar: show delete while pointer is over the title strip (incl. trash hit target).
         let title_h = (22.0 * gview.zoom).clamp(18.0, 28.0);
@@ -1453,9 +1434,7 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
         );
         // Delete via canvas pointer only — never ui.interact (expands layout / window).
         let del_hit = del_rect.intersect(canvas_clip);
-        let del_hover = del_hit.width() > 1.0
-            && del_hit.height() > 1.0
-            && del_hit.contains(ptr);
+        let del_hover = del_hit.width() > 1.0 && del_hit.height() > 1.0 && del_hit.contains(ptr);
         let title_hover = title_rect.intersect(canvas_clip).contains(ptr) || del_hover;
         if title_hover && canvas_clip.contains(del_rect.center()) {
             painter.text(
@@ -1487,8 +1466,7 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
                 egui::Stroke::new(1.0, Color32::from_gray(40)),
             );
             // Port name labels — only when pin center is inside canvas (no bleed).
-            let label_font =
-                egui::FontId::proportional((9.0 * gview.zoom).clamp(7.0, 15.0));
+            let label_font = egui::FontId::proportional((9.0 * gview.zoom).clamp(7.0, 15.0));
             let label_col = Color32::from_rgb(160, 168, 184);
             if canvas_clip.contains(pr.center()) {
                 match port.dir {
@@ -1583,8 +1561,7 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
                 });
                 if r.contains(origin) && !on_del && !on_port {
                     let (gx, gy) = screen_to_graph(origin, rect, &gview);
-                    begin_node_drag =
-                        Some((nid, Vec2::new(gx - node_clone.x, gy - node_clone.y)));
+                    begin_node_drag = Some((nid, Vec2::new(gx - node_clone.x, gy - node_clone.y)));
                 }
             }
         }
@@ -1646,8 +1623,7 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
             )
             .intersect(canvas_clip);
 
-            let click = response.clicked()
-                && pointer.is_some_and(|p| canvas_clip.contains(p));
+            let click = response.clicked() && pointer.is_some_and(|p| canvas_clip.contains(p));
             let ptr = pointer.unwrap_or(Pos2::new(-99999.0, -99999.0));
 
             if is_media {
@@ -1698,22 +1674,13 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
                         let mut dlg = rfd::FileDialog::new();
                         dlg = match &node_clone.kind {
                             GraphNodeKind::ObjectImage { .. } => dlg
-                                .add_filter(
-                                    "Images",
-                                    &["png", "jpg", "jpeg", "webp", "gif", "bmp"],
-                                )
+                                .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
                                 .add_filter("All", &["*"]),
                             GraphNodeKind::ObjectVideo { .. } => dlg
-                                .add_filter(
-                                    "Video",
-                                    &["mp4", "webm", "mov", "mkv", "avi", "m4v"],
-                                )
+                                .add_filter("Video", &["mp4", "webm", "mov", "mkv", "avi", "m4v"])
                                 .add_filter("All", &["*"]),
                             GraphNodeKind::ObjectAudio { .. } => dlg
-                                .add_filter(
-                                    "Audio",
-                                    &["mp3", "wav", "ogg", "flac", "m4a", "aac"],
-                                )
+                                .add_filter("Audio", &["mp3", "wav", "ogg", "flac", "m4a", "aac"])
                                 .add_filter("All", &["*"]),
                             GraphNodeKind::ObjectSeptic { .. }
                             | GraphNodeKind::ObjectMouse { .. } => dlg
@@ -1782,15 +1749,7 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
                                 )
                             })
                             .unwrap_or((0.5, 0.5, 0.0, 0.0));
-                        paint_mouse_xy_preview(
-                            &painter,
-                            img_rect,
-                            mx,
-                            my,
-                            mshake,
-                            mevt,
-                            z,
-                        );
+                        paint_mouse_xy_preview(&painter, img_rect, mx, my, mshake, mevt, z);
                     } else {
                         let preview_eval = view.project.document.layers[layer_idx]
                             .node_graph
@@ -1837,11 +1796,9 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
                                     let key = eval.media_cache_key(path);
                                     view.textures.texture_id(&key)
                                 }
-                                crate::document::GraphImageSource::AppObjects(ids) => {
-                                    ids.iter().find_map(|id| {
-                                        view.image_textures.get(id).map(|t| t.id())
-                                    })
-                                }
+                                crate::document::GraphImageSource::AppObjects(ids) => ids
+                                    .iter()
+                                    .find_map(|id| view.image_textures.get(id).map(|t| t.id())),
                                 crate::document::GraphImageSource::Empty => None,
                             };
                             if let Some(tid) = tid {
@@ -1867,11 +1824,7 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
                                     _ => (img_rect.width(), img_rect.height()),
                                 };
                                 let fit = aspect_fit_rect(img_rect, tw, th);
-                                painter.rect_filled(
-                                    img_rect,
-                                    2.0,
-                                    Color32::from_rgb(24, 26, 32),
-                                );
+                                painter.rect_filled(img_rect, 2.0, Color32::from_rgb(24, 26, 32));
                                 painter.image(tid, fit, uv, Color32::WHITE);
                             } else {
                                 painter.text(
@@ -1903,8 +1856,7 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
                     link_col,
                 );
                 if click && prev_rect.contains(ptr) {
-                    view.state.preview_node =
-                        if preview_open { None } else { Some(nid) };
+                    view.state.preview_node = if preview_open { None } else { Some(nid) };
                 }
             }
 
@@ -1966,8 +1918,14 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
         if edit && view.state.selected == Some(nid) {
             if matches!(node_clone.kind, GraphNodeKind::Value { .. }) {
                 let edit_rect = Rect::from_min_size(
-                    Pos2::new(r.min.x + 10.0 * gview.zoom.max(0.7), r.min.y + 26.0 * gview.zoom.max(0.7)),
-                    Vec2::new((r.width() - 20.0).max(20.0), (18.0 * gview.zoom).clamp(16.0, 28.0)),
+                    Pos2::new(
+                        r.min.x + 10.0 * gview.zoom.max(0.7),
+                        r.min.y + 26.0 * gview.zoom.max(0.7),
+                    ),
+                    Vec2::new(
+                        (r.width() - 20.0).max(20.0),
+                        (18.0 * gview.zoom).clamp(16.0, 28.0),
+                    ),
                 );
                 if canvas_clip.contains(edit_rect.min)
                     && canvas_clip.contains(edit_rect.max - Vec2::splat(0.5))
@@ -2011,8 +1969,14 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
                     _ => String::new(),
                 };
                 let edit_rect = Rect::from_min_size(
-                    Pos2::new(r.min.x + 8.0 * gview.zoom.max(0.7), r.min.y + 26.0 * gview.zoom.max(0.7)),
-                    Vec2::new((r.width() - 16.0).max(20.0), (18.0 * gview.zoom).clamp(16.0, 28.0)),
+                    Pos2::new(
+                        r.min.x + 8.0 * gview.zoom.max(0.7),
+                        r.min.y + 26.0 * gview.zoom.max(0.7),
+                    ),
+                    Vec2::new(
+                        (r.width() - 16.0).max(20.0),
+                        (18.0 * gview.zoom).clamp(16.0, 28.0),
+                    ),
                 );
                 if canvas_clip.contains(edit_rect.min)
                     && canvas_clip.contains(edit_rect.max - Vec2::splat(0.5))
@@ -2047,7 +2011,9 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
 
     // Hover affordance for connector pick.
     if wire_hit.is_some() && view.state.wire_drag.is_none() {
-        response.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+        response
+            .clone()
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
     }
 
     // Click empty / wire: select connector (prefer wire over deselect).
@@ -2059,9 +2025,8 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
             *view.status = "Connector selected — Delete/Backspace to remove".into();
         } else if click_select.is_none() {
             // Clicked empty canvas (not a node) → clear wire selection.
-            let on_any_node = pointer.is_some_and(|mp| {
-                node_screen.iter().any(|(_, nr)| nr.contains(mp))
-            });
+            let on_any_node =
+                pointer.is_some_and(|mp| node_screen.iter().any(|(_, nr)| nr.contains(mp)));
             if !on_any_node {
                 view.state.selected_link = None;
             }
@@ -2251,9 +2216,7 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
         } else {
             vec![
                 GraphNodeKind::Value { value: 0.0 },
-                GraphNodeKind::ExprX {
-                    expr: "x".into(),
-                },
+                GraphNodeKind::ExprX { expr: "x".into() },
                 GraphNodeKind::Brightness,
                 GraphNodeKind::ObjectFromApp {
                     node_ids: view.selection.clone(),
@@ -2295,9 +2258,7 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
                                 .map(|g| g.view.clone())
                                 .unwrap_or_default(),
                         );
-                        if let Some(g) = view.project.document.layers[layer_idx]
-                            .node_graph
-                            .as_mut()
+                        if let Some(g) = view.project.document.layers[layer_idx].node_graph.as_mut()
                         {
                             let id = g.add_node(kind, gx, gy);
                             if let Some((from_n, from_p)) = wire_from {
@@ -2343,7 +2304,6 @@ fn node_editor_canvas(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usi
             ui.close();
         }
     });
-
 }
 
 fn truncate_middle(s: &str, max_chars: usize) -> String {
@@ -2362,8 +2322,6 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
     out.extend(chars.iter().rev().take(tail).rev());
     out
 }
-
-
 
 fn paint_grid(painter: &egui::Painter, rect: Rect, pan_x: f32, pan_y: f32, zoom: f32) {
     let step = 24.0 * zoom;
@@ -2390,7 +2348,14 @@ fn paint_grid(painter: &egui::Painter, rect: Rect, pan_x: f32, pan_y: f32, zoom:
     }
 }
 
-fn graph_to_screen(x: f32, y: f32, w: f32, h: f32, canvas: Rect, view: &crate::document::GraphView) -> Rect {
+fn graph_to_screen(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    canvas: Rect,
+    view: &crate::document::GraphView,
+) -> Rect {
     let z = view.zoom;
     let min = canvas.min + Vec2::new(x * z + view.pan_x, y * z + view.pan_y);
     Rect::from_min_size(min, Vec2::new(w * z, h * z))
@@ -2427,8 +2392,16 @@ fn port_rect_for(
 ) -> Rect {
     let h = node_height(node, preview_open);
     let body = graph_to_screen(node.x, node.y, node_width(node), h, canvas, view);
-    let inputs: Vec<_> = node.ports().into_iter().filter(|p| p.dir == PortDir::Input).collect();
-    let outputs: Vec<_> = node.ports().into_iter().filter(|p| p.dir == PortDir::Output).collect();
+    let inputs: Vec<_> = node
+        .ports()
+        .into_iter()
+        .filter(|p| p.dir == PortDir::Input)
+        .collect();
+    let outputs: Vec<_> = node
+        .ports()
+        .into_iter()
+        .filter(|p| p.dir == PortDir::Output)
+        .collect();
     let (side_index, total) = match port.dir {
         PortDir::Input => (
             inputs.iter().position(|p| p.id == port.id).unwrap_or(0),
@@ -2446,7 +2419,10 @@ fn port_rect_for(
         PortDir::Input => body.min.x,
         PortDir::Output => body.max.x,
     };
-    Rect::from_center_size(Pos2::new(x, y), Vec2::splat(PORT_R * 2.0 * view.zoom.max(0.7)))
+    Rect::from_center_size(
+        Pos2::new(x, y),
+        Vec2::splat(PORT_R * 2.0 * view.zoom.max(0.7)),
+    )
 }
 
 /// One-quadrant mouse XY preview (origin bottom-left, X→ Y↑, domain 0..1).
@@ -2561,11 +2537,11 @@ fn paint_mouse_xy_preview(
 
     let clicked = event >= 0.5;
     let r_pt = (3.5 * z).clamp(2.5, 6.0);
-    painter.circle_filled(pt, r_pt + if clicked { 1.5 } else { 0.0 }, if clicked {
-        click_col
-    } else {
-        accent
-    });
+    painter.circle_filled(
+        pt,
+        r_pt + if clicked { 1.5 } else { 0.0 },
+        if clicked { click_col } else { accent },
+    );
     painter.circle_stroke(
         pt,
         r_pt + 1.0,
@@ -2738,12 +2714,7 @@ fn paint_wire_flowchart(
 }
 
 /// Draw orthogonal polyline with true quarter-circle corner fillets (no dots).
-fn paint_polyline_curved(
-    painter: &egui::Painter,
-    pts: &[Pos2],
-    color: Color32,
-    thickness: f32,
-) {
+fn paint_polyline_curved(painter: &egui::Painter, pts: &[Pos2], color: Color32, thickness: f32) {
     if pts.len() < 2 {
         return;
     }
@@ -2774,16 +2745,8 @@ fn paint_polyline_curved(
             0.0
         };
 
-        let start = if r_in > 0.5 {
-            p0 + dir * r_in
-        } else {
-            p0
-        };
-        let end = if r_out > 0.5 {
-            p1 - dir * r_out
-        } else {
-            p1
-        };
+        let start = if r_in > 0.5 { p0 + dir * r_in } else { p0 };
+        let end = if r_out > 0.5 { p1 - dir * r_out } else { p1 };
 
         if (end - start).length_sq() > 0.25 {
             painter.line_segment([start, end], stroke);
@@ -2907,9 +2870,11 @@ pub fn parameter_tab_ui(view: &mut NodeEditorView<'_>, ui: &mut Ui) -> NodeEdito
 
         if g.parameters.is_empty() {
             ui.label(
-                RichText::new("No parameter nodes yet. Use Add → Parameter → Real / Color / Position.")
-                    .small()
-                    .weak(),
+                RichText::new(
+                    "No parameter nodes yet. Use Add → Parameter → Real / Color / Position.",
+                )
+                .small()
+                .weak(),
             );
         }
 
@@ -2922,12 +2887,7 @@ pub fn parameter_tab_ui(view: &mut NodeEditorView<'_>, ui: &mut Ui) -> NodeEdito
                             ui.add(egui::DragValue::new(&mut p.v0).speed(0.05));
                         }
                         GraphParamKind::Color => {
-                            let mut c = [
-                                p.v0 as f32,
-                                p.v1 as f32,
-                                p.v2 as f32,
-                                p.v3 as f32,
-                            ];
+                            let mut c = [p.v0 as f32, p.v1 as f32, p.v2 as f32, p.v3 as f32];
                             if ui.color_edit_button_rgba_unmultiplied(&mut c).changed() {
                                 p.v0 = c[0] as f64;
                                 p.v1 = c[1] as f64;
@@ -2951,11 +2911,7 @@ pub fn parameter_tab_ui(view: &mut NodeEditorView<'_>, ui: &mut Ui) -> NodeEdito
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("frame {frame}"))
-                            .small()
-                            .weak(),
-                    );
+                    ui.label(RichText::new(format!("frame {frame}")).small().weak());
                     if ui
                         .small_button("+ KF")
                         .on_hover_text("Insert keyframe(s) at current frame")

@@ -2,7 +2,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::document::{eval_expr_vars, BezierHandleMode, ExprVars, Fill, NodeId, ProjectFile};
+use crate::document::{BezierHandleMode, ExprVars, Fill, NodeId, ProjectFile, eval_expr_vars};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InterpolationMode {
@@ -67,9 +67,19 @@ pub fn content_max_animation_frame(project: &ProjectFile, fps: u32) -> usize {
             continue;
         }
         let tracks = [
-            &anim.pos_x, &anim.pos_y, &anim.rotation, &anim.opacity,
-            &anim.color_r, &anim.color_g, &anim.color_b, &anim.color_a,
-            &anim.stroke_width, &anim.stroke_r, &anim.stroke_g, &anim.stroke_b, &anim.stroke_a,
+            &anim.pos_x,
+            &anim.pos_y,
+            &anim.rotation,
+            &anim.opacity,
+            &anim.color_r,
+            &anim.color_g,
+            &anim.color_b,
+            &anim.color_a,
+            &anim.stroke_width,
+            &anim.stroke_r,
+            &anim.stroke_g,
+            &anim.stroke_b,
+            &anim.stroke_a,
         ];
         for t in tracks {
             if let Some(last) = t.keyframes.last() {
@@ -199,7 +209,7 @@ impl KeyframeTrack {
         }
         for i in 0..last_idx {
             let kf0 = &self.keyframes[i];
-            let kf1 = &self.keyframes[i+1];
+            let kf1 = &self.keyframes[i + 1];
             if frame >= kf0.frame && frame <= kf1.frame {
                 let range = (kf1.frame - kf0.frame) as f64;
                 if range < 1e-9 {
@@ -210,15 +220,13 @@ impl KeyframeTrack {
                     let x_target = (frame - kf0.frame) as f64;
                     let x1 = kf0.handle_right.0.clamp(0.0, range);
                     let u = solve_u(x_target, x1, range);
-                    
+
                     let omt = 1.0 - u;
                     let y0 = kf0.value;
                     let y1 = kf0.value + kf0.handle_right.1;
                     let y2 = kf1.value;
-                    
-                    let val = omt * omt * y0
-                        + 2.0 * omt * u * y1
-                        + u * u * y2;
+
+                    let val = omt * omt * y0 + 2.0 * omt * u * y1 + u * u * y2;
                     return Some(val);
                 } else {
                     return Some(kf0.value + t * (kf1.value - kf0.value));
@@ -394,9 +402,7 @@ impl StackAnimationFunction {
         if expr.is_empty() {
             return Ok(Some(ch.start_value));
         }
-        eval_expr_vars(expr, vars)
-            .map(Some)
-            .map_err(|e| e.0)
+        eval_expr_vars(expr, vars).map(Some).map_err(|e| e.0)
     }
 }
 
@@ -461,13 +467,11 @@ impl NodeAnimation {
                 }
                 self.geom_tracks.get_mut(idx)
             }
-            _ if label.starts_with("param:") => {
-                Some(
-                    self.param_tracks
-                        .entry(label.to_string())
-                        .or_insert_with(KeyframeTrack::default),
-                )
-            }
+            _ if label.starts_with("param:") => Some(
+                self.param_tracks
+                    .entry(label.to_string())
+                    .or_insert_with(KeyframeTrack::default),
+            ),
             _ => None,
         }
     }
@@ -583,12 +587,7 @@ impl NodeAnimation {
     }
 
     /// Clear keyframes strictly inside the stack span; keep start (and later end) keyframes.
-    pub fn clear_keyframes_under_stack(
-        &mut self,
-        tracks: &[&str],
-        start: usize,
-        end: usize,
-    ) {
+    pub fn clear_keyframes_under_stack(&mut self, tracks: &[&str], start: usize, end: usize) {
         for label in tracks {
             if let Some(track) = self.get_track_mut(label) {
                 track.keyframes.retain(|kf| {
@@ -639,8 +638,7 @@ impl NodeAnimation {
         self.stack_functions.retain(|s| s.id != id);
 
         // Frames that remaining stacks still need as anchors (keep those).
-        let mut keep: std::collections::HashSet<(String, usize)> =
-            std::collections::HashSet::new();
+        let mut keep: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
         for other in &self.stack_functions {
             let oe = other.end_frame();
             for ch in &other.channels {

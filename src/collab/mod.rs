@@ -12,7 +12,7 @@ mod stub;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use desktop::*;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub use sync_project::*;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub use stub::*;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub use sync_project::*;

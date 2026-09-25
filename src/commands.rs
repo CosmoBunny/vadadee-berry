@@ -213,13 +213,8 @@ mod tests {
         let before = snapshot_document(&project.document);
         project.document.add_layer("L2");
         let after = snapshot_document(&project.document);
-        let dispatch = |project: &mut ProjectFile,
-                        history: &mut History,
-                        cmd: EditorCommand| {
-            CommandDispatcher::dispatch(
-                CommandContext { project, history },
-                cmd,
-            )
+        let dispatch = |project: &mut ProjectFile, history: &mut History, cmd: EditorCommand| {
+            CommandDispatcher::dispatch(CommandContext { project, history }, cmd)
         };
         dispatch(
             &mut project,

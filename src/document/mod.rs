@@ -1,25 +1,25 @@
-mod node;
-mod path_effects;
-mod style;
 mod animation;
 mod av_clip;
-mod music;
-mod shading;
 pub mod flowchart;
+mod music;
+mod node;
 mod node_graph;
+mod path_effects;
 pub mod septic;
+mod shading;
+mod style;
 
-pub use av_clip::*;
-pub use node::*;
-pub use path_effects::*;
-pub use style::*;
 pub use animation::*;
+pub use av_clip::*;
 pub use music::*;
-pub use shading::*;
+pub use node::*;
 pub use node_graph::*;
+pub use path_effects::*;
 pub use septic::*;
+pub use shading::*;
+pub use style::*;
 pub mod expr;
-pub use expr::{eval_expr, eval_expr_vars, ExprError, ExprVars};
+pub use expr::{ExprError, ExprVars, eval_expr, eval_expr_vars};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -123,7 +123,7 @@ pub struct Layer {
     pub visible: bool,
     pub locked: bool,
     pub nodes: Vec<NodeId>,
-    
+
     #[serde(default)]
     pub kind: LayerKind,
     #[serde(default)]
@@ -132,7 +132,7 @@ pub struct Layer {
     pub volume: f32,
     #[serde(default = "default_is_renderer")]
     pub is_renderer: bool,
-    
+
     #[serde(default = "default_zero")]
     pub x: f32,
     #[serde(default = "default_zero")]
@@ -212,9 +212,9 @@ pub struct Layer {
 impl Document {
     /// P7d/e: if `node_id` is a NE Output proxy Image, return owning layer index.
     pub fn ne_output_proxy_layer_index(&self, node_id: Uuid) -> Option<usize> {
-        self.layers.iter().position(|l| {
-            l.kind == LayerKind::NodeEditor && l.ne_output_proxy == Some(node_id)
-        })
+        self.layers
+            .iter()
+            .position(|l| l.kind == LayerKind::NodeEditor && l.ne_output_proxy == Some(node_id))
     }
 }
 
@@ -252,7 +252,13 @@ fn default_capture_bitrate_kbps() -> u32 {
 }
 
 impl Layer {
-    pub fn new_image(id: Uuid, name: String, visible: bool, locked: bool, nodes: Vec<NodeId>) -> Self {
+    pub fn new_image(
+        id: Uuid,
+        name: String,
+        visible: bool,
+        locked: bool,
+        nodes: Vec<NodeId>,
+    ) -> Self {
         Self {
             id,
             name,
@@ -593,27 +599,18 @@ impl Layer {
         nodes: &NodeStore,
         eval: &GraphOutputEval,
     ) -> (f64, f64, f64, f64, f64) {
-        let (base_x, base_y, base_w, base_h, base_rot_rad) =
-            if let Some(pid) = self.ne_output_proxy {
-                if let Some(n) = nodes.get(pid) {
-                    if let NodeKind::Image {
-                        x,
-                        y,
-                        width,
-                        height,
-                        ..
-                    } = &n.kind
-                    {
-                        (*x, *y, *width, *height, n.get_rotation())
-                    } else {
-                        (
-                            self.x as f64,
-                            self.y as f64,
-                            self.width as f64,
-                            self.height as f64,
-                            (self.rotation as f64).to_radians(),
-                        )
-                    }
+        let (base_x, base_y, base_w, base_h, base_rot_rad) = if let Some(pid) = self.ne_output_proxy
+        {
+            if let Some(n) = nodes.get(pid) {
+                if let NodeKind::Image {
+                    x,
+                    y,
+                    width,
+                    height,
+                    ..
+                } = &n.kind
+                {
+                    (*x, *y, *width, *height, n.get_rotation())
                 } else {
                     (
                         self.x as f64,
@@ -631,7 +628,16 @@ impl Layer {
                     self.height as f64,
                     (self.rotation as f64).to_radians(),
                 )
-            };
+            }
+        } else {
+            (
+                self.x as f64,
+                self.y as f64,
+                self.width as f64,
+                self.height as f64,
+                (self.rotation as f64).to_radians(),
+            )
+        };
         let dx = base_x + eval.geo_off_x;
         let dy = base_y + eval.geo_off_y;
         let w = (base_w * eval.geo_scale_w).max(1.0);
@@ -891,7 +897,6 @@ fn default_is_renderer() -> bool {
     true
 }
 
-
 impl Document {
     pub fn new_default_project() -> ProjectFile {
         Self::new_empty_project()
@@ -904,7 +909,13 @@ impl Document {
             width: A4_WIDTH_PX,
             height: A4_HEIGHT_PX,
             active_layer_index: 0,
-            layers: vec![Layer::new_image(layer_id, "Layer 1".into(), true, false, vec![])],
+            layers: vec![Layer::new_image(
+                layer_id,
+                "Layer 1".into(),
+                true,
+                false,
+                vec![],
+            )],
             defs: IndexMap::new(),
             path_effects: IndexMap::new(),
             tiling_effects: IndexMap::new(),
@@ -933,7 +944,6 @@ impl Document {
         let a = self.page_color[3];
         format!(r#"fill="rgb({},{},{})" fill-opacity="{:.2}""#, r, g, b, a)
     }
-
 
     pub fn active_layer_mut(&mut self) -> Option<&mut Layer> {
         self.layers.get_mut(self.active_layer_index)
@@ -990,11 +1000,7 @@ impl Document {
         self.add_empty_av_layer_with_role(name, AvRole::Video)
     }
 
-    pub fn add_empty_av_layer_with_role(
-        &mut self,
-        name: impl Into<String>,
-        role: AvRole,
-    ) -> usize {
+    pub fn add_empty_av_layer_with_role(&mut self, name: impl Into<String>, role: AvRole) -> usize {
         let layer = Layer::new_empty_av_layer_with_role(Uuid::new_v4(), name.into(), role);
         self.layers.push(layer);
         self.layers.len() - 1
@@ -1057,7 +1063,6 @@ impl Document {
     pub fn add_audio_layer(&mut self, name: impl Into<String>, audio_path: String) -> usize {
         self.add_av_layer(name, audio_path)
     }
-
 
     pub fn move_node_in_active_layer(&mut self, id: NodeId, delta: isize) -> bool {
         let Some(layer) = self.layers.get_mut(self.active_layer_index) else {
@@ -1221,7 +1226,11 @@ mod p7_proxy_tests {
             .unwrap();
         if let Some(n) = pf.nodes.get_mut(id) {
             if let NodeKind::Image {
-                x, y, width, height, ..
+                x,
+                y,
+                width,
+                height,
+                ..
             } = &mut n.kind
             {
                 *x = 50.0;
@@ -1231,11 +1240,12 @@ mod p7_proxy_tests {
             }
             n.set_rotation(std::f64::consts::FRAC_PI_2);
         }
-        assert_eq!(
-            pf.document.ne_output_proxy_layer_index(id),
-            Some(i)
+        assert_eq!(pf.document.ne_output_proxy_layer_index(id), Some(i));
+        assert!(
+            pf.document
+                .ne_output_proxy_layer_index(Uuid::new_v4())
+                .is_none()
         );
-        assert!(pf.document.ne_output_proxy_layer_index(Uuid::new_v4()).is_none());
 
         let eval = GraphOutputEval {
             geo_off_x: 5.0,

@@ -368,7 +368,12 @@ mod tests {
         assert!(s0.confidence >= 0.4, "first conf={}", s0.confidence);
         let s1 = track_targets(id, &scene_empty, &[target], 0.4, "b", 0.1);
         // Hold last position
-        assert!((s1.cx - s0.cx).abs() < 0.05, "hold cx {} vs {}", s1.cx, s0.cx);
+        assert!(
+            (s1.cx - s0.cx).abs() < 0.05,
+            "hold cx {} vs {}",
+            s1.cx,
+            s0.cx
+        );
         assert!((s1.cy - s0.cy).abs() < 0.05);
         clear_tracker(id);
     }

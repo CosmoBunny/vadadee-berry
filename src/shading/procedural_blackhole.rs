@@ -39,10 +39,7 @@ fn lens_uv(uv: (f32, f32), aspect: f32, disk_r: f32, strength: f32) -> (f32, f32
     let r = (p.0 * p.0 + p.1 * p.1).sqrt();
     let warp = strength * 0.12 / (r + disk_r * 0.35).powf(1.4);
     let scale = 1.0 + warp;
-    (
-        0.5 + p.0 * scale / aspect,
-        0.5 + p.1 * scale,
-    )
+    (0.5 + p.0 * scale / aspect, 0.5 + p.1 * scale)
 }
 
 fn stars(uv: (f32, f32), t: f32) -> [f32; 3] {
@@ -76,9 +73,8 @@ fn disk_color(a: f32, r: f32, disk_r: f32, t: f32) -> f32 {
     // Rotating Doppler beaming (one bright side), not 6-fold lobes.
     let spin_angle = a - t * 1.6;
     let doppler = 0.55 + 0.45 * spin_angle.cos();
-    let turbulence = 0.85
-        + 0.15 * (a * 2.0 + r * 28.0 - t * 3.0).sin()
-        + 0.08 * hash21((a * 4.0, r * 30.0 + t));
+    let turbulence =
+        0.85 + 0.15 * (a * 2.0 + r * 28.0 - t * 3.0).sin() + 0.08 * hash21((a * 4.0, r * 30.0 + t));
     (band.powf(0.55) * doppler * turbulence).clamp(0.0, 1.0)
 }
 
@@ -158,10 +154,7 @@ fn noise2(p: (f32, f32)) -> f32 {
     let b = hash21((i.0 + 1.0, i.1));
     let c = hash21((i.0, i.1 + 1.0));
     let d = hash21((i.0 + 1.0, i.1 + 1.0));
-    a * (1.0 - u.0) * (1.0 - u.1)
-        + b * u.0 * (1.0 - u.1)
-        + c * (1.0 - u.0) * u.1
-        + d * u.0 * u.1
+    a * (1.0 - u.0) * (1.0 - u.1) + b * u.0 * (1.0 - u.1) + c * (1.0 - u.0) * u.1 + d * u.0 * u.1
 }
 
 fn fbm2(mut p: (f32, f32)) -> f32 {
@@ -204,7 +197,11 @@ pub fn sample_galaxy(uv: (f32, f32), time_secs: f32, aspect: f32) -> [u8; 3] {
     col.2 += gold.2 * core * 1.4 + disk * 0.55;
 
     let n = noise2((p.0 * 3.0, p.1 * 3.0));
-    let bg = (0.02 * (0.6 + 0.4 * n), 0.01 * (0.6 + 0.4 * n), 0.06 * (0.6 + 0.4 * n));
+    let bg = (
+        0.02 * (0.6 + 0.4 * n),
+        0.01 * (0.6 + 0.4 * n),
+        0.06 * (0.6 + 0.4 * n),
+    );
     let m = smoothstep(1.6, 0.15, r);
     col = (
         bg.0 + (col.0 - bg.0) * m,

@@ -21,7 +21,11 @@ pub enum PathEditTarget {
 impl PathEditTarget {
     pub fn anchor_index(self) -> usize {
         match self {
-            Self::Anchor(i) | Self::HandleOut(i) | Self::HandleIn(i) | Self::MidCtrl1(i) | Self::MidCtrl2(i) => i,
+            Self::Anchor(i)
+            | Self::HandleOut(i)
+            | Self::HandleIn(i)
+            | Self::MidCtrl1(i)
+            | Self::MidCtrl2(i) => i,
         }
     }
 }
@@ -354,8 +358,19 @@ impl TextStyle {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NodeKind {
-    Rect { x: f64, y: f64, w: f64, h: f64, rx: f64 },
-    Ellipse { cx: f64, cy: f64, rx: f64, ry: f64 },
+    Rect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        rx: f64,
+    },
+    Ellipse {
+        cx: f64,
+        cy: f64,
+        rx: f64,
+        ry: f64,
+    },
     Polygon {
         cx: f64,
         cy: f64,
@@ -363,9 +378,17 @@ pub enum NodeKind {
         sides: u32,
         rotation_rad: f64,
     },
-    Path { path: PathData },
-    Text { x: f64, y: f64, style: TextStyle },
-    Group { children: Vec<NodeId> },
+    Path {
+        path: PathData,
+    },
+    Text {
+        x: f64,
+        y: f64,
+        style: TextStyle,
+    },
+    Group {
+        children: Vec<NodeId>,
+    },
     Image {
         x: f64,
         y: f64,
@@ -471,13 +494,7 @@ pub fn build_arc_bez(
     // Approximate arc with a cubic or use kurbo Arc if possible; for simplicity use to_path on ellipse sector.
     // kurbo Ellipse + arc_to is limited; we use a simple multi-line approx or kurbo's Arc.
     // kurbo 0.13 has Arc:
-    let arc = kurbo::Arc::new(
-        (cx, cy),
-        (radius, radius),
-        start,
-        sweep,
-        0.0,
-    );
+    let arc = kurbo::Arc::new((cx, cy), (radius, radius), start, sweep, 0.0);
     // Append the arc segments (to_path gives the curve)
     let arc_path = arc.to_path(0.1);
     // Skip the initial move of the arc_path since we already moved
@@ -513,7 +530,8 @@ pub fn regular_polygon_vertices(
     let n = sides.max(3) as f64;
     (0..sides.max(3))
         .map(|i| {
-            let a = rotation_rad - std::f64::consts::FRAC_PI_2 + i as f64 * 2.0 * std::f64::consts::PI / n;
+            let a = rotation_rad - std::f64::consts::FRAC_PI_2
+                + i as f64 * 2.0 * std::f64::consts::PI / n;
             (cx + r * a.cos(), cy + r * a.sin())
         })
         .collect()
@@ -573,7 +591,10 @@ impl PathData {
         Self {
             verbs,
             points,
-            closed: path.elements().last().is_some_and(|e| matches!(e, kurbo::PathEl::ClosePath)),
+            closed: path
+                .elements()
+                .last()
+                .is_some_and(|e| matches!(e, kurbo::PathEl::ClosePath)),
             smooth_anchors: Vec::new(),
             handle_out_offset: HashMap::new(),
             handle_in_offset: HashMap::new(),
@@ -591,7 +612,13 @@ impl PathData {
 
     pub fn set_handle_mode(&mut self, anchor_idx: usize, mode: BezierHandleMode) {
         self.handle_modes.insert(anchor_idx, mode);
-        if matches!(mode, BezierHandleMode::Symmetric | BezierHandleMode::Asymmetric | BezierHandleMode::EqualLength | BezierHandleMode::Both) {
+        if matches!(
+            mode,
+            BezierHandleMode::Symmetric
+                | BezierHandleMode::Asymmetric
+                | BezierHandleMode::EqualLength
+                | BezierHandleMode::Both
+        ) {
             // Ensure both handles exist (mirror the one we have) so the canvas draws
             // the "second line" for the independent handle immediately.
             let has_out = self.handle_out_offset.contains_key(&anchor_idx);
@@ -602,7 +629,8 @@ impl PathData {
                 }
             } else if has_in && !has_out {
                 if let Some(&off) = self.handle_in_offset.get(&anchor_idx) {
-                    self.handle_out_offset.insert(anchor_idx, [-off[0], -off[1]]);
+                    self.handle_out_offset
+                        .insert(anchor_idx, [-off[0], -off[1]]);
                 }
             }
         } else if mode == BezierHandleMode::LeftOnly {
@@ -612,7 +640,8 @@ impl PathData {
                 let closed = self.is_closed();
                 let tan = anchor_tangent(&anchors, anchor_idx, closed);
                 let dist = 32.0;
-                self.handle_in_offset.insert(anchor_idx, [-tan.0 * dist, -tan.1 * dist]);
+                self.handle_in_offset
+                    .insert(anchor_idx, [-tan.0 * dist, -tan.1 * dist]);
             }
         } else if mode == BezierHandleMode::RightOnly {
             self.handle_in_offset.remove(&anchor_idx);
@@ -621,7 +650,8 @@ impl PathData {
                 let closed = self.is_closed();
                 let tan = anchor_tangent(&anchors, anchor_idx, closed);
                 let dist = 32.0;
-                self.handle_out_offset.insert(anchor_idx, [tan.0 * dist, tan.1 * dist]);
+                self.handle_out_offset
+                    .insert(anchor_idx, [tan.0 * dist, tan.1 * dist]);
             }
         }
         // Rebuild so the baked curve points reflect any newly initialized opposite handle.
@@ -676,16 +706,27 @@ impl PathData {
             }
             let tan = anchor_tangent(&anchors, anchor_idx, self.is_closed());
             let dist = if anchors.len() > 1 {
-                let prev_idx = if anchor_idx > 0 { anchor_idx - 1 } else { anchors.len() - 1 };
+                let prev_idx = if anchor_idx > 0 {
+                    anchor_idx - 1
+                } else {
+                    anchors.len() - 1
+                };
                 let next_idx = (anchor_idx + 1) % anchors.len();
-                let d1 = (anchors[anchor_idx].0 - anchors[prev_idx].0).hypot(anchors[anchor_idx].1 - anchors[prev_idx].1);
-                let d2 = (anchors[next_idx].0 - anchors[anchor_idx].0).hypot(anchors[next_idx].1 - anchors[anchor_idx].1);
+                let d1 = (anchors[anchor_idx].0 - anchors[prev_idx].0)
+                    .hypot(anchors[anchor_idx].1 - anchors[prev_idx].1);
+                let d2 = (anchors[next_idx].0 - anchors[anchor_idx].0)
+                    .hypot(anchors[next_idx].1 - anchors[anchor_idx].1);
                 (d1 + d2) * 0.25
             } else {
                 30.0
-            }.max(1.0);
-            self.handle_out_offset.entry(anchor_idx).or_insert([tan.0 * dist, tan.1 * dist]);
-            self.handle_in_offset.entry(anchor_idx).or_insert([-tan.0 * dist, -tan.1 * dist]);
+            }
+            .max(1.0);
+            self.handle_out_offset
+                .entry(anchor_idx)
+                .or_insert([tan.0 * dist, tan.1 * dist]);
+            self.handle_in_offset
+                .entry(anchor_idx)
+                .or_insert([-tan.0 * dist, -tan.1 * dist]);
         } else {
             self.smooth_anchors.retain(|&i| i != anchor_idx);
             self.handle_out_offset.remove(&anchor_idx);
@@ -899,12 +940,7 @@ impl PathData {
     }
 
     /// Hit-test path segments; returns anchor indices at segment ends and nearest point on curve.
-    pub fn hit_segment(
-        &self,
-        x: f64,
-        y: f64,
-        threshold: f64,
-    ) -> Option<(usize, usize, f64, f64)> {
+    pub fn hit_segment(&self, x: f64, y: f64, threshold: f64) -> Option<(usize, usize, f64, f64)> {
         let anchors = self.anchor_positions();
         if anchors.len() < 2 {
             return None;
@@ -967,12 +1003,7 @@ impl PathData {
         (best_dist, best_pt.0, best_pt.1)
     }
 
-    fn nearest_on_line_segment(
-        x: f64,
-        y: f64,
-        p0: (f64, f64),
-        p1: (f64, f64),
-    ) -> (f64, f64, f64) {
+    fn nearest_on_line_segment(x: f64, y: f64, p0: (f64, f64), p1: (f64, f64)) -> (f64, f64, f64) {
         let dx = p1.0 - p0.0;
         let dy = p1.1 - p0.1;
         let len_sq = dx * dx + dy * dy;
@@ -1025,11 +1056,7 @@ impl PathData {
         }
         let n = anchors.len();
         let mut rev: Vec<(f64, f64)> = anchors.into_iter().rev().collect();
-        let mut smooth: Vec<usize> = self
-            .smooth_anchors
-            .iter()
-            .map(|&i| n - 1 - i)
-            .collect();
+        let mut smooth: Vec<usize> = self.smooth_anchors.iter().map(|&i| n - 1 - i).collect();
         smooth.sort_unstable();
         let mut out = HashMap::new();
         let mut inn = HashMap::new();
@@ -1339,17 +1366,15 @@ impl PathData {
         let closed = self.is_closed();
         let mut bez = BezPath::new();
         bez.move_to((anchors[0].0, anchors[0].1));
-        
-        let smooth: Vec<bool> = (0..n)
-            .map(|i| self.is_anchor_smooth(i))
-            .collect();
-            
+
+        let smooth: Vec<bool> = (0..n).map(|i| self.is_anchor_smooth(i)).collect();
+
         let seg_count = if closed { n } else { n.saturating_sub(1) };
         for i in 0..seg_count {
             let j = (i + 1) % n;
             let p0 = anchors[i];
             let p1 = anchors[j];
-            
+
             if smooth[i] || smooth[j] {
                 let (c1, c2) = segment_controls(
                     &anchors,
@@ -1534,8 +1559,14 @@ impl PathData {
         let mut i = 0usize;
         while i < els.len() {
             match els[i] {
-                kurbo::PathEl::MoveTo(p) => { pts.push((p.x, p.y)); i += 1; }
-                kurbo::PathEl::LineTo(p) => { pts.push((p.x, p.y)); i += 1; }
+                kurbo::PathEl::MoveTo(p) => {
+                    pts.push((p.x, p.y));
+                    i += 1;
+                }
+                kurbo::PathEl::LineTo(p) => {
+                    pts.push((p.x, p.y));
+                    i += 1;
+                }
                 kurbo::PathEl::QuadTo(_, p2) => {
                     let p0 = pts.last().copied().unwrap_or((p2.x, p2.y));
                     let p1 = match els.get(i) {
@@ -1564,15 +1595,24 @@ impl PathData {
                     for s in 1..=steps {
                         let t = s as f64 / steps as f64;
                         let u = 1.0 - t;
-                        let x = u * u * u * p0.0 + 3.0 * u * u * t * p1.0 + 3.0 * u * t * t * p2.0 + t * t * t * p3.x;
-                        let y = u * u * u * p0.1 + 3.0 * u * u * t * p1.1 + 3.0 * u * t * t * p2.1 + t * t * t * p3.y;
+                        let x = u * u * u * p0.0
+                            + 3.0 * u * u * t * p1.0
+                            + 3.0 * u * t * t * p2.0
+                            + t * t * t * p3.x;
+                        let y = u * u * u * p0.1
+                            + 3.0 * u * u * t * p1.1
+                            + 3.0 * u * t * t * p2.1
+                            + t * t * t * p3.y;
                         pts.push((x, y));
                     }
                     i += 1;
                 }
                 kurbo::PathEl::ClosePath => {
                     if let Some(start) = pts.first().copied() {
-                        if pts.last().map_or(true, |p| (p.0 - start.0).hypot(p.1 - start.1) > 1e-4) {
+                        if pts
+                            .last()
+                            .map_or(true, |p| (p.0 - start.0).hypot(p.1 - start.1) > 1e-4)
+                        {
                             pts.push(start);
                         }
                     }
@@ -1585,7 +1625,9 @@ impl PathData {
 
     fn _approx_len(&self, tolerance: f64) -> f64 {
         let pts = self._flatten(tolerance);
-        if pts.len() < 2 { return 0.0; }
+        if pts.len() < 2 {
+            return 0.0;
+        }
         let mut len = 0.0;
         for w in pts.windows(2) {
             len += (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
@@ -1601,8 +1643,10 @@ impl PathData {
         let closed = self.is_closed();
         if closed && pts.len() >= 2 {
             let first = pts[0];
-            let last = pts[pts.len()-1];
-            if (first.0 - last.0).hypot(first.1 - last.1) > 1e-4 { pts.push(first); }
+            let last = pts[pts.len() - 1];
+            if (first.0 - last.0).hypot(first.1 - last.1) > 1e-4 {
+                pts.push(first);
+            }
         }
         let mut cum = vec![0.0];
         for w in pts.windows(2) {
@@ -1618,18 +1662,22 @@ impl PathData {
         }
         if d <= 0.0 {
             let (x0, y0) = pts[0];
-            let (x1, y1) = pts.get(1).copied().unwrap_or((x0+1.0, y0));
-            return (x0, y0, (y1-y0).atan2(x1-x0));
+            let (x1, y1) = pts.get(1).copied().unwrap_or((x0 + 1.0, y0));
+            return (x0, y0, (y1 - y0).atan2(x1 - x0));
         }
         for i in 1..cum.len() {
             if cum[i] >= d {
-                let d0 = cum[i-1];
+                let d0 = cum[i - 1];
                 let d1 = cum[i];
-                let t = if (d1-d0).abs() < 1e-9 { 0.0 } else { (d - d0) / (d1 - d0) };
-                let (x0, y0) = pts[i-1];
+                let t = if (d1 - d0).abs() < 1e-9 {
+                    0.0
+                } else {
+                    (d - d0) / (d1 - d0)
+                };
+                let (x0, y0) = pts[i - 1];
                 let (x1, y1) = pts[i];
-                let x = x0 + (x1-x0)*t;
-                let y = y0 + (y1-y0)*t;
+                let x = x0 + (x1 - x0) * t;
+                let y = y0 + (y1 - y0) * t;
                 let ang = (y1 - y0).atan2(x1 - x0);
                 return (x, y, ang);
             }
@@ -1732,17 +1780,39 @@ impl ObjectOnPath for Node {}
 impl ObjectOnPath for PathData {}
 
 impl FaceRenderable for Node {
-    fn bounds(&self) -> kurbo::Rect { self.bounds() }
-    fn bez_path(&self) -> kurbo::BezPath { self.bez_path() }
-    fn fill(&self) -> &Fill { &self.style.fill }
-    fn stroke(&self) -> &Stroke { &self.style.stroke }
-    fn opacity(&self) -> f32 { self.style.opacity }
-    fn set_opacity(&mut self, opacity: f32) { self.style.opacity = opacity; }
-    fn translate(&mut self, dx: f64, dy: f64) { Node::translate(self, dx, dy); }
-    fn scale_about_center(&mut self, scale: f64) { Node::scale_about_center(self, scale); }
-    fn rotate_about_center(&mut self, angle_rad: f64) { Node::rotate_about_center(self, angle_rad); }
-    fn clone_renderable(&self) -> Box<dyn FaceRenderable> { Box::new(self.clone()) }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn bounds(&self) -> kurbo::Rect {
+        self.bounds()
+    }
+    fn bez_path(&self) -> kurbo::BezPath {
+        self.bez_path()
+    }
+    fn fill(&self) -> &Fill {
+        &self.style.fill
+    }
+    fn stroke(&self) -> &Stroke {
+        &self.style.stroke
+    }
+    fn opacity(&self) -> f32 {
+        self.style.opacity
+    }
+    fn set_opacity(&mut self, opacity: f32) {
+        self.style.opacity = opacity;
+    }
+    fn translate(&mut self, dx: f64, dy: f64) {
+        Node::translate(self, dx, dy);
+    }
+    fn scale_about_center(&mut self, scale: f64) {
+        Node::scale_about_center(self, scale);
+    }
+    fn rotate_about_center(&mut self, angle_rad: f64) {
+        Node::rotate_about_center(self, angle_rad);
+    }
+    fn clone_renderable(&self) -> Box<dyn FaceRenderable> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl PathMagic for Node {
@@ -1774,15 +1844,27 @@ impl PathMagic for Node {
             (0.0, 0.0, 0.0)
         }
     }
-    fn clone_path(&self) -> Box<dyn PathMagic> { Box::new(self.clone()) }
+    fn clone_path(&self) -> Box<dyn PathMagic> {
+        Box::new(self.clone())
+    }
 }
 
 impl PathMagic for PathData {
-    fn to_bez(&self) -> kurbo::BezPath { self.to_bez() }
-    fn is_closed(&self) -> bool { self.is_closed() }
-    fn total_length(&self, tolerance: f64) -> f64 { self._approx_len(tolerance) }
-    fn sample_at(&self, dist: f64, tolerance: f64) -> (f64, f64, f64) { self._sample(dist, tolerance) }
-    fn clone_path(&self) -> Box<dyn PathMagic> { Box::new(self.clone()) }
+    fn to_bez(&self) -> kurbo::BezPath {
+        self.to_bez()
+    }
+    fn is_closed(&self) -> bool {
+        self.is_closed()
+    }
+    fn total_length(&self, tolerance: f64) -> f64 {
+        self._approx_len(tolerance)
+    }
+    fn sample_at(&self, dist: f64, tolerance: f64) -> (f64, f64, f64) {
+        self._sample(dist, tolerance)
+    }
+    fn clone_path(&self) -> Box<dyn PathMagic> {
+        Box::new(self.clone())
+    }
 }
 
 impl Tiling for Node {
@@ -1823,18 +1905,22 @@ impl CircularClone for Node {
         (w.max(h) * 1.5).max(10.0)
     }
     fn set_radius(&mut self, _r: f64) {}
-    fn sides(&self) -> usize { 6 }
+    fn sides(&self) -> usize {
+        6
+    }
     fn set_sides(&mut self, _n: usize) {}
     fn circular_placements(&self) -> Vec<(f64, f64, f64)> {
         let (cx, cy) = self.origin();
         let r = self.radius();
         let n = self.sides().max(3);
-        (0..n).map(|i| {
-            let ang = (i as f64 / n as f64) * std::f64::consts::TAU;
-            let x = cx + r * ang.cos();
-            let y = cy + r * ang.sin();
-            (x, y, ang)
-        }).collect()
+        (0..n)
+            .map(|i| {
+                let ang = (i as f64 / n as f64) * std::f64::consts::TAU;
+                let x = cx + r * ang.cos();
+                let y = cy + r * ang.sin();
+                (x, y, ang)
+            })
+            .collect()
     }
 }
 
@@ -1854,20 +1940,26 @@ impl CircularClone for PathData {
             p[1] += dy;
         }
     }
-    fn radius(&self) -> f64 { 48.0 }
+    fn radius(&self) -> f64 {
+        48.0
+    }
     fn set_radius(&mut self, _r: f64) {}
-    fn sides(&self) -> usize { 6 }
+    fn sides(&self) -> usize {
+        6
+    }
     fn set_sides(&mut self, _n: usize) {}
     fn circular_placements(&self) -> Vec<(f64, f64, f64)> {
         let (cx, cy) = self.origin();
         let r = self.radius();
         let n = self.sides().max(3);
-        (0..n).map(|i| {
-            let ang = (i as f64 / n as f64) * std::f64::consts::TAU;
-            let x = cx + r * ang.cos();
-            let y = cy + r * ang.sin();
-            (x, y, ang)
-        }).collect()
+        (0..n)
+            .map(|i| {
+                let ang = (i as f64 / n as f64) * std::f64::consts::TAU;
+                let x = cx + r * ang.cos();
+                let y = cy + r * ang.sin();
+                (x, y, ang)
+            })
+            .collect()
     }
 }
 
@@ -1950,7 +2042,9 @@ impl Node {
                 }
             }
             NodeKind::Text { x, y, .. } => (*x, *y),
-            NodeKind::Group { .. } => (self.transform.translation[0], self.transform.translation[1]),
+            NodeKind::Group { .. } => {
+                (self.transform.translation[0], self.transform.translation[1])
+            }
             NodeKind::Image { x, y, .. } => (*x, *y),
             NodeKind::Plotter { x, y, .. } => (*x, *y),
             NodeKind::Arc { cx, cy, .. } => (*cx, *cy),
@@ -2009,16 +2103,22 @@ impl Node {
     }
 
     pub fn rect(x: f64, y: f64, w: f64, h: f64, fill: Fill) -> Self {
-        let mut n = Self::new(NodeKind::Rect { x, y, w, h, rx: 0.0 }, "Rectangle");
+        let mut n = Self::new(
+            NodeKind::Rect {
+                x,
+                y,
+                w,
+                h,
+                rx: 0.0,
+            },
+            "Rectangle",
+        );
         n.style.fill = fill;
         n
     }
 
     pub fn ellipse(cx: f64, cy: f64, rx: f64, ry: f64, fill: Fill) -> Self {
-        let mut n = Self::new(
-            NodeKind::Ellipse { cx, cy, rx, ry },
-            "Ellipse",
-        );
+        let mut n = Self::new(NodeKind::Ellipse { cx, cy, rx, ry }, "Ellipse");
         n.style.fill = fill;
         n
     }
@@ -2039,7 +2139,12 @@ impl Node {
     }
 
     pub fn path_from_bez(path: BezPath, name: impl Into<String>) -> Self {
-        Self::new(NodeKind::Path { path: PathData::from_bez(&path) }, name)
+        Self::new(
+            NodeKind::Path {
+                path: PathData::from_bez(&path),
+            },
+            name,
+        )
     }
 
     pub fn group(children: Vec<NodeId>, name: impl Into<String>) -> Self {
@@ -2068,18 +2173,10 @@ impl Node {
                 let Some(local) = acc else {
                     return Rect::ZERO;
                 };
-                let (tx, ty) = (
-                    self.transform.translation[0],
-                    self.transform.translation[1],
-                );
+                let (tx, ty) = (self.transform.translation[0], self.transform.translation[1]);
                 let rot = self.transform.rotation_rad;
                 if rot.abs() < 1e-12 {
-                    return Rect::new(
-                        local.x0 + tx,
-                        local.y0 + ty,
-                        local.x1 + tx,
-                        local.y1 + ty,
-                    );
+                    return Rect::new(local.x0 + tx, local.y0 + ty, local.x1 + tx, local.y1 + ty);
                 }
                 let cos = rot.cos();
                 let sin = rot.sin();
@@ -2238,20 +2335,32 @@ impl Node {
             }
             NodeKind::Group { .. } => GeometryProfile::Unsupported,
             NodeKind::Image { .. } => GeometryProfile::Unsupported,
-            NodeKind::Arc { cx, cy, radius, start_angle_rad, sweep_angle_rad, join } => {
-                GeometryProfile::Arc {
-                    origin_x: *cx,
-                    origin_y: *cy,
-                    radius: *radius,
-                    start_angle_deg: start_angle_rad.to_degrees(),
-                    sweep_angle_deg: sweep_angle_rad.to_degrees(),
-                    join: *join,
-                }
-            }
+            NodeKind::Arc {
+                cx,
+                cy,
+                radius,
+                start_angle_rad,
+                sweep_angle_rad,
+                join,
+            } => GeometryProfile::Arc {
+                origin_x: *cx,
+                origin_y: *cy,
+                radius: *radius,
+                start_angle_deg: start_angle_rad.to_degrees(),
+                sweep_angle_deg: sweep_angle_rad.to_degrees(),
+                join: *join,
+            },
             NodeKind::BrushStroke { .. } => GeometryProfile::Unsupported,
-            NodeKind::FlowchartNode { cx, cy, w, h, corner_rx, .. } => GeometryProfile::Rect {
-                origin_x: *cx - *w/2.0,
-                origin_y: *cy - *h/2.0,
+            NodeKind::FlowchartNode {
+                cx,
+                cy,
+                w,
+                h,
+                corner_rx,
+                ..
+            } => GeometryProfile::Rect {
+                origin_x: *cx - *w / 2.0,
+                origin_y: *cy - *h / 2.0,
                 width: *w,
                 height: *h,
                 corner_radius: *corner_rx,
@@ -2279,7 +2388,7 @@ impl Node {
                         cyclic: false,
                     }
                 }
-            },
+            }
         }
     }
 
@@ -2437,10 +2546,14 @@ impl Node {
     pub fn bounds(&self) -> Rect {
         match &self.kind {
             NodeKind::Rect { x, y, w, h, .. } => Rect::new(*x, *y, *x + *w, *y + *h),
-            NodeKind::Ellipse { cx, cy, rx, ry } => {
-                Rect::new(cx - rx, cy - ry, cx + rx, cy + ry)
-            }
-            NodeKind::Polygon { cx, cy, r, sides, rotation_rad } => {
+            NodeKind::Ellipse { cx, cy, rx, ry } => Rect::new(cx - rx, cy - ry, cx + rx, cy + ry),
+            NodeKind::Polygon {
+                cx,
+                cy,
+                r,
+                sides,
+                rotation_rad,
+            } => {
                 let verts = regular_polygon_vertices(*cx, *cy, *r, *sides, *rotation_rad);
                 if verts.is_empty() {
                     Rect::new(cx - r, cy - r, cx + r, cy + r)
@@ -2463,11 +2576,17 @@ impl Node {
                 text_bounds_rotated(*x, *y, style, self.transform.rotation_rad)
             }
             NodeKind::Group { .. } => Rect::ZERO,
-            NodeKind::Image { x, y, width, height, .. } => {
-                image_bounds_rotated(*x, *y, *width, *height, self.transform.rotation_rad)
-            }
+            NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => image_bounds_rotated(*x, *y, *width, *height, self.transform.rotation_rad),
             NodeKind::Plotter { x, y, w, h, .. } => Rect::new(*x, *y, *x + *w, *y + *h),
-            NodeKind::Arc { cx, cy, radius, .. } => Rect::new(cx - radius, cy - radius, cx + radius, cy + radius),
+            NodeKind::Arc { cx, cy, radius, .. } => {
+                Rect::new(cx - radius, cy - radius, cx + radius, cy + radius)
+            }
             NodeKind::BrushStroke { points } => {
                 let mut min_x = f64::MAX;
                 let mut min_y = f64::MAX;
@@ -2486,7 +2605,9 @@ impl Node {
                     Rect::ZERO
                 }
             }
-            NodeKind::FlowchartNode { cx, cy, w, h, .. } => Rect::new(cx - w/2.0, cy - h/2.0, cx + w/2.0, cy + h/2.0),
+            NodeKind::FlowchartNode { cx, cy, w, h, .. } => {
+                Rect::new(cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0)
+            }
             NodeKind::FlowchartPath { path } => {
                 if path.points.is_empty() {
                     Rect::ZERO
@@ -2545,9 +2666,14 @@ impl Node {
             NodeKind::Plotter { x, y, w, h, .. } => {
                 Rect::new(*x, *y, *x + *w, *y + *h).to_path(0.1)
             }
-            NodeKind::Arc { cx, cy, radius, start_angle_rad, sweep_angle_rad, join } => {
-                build_arc_bez(*cx, *cy, *radius, *start_angle_rad, *sweep_angle_rad, *join)
-            }
+            NodeKind::Arc {
+                cx,
+                cy,
+                radius,
+                start_angle_rad,
+                sweep_angle_rad,
+                join,
+            } => build_arc_bez(*cx, *cy, *radius, *start_angle_rad, *sweep_angle_rad, *join),
             NodeKind::BrushStroke { points } => {
                 let mut path = BezPath::new();
                 if let Some(&(first_pos, _)) = points.first() {
@@ -2559,7 +2685,7 @@ impl Node {
                 path
             }
             NodeKind::FlowchartNode { cx, cy, w, h, .. } => {
-                let r = Rect::new(cx - w/2.0, cy - h/2.0, cx + w/2.0, cy + h/2.0);
+                let r = Rect::new(cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0);
                 r.to_rounded_rect(12.0).to_path(0.1)
             }
             NodeKind::FlowchartPath { path } => {
@@ -2610,7 +2736,9 @@ impl Node {
                     let segment_dy = pos[1] - prev_pos[1];
                     let len_sq = segment_dx * segment_dx + segment_dy * segment_dy;
                     if len_sq > 1e-8 {
-                        let t = ((doc_x - prev_pos[0]) * segment_dx + (doc_y - prev_pos[1]) * segment_dy) / len_sq;
+                        let t = ((doc_x - prev_pos[0]) * segment_dx
+                            + (doc_y - prev_pos[1]) * segment_dy)
+                            / len_sq;
                         let t = t.clamp(0.0, 1.0);
                         let proj_x = prev_pos[0] + t * segment_dx;
                         let proj_y = prev_pos[1] + t * segment_dy;
@@ -2631,7 +2759,14 @@ impl Node {
                 .inflate(tol, tol)
                 .contains(pt);
         }
-        if let NodeKind::Image { x, y, width, height, .. } = &self.kind {
+        if let NodeKind::Image {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } = &self.kind
+        {
             let tol = stroke_slop.max(1.0);
             return image_contains_rotated(
                 *x,
@@ -2669,8 +2804,7 @@ impl Node {
                 return;
             }
             NodeKind::Arc {
-                start_angle_rad,
-                ..
+                start_angle_rad, ..
             } => {
                 *start_angle_rad += angle_rad;
                 return;
@@ -2689,13 +2823,9 @@ impl Node {
         };
         match &mut self.kind {
             NodeKind::Rect { x, y, w, h, .. } | NodeKind::Plotter { x, y, w, h, .. } => {
-                let corners = [
-                    (*x, *y),
-                    (*x + *w, *y),
-                    (*x + *w, *y + *h),
-                    (*x, *y + *h),
-                ];
-                let mapped: Vec<(f64, f64)> = corners.iter().map(|(px, py)| map(*px, *py)).collect();
+                let corners = [(*x, *y), (*x + *w, *y), (*x + *w, *y + *h), (*x, *y + *h)];
+                let mapped: Vec<(f64, f64)> =
+                    corners.iter().map(|(px, py)| map(*px, *py)).collect();
                 let path = PathData::from_anchor_data(
                     &mapped,
                     &[],
@@ -2706,8 +2836,13 @@ impl Node {
                 // Rotating a plotter bakes it to a path (region only).
                 self.kind = NodeKind::Path { path };
             }
-            NodeKind::Ellipse { cx: ecx, cy: ecy, rx, ry } => {
-                if ( *rx - *ry ).abs() < 0.01 {
+            NodeKind::Ellipse {
+                cx: ecx,
+                cy: ecy,
+                rx,
+                ry,
+            } => {
+                if (*rx - *ry).abs() < 0.01 {
                     // preserve circle size on rotation
                     let (nx, ny) = map(*ecx, *ecy);
                     *ecx = nx;
@@ -2743,7 +2878,9 @@ impl Node {
             NodeKind::Text { .. } | NodeKind::Image { .. } => {
                 // Orientation only on `transform.rotation_rad` (paint pivots on center).
             }
-            NodeKind::Arc { cx: acx, cy: acy, .. } => {
+            NodeKind::Arc {
+                cx: acx, cy: acy, ..
+            } => {
                 let (nx, ny) = map(*acx, *acy);
                 *acx = nx;
                 *acy = ny;
@@ -2810,7 +2947,13 @@ impl Node {
                 *x = nx;
                 *y = ny;
             }
-            NodeKind::Image { x, y, width, height, .. } => {
+            NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => {
                 *width *= scale;
                 *height *= scale;
                 *x = cx - *width * 0.5;
@@ -2827,7 +2970,13 @@ impl Node {
                     pt.1 *= scale as f32;
                 }
             }
-            NodeKind::FlowchartNode { cx: fcx, cy: fcy, w, h, .. } => {
+            NodeKind::FlowchartNode {
+                cx: fcx,
+                cy: fcy,
+                w,
+                h,
+                ..
+            } => {
                 *fcx = cx + (*fcx - cx) * scale;
                 *fcy = cy + (*fcy - cy) * scale;
                 *w *= scale;
@@ -2909,8 +3058,12 @@ impl Node {
         let w = (bounds.x1 - bounds.x0).max(1.0);
         let h = (bounds.y1 - bounds.y0).max(1.0);
         match &mut self.kind {
-            NodeKind::Rect { x, y, w: rw, h: rh, .. }
-            | NodeKind::Plotter { x, y, w: rw, h: rh, .. } => {
+            NodeKind::Rect {
+                x, y, w: rw, h: rh, ..
+            }
+            | NodeKind::Plotter {
+                x, y, w: rw, h: rh, ..
+            } => {
                 *x = bounds.x0;
                 *y = bounds.y0;
                 *rw = w;
@@ -2944,7 +3097,13 @@ impl Node {
                 *y = bounds.y0;
             }
             NodeKind::Group { .. } => {}
-            NodeKind::Image { x, y, width, height, .. } => {
+            NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => {
                 *x = bounds.x0;
                 *y = bounds.y0;
                 *width = w;
@@ -3140,20 +3299,38 @@ impl Node {
                 // Positions computed via D = R / tan(θ/2) so always equidistant from vertex.
                 let anchors_list = path.anchor_positions();
                 for (&k, _f) in &path.corner_fillets {
-                    if k >= anchors_list.len() { continue; }
+                    if k >= anchors_list.len() {
+                        continue;
+                    }
                     let p = anchors_list[k];
-                    let prev_idx = if k > 0 { k - 1 } else if path.is_closed() && anchors_list.len() > 2 { anchors_list.len() - 1 } else { continue };
+                    let prev_idx = if k > 0 {
+                        k - 1
+                    } else if path.is_closed() && anchors_list.len() > 2 {
+                        anchors_list.len() - 1
+                    } else {
+                        continue;
+                    };
                     let pa = anchors_list[prev_idx];
-                    let lenp = ((p.0 - pa.0).powi(2) + (p.1 - pa.1).powi(2)).sqrt().max(1e-9);
+                    let lenp = ((p.0 - pa.0).powi(2) + (p.1 - pa.1).powi(2))
+                        .sqrt()
+                        .max(1e-9);
                     let uxp = (pa.0 - p.0) / lenp;
                     let uyp = (pa.1 - p.1) / lenp;
                     let D = path.fillet_tangent_d(k);
                     let t1 = (p.0 + uxp * D, p.1 + uyp * D);
                     hits.push((PathEditTarget::MidCtrl1(k), t1));
                     // next leg
-                    let nxt_idx = if k + 1 < anchors_list.len() { k + 1 } else if path.is_closed() && anchors_list.len() > 2 { 0 } else { continue };
+                    let nxt_idx = if k + 1 < anchors_list.len() {
+                        k + 1
+                    } else if path.is_closed() && anchors_list.len() > 2 {
+                        0
+                    } else {
+                        continue;
+                    };
                     let pb = anchors_list[nxt_idx];
-                    let lenn = ((p.0 - pb.0).powi(2) + (p.1 - pb.1).powi(2)).sqrt().max(1e-9);
+                    let lenn = ((p.0 - pb.0).powi(2) + (p.1 - pb.1).powi(2))
+                        .sqrt()
+                        .max(1e-9);
                     let uxn = (pb.0 - p.0) / lenn;
                     let uyn = (pb.1 - p.1) / lenn;
                     let t2 = (p.0 + uxn * D, p.1 + uyn * D);
@@ -3204,9 +3381,21 @@ impl Node {
                         let p = anchors.get(seg).copied().unwrap_or((0.0, 0.0));
                         let is_prev_leg = matches!(target, PathEditTarget::MidCtrl1(_));
                         let other_idx = if is_prev_leg {
-                            if seg > 0 { seg - 1 } else if path.is_closed() && anchors.len() > 2 { anchors.len() - 1 } else { seg }
+                            if seg > 0 {
+                                seg - 1
+                            } else if path.is_closed() && anchors.len() > 2 {
+                                anchors.len() - 1
+                            } else {
+                                seg
+                            }
                         } else {
-                            if seg + 1 < anchors.len() { seg + 1 } else if path.is_closed() && anchors.len() > 2 { 0 } else { seg }
+                            if seg + 1 < anchors.len() {
+                                seg + 1
+                            } else if path.is_closed() && anchors.len() > 2 {
+                                0
+                            } else {
+                                seg
+                            }
                         };
                         let other = anchors.get(other_idx).copied().unwrap_or(p);
                         // project (x,y) onto the leg line from p to other
@@ -3270,17 +3459,36 @@ impl Node {
             NodeKind::Text { x, y, .. } => vec![(*x, *y)],
             NodeKind::Group { .. } => vec![],
             NodeKind::BrushStroke { .. } => vec![],
-            NodeKind::Image { x, y, width, height, .. } => vec![
+            NodeKind::Image {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => vec![
                 (*x + *width * 0.5, *y + *height * 0.5), // center
                 (*x, *y),
                 (*x + *width, *y),
                 (*x + *width, *y + *height),
                 (*x, *y + *height),
             ],
-            NodeKind::Arc { cx, cy, radius, start_angle_rad, sweep_angle_rad, .. } => {
+            NodeKind::Arc {
+                cx,
+                cy,
+                radius,
+                start_angle_rad,
+                sweep_angle_rad,
+                ..
+            } => {
                 let mid = *start_angle_rad + *sweep_angle_rad * 0.5;
-                let p_start = (*cx + *radius * start_angle_rad.cos(), *cy + *radius * start_angle_rad.sin());
-                let p_end = (*cx + *radius * (start_angle_rad + sweep_angle_rad).cos(), *cy + *radius * (start_angle_rad + sweep_angle_rad).sin());
+                let p_start = (
+                    *cx + *radius * start_angle_rad.cos(),
+                    *cy + *radius * start_angle_rad.sin(),
+                );
+                let p_end = (
+                    *cx + *radius * (start_angle_rad + sweep_angle_rad).cos(),
+                    *cy + *radius * (start_angle_rad + sweep_angle_rad).sin(),
+                );
                 let p_rim = (*cx + *radius * mid.cos(), *cy + *radius * mid.sin());
                 vec![(*cx, *cy), p_rim, p_start, p_end]
             }
@@ -3292,8 +3500,12 @@ impl Node {
     pub fn set_edit_handle(&mut self, index: usize, x: f64, y: f64) {
         let circle = self.is_circle();
         match &mut self.kind {
-            NodeKind::Rect { x: rx, y: ry, w, h, .. }
-            | NodeKind::Plotter { x: rx, y: ry, w, h, .. } => match index {
+            NodeKind::Rect {
+                x: rx, y: ry, w, h, ..
+            }
+            | NodeKind::Plotter {
+                x: rx, y: ry, w, h, ..
+            } => match index {
                 0 => {
                     *rx = x - *w * 0.5;
                     *ry = y - *h * 0.5;
@@ -3351,7 +3563,7 @@ impl Node {
                         _ => {}
                     }
                 }
-            },
+            }
             NodeKind::Polygon { cx, cy, r, .. } => match index {
                 0 => {
                     *cx = x;
@@ -3370,23 +3582,62 @@ impl Node {
                 }
             }
             NodeKind::Group { .. } => {}
-            NodeKind::Image { x: ix, y: iy, width: iw, height: ih, .. } => match index {
-                0 => { // center
+            NodeKind::Image {
+                x: ix,
+                y: iy,
+                width: iw,
+                height: ih,
+                ..
+            } => match index {
+                0 => {
+                    // center
                     *ix = x - *iw * 0.5;
                     *iy = y - *ih * 0.5;
                 }
-                1 => { let x1 = *ix + *iw; let y1 = *iy + *ih; *ix = x.min(x1-1.); *iy = y.min(y1-1.); *iw = (x1-*ix).max(1.); *ih=(y1-*iy).max(1.); }
-                2 => { let y1 = *iy + *ih; *iw = (x - *ix).max(1.); *iy = y.min(y1-1.); *ih = (y1-*iy).max(1.); }
-                3 => { *iw = (x - *ix).max(1.); *ih = (y - *iy).max(1.); }
-                4 => { let x1 = *ix + *iw; *ix = x.min(x1-1.); *ih = (y-*iy).max(1.); *iw = (x1-*ix).max(1.); }
+                1 => {
+                    let x1 = *ix + *iw;
+                    let y1 = *iy + *ih;
+                    *ix = x.min(x1 - 1.);
+                    *iy = y.min(y1 - 1.);
+                    *iw = (x1 - *ix).max(1.);
+                    *ih = (y1 - *iy).max(1.);
+                }
+                2 => {
+                    let y1 = *iy + *ih;
+                    *iw = (x - *ix).max(1.);
+                    *iy = y.min(y1 - 1.);
+                    *ih = (y1 - *iy).max(1.);
+                }
+                3 => {
+                    *iw = (x - *ix).max(1.);
+                    *ih = (y - *iy).max(1.);
+                }
+                4 => {
+                    let x1 = *ix + *iw;
+                    *ix = x.min(x1 - 1.);
+                    *ih = (y - *iy).max(1.);
+                    *iw = (x1 - *ix).max(1.);
+                }
                 _ => {}
             },
-            NodeKind::Arc { cx, cy, radius, start_angle_rad, sweep_angle_rad, .. } => match index {
-                0 => { *cx = x; *cy = y; }
-                1 => { // rim midpoint -> adjust radius only
+            NodeKind::Arc {
+                cx,
+                cy,
+                radius,
+                start_angle_rad,
+                sweep_angle_rad,
+                ..
+            } => match index {
+                0 => {
+                    *cx = x;
+                    *cy = y;
+                }
+                1 => {
+                    // rim midpoint -> adjust radius only
                     *radius = ((x - *cx).hypot(y - *cy)).max(1.0);
                 }
-                2 => { // start angle point
+                2 => {
+                    // start angle point
                     let angle = (y - *cy).atan2(x - *cx);
                     let end_angle = *start_angle_rad + *sweep_angle_rad;
                     *start_angle_rad = angle;
@@ -3401,7 +3652,8 @@ impl Node {
                     *sweep_angle_rad = new_sweep;
                     *radius = ((x - *cx).hypot(y - *cy)).max(1.0);
                 }
-                3 => { // end angle point
+                3 => {
+                    // end angle point
                     let angle = (y - *cy).atan2(x - *cx);
                     let mut new_sweep = angle - *start_angle_rad;
                     while new_sweep > std::f64::consts::PI * 2.0 {
@@ -3414,7 +3666,7 @@ impl Node {
                     *radius = ((x - *cx).hypot(y - *cy)).max(1.0);
                 }
                 _ => {}
-            }
+            },
             NodeKind::BrushStroke { .. } => {}
             NodeKind::FlowchartNode { .. } => {}
             NodeKind::FlowchartPath { .. } => {}
@@ -3446,15 +3698,29 @@ impl Node {
                 *plot_stroke_width as f64,
             ],
             NodeKind::Ellipse { rx, ry, .. } => vec![*rx, *ry],
-            NodeKind::Polygon { r, sides, rotation_rad, .. } => vec![*r, *sides as f64, *rotation_rad],
-            NodeKind::Arc { radius, start_angle_rad, sweep_angle_rad, .. } => vec![*radius, *start_angle_rad, *sweep_angle_rad],
+            NodeKind::Polygon {
+                r,
+                sides,
+                rotation_rad,
+                ..
+            } => vec![*r, *sides as f64, *rotation_rad],
+            NodeKind::Arc {
+                radius,
+                start_angle_rad,
+                sweep_angle_rad,
+                ..
+            } => vec![*radius, *start_angle_rad, *sweep_angle_rad],
             NodeKind::Path { path } => {
                 let mut pv = Vec::new();
                 let anchors = path.anchor_positions();
                 for (i, p) in anchors.iter().enumerate() {
                     pv.push(p.0);
                     pv.push(p.1);
-                    let out_off = path.handle_out_offset.get(&i).copied().unwrap_or([0.0, 0.0]);
+                    let out_off = path
+                        .handle_out_offset
+                        .get(&i)
+                        .copied()
+                        .unwrap_or([0.0, 0.0]);
                     pv.push(out_off[0]);
                     pv.push(out_off[1]);
                     let in_off = path.handle_in_offset.get(&i).copied().unwrap_or([0.0, 0.0]);
@@ -3477,7 +3743,14 @@ impl Node {
 
         // Append fill gradient stops and properties
         match &self.style.fill {
-            Fill::LinearGradient { angle_deg, line_x0, line_y0, line_x1, line_y1, stops } => {
+            Fill::LinearGradient {
+                angle_deg,
+                line_x0,
+                line_y0,
+                line_x1,
+                line_y1,
+                stops,
+            } => {
                 v.push(1.0); // Marker for LinearGradient
                 v.push(*angle_deg as f64);
                 v.push(*line_x0 as f64);
@@ -3493,7 +3766,11 @@ impl Node {
                     v.push(stop.color.rgba[3] as f64);
                 }
             }
-            Fill::RadialGradient { center_x, center_y, stops } => {
+            Fill::RadialGradient {
+                center_x,
+                center_y,
+                stops,
+            } => {
                 v.push(2.0); // Marker for RadialGradient
                 v.push(*center_x as f64);
                 v.push(*center_y as f64);
@@ -3571,14 +3848,24 @@ impl Node {
                     *ry = floats[1];
                 }
             }
-            NodeKind::Polygon { r, sides, rotation_rad, .. } => {
+            NodeKind::Polygon {
+                r,
+                sides,
+                rotation_rad,
+                ..
+            } => {
                 if floats.len() >= 3 {
                     *r = floats[0];
                     *sides = (floats[1].round() as u32).max(3);
                     *rotation_rad = floats[2];
                 }
             }
-            NodeKind::Arc { radius, start_angle_rad, sweep_angle_rad, .. } => {
+            NodeKind::Arc {
+                radius,
+                start_angle_rad,
+                sweep_angle_rad,
+                ..
+            } => {
                 if floats.len() >= 3 {
                     *radius = floats[0];
                     *start_angle_rad = floats[1];
@@ -3744,13 +4031,7 @@ pub fn image_bounds(x: f64, y: f64, width: f64, height: f64) -> Rect {
 }
 
 /// Axis-aligned bounds of an image after rotation about its rect center.
-pub fn image_bounds_rotated(
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    rotation_rad: f64,
-) -> Rect {
+pub fn image_bounds_rotated(x: f64, y: f64, width: f64, height: f64, rotation_rad: f64) -> Rect {
     rect_bounds_rotated(image_bounds(x, y, width, height), rotation_rad)
 }
 
@@ -3767,12 +4048,7 @@ pub fn rect_bounds_rotated(r: Rect, rotation_rad: f64) -> Rect {
     let mut min_y = f64::MAX;
     let mut max_x = f64::MIN;
     let mut max_y = f64::MIN;
-    for (px, py) in [
-        (r.x0, r.y0),
-        (r.x1, r.y0),
-        (r.x1, r.y1),
-        (r.x0, r.y1),
-    ] {
+    for (px, py) in [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)] {
         let dx = px - cx;
         let dy = py - cy;
         let wx = cx + dx * c - dy * s;
@@ -3852,11 +4128,7 @@ pub fn image_doc_to_uv(
 fn path_anchor_positions(path: &PathData) -> Vec<(f64, f64)> {
     let mut positions: Vec<(f64, f64)> = path_anchor_point_indices(path)
         .into_iter()
-        .filter_map(|pi| {
-            path.points
-                .get(pi)
-                .map(|p| (p[0], p[1]))
-        })
+        .filter_map(|pi| path.points.get(pi).map(|p| (p[0], p[1])))
         .collect();
     if path.is_closed() && positions.len() > 1 {
         let first = positions[0];
@@ -3868,13 +4140,7 @@ fn path_anchor_positions(path: &PathData) -> Vec<(f64, f64)> {
     positions
 }
 
-fn cubic_at(
-    p0: (f64, f64),
-    p1: (f64, f64),
-    p2: (f64, f64),
-    p3: (f64, f64),
-    t: f64,
-) -> (f64, f64) {
+fn cubic_at(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), t: f64) -> (f64, f64) {
     let u = 1.0 - t;
     let uu = u * u;
     let tt = t * t;
@@ -3916,10 +4182,7 @@ fn anchor_tangent(anchors: &[(f64, f64)], idx: usize, closed: bool) -> (f64, f64
     };
     match (prev, next) {
         (Some(p), Some(ni)) => {
-            let v1 = unit_vec(
-                anchors[idx].0 - anchors[p].0,
-                anchors[idx].1 - anchors[p].1,
-            );
+            let v1 = unit_vec(anchors[idx].0 - anchors[p].0, anchors[idx].1 - anchors[p].1);
             let v2 = unit_vec(
                 anchors[ni].0 - anchors[idx].0,
                 anchors[ni].1 - anchors[idx].1,
@@ -3930,10 +4193,7 @@ fn anchor_tangent(anchors: &[(f64, f64)], idx: usize, closed: bool) -> (f64, f64
             anchors[ni].0 - anchors[idx].0,
             anchors[ni].1 - anchors[idx].1,
         ),
-        (Some(p), None) => unit_vec(
-            anchors[idx].0 - anchors[p].0,
-            anchors[idx].1 - anchors[p].1,
-        ),
+        (Some(p), None) => unit_vec(anchors[idx].0 - anchors[p].0, anchors[idx].1 - anchors[p].1),
         (None, None) => (1.0, 0.0),
     }
 }
@@ -3954,7 +4214,10 @@ fn segment_controls(
     let dist = (p3.0 - p0.0).hypot(p3.1 - p0.1).max(1e-6);
     let t_len = dist / 3.0;
 
-    let mode_i = handle_modes.get(&i).copied().unwrap_or(BezierHandleMode::Symmetric);
+    let mode_i = handle_modes
+        .get(&i)
+        .copied()
+        .unwrap_or(BezierHandleMode::Symmetric);
     let smooth_i_eff = smooth_i && mode_i != BezierHandleMode::LeftOnly;
 
     let c1 = if smooth_i_eff {
@@ -3968,7 +4231,10 @@ fn segment_controls(
         p0
     };
 
-    let mode_j = handle_modes.get(&j).copied().unwrap_or(BezierHandleMode::Symmetric);
+    let mode_j = handle_modes
+        .get(&j)
+        .copied()
+        .unwrap_or(BezierHandleMode::Symmetric);
     let smooth_j_eff = smooth_j && mode_j != BezierHandleMode::RightOnly;
 
     let c2 = if smooth_j_eff {
@@ -4024,11 +4290,9 @@ mod bezier_tests {
     fn flatten_path_points(path: &BezPath, tolerance: f64) -> Vec<(f64, f64)> {
         let mut pts = Vec::new();
         let els: Vec<PathEl> = path.elements().iter().copied().collect();
-        kurbo::flatten(els, tolerance, |el| {
-            match el {
-                PathEl::MoveTo(p) | PathEl::LineTo(p) => pts.push((p.x, p.y)),
-                _ => {}
-            }
+        kurbo::flatten(els, tolerance, |el| match el {
+            PathEl::MoveTo(p) | PathEl::LineTo(p) => pts.push((p.x, p.y)),
+            _ => {}
         });
         pts
     }
@@ -4036,13 +4300,7 @@ mod bezier_tests {
     #[test]
     fn closed_path_anchor_count_stable() {
         let anchors = vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)];
-        let path = PathData::from_anchor_data(
-            &anchors,
-            &[],
-            HashMap::new(),
-            HashMap::new(),
-            true,
-        );
+        let path = PathData::from_anchor_data(&anchors, &[], HashMap::new(), HashMap::new(), true);
         assert_eq!(path.anchor_positions().len(), 4);
         let mut path = path;
         path.set_anchor_position(1, 120.0, 10.0);
@@ -4066,7 +4324,11 @@ mod bezier_tests {
         // Set a corner fillet at the smooth anchor to exercise cubic emission in to_bez
         path.set_corner_fillet(1, 8.0);
         let bez = path.to_bez();
-        assert!(bez.elements().iter().any(|e| matches!(e, PathEl::CurveTo(_, _, _))));
+        assert!(
+            bez.elements()
+                .iter()
+                .any(|e| matches!(e, PathEl::CurveTo(_, _, _)))
+        );
         let flat = flatten_path_points(&bez, 0.5);
         assert!(flat.len() > 3, "flat len {}", flat.len());
     }

@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{
-    DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_NULL,
-    CODEC_TYPE_VORBIS,
+    CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_NULL, CODEC_TYPE_VORBIS,
+    DecoderOptions,
 };
 use symphonia::core::errors::Error;
 use symphonia::core::formats::FormatOptions;
@@ -204,7 +204,10 @@ fn extract_audio_to_wav_inner(
     })?;
     if !wav_is_playable(wav_path) {
         let _ = std::fs::remove_file(wav_path);
-        return Err(format!("wav not playable after write: {}", wav_path.display()));
+        return Err(format!(
+            "wav not playable after write: {}",
+            wav_path.display()
+        ));
     }
     let sz = wav_path.metadata().map(|m| m.len()).unwrap_or(0);
     report(1.0);
@@ -289,8 +292,7 @@ pub fn stream_file_to_player_rate(
             }
         }
         // Tiny fallback (≤8s) only if streaming fails.
-        if let Some(buf) =
-            rodio_source_from_path_capped_rate(path, offset_secs, 8.0, playback_rate)
+        if let Some(buf) = rodio_source_from_path_capped_rate(path, offset_secs, 8.0, playback_rate)
         {
             player.append(buf);
             player.play();
@@ -305,8 +307,8 @@ pub fn stream_file_to_player_rate(
             Ok(mut decoder) => {
                 use rodio::Source;
                 if offset_secs > 0.05 {
-                    let _ = decoder
-                        .try_seek(std::time::Duration::from_secs_f32(offset_secs.max(0.0)));
+                    let _ =
+                        decoder.try_seek(std::time::Duration::from_secs_f32(offset_secs.max(0.0)));
                 }
                 if (playback_rate - 1.0).abs() <= 0.02 {
                     player.append(decoder);
@@ -321,13 +323,13 @@ pub fn stream_file_to_player_rate(
     }
 
     if let Some(pcm) = load_pcm_from_file(path) {
-        let ch = NonZeroU16::new(pcm.channels.max(1))
-            .ok_or_else(|| "bad channel count".to_string())?;
+        let ch =
+            NonZeroU16::new(pcm.channels.max(1)).ok_or_else(|| "bad channel count".to_string())?;
         let base_rate = pcm.sample_rate.max(1) as f32;
         let out_rate = ((base_rate * playback_rate).round() as u32).max(1);
         let rate = NonZeroU32::new(out_rate).ok_or_else(|| "bad sample rate".to_string())?;
-        let skip = (offset_secs.max(0.0) * pcm.sample_rate as f32 * pcm.channels as f32)
-            .round() as usize;
+        let skip =
+            (offset_secs.max(0.0) * pcm.sample_rate as f32 * pcm.channels as f32).round() as usize;
         let samples: Vec<f32> = if skip >= pcm.samples.len() {
             Vec::new()
         } else {
@@ -495,11 +497,7 @@ pub fn load_pcm_from_file(path: &Path) -> Option<CachedPcm> {
     if crate::document::AvClip::path_is_still_image(path_str.as_ref()) {
         return None;
     }
-    if path
-        .metadata()
-        .map(|m| m.len() < 2048)
-        .unwrap_or(true)
-    {
+    if path.metadata().map(|m| m.len() < 2048).unwrap_or(true) {
         return None;
     }
     if path
@@ -617,10 +615,7 @@ pub fn spawn_preload_pcm(cache: AudioPcmCache, key: String, path: PathBuf) {
 }
 
 pub fn pcm_cache_has(cache: &AudioPcmCache, path: &str) -> bool {
-    cache
-        .lock()
-        .ok()
-        .is_some_and(|m| m.contains_key(path))
+    cache.lock().ok().is_some_and(|m| m.contains_key(path))
 }
 
 pub fn prepare_samples_at_offset(
@@ -785,7 +780,10 @@ fn decode_audio_stereo_symphonia(
     })
 }
 
-fn decode_audio_stereo_libav(input: &Path, report: ExtractProgress) -> Result<StereoPcmI16, String> {
+fn decode_audio_stereo_libav(
+    input: &Path,
+    report: ExtractProgress,
+) -> Result<StereoPcmI16, String> {
     let path = input.to_str().ok_or("bad path")?;
     let (interleaved, rate) = crate::video_decode::decode_audio_to_stereo_i16_libav(path, |p| {
         report(0.12 + p * 0.72);
@@ -860,12 +858,7 @@ fn write_wav(path: &Path, samples: &[i16], rate: u32, channels: u16) -> Result<(
     write_wav_hound(path, samples, rate, channels)
 }
 
-fn write_wav_hound(
-    path: &Path,
-    samples: &[i16],
-    rate: u32,
-    channels: u16,
-) -> Result<(), String> {
+fn write_wav_hound(path: &Path, samples: &[i16], rate: u32, channels: u16) -> Result<(), String> {
     let spec = hound::WavSpec {
         channels,
         sample_rate: rate,
@@ -876,11 +869,19 @@ fn write_wav_hound(
         let mut writer =
             hound::WavWriter::create(path, spec).map_err(|e| format!("wav create: {e}"))?;
         for &s in samples {
-            writer.write_sample(s).map_err(|e| format!("wav sample: {e}"))?;
+            writer
+                .write_sample(s)
+                .map_err(|e| format!("wav sample: {e}"))?;
         }
-        writer.finalize().map_err(|e| format!("wav finalize: {e}"))?;
+        writer
+            .finalize()
+            .map_err(|e| format!("wav finalize: {e}"))?;
     }
-    if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(path) {
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
         let _ = f.sync_all();
     }
     Ok(())
@@ -966,7 +967,9 @@ pub fn write_mono_f32_as_wav(mono: &[f32], src_rate: u32, output: &Path) -> Resu
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioExtractStatus {
     /// Left-to-right fill uses `progress` (0..1).
-    Extracting { progress: f32 },
+    Extracting {
+        progress: f32,
+    },
     Ready(PathBuf),
     Failed,
 }

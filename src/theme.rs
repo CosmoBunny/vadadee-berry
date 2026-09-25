@@ -42,8 +42,7 @@ pub fn apply(ctx: &egui::Context) {
     load_nerd_font(ctx);
 
     ctx.options_mut(|o| {
-        o.input_options.zoom_modifier =
-            egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+        o.input_options.zoom_modifier = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
     });
 
     ctx.tessellation_options_mut(|t| {
@@ -93,10 +92,9 @@ pub fn apply(ctx: &egui::Context) {
         TextStyle::Heading,
         FontId::new(15.0, FontFamily::Proportional),
     );
-    style.text_styles.insert(
-        TextStyle::Body,
-        FontId::new(13.0, FontFamily::Proportional),
-    );
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::new(13.0, FontFamily::Proportional));
     style.text_styles.insert(
         TextStyle::Button,
         FontId::new(13.0, FontFamily::Proportional),
@@ -359,15 +357,15 @@ fn show_overlay_area_inner(
         area = area.constrain_to(clip);
     }
     let response = area.show(ctx, |ui| {
-            ui.set_width(rect.width());
-            ui.set_height(rect.height());
-            floating_card_frame(alpha).show(ui, |ui| {
-                ui.set_opacity(alpha);
-                ui.set_width(ui.available_width());
-                ui.set_height(ui.available_height());
-                add_contents(ui);
-            });
+        ui.set_width(rect.width());
+        ui.set_height(rect.height());
+        floating_card_frame(alpha).show(ui, |ui| {
+            ui.set_opacity(alpha);
+            ui.set_width(ui.available_width());
+            ui.set_height(ui.available_height());
+            add_contents(ui);
         });
+    });
     response.response.rect
 }
 
@@ -394,7 +392,10 @@ pub fn canvas_frame(alpha: f32) -> egui::Frame {
     let alpha = alpha.clamp(0.0, 1.0);
     egui::Frame::new()
         .fill(colors::CANVAS_BG.gamma_multiply(alpha))
-        .stroke(Stroke::new(1.0, colors::BORDER.gamma_multiply(alpha * 0.65)))
+        .stroke(Stroke::new(
+            1.0,
+            colors::BORDER.gamma_multiply(alpha * 0.65),
+        ))
         .corner_radius(CornerRadius::same(FLOAT_RADIUS))
         .inner_margin(Margin::ZERO)
 }
@@ -465,10 +466,7 @@ pub fn action_content_frame_alpha(alpha: f32) -> egui::Frame {
 }
 
 /// Grouped constraint block inside the geometry / appearance panels.
-pub fn constraint_block(
-    ui: &mut egui::Ui,
-    add_contents: impl FnOnce(&mut egui::Ui),
-) {
+pub fn constraint_block(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(colors::BG_ELEVATED)
         .stroke(Stroke::new(1.0, colors::BORDER))

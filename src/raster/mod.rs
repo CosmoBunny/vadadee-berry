@@ -98,16 +98,7 @@ impl RasterBuffer {
         alpha_lock: bool,
     ) {
         self.stamp_circle_clipped_poly(
-            cx,
-            cy,
-            radius,
-            hardness,
-            color,
-            opacity,
-            erase,
-            clip,
-            alpha_lock,
-            None,
+            cx, cy, radius, hardness, color, opacity, erase, clip, alpha_lock, None,
         );
     }
 
@@ -236,9 +227,8 @@ impl RasterBuffer {
                 let py = y as f64 + 0.5;
                 let has_poly = poly_components.map(|c| !c.is_empty()).unwrap_or(false);
                 let has_rect = rect_mask.is_some();
-                let has_bitmap = pixel_region.is_some_and(|(_, _, w, h, m)| {
-                    w > 0 && h > 0 && !m.is_empty()
-                });
+                let has_bitmap =
+                    pixel_region.is_some_and(|(_, _, w, h, m)| w > 0 && h > 0 && !m.is_empty());
                 if has_poly || has_rect || has_bitmap {
                     let in_poly = has_poly
                         && poly_components.is_some_and(|comps| {
@@ -621,11 +611,7 @@ pub fn stamps_for_new_sample(
             // Segment from hist[n-2] → hist[n-1], neighbors hist[n-3] and extrapolated tip.
             let p1 = hist[n - 2];
             let p2 = hist[n - 1];
-            let p0 = if n >= 3 {
-                hist[n - 3]
-            } else {
-                p1
-            };
+            let p0 = if n >= 3 { hist[n - 3] } else { p1 };
             // Extrapolate p3 past p2 along last direction for end tension.
             let p3 = {
                 let dx = p2.0 - p1.0;
@@ -745,8 +731,8 @@ pub fn point_in_polygon(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
     for i in 0..n {
         let (xi, yi) = poly[i];
         let (xj, yj) = poly[j];
-        let intersect = ((yi > py) != (yj > py))
-            && (px < (xj - xi) * (py - yi) / (yj - yi + 1e-30) + xi);
+        let intersect =
+            ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi + 1e-30) + xi);
         if intersect {
             inside = !inside;
         }
@@ -907,17 +893,7 @@ mod tests {
                 buf.rgba[i + 3] = 255;
             }
         }
-        buf.stamp_circle_clipped(
-            4.0,
-            4.0,
-            6.0,
-            1.0,
-            [0, 0, 255, 255],
-            1.0,
-            false,
-            None,
-            true,
-        );
+        buf.stamp_circle_clipped(4.0, 4.0, 6.0, 1.0, [0, 0, 255, 255], 1.0, false, None, true);
         // Transparent right stays empty.
         let r = (4 * 8 + 6) * 4;
         assert_eq!(buf.rgba[r + 3], 0, "alpha lock must not paint empty");
@@ -942,7 +918,10 @@ mod tests {
         let out = expand_circular_symmetry(&pts, (0.0, 0.0), 4, 0.0);
         assert!(out.len() >= 4, "got {}", out.len());
         // Original-ish tip should exist near (10,0)
-        assert!(out.iter().any(|(x, y)| (x - 10.0).abs() < 0.1 && y.abs() < 0.1));
+        assert!(
+            out.iter()
+                .any(|(x, y)| (x - 10.0).abs() < 0.1 && y.abs() < 0.1)
+        );
     }
 
     #[test]
@@ -992,7 +971,11 @@ mod tests {
         flood_fill(&mut work, 7, 7, 0, 0, [1, 2, 3, 255], 0);
         // Center (3,3) must still match original black/transparent hole.
         let c = (3 * 7 + 3) * 4;
-        assert_eq!(&work[c..c + 4], &before[c..c + 4], "hole must not be selected");
+        assert_eq!(
+            &work[c..c + 4],
+            &before[c..c + 4],
+            "hole must not be selected"
+        );
         // Border pixel should have changed.
         assert_ne!(&work[0..4], &before[0..4]);
     }
@@ -1005,7 +988,11 @@ mod tests {
         let p2 = (10.0, 10.0);
         let p3 = (0.0, 10.0);
         let (pts, _) = stamps_along_catmull(p0, p1, p2, p3, 1.0, 0.0, true);
-        assert!(pts.len() > 5, "expected dense curve stamps, got {}", pts.len());
+        assert!(
+            pts.len() > 5,
+            "expected dense curve stamps, got {}",
+            pts.len()
+        );
         let off_chord = pts.iter().any(|(x, y)| *x > 10.2 && *y > 1.0 && *y < 9.0);
         assert!(off_chord, "Catmull path stayed on the chord x=10");
     }

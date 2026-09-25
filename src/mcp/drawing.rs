@@ -1,6 +1,6 @@
 //! Shared MCP drawing helpers (colors, tool schemas).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::document::{Fill, Paint, Stroke};
 
@@ -86,7 +86,10 @@ pub fn stroke_from_style(style: &McpShapeStyle) -> Stroke {
     stroke
 }
 
-pub fn apply_style_patch(style: &mut crate::document::NodeStyle, patch: &Value) -> Result<(), String> {
+pub fn apply_style_patch(
+    style: &mut crate::document::NodeStyle,
+    patch: &Value,
+) -> Result<(), String> {
     if let Some(rgb) = patch
         .get("fill_color")
         .or_else(|| patch.get("fill"))
@@ -177,7 +180,9 @@ pub fn apply_style_patch(style: &mut crate::document::NodeStyle, patch: &Value) 
 }
 
 fn apply_marker_patch(marker: &mut crate::document::PathMarker, p: Option<&Value>) {
-    let Some(p) = p else { return; };
+    let Some(p) = p else {
+        return;
+    };
     if let Some(k) = p.get("kind").and_then(|v| v.as_str()) {
         marker.kind = match k.to_lowercase().as_str() {
             "triangle" => crate::document::MarkerKind::Triangle,
@@ -189,7 +194,11 @@ fn apply_marker_patch(marker: &mut crate::document::PathMarker, p: Option<&Value
             _ => crate::document::MarkerKind::None,
         };
     }
-    if let Some(rgb) = p.get("color").or_else(|| p.get("fill_color")).and_then(parse_color_value) {
+    if let Some(rgb) = p
+        .get("color")
+        .or_else(|| p.get("fill_color"))
+        .and_then(parse_color_value)
+    {
         let a = p.get("alpha").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
         marker.color = crate::document::Paint::from_hex(rgb, a);
     }
@@ -204,7 +213,11 @@ fn apply_marker_patch(marker: &mut crate::document::PathMarker, p: Option<&Value
     } else if let Some(o) = p.get("offset").and_then(|v| v.as_f64()) {
         marker.offset = [o, 0.0];
     }
-    if let Some(r) = p.get("rotation").or_else(|| p.get("rotation_deg")).and_then(|v| v.as_f64()) {
+    if let Some(r) = p
+        .get("rotation")
+        .or_else(|| p.get("rotation_deg"))
+        .and_then(|v| v.as_f64())
+    {
         marker.rotation = r;
     }
     if let Some(a) = p.get("auto_rotate").and_then(|v| v.as_bool()) {
@@ -269,9 +282,7 @@ pub fn load_image_bytes_from_args(args: &Value) -> Result<Vec<u8>, String> {
         let expected = (pw as usize) * (ph as usize) * 4;
         let mut raw = Vec::with_capacity(expected);
         for v in arr {
-            let b = v
-                .as_u64()
-                .ok_or("rgba values must be integers 0..255")? as u8;
+            let b = v.as_u64().ok_or("rgba values must be integers 0..255")? as u8;
             raw.push(b);
         }
         if raw.len() != expected {
@@ -282,11 +293,8 @@ pub fn load_image_bytes_from_args(args: &Value) -> Result<Vec<u8>, String> {
         }
         let img = image::RgbaImage::from_raw(pw, ph, raw).ok_or("invalid rgba dimensions")?;
         let mut png = Vec::new();
-        img.write_to(
-            &mut std::io::Cursor::new(&mut png),
-            image::ImageFormat::Png,
-        )
-        .map_err(|e| format!("rgba→png failed: {e}"))?;
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .map_err(|e| format!("rgba→png failed: {e}"))?;
         return Ok(png);
     }
     Err(
@@ -620,7 +628,6 @@ pub fn drawing_tools() -> Vec<Value> {
         }),
         &["id", "geometry"],
     ));
-
 
     tools.push(tool(
         "create_path",

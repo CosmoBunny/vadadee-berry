@@ -179,7 +179,11 @@ pub fn anchor_positions_on_side(
 }
 
 /// Parameter `t` in 0..1 along the straight edge (excluding corners).
-pub fn edge_doc_parameter(geom: &FlowchartNodeGeom, side: FlowchartEdgeSide, doc: (f64, f64)) -> f64 {
+pub fn edge_doc_parameter(
+    geom: &FlowchartNodeGeom,
+    side: FlowchartEdgeSide,
+    doc: (f64, f64),
+) -> f64 {
     let r = geom.doc_rect();
     let inset = edge_inset(geom);
     match side {
@@ -291,11 +295,7 @@ pub fn anchor_port_normal(
             let dx = toward.0 - anchor_pos.0;
             let dy = toward.1 - anchor_pos.1;
             if dx.abs() >= dy.abs() {
-                if dx >= 0.0 {
-                    (1.0, 0.0)
-                } else {
-                    (-1.0, 0.0)
-                }
+                if dx >= 0.0 { (1.0, 0.0) } else { (-1.0, 0.0) }
             } else if dy >= 0.0 {
                 (0.0, 1.0)
             } else {
@@ -333,22 +333,14 @@ pub fn estimated_port_normals(start: (f64, f64), end: (f64, f64)) -> ((f64, f64)
     let dx = end.0 - start.0;
     let dy = end.1 - start.1;
     let start_n = if dx.abs() >= dy.abs() {
-        if dx >= 0.0 {
-            (1.0, 0.0)
-        } else {
-            (-1.0, 0.0)
-        }
+        if dx >= 0.0 { (1.0, 0.0) } else { (-1.0, 0.0) }
     } else if dy >= 0.0 {
         (0.0, 1.0)
     } else {
         (0.0, -1.0)
     };
     let end_n = if dx.abs() >= dy.abs() {
-        if dx >= 0.0 {
-            (-1.0, 0.0)
-        } else {
-            (1.0, 0.0)
-        }
+        if dx >= 0.0 { (-1.0, 0.0) } else { (1.0, 0.0) }
     } else if dy >= 0.0 {
         (0.0, -1.0)
     } else {
@@ -357,11 +349,7 @@ pub fn estimated_port_normals(start: (f64, f64), end: (f64, f64)) -> ((f64, f64)
     (start_n, end_n)
 }
 
-pub fn route_orthogonal(
-    start: (f64, f64),
-    end: (f64, f64),
-    obstacles: &[Rect],
-) -> Vec<(f64, f64)> {
+pub fn route_orthogonal(start: (f64, f64), end: (f64, f64), obstacles: &[Rect]) -> Vec<(f64, f64)> {
     let (sn, en) = estimated_port_normals(start, end);
     route_orthogonal_with_normals(start, end, sn, en, obstacles)
 }
@@ -378,10 +366,7 @@ pub fn route_orthogonal_with_normals(
         start.0 + start_normal.0 * stub,
         start.1 + start_normal.1 * stub,
     );
-    let stub_b = (
-        end.0 + end_normal.0 * stub,
-        end.1 + end_normal.1 * stub,
-    );
+    let stub_b = (end.0 + end_normal.0 * stub, end.1 + end_normal.1 * stub);
     // Pathfind only between stub waypoints (outside node halos), then attach anchor segments.
     let mut mid = route_orthogonal_mid(stub_a, stub_b, obstacles);
     if mid.is_empty() {
@@ -392,7 +377,11 @@ pub fn route_orthogonal_with_normals(
         pts.push(stub_a);
     }
     for p in mid.iter().copied().skip(1) {
-        if pts.last().copied().map_or(true, |q| (q.0 - p.0).hypot(q.1 - p.1) > 1e-6) {
+        if pts
+            .last()
+            .copied()
+            .map_or(true, |q| (q.0 - p.0).hypot(q.1 - p.1) > 1e-6)
+        {
             pts.push(p);
         }
     }
@@ -416,8 +405,8 @@ pub fn route_orthogonal_with_normals(
             pts.insert(1, stub_a);
         }
         let n = pts.len();
-        if (pts[n-2].0 - stub_b.0).hypot(pts[n-2].1 - stub_b.1) > 1e-6 {
-            pts.insert(n-1, stub_b);
+        if (pts[n - 2].0 - stub_b.0).hypot(pts[n - 2].1 - stub_b.1) > 1e-6 {
+            pts.insert(n - 1, stub_b);
         }
     }
 
@@ -505,25 +494,16 @@ pub fn orthogonalize_flowchart_path(pts: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     orthogonalize_polyline(pts)
 }
 
-pub fn fix_flowchart_path_anchor_endpoints(
-    path: &mut FlowchartPathData,
-    nodes: &super::NodeStore,
-) {
+pub fn fix_flowchart_path_anchor_endpoints(path: &mut FlowchartPathData, nodes: &super::NodeStore) {
     if let (Some(nid), Some(anc)) = (path.start_node, path.start_anchor) {
-        if let Some(g) = nodes
-            .get(nid)
-            .and_then(|n| node_as_flowchart_geom(&n.kind))
-        {
+        if let Some(g) = nodes.get(nid).and_then(|n| node_as_flowchart_geom(&n.kind)) {
             if let Some(p) = path.points.first_mut() {
                 *p = g.anchor_position(anc);
             }
         }
     }
     if let (Some(nid), Some(anc)) = (path.end_node, path.end_anchor) {
-        if let Some(g) = nodes
-            .get(nid)
-            .and_then(|n| node_as_flowchart_geom(&n.kind))
-        {
+        if let Some(g) = nodes.get(nid).and_then(|n| node_as_flowchart_geom(&n.kind)) {
             if let Some(p) = path.points.last_mut() {
                 *p = g.anchor_position(anc);
             }
@@ -531,11 +511,7 @@ pub fn fix_flowchart_path_anchor_endpoints(
     }
 }
 
-fn route_orthogonal_mid(
-    start: (f64, f64),
-    end: (f64, f64),
-    obstacles: &[Rect],
-) -> Vec<(f64, f64)> {
+fn route_orthogonal_mid(start: (f64, f64), end: (f64, f64), obstacles: &[Rect]) -> Vec<(f64, f64)> {
     let mut candidates: Vec<Vec<(f64, f64)>> = vec![
         orthogonal_l_route(start, end, (end.0, start.1)),
         orthogonal_l_route(start, end, (start.0, end.1)),
@@ -550,7 +526,11 @@ fn route_orthogonal_mid(
     if !obstacles.is_empty() {
         let pad = FLOWCHART_OBSTACLE_HALO + 10.0;
         let top = obstacles.iter().map(|r| r.y0).fold(f64::INFINITY, f64::min) - pad;
-        let bot = obstacles.iter().map(|r| r.y1).fold(f64::NEG_INFINITY, f64::max) + pad;
+        let bot = obstacles
+            .iter()
+            .map(|r| r.y1)
+            .fold(f64::NEG_INFINITY, f64::max)
+            + pad;
         let around_top = vec![start, (start.0, top), (end.0, top), end];
         let around_bot = vec![start, (start.0, bot), (end.0, bot), end];
         candidates.push(around_top);
@@ -560,11 +540,14 @@ fn route_orthogonal_mid(
     // Add candidates for crossing in the gaps between nodes (with margin from nearest)
     // This prevents going far away high/low when there is space between stacked nodes.
     if obstacles.len() >= 2 {
-        let mut rects: Vec<Rect> = obstacles.iter().map(|&r| r.inflate(-FLOWCHART_OBSTACLE_HALO, -FLOWCHART_OBSTACLE_HALO)).collect();
+        let mut rects: Vec<Rect> = obstacles
+            .iter()
+            .map(|&r| r.inflate(-FLOWCHART_OBSTACLE_HALO, -FLOWCHART_OBSTACLE_HALO))
+            .collect();
         rects.sort_by(|a, b| a.y0.partial_cmp(&b.y0).unwrap_or(std::cmp::Ordering::Equal));
-        for i in 0..rects.len()-1 {
+        for i in 0..rects.len() - 1 {
             let higher = &rects[i]; // smaller y0
-            let lower = &rects[i+1];
+            let lower = &rects[i + 1];
             let gap_top = higher.y1 + FLOWCHART_OBSTACLE_HALO;
             let gap_bot = lower.y0 - FLOWCHART_OBSTACLE_HALO;
             if gap_bot > gap_top {
@@ -581,7 +564,11 @@ fn route_orthogonal_mid(
             continue;
         }
         let len = route_polyline_length(base);
-        let penalty = if route_has_inner_crossing(base, obstacles) { 10000.0 } else { 0.0 };
+        let penalty = if route_has_inner_crossing(base, obstacles) {
+            10000.0
+        } else {
+            0.0
+        };
         let score = len + penalty;
         if score < best_score {
             best_score = score;
@@ -595,11 +582,7 @@ fn route_orthogonal_mid(
     orthogonalize_polyline(pushed)
 }
 
-fn orthogonal_l_route(
-    start: (f64, f64),
-    end: (f64, f64),
-    corner: (f64, f64),
-) -> Vec<(f64, f64)> {
+fn orthogonal_l_route(start: (f64, f64), end: (f64, f64), corner: (f64, f64)) -> Vec<(f64, f64)> {
     let mut pts = vec![start];
     for p in [corner, end] {
         if pts
@@ -617,7 +600,11 @@ fn orthogonal_elbow_route(start: (f64, f64), end: (f64, f64)) -> Vec<(f64, f64)>
     let mut pts = vec![start];
     let mid_x = (start.0 + end.0) * 0.5;
     for p in [(mid_x, start.1), (mid_x, end.1), end] {
-        if pts.last().copied().map_or(true, |last| (last.0 - p.0).hypot(last.1 - p.1) > 1e-6) {
+        if pts
+            .last()
+            .copied()
+            .map_or(true, |last| (last.0 - p.0).hypot(last.1 - p.1) > 1e-6)
+        {
             pts.push(p);
         }
     }
@@ -635,9 +622,15 @@ fn route_has_inner_crossing(pts: &[(f64, f64)], obstacles: &[Rect]) -> bool {
         return false;
     }
     let min_y = obstacles.iter().map(|r| r.y0).fold(f64::INFINITY, f64::min);
-    let max_y = obstacles.iter().map(|r| r.y1).fold(f64::NEG_INFINITY, f64::max);
+    let max_y = obstacles
+        .iter()
+        .map(|r| r.y1)
+        .fold(f64::NEG_INFINITY, f64::max);
     let min_x = obstacles.iter().map(|r| r.x0).fold(f64::INFINITY, f64::min);
-    let max_x = obstacles.iter().map(|r| r.x1).fold(f64::NEG_INFINITY, f64::max);
+    let max_x = obstacles
+        .iter()
+        .map(|r| r.x1)
+        .fold(f64::NEG_INFINITY, f64::max);
     for w in pts.windows(2) {
         let a = w[0];
         let b = w[1];
@@ -920,7 +913,11 @@ fn segment_intersects_rect_interior(a: (f64, f64), b: (f64, f64), r: Rect) -> bo
 fn dedupe_points(pts: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     let mut out = Vec::new();
     for p in pts {
-        if out.last().copied().map_or(true, |q: (f64, f64)| (q.0 - p.0).hypot(q.1 - p.1) > 0.5) {
+        if out
+            .last()
+            .copied()
+            .map_or(true, |q: (f64, f64)| (q.0 - p.0).hypot(q.1 - p.1) > 0.5)
+        {
             out.push(p);
         }
     }
@@ -943,11 +940,9 @@ pub fn flatten_flowchart_stroke(points: &[(f64, f64)], corner_r: f64) -> Vec<(f6
     let bez = rounded_orthogonal_bez(points, corner_r);
     let mut out = Vec::new();
     let els: Vec<PathEl> = bez.elements().iter().copied().collect();
-    kurbo::flatten(els, 0.35, |el| {
-        match el {
-            PathEl::MoveTo(p) | PathEl::LineTo(p) => out.push((p.x, p.y)),
-            _ => {}
-        }
+    kurbo::flatten(els, 0.35, |el| match el {
+        PathEl::MoveTo(p) | PathEl::LineTo(p) => out.push((p.x, p.y)),
+        _ => {}
     });
     out
 }
@@ -960,9 +955,7 @@ pub fn flowchart_stroke_hit_with_corner(
     stroke_width: f64,
     corner_r: f64,
 ) -> bool {
-    let tol = stroke_slop
-        .max(stroke_width * 0.5 + 4.0)
-        .max(8.0);
+    let tol = stroke_slop.max(stroke_width * 0.5 + 4.0).max(8.0);
     let flat = flatten_flowchart_stroke(points, corner_r.max(2.0));
     for w in flat.windows(2) {
         if point_near_segment(doc_x, doc_y, w[0].0, w[0].1, w[1].0, w[1].1, tol) {
@@ -1024,10 +1017,7 @@ pub fn rebalance_flowchart_edge_anchors_with_pending(
         };
         if let (Some(nid), Some(anc)) = (path.start_node, path.start_anchor) {
             if let FlowchartAnchor::Edge { side, .. } = anc {
-                if let Some(geom) = store
-                    .get(nid)
-                    .and_then(|n| node_as_flowchart_geom(&n.kind))
-                {
+                if let Some(geom) = store.get(nid).and_then(|n| node_as_flowchart_geom(&n.kind)) {
                     let doc = path.points.first().copied().unwrap_or((0.0, 0.0));
                     by_edge.entry((nid, side)).or_default().push(EdgeSortEntry {
                         path_id: pid,
@@ -1039,10 +1029,7 @@ pub fn rebalance_flowchart_edge_anchors_with_pending(
         }
         if let (Some(nid), Some(anc)) = (path.end_node, path.end_anchor) {
             if let FlowchartAnchor::Edge { side, .. } = anc {
-                if let Some(geom) = store
-                    .get(nid)
-                    .and_then(|n| node_as_flowchart_geom(&n.kind))
-                {
+                if let Some(geom) = store.get(nid).and_then(|n| node_as_flowchart_geom(&n.kind)) {
                     let doc = path.points.last().copied().unwrap_or((0.0, 0.0));
                     by_edge.entry((nid, side)).or_default().push(EdgeSortEntry {
                         path_id: pid,
@@ -1060,11 +1047,14 @@ pub fn rebalance_flowchart_edge_anchors_with_pending(
                 .get(*nid)
                 .and_then(|n| node_as_flowchart_geom(&n.kind))
             {
-                by_edge.entry((*nid, *side)).or_default().push(EdgeSortEntry {
-                    path_id: PREVIEW_PATH_SENTINEL,
-                    is_start: false,
-                    sort_key: edge_sort_key(&geom, *side, *doc),
-                });
+                by_edge
+                    .entry((*nid, *side))
+                    .or_default()
+                    .push(EdgeSortEntry {
+                        path_id: PREVIEW_PATH_SENTINEL,
+                        is_start: false,
+                        sort_key: edge_sort_key(&geom, *side, *doc),
+                    });
             }
         }
     }
@@ -1117,7 +1107,9 @@ pub fn rebalance_flowchart_edge_anchors_with_pending(
                     side: old_side,
                     ..
                 }),
-                FlowchartAnchor::Edge { side, slot, slots, .. },
+                FlowchartAnchor::Edge {
+                    side, slot, slots, ..
+                },
             ) if old_side == *side => FlowchartAnchor::edge_at_doc_t(*side, *slot, *slots, t),
             _ => anc,
         };
@@ -1222,18 +1214,9 @@ pub fn sync_flowchart_path_endpoints(
     };
 
     let (sn, en) = match (start_anc, end_anc) {
-        (Some(sa), Some(ea)) => (
-            anchor_port_normal(sa, s, e),
-            anchor_port_normal(ea, e, s),
-        ),
-        (Some(sa), None) => (
-            anchor_port_normal(sa, s, e),
-            estimated_port_normals(s, e).1,
-        ),
-        (None, Some(ea)) => (
-            estimated_port_normals(s, e).0,
-            anchor_port_normal(ea, e, s),
-        ),
+        (Some(sa), Some(ea)) => (anchor_port_normal(sa, s, e), anchor_port_normal(ea, e, s)),
+        (Some(sa), None) => (anchor_port_normal(sa, s, e), estimated_port_normals(s, e).1),
+        (None, Some(ea)) => (estimated_port_normals(s, e).0, anchor_port_normal(ea, e, s)),
         (None, None) => estimated_port_normals(s, e),
     };
     path.points = route_orthogonal_with_normals(s, e, sn, en, obstacles);
@@ -1252,7 +1235,10 @@ pub fn flowchart_path_jump_points(
         for seg_b in polyline_segments(other) {
             for seg_a in &segs_a {
                 if let Some(p) = segment_intersection(*seg_a, seg_b) {
-                    if !jumps.iter().any(|q: &(f64, f64)| (q.0 - p.0).hypot(q.1 - p.1) < 3.0) {
+                    if !jumps
+                        .iter()
+                        .any(|q: &(f64, f64)| (q.0 - p.0).hypot(q.1 - p.1) < 3.0)
+                    {
                         jumps.push(p);
                     }
                 }
@@ -1310,10 +1296,7 @@ pub fn rounded_orthogonal_bez(points: &[(f64, f64)], radius: f64) -> BezPath {
         let before = Point::new(cur.0 - u1.x * trim, cur.1 - u1.y * trim);
         let after = Point::new(cur.0 + u2.x * trim, cur.1 + u2.y * trim);
         bez.push(PathEl::LineTo(before));
-        bez.push(PathEl::QuadTo(
-            Point::new(cur.0, cur.1),
-            after,
-        ));
+        bez.push(PathEl::QuadTo(Point::new(cur.0, cur.1), after));
     }
     let last = points[points.len() - 1];
     bez.push(PathEl::LineTo(Point::new(last.0, last.1)));
@@ -1358,19 +1341,14 @@ mod routing_tests {
             h: 60.0,
             corner_rx: 12.0,
         };
-        let start = top.anchor_position(FlowchartAnchor::edge(
-            FlowchartEdgeSide::Left,
-            0,
-            1,
-        ));
-        let end = bottom.anchor_position(FlowchartAnchor::edge(
-            FlowchartEdgeSide::Right,
-            0,
-            1,
-        ));
+        let start = top.anchor_position(FlowchartAnchor::edge(FlowchartEdgeSide::Left, 0, 1));
+        let end = bottom.anchor_position(FlowchartAnchor::edge(FlowchartEdgeSide::Right, 0, 1));
         let obstacles = [
-            top.doc_rect().inflate(FLOWCHART_OBSTACLE_HALO, FLOWCHART_OBSTACLE_HALO),
-            bottom.doc_rect().inflate(FLOWCHART_OBSTACLE_HALO, FLOWCHART_OBSTACLE_HALO),
+            top.doc_rect()
+                .inflate(FLOWCHART_OBSTACLE_HALO, FLOWCHART_OBSTACLE_HALO),
+            bottom
+                .doc_rect()
+                .inflate(FLOWCHART_OBSTACLE_HALO, FLOWCHART_OBSTACLE_HALO),
         ];
         let sn = anchor_port_normal(
             FlowchartAnchor::edge(FlowchartEdgeSide::Left, 0, 1),
@@ -1386,8 +1364,13 @@ mod routing_tests {
         assert!(pts.len() >= 3);
         // Only check non-stub segments (stubs legitimately start/end on/near node boundary)
         let internal_windows: Vec<_> = if pts.len() > 2 {
-            pts.windows(2).skip(1).take(pts.len().saturating_sub(3)).collect()
-        } else { vec![] };
+            pts.windows(2)
+                .skip(1)
+                .take(pts.len().saturating_sub(3))
+                .collect()
+        } else {
+            vec![]
+        };
         for w in internal_windows {
             for &r in &obstacles {
                 assert!(
@@ -1409,16 +1392,8 @@ mod routing_tests {
             h: 80.0,
             corner_rx: 10.0,
         };
-        let start = geom.anchor_position(FlowchartAnchor::edge(
-            FlowchartEdgeSide::Left,
-            0,
-            1,
-        ));
-        let end = geom.anchor_position(FlowchartAnchor::edge(
-            FlowchartEdgeSide::Top,
-            0,
-            1,
-        ));
+        let start = geom.anchor_position(FlowchartAnchor::edge(FlowchartEdgeSide::Left, 0, 1));
+        let end = geom.anchor_position(FlowchartAnchor::edge(FlowchartEdgeSide::Top, 0, 1));
         let obstacle = [geom
             .doc_rect()
             .inflate(FLOWCHART_OBSTACLE_HALO, FLOWCHART_OBSTACLE_HALO)];
@@ -1435,8 +1410,13 @@ mod routing_tests {
         let pts = route_orthogonal_with_normals(start, end, sn, en, &obstacle);
         // Only check non-stub internal segments for self-connect on same node
         let internal: Vec<_> = if pts.len() > 2 {
-            pts.windows(2).skip(1).take(pts.len().saturating_sub(3)).collect()
-        } else { vec![] };
+            pts.windows(2)
+                .skip(1)
+                .take(pts.len().saturating_sub(3))
+                .collect()
+        } else {
+            vec![]
+        };
         for w in internal {
             assert!(!segment_intersects_rect_interior(w[0], w[1], obstacle[0]));
         }

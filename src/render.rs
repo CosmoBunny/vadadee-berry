@@ -1,7 +1,5 @@
+use egui::epaint::{CubicBezierShape, EllipseShape, PathShape, PathStroke, QuadraticBezierShape};
 use egui::{Align2, Color32, FontFamily, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, Vec2};
-use egui::epaint::{
-    CubicBezierShape, EllipseShape, PathShape, PathStroke, QuadraticBezierShape,
-};
 use kurbo::{BezPath, Ellipse, PathEl, Rect as KurboRect, Shape as KurboShape};
 use lyon::math::Point;
 use lyon::path::Path;
@@ -13,13 +11,13 @@ use lyon::tessellation::{
 use crate::canvas::Viewport;
 use std::collections::HashSet;
 
-use crate::document::{
-    ArcJoin, FaceRenderable, Fill, LineCap, LineJoin, MarkerKind, Node, NodeId, NodeKind, NodeStore,
-    Paint, PathMagic, PathMarker, StrokePaintOrder, TextStyle, regular_polygon_vertices,
-};
 use crate::document::Stroke as DocStroke;
-use crate::theme::colors;
+use crate::document::{
+    ArcJoin, FaceRenderable, Fill, LineCap, LineJoin, MarkerKind, Node, NodeId, NodeKind,
+    NodeStore, Paint, PathMagic, PathMarker, StrokePaintOrder, TextStyle, regular_polygon_vertices,
+};
 use crate::gradient_ui::GradientLineHandle;
+use crate::theme::colors;
 use crate::tools::ResizeHandle;
 
 fn path_flatten_tolerance(viewport: &Viewport) -> f64 {
@@ -109,7 +107,12 @@ pub fn draw_page_shadow(painter: &Painter, page: Rect, page_color: Color32) {
     let shadow = page.expand(6.0);
     painter.rect_filled(shadow, 4.0, Color32::from_black_alpha(80));
     painter.rect_filled(page, 0.0, page_color);
-    painter.rect_stroke(page, 0.0, Stroke::new(1.0, Color32::from_gray(120)), egui::StrokeKind::Inside);
+    painter.rect_stroke(
+        page,
+        0.0,
+        Stroke::new(1.0, Color32::from_gray(120)),
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn paint_to_color(p: Paint, opacity: f32) -> Color32 {
@@ -142,14 +145,7 @@ pub fn sample_paint_fill(fill: &Fill, opacity: f32, nx: f32, ny: f32) -> Color32
     sample_fill_at(fill, opacity, nx, ny)
 }
 
-fn draw_gradient_line(
-    painter: &Painter,
-    p0: Pos2,
-    p1: Pos2,
-    c0: Color32,
-    c1: Color32,
-    width: f32,
-) {
+fn draw_gradient_line(painter: &Painter, p0: Pos2, p1: Pos2, c0: Color32, c1: Color32, width: f32) {
     const SEGS: usize = 12;
     for i in 0..SEGS {
         let t0 = i as f32 / SEGS as f32;
@@ -208,8 +204,7 @@ fn draw_stroke_closed_ring(
         let (nx1, ny1) = doc_norm(doc_pts[j].0, doc_pts[j].1, x0, y0, x1, y1);
         let c0 = sample_fill_at(style, opacity, nx0, ny0);
         let c1 = sample_fill_at(style, opacity, nx1, ny1);
-        let (seg_a, seg_b) =
-            segment_endpoints_for_join(screen_pts, i, true, join, half);
+        let (seg_a, seg_b) = segment_endpoints_for_join(screen_pts, i, true, join, half);
         if matches!(style, Fill::Solid(_)) {
             painter.line_segment([seg_a, seg_b], Stroke::new(width, c0));
         } else {
@@ -297,8 +292,7 @@ fn draw_stroke_open_polyline(
         let (nx1, ny1) = doc_norm(doc_pts[i + 1].0, doc_pts[i + 1].1, x0, y0, x1, y1);
         let c0 = sample_fill_at(style, opacity, nx0, ny0);
         let c1 = sample_fill_at(style, opacity, nx1, ny1);
-        let (seg_a, seg_b) =
-            segment_endpoints_for_join(screen_pts, i, false, join, half);
+        let (seg_a, seg_b) = segment_endpoints_for_join(screen_pts, i, false, join, half);
         if matches!(style, Fill::Solid(_)) {
             painter.line_segment([seg_a, seg_b], Stroke::new(width, c0));
         } else {
@@ -499,8 +493,7 @@ fn draw_solid_bez_stroke(
     if width <= 0.0 || color.a() == 0 {
         return;
     }
-    if let Some(mesh) =
-        stroke_bez_lyon_mesh(bez, viewport, origin, width, color, join, cap, closed)
+    if let Some(mesh) = stroke_bez_lyon_mesh(bez, viewport, origin, width, color, join, cap, closed)
     {
         painter.add(Shape::mesh(mesh));
         return;
@@ -565,7 +558,12 @@ fn stroke_bez_lyon_mesh(
 }
 
 /// Paint a lyon stroke mesh plus a soft AA fringe via a wider, translucent second pass.
-pub fn paint_stroke_mesh_with_aa(painter: &Painter, mesh: Mesh, fringe_color: Color32, fringe_width_boost: f32) {
+pub fn paint_stroke_mesh_with_aa(
+    painter: &Painter,
+    mesh: Mesh,
+    fringe_color: Color32,
+    fringe_width_boost: f32,
+) {
     // Soft underlay first (slightly expanded visually via thicker alternative path is not available
     // on mesh; approximate with a second mesh draw at reduced alpha when caller passes fringe).
     if fringe_color.a() > 0 && fringe_width_boost > 0.0 {
@@ -707,11 +705,7 @@ fn bez_to_lyon_path(bez: &BezPath, viewport: &Viewport, origin: Pos2) -> Path {
                 if !open {
                     begin_at(&mut builder, &mut open, p1.x, p1.y);
                 }
-                builder.cubic_bezier_to(
-                    map(p1.x, p1.y),
-                    map(p2.x, p2.y),
-                    map(p3.x, p3.y),
-                );
+                builder.cubic_bezier_to(map(p1.x, p1.y), map(p2.x, p2.y), map(p3.x, p3.y));
             }
             PathEl::ClosePath => {
                 if open {
@@ -753,11 +747,9 @@ fn ellipse_ring_points(
 fn flatten_path_points(path: &BezPath, tolerance: f64) -> Vec<(f64, f64)> {
     let mut pts = Vec::new();
     let els: Vec<PathEl> = path.elements().iter().copied().collect();
-    kurbo::flatten(els, tolerance, |el| {
-        match el {
-            PathEl::MoveTo(p) | PathEl::LineTo(p) => pts.push((p.x, p.y)),
-            _ => {}
-        }
+    kurbo::flatten(els, tolerance, |el| match el {
+        PathEl::MoveTo(p) | PathEl::LineTo(p) => pts.push((p.x, p.y)),
+        _ => {}
     });
     if pts.len() > 1 && pts.first() == pts.last() {
         pts.pop();
@@ -826,16 +818,19 @@ fn rounded_rect_gradient_mesh(
     clipped_gradient_mesh_from_bez(&path, viewport, origin, doc, fill, opacity)
 }
 
-fn rect_gradient_mesh(
-    screen: Rect,
-    doc: (f64, f64, f64, f64),
-    fill: &Fill,
-    opacity: f32,
-) -> Mesh {
+fn rect_gradient_mesh(screen: Rect, doc: (f64, f64, f64, f64), fill: &Fill, opacity: f32) -> Mesh {
     // For LinearGradient we use a band-based tessellation with iso-lines at the stop positions.
     // This guarantees that color bands are straight lines perpendicular to the gradient line
     // and the transitions are exactly at the stop positions along the line (linear spread w.r.t. the line).
-    if let Fill::LinearGradient { line_x0: lx0, line_y0: ly0, line_x1: lx1, line_y1: ly1, stops, .. } = fill {
+    if let Fill::LinearGradient {
+        line_x0: lx0,
+        line_y0: ly0,
+        line_x1: lx1,
+        line_y1: ly1,
+        stops,
+        ..
+    } = fill
+    {
         return linear_gradient_rect_bands(screen, *lx0, *ly0, *lx1, *ly1, stops, opacity);
     }
 
@@ -884,20 +879,30 @@ fn linear_gradient_rect_bands(
 
     if stops.len() < 2 {
         // degenerate, just a solid-ish quad using first color
-        let c = sample_fill_at(&crate::document::Fill::Solid(stops.first().map(|s| s.color).unwrap_or(crate::document::Paint::none())), opacity, 0.0, 0.0);
+        let c = sample_fill_at(
+            &crate::document::Fill::Solid(
+                stops
+                    .first()
+                    .map(|s| s.color)
+                    .unwrap_or(crate::document::Paint::none()),
+            ),
+            opacity,
+            0.0,
+            0.0,
+        );
         let base = mesh.vertices.len() as u32;
         mesh.colored_vertex(screen.left_top(), c);
         mesh.colored_vertex(screen.right_top(), c);
         mesh.colored_vertex(screen.right_bottom(), c);
         mesh.colored_vertex(screen.left_bottom(), c);
-        mesh.add_triangle(base, base+1, base+2);
-        mesh.add_triangle(base, base+2, base+3);
+        mesh.add_triangle(base, base + 1, base + 2);
+        mesh.add_triangle(base, base + 2, base + 3);
         return mesh;
     }
 
     // Collect critical levels: all stop positions + the projected t at the 4 corners (for caps)
     let mut levels: Vec<f32> = stops.iter().map(|s| s.pos).collect();
-    let corner_norms = [(0f32,0f32), (1f32,0f32), (1f32,1f32), (0f32,1f32)];
+    let corner_norms = [(0f32, 0f32), (1f32, 0f32), (1f32, 1f32), (0f32, 1f32)];
     for (nx, ny) in corner_norms {
         let tt = crate::document::project_onto_linear_line(nx, ny, lx0, ly0, lx1, ly1);
         levels.push(tt);
@@ -1016,7 +1021,12 @@ fn linear_gradient_rect_bands(
         let vy = ly1 - ly0;
         let l2 = vx * vx + vy * vy;
         if l2 < 1e-12 {
-            return vec![screen.left_top(), screen.right_top(), screen.right_bottom(), screen.left_bottom()];
+            return vec![
+                screen.left_top(),
+                screen.right_top(),
+                screen.right_bottom(),
+                screen.left_bottom(),
+            ];
         }
         // Walk the unit rect boundary in order and clip to the half-plane
         let uc = [(0f32, 0f32), (1., 0.), (1., 1.), (0., 1.)];
@@ -1184,11 +1194,11 @@ fn fill_param_at(fill: &Fill, nx: f32, ny: f32) -> f32 {
             line_x1,
             line_y1,
             ..
-        } => crate::document::project_onto_linear_line(nx, ny, *line_x0, *line_y0, *line_x1, *line_y1),
+        } => crate::document::project_onto_linear_line(
+            nx, ny, *line_x0, *line_y0, *line_x1, *line_y1,
+        ),
         Fill::RadialGradient {
-            center_x,
-            center_y,
-            ..
+            center_x, center_y, ..
         } => {
             let dx = nx - center_x;
             let dy = ny - center_y;
@@ -1483,11 +1493,7 @@ fn draw_shape_fill(
         Fill::Solid(p) => {
             let c = paint_to_color(*p, opacity);
             if corner_screen > 0.0 {
-                painter.rect_filled(
-                    screen_rect,
-                    corner_screen.min(screen_rect.width() / 2.0),
-                    c,
-                );
+                painter.rect_filled(screen_rect, corner_screen.min(screen_rect.width() / 2.0), c);
             } else {
                 painter.rect_filled(screen_rect, 0.0, c);
             }
@@ -1848,10 +1854,7 @@ pub fn draw_node(
                             && p.y <= clip.bottom() + r.height()
                     });
                     if screen_pts.len() >= 2 {
-                        painter.add(egui::Shape::line(
-                            screen_pts,
-                            egui::Stroke::new(sw, col),
-                        ));
+                        painter.add(egui::Shape::line(screen_pts, egui::Stroke::new(sw, col)));
                     }
                     // Region outline when no object stroke (subtle)
                     if stroke_w.is_none() {
@@ -1903,12 +1906,7 @@ pub fn draw_node(
                     _ => {
                         let bez = ellipse_bez_path(*cx, *cy, *rx, *ry);
                         let mesh = clipped_gradient_mesh_from_bez(
-                            &bez,
-                            viewport,
-                            origin,
-                            doc_bounds,
-                            fill,
-                            opacity,
+                            &bez, viewport, origin, doc_bounds, fill, opacity,
                         );
                         painter.add(Shape::mesh(mesh));
                     }
@@ -1965,12 +1963,7 @@ pub fn draw_node(
                     _ => {
                         let bez = polygon_bez_path(&verts);
                         let mesh = clipped_gradient_mesh_from_bez(
-                            &bez,
-                            viewport,
-                            origin,
-                            doc_bounds,
-                            fill,
-                            opacity,
+                            &bez, viewport, origin, doc_bounds, fill, opacity,
                         );
                         painter.add(Shape::mesh(mesh));
                     }
@@ -2006,8 +1999,7 @@ pub fn draw_node(
                         closed,
                     );
                 } else {
-                    let (screen_pts, doc_pts) =
-                        polyline_from_bez(&bez, viewport, origin, closed);
+                    let (screen_pts, doc_pts) = polyline_from_bez(&bez, viewport, origin, closed);
                     if closed && screen_pts.len() >= 3 {
                         draw_stroke_closed_ring(
                             painter,
@@ -2044,12 +2036,7 @@ pub fn draw_node(
                 let bounds = node.bounds();
                 let doc_bounds = (bounds.x0, bounds.y0, bounds.x1, bounds.y1);
                 let mesh = clipped_gradient_mesh_from_bez(
-                    &bez,
-                    viewport,
-                    origin,
-                    doc_bounds,
-                    fill,
-                    opacity,
+                    &bez, viewport, origin, doc_bounds, fill, opacity,
                 );
                 if !mesh.vertices.is_empty() {
                     painter.add(Shape::mesh(mesh));
@@ -2058,14 +2045,7 @@ pub fn draw_node(
 
             // Skip fill contribution from here (we emitted accurate mesh above for solid
             // and the gradient branch for others). Stroke contribution is no-op here.
-            let shapes = bez_to_egui_shapes(
-                &bez,
-                viewport,
-                origin,
-                None,
-                None,
-                closed,
-            );
+            let shapes = bez_to_egui_shapes(&bez, viewport, origin, None, None, closed);
             for s in shapes {
                 painter.add(s);
             }
@@ -2078,7 +2058,14 @@ pub fn draw_node(
             // Draw start/mid/end point icons (arrows, rings etc) for Path (pen) geometry
             draw_path_markers(painter, viewport, origin, &bez, closed, &node.style.stroke);
         }
-        NodeKind::FlowchartNode { cx, cy, w, h, corner_rx, .. } => {
+        NodeKind::FlowchartNode {
+            cx,
+            cy,
+            w,
+            h,
+            corner_rx,
+            ..
+        } => {
             let x = cx - w / 2.0;
             let y = cy - h / 2.0;
             let rx = *corner_rx;
@@ -2104,9 +2091,19 @@ pub fn draw_node(
             if let Some(sw) = stroke_w {
                 let egui_c = egui::Color32::from(c_stroke);
                 if corner_screen > 0.1 {
-                    painter.rect_stroke(r, corner_screen, egui::Stroke::new(sw, egui_c), egui::StrokeKind::Middle);
+                    painter.rect_stroke(
+                        r,
+                        corner_screen,
+                        egui::Stroke::new(sw, egui_c),
+                        egui::StrokeKind::Middle,
+                    );
                 } else {
-                    painter.rect_stroke(r, 0.0, egui::Stroke::new(sw, egui_c), egui::StrokeKind::Middle);
+                    painter.rect_stroke(
+                        r,
+                        0.0,
+                        egui::Stroke::new(sw, egui_c),
+                        egui::StrokeKind::Middle,
+                    );
                 }
             }
             if let crate::document::NodeKind::FlowchartNode {
@@ -2121,11 +2118,8 @@ pub fn draw_node(
             {
                 if !label.is_empty() {
                     let size = (*label_font_size as f32 * viewport.zoom).max(6.0);
-                    let font_id = crate::fonts::FontRegistry::font_id(
-                        painter.ctx(),
-                        label_font_family,
-                        size,
-                    );
+                    let font_id =
+                        crate::fonts::FontRegistry::font_id(painter.ctx(), label_font_family, size);
                     let align2 = match label_align {
                         crate::document::TextAlign::Left => egui::Align2::LEFT_CENTER,
                         crate::document::TextAlign::Center => egui::Align2::CENTER_CENTER,
@@ -2141,7 +2135,9 @@ pub fn draw_node(
                         job.append(label, 0.0, fmt);
                         let galley = painter.layout_job(job);
                         let galley_rect = egui::Rect::from_center_size(r.center(), galley.size());
-                        let pos = align2.align_size_within_rect(galley.size(), galley_rect).min;
+                        let pos = align2
+                            .align_size_within_rect(galley.size(), galley_rect)
+                            .min;
                         painter.galley(pos, galley, text_color);
                     } else {
                         painter.text(r.center(), align2, label, font_id, text_color);
@@ -2150,11 +2146,24 @@ pub fn draw_node(
             }
         }
         NodeKind::FlowchartPath { path: fp } => {
-            if fp.points.len() < 2 { return; }
-            let bez = crate::document::flowchart::rounded_orthogonal_bez(&fp.points, fp.corner_radius);
+            if fp.points.len() < 2 {
+                return;
+            }
+            let bez =
+                crate::document::flowchart::rounded_orthogonal_bez(&fp.points, fp.corner_radius);
             let c = sample_fill_at(stroke_style, opacity, 0.5, 0.5);
             if let Some(sw) = stroke_w {
-                draw_solid_bez_stroke(painter, &bez, viewport, origin, sw, c, stroke_join, stroke_cap, false);
+                draw_solid_bez_stroke(
+                    painter,
+                    &bez,
+                    viewport,
+                    origin,
+                    sw,
+                    c,
+                    stroke_join,
+                    stroke_cap,
+                    false,
+                );
             }
             let ms = fp.endpoint_marker_size as f32;
             if ms > 0.0 {
@@ -2167,7 +2176,12 @@ pub fn draw_node(
                 // from (start): hollow square (stroke only) to indicate origin
                 {
                     let r = egui::Rect::from_center_size(start_screen, size);
-                    painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5, c), egui::StrokeKind::Middle);
+                    painter.rect_stroke(
+                        r,
+                        0.0,
+                        egui::Stroke::new(1.5, c),
+                        egui::StrokeKind::Middle,
+                    );
                 }
                 // to (end): solid filled square to indicate target
                 {
@@ -2194,7 +2208,13 @@ pub fn draw_node(
                 node.get_rotation(),
             );
         }
-        NodeKind::Image { x, y, width, height, .. } => {
+        NodeKind::Image {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } => {
             if let Some(tex) = image_textures.get(&node.id) {
                 let tl = viewport.doc_to_screen((*x, *y), origin);
                 let br = viewport.doc_to_screen((*x + *width, *y + *height), origin);
@@ -2213,7 +2233,10 @@ pub fn draw_node(
             let bez = node.bez_path();
             let is_closed_fill = matches!(
                 &node.kind,
-                NodeKind::Arc { join: ArcJoin::Chord | ArcJoin::ToOrigin, .. }
+                NodeKind::Arc {
+                    join: ArcJoin::Chord | ArcJoin::ToOrigin,
+                    ..
+                }
             );
             let has_fill = fill.is_visible();
 
@@ -2266,7 +2289,8 @@ pub fn draw_node(
                 } else {
                     let bounds = node.bounds();
                     let docb = (bounds.x0, bounds.y0, bounds.x1, bounds.y1);
-                    let mesh = clipped_gradient_mesh_from_bez(&bez, viewport, origin, docb, fill, opacity);
+                    let mesh =
+                        clipped_gradient_mesh_from_bez(&bez, viewport, origin, docb, fill, opacity);
                     if !mesh.vertices.is_empty() {
                         painter.add(Shape::mesh(mesh));
                     }
@@ -2290,7 +2314,10 @@ pub fn draw_node(
                     let dx = pos[0] - prev_pos[0];
                     let dy = pos[1] - prev_pos[1];
                     let dist = dx.hypot(dy);
-                    let step = (1.0 / (viewport.zoom as f64)).max(0.5).min(width as f64 / 8.0).max(0.1);
+                    let step = (1.0 / (viewport.zoom as f64))
+                        .max(0.5)
+                        .min(width as f64 / 8.0)
+                        .max(0.1);
                     if dist > step {
                         let steps = (dist / step).ceil() as usize;
                         for s in 1..steps {
@@ -2406,20 +2433,12 @@ pub fn selection_union_screen_rect(
         let mut b = node.bounds_with_store(nodes);
         if let Some(e) = tiling_effects.values().find(|e| e.source_id == *id) {
             let whole = crate::document::compute_tiling_whole_bounds(node, e);
-            b = if e.hide_source {
-                whole
-            } else {
-                b.union(whole)
-            };
+            b = if e.hide_source { whole } else { b.union(whole) };
         }
         if let Some(e) = circular_effects.values().find(|e| e.source_id == *id) {
             let whole = crate::document::compute_circular_whole_bounds(node, e);
             // Don't keep the hidden source's old bbox edge glued to the selection box.
-            b = if e.hide_source {
-                whole
-            } else {
-                b.union(whole)
-            };
+            b = if e.hide_source { whole } else { b.union(whole) };
         }
         union = Some(match union {
             None => b,
@@ -2444,9 +2463,18 @@ pub fn draw_group_selection_bounds(painter: &Painter, screen_rect: Rect) {
 
 pub fn draw_transform_handles(painter: &Painter, screen_rect: Rect, rotation_mode: bool) {
     let r = screen_rect;
-    let stroke_color = if rotation_mode { colors::POWERLINE_C } else { colors::SELECTION };
-    painter.rect_stroke(r, 0.0, Stroke::new(1.0, stroke_color), egui::StrokeKind::Outside);
-    
+    let stroke_color = if rotation_mode {
+        colors::POWERLINE_C
+    } else {
+        colors::SELECTION
+    };
+    painter.rect_stroke(
+        r,
+        0.0,
+        Stroke::new(1.0, stroke_color),
+        egui::StrokeKind::Outside,
+    );
+
     let positions = handle_positions(r);
     for (i, c) in positions.into_iter().enumerate() {
         let is_corner = i == 0 || i == 2 || i == 4 || i == 6; // Nw, Ne, Se, Sw
@@ -2478,21 +2506,29 @@ fn handle_positions(r: Rect) -> [Pos2; 8] {
     ]
 }
 
-pub fn hit_resize_handle(
-    screen_rect: Rect,
-    pointer: Pos2,
-    zoom: f32,
-) -> Option<ResizeHandle> {
+pub fn hit_resize_handle(screen_rect: Rect, pointer: Pos2, zoom: f32) -> Option<ResizeHandle> {
     let slop = 10.0 / zoom.max(0.1);
     let handles = [
         (ResizeHandle::Nw, screen_rect.left_top()),
-        (ResizeHandle::N, Pos2::new(screen_rect.center().x, screen_rect.top())),
+        (
+            ResizeHandle::N,
+            Pos2::new(screen_rect.center().x, screen_rect.top()),
+        ),
         (ResizeHandle::Ne, screen_rect.right_top()),
-        (ResizeHandle::E, Pos2::new(screen_rect.right(), screen_rect.center().y)),
+        (
+            ResizeHandle::E,
+            Pos2::new(screen_rect.right(), screen_rect.center().y),
+        ),
         (ResizeHandle::Se, screen_rect.right_bottom()),
-        (ResizeHandle::S, Pos2::new(screen_rect.center().x, screen_rect.bottom())),
+        (
+            ResizeHandle::S,
+            Pos2::new(screen_rect.center().x, screen_rect.bottom()),
+        ),
         (ResizeHandle::Sw, screen_rect.left_bottom()),
-        (ResizeHandle::W, Pos2::new(screen_rect.left(), screen_rect.center().y)),
+        (
+            ResizeHandle::W,
+            Pos2::new(screen_rect.left(), screen_rect.center().y),
+        ),
     ];
     for (h, pos) in handles {
         if pointer.distance(pos) <= slop {
@@ -2603,10 +2639,7 @@ pub fn draw_nodes_ex(
         }
 
         if let NodeKind::Group { children } = &node.kind {
-            let (gx, gy) = (
-                node.transform.translation[0],
-                node.transform.translation[1],
-            );
+            let (gx, gy) = (node.transform.translation[0], node.transform.translation[1]);
             let rot = node.transform.rotation_rad;
             let cos = rot.cos();
             let sin = rot.sin();
@@ -2676,7 +2709,13 @@ fn blend_content_key(zoom: f32, blend_id: NodeId, under: &[(NodeId, &Node)]) -> 
             _ => 1u8.hash(&mut h),
         }
         ((n.style.stroke.width * 10.0) as i32).hash(&mut h);
-        if let NodeKind::Image { bytes, width, height, .. } = &n.kind {
+        if let NodeKind::Image {
+            bytes,
+            width,
+            height,
+            ..
+        } = &n.kind
+        {
             bytes.len().hash(&mut h);
             ((*width * 10.0) as i64).hash(&mut h);
             ((*height * 10.0) as i64).hash(&mut h);
@@ -2787,15 +2826,15 @@ fn draw_nodes_with_blend(
         });
 
         // Prefer cache; if miss, try stale tex while pointer is busy (smooth pan/zoom).
-        let interact = painter.ctx().input(|inp| {
-            inp.pointer.any_down() || inp.smooth_scroll_delta != egui::Vec2::ZERO
-        });
+        let interact = painter
+            .ctx()
+            .input(|inp| inp.pointer.any_down() || inp.smooth_scroll_delta != egui::Vec2::ZERO);
         let tex = if let Some(t) = cached_tex {
             t
         } else {
-            let stale = painter.ctx().data(|d| {
-                d.get_temp::<BlendRoiCache>(cache_id).map(|e| e.tex.clone())
-            });
+            let stale = painter
+                .ctx()
+                .data(|d| d.get_temp::<BlendRoiCache>(cache_id).map(|e| e.tex.clone()));
             if interact {
                 if let Some(t) = stale {
                     painter.ctx().request_repaint();
@@ -2891,16 +2930,7 @@ fn rebuild_blend_roi_tex(
             continue;
         }
         stamp_node_into_blend_roi(
-            &mut layer,
-            rw,
-            rh,
-            roi,
-            sx,
-            sy,
-            under_n,
-            nodes,
-            viewport,
-            origin,
+            &mut layer, rw, rh, roi, sx, sy, under_n, nodes, viewport, origin,
         );
     }
 
@@ -3017,12 +3047,7 @@ fn rasterize_node_region(
                 crop
             } else {
                 // Nearest: sharp (and faster) — Triangle made blended images look soft/muddy.
-                image::imageops::resize(
-                    &crop,
-                    out_w,
-                    out_h,
-                    image::imageops::FilterType::Nearest,
-                )
+                image::imageops::resize(&crop, out_w, out_h, image::imageops::FilterType::Nearest)
             };
             Some(resized.into_raw())
         }
@@ -3045,10 +3070,7 @@ fn rasterize_node_region(
             }
             // Stroke only when the region includes the shape edge (near u/v border).
             let near_edge = u0 < 0.02 || v0 < 0.02 || u1 > 0.98 || v1 > 0.98;
-            if near_edge
-                && node.style.stroke.width > 0.01
-                && node.style.stroke.style.is_visible()
-            {
+            if near_edge && node.style.stroke.width > 0.01 && node.style.stroke.style.is_visible() {
                 if let Fill::Solid(sp) = &node.style.stroke.style {
                     let sa = (sp.rgba[3].clamp(0.0, 1.0) * 255.0).round() as u8;
                     let sr = (sp.rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -3164,8 +3186,7 @@ fn resize_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
         return src.to_vec();
     }
     if let Some(img) = image::RgbaImage::from_raw(sw, sh, src.to_vec()) {
-        let resized =
-            image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Triangle);
+        let resized = image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Triangle);
         return resized.into_raw();
     }
     // Nearest-neighbor fallback.
@@ -3196,7 +3217,9 @@ pub fn draw_tiling_effects(
 ) {
     use crate::document::{FaceRenderable, node_at_placement};
     for effect in effects.values() {
-        let Some(source) = nodes.get(effect.source_id) else { continue; };
+        let Some(source) = nodes.get(effect.source_id) else {
+            continue;
+        };
         let src_face: &dyn FaceRenderable = source;
         let b = source.bounds();
         let w = b.x1 - b.x0;
@@ -3209,7 +3232,8 @@ pub fn draw_tiling_effects(
                 let top = first_top + iy as f64 * effect.gap_y;
                 let cx = left + w / 2.0;
                 let cy = top + h / 2.0;
-                let rot = (ix as f64 * effect.row_rotation + iy as f64 * effect.col_rotation).to_radians();
+                let rot = (ix as f64 * effect.row_rotation + iy as f64 * effect.col_rotation)
+                    .to_radians();
                 let sc = 1.0 + (ix as f64 * effect.row_scale + iy as f64 * effect.col_scale);
                 let pl = crate::document::PathPlacement {
                     x: cx,
@@ -3219,7 +3243,15 @@ pub fn draw_tiling_effects(
                     opacity_mul: 1.0,
                 };
                 let inst = node_at_placement(src_face, &pl);
-                draw_node(painter, &inst, viewport, origin, false, fonts, image_textures);
+                draw_node(
+                    painter,
+                    &inst,
+                    viewport,
+                    origin,
+                    false,
+                    fonts,
+                    image_textures,
+                );
             }
         }
         if selection.contains(&effect.source_id) {
@@ -3254,13 +3286,23 @@ pub fn draw_circular_effects(
 ) {
     use crate::document::{FaceRenderable, node_at_placement};
     for effect in effects.values() {
-        let Some(source) = nodes.get(effect.source_id) else { continue; };
+        let Some(source) = nodes.get(effect.source_id) else {
+            continue;
+        };
         let src_face: &dyn FaceRenderable = source;
         let n = effect.copies.max(3);
         for i in 0..n {
             let pl = effect.path_placement(i);
             let inst = node_at_placement(src_face, &pl);
-            draw_node(painter, &inst, viewport, origin, false, fonts, image_textures);
+            draw_node(
+                painter,
+                &inst,
+                viewport,
+                origin,
+                false,
+                fonts,
+                image_textures,
+            );
         }
         if selection.contains(&effect.source_id) {
             let p0 = viewport.doc_to_screen((effect.base_x, effect.base_y), origin);
@@ -3294,9 +3336,7 @@ pub fn draw_path_effects(
     image_textures: &std::collections::HashMap<NodeId, egui::TextureHandle>,
     selection: &[NodeId],
 ) {
-    use crate::document::{
-        effect_placements, node_at_placement, Fill, NodeKind, OnPathMode,
-    };
+    use crate::document::{Fill, NodeKind, OnPathMode, effect_placements, node_at_placement};
     let tol = 0.5 / viewport.zoom as f64;
     for effect in effects.values() {
         let Some(source) = nodes.get(effect.source_id) else {
@@ -3333,15 +3373,7 @@ pub fn draw_path_effects(
                 if let Some(path_node) = nodes.get(effect.path_id) {
                     let mut p = path_node.clone();
                     p.style.fill = Fill::None;
-                    draw_node(
-                        painter,
-                        &p,
-                        viewport,
-                        origin,
-                        false,
-                        fonts,
-                        image_textures,
-                    );
+                    draw_node(painter, &p, viewport, origin, false, fonts, image_textures);
                 }
             }
             continue;
@@ -3370,7 +3402,7 @@ fn marker_local_points(kind: MarkerKind, size: f32) -> Vec<(f32, f32)> {
     match kind {
         // Attach point at (0,0) in local space (on the line), tip forward +x
         MarkerKind::Triangle => vec![(h, 0.0), (0.0, -h * 0.65), (0.0, h * 0.65)],
-        MarkerKind::Square => vec![(-h, -h), (h, -h), (h, h), (-h, h)],  // centered, (0,0) center ok
+        MarkerKind::Square => vec![(-h, -h), (h, -h), (h, h), (-h, h)], // centered, (0,0) center ok
         MarkerKind::HollowSquare => vec![(-h, -h), (h, -h), (h, h), (-h, h)],
         MarkerKind::Ring => {
             let mut v = vec![];
@@ -3380,7 +3412,7 @@ fn marker_local_points(kind: MarkerKind, size: f32) -> Vec<(f32, f32)> {
             }
             v
         }
-        MarkerKind::Line => vec![(0.0, -h), (0.0, h)],  // centered vertical for perp
+        MarkerKind::Line => vec![(0.0, -h), (0.0, h)], // centered vertical for perp
         MarkerKind::Arrow => vec![
             (h, 0.0),
             (0.0, -0.48 * h),
@@ -3454,7 +3486,11 @@ fn draw_one_marker(
         }
         MarkerKind::Ring => {
             let r = size * 0.42;
-            painter.add(Shape::circle_stroke(sp, r, egui::Stroke::new(size * 0.11, col)));
+            painter.add(Shape::circle_stroke(
+                sp,
+                r,
+                egui::Stroke::new(size * 0.11, col),
+            ));
         }
         MarkerKind::Line => {
             let loc = marker_local_points(m.kind, size);
@@ -3470,13 +3506,19 @@ fn draw_one_marker(
     }
 }
 
-fn get_marker_placements(bez: &BezPath) -> (Option<(f64, f64, f64)>, Vec<(f64, f64, f64)>, Option<(f64, f64, f64)>) {
+fn get_marker_placements(
+    bez: &BezPath,
+) -> (
+    Option<(f64, f64, f64)>,
+    Vec<(f64, f64, f64)>,
+    Option<(f64, f64, f64)>,
+) {
     let els = bez.elements();
     if els.is_empty() {
         return (None, vec![], None);
     }
     let mut knots: Vec<(f64, f64)> = vec![];
-    let mut out_tans: Vec<f64> = vec![];  // forward (outgoing) tangent at this knot, from bezier control if curve
+    let mut out_tans: Vec<f64> = vec![]; // forward (outgoing) tangent at this knot, from bezier control if curve
     let mut prev_pt: Option<(f64, f64)> = None;
     for el in els {
         match el {
@@ -3541,17 +3583,17 @@ fn get_marker_placements(bez: &BezPath) -> (Option<(f64, f64, f64)>, Vec<(f64, f
     // Fill in unset (use incoming for last, chord fallback for mids)
     if n >= 2 {
         // for last knot use the direction from prev segment (incoming as forward at end)
-        if out_tans[n-1] == 0.0 {
-            let (px, py) = knots[n-2];
-            let (x, y) = knots[n-1];
-            out_tans[n-1] = (y - py).atan2(x - px);
+        if out_tans[n - 1] == 0.0 {
+            let (px, py) = knots[n - 2];
+            let (x, y) = knots[n - 1];
+            out_tans[n - 1] = (y - py).atan2(x - px);
         }
     }
-    for i in 1..n-1 {
+    for i in 1..n - 1 {
         if out_tans[i] == 0.0 {
             // fallback to chord
-            let (px, py) = knots[i-1];
-            let (nx, ny) = knots[i+1];
+            let (px, py) = knots[i - 1];
+            let (nx, ny) = knots[i + 1];
             out_tans[i] = (ny - py).atan2(nx - px);
         }
     }
@@ -3567,7 +3609,11 @@ fn get_marker_placements(bez: &BezPath) -> (Option<(f64, f64, f64)>, Vec<(f64, f
     }
     let start = res.first().copied();
     let end = res.last().copied();
-    let mids = if n > 2 { res[1..n-1].to_vec() } else { vec![] };
+    let mids = if n > 2 {
+        res[1..n - 1].to_vec()
+    } else {
+        vec![]
+    };
     (start, mids, end)
 }
 
@@ -3582,11 +3628,19 @@ fn draw_path_markers(
     let (start, mids, end) = get_marker_placements(bez);
     if let Some((x, y, ang)) = start {
         let adj_ang = if stroke.start_marker.auto_rotate {
-            ang + std::f64::consts::PI  // opposite for start
+            ang + std::f64::consts::PI // opposite for start
         } else {
             ang
         };
-        draw_one_marker(painter, viewport, origin, x, y, adj_ang, &stroke.start_marker);
+        draw_one_marker(
+            painter,
+            viewport,
+            origin,
+            x,
+            y,
+            adj_ang,
+            &stroke.start_marker,
+        );
     }
     for (x, y, ang) in mids {
         draw_one_marker(painter, viewport, origin, x, y, ang, &stroke.mid_marker);
@@ -3684,7 +3738,12 @@ pub fn draw_preview_polygon(
     ));
 }
 
-pub fn append_smoothed_points(path: &mut kurbo::BezPath, pts: &[[f64; 2]], smoothness: f32, is_first: bool) {
+pub fn append_smoothed_points(
+    path: &mut kurbo::BezPath,
+    pts: &[[f64; 2]],
+    smoothness: f32,
+    is_first: bool,
+) {
     if pts.is_empty() {
         return;
     }
@@ -3693,7 +3752,7 @@ pub fn append_smoothed_points(path: &mut kurbo::BezPath, pts: &[[f64; 2]], smoot
     } else {
         path.line_to(kurbo::Point::new(pts[0][0], pts[0][1]));
     }
-    
+
     let n = pts.len();
     if n < 3 {
         for pt in pts.iter().skip(1) {
@@ -3707,10 +3766,10 @@ pub fn append_smoothed_points(path: &mut kurbo::BezPath, pts: &[[f64; 2]], smoot
         let p_next = pts[i + 1];
         let mx = (p_curr[0] + p_next[0]) / 2.0;
         let my = (p_curr[1] + p_next[1]) / 2.0;
-        
+
         let end_x = p_curr[0] * (1.0 - smoothness as f64) + mx * smoothness as f64;
         let end_y = p_curr[1] * (1.0 - smoothness as f64) + my * smoothness as f64;
-        
+
         path.quad_to(
             kurbo::Point::new(p_curr[0], p_curr[1]),
             kurbo::Point::new(end_x, end_y),
@@ -3866,7 +3925,10 @@ pub fn draw_brush_preview(
                 let dx = pos[0] - prev_pos[0];
                 let dy = pos[1] - prev_pos[1];
                 let dist = dx.hypot(dy);
-                let step = (1.0 / (viewport.zoom as f64)).max(0.5).min(width as f64 / 8.0).max(0.1);
+                let step = (1.0 / (viewport.zoom as f64))
+                    .max(0.5)
+                    .min(width as f64 / 8.0)
+                    .max(0.1);
                 if dist > step {
                     let steps = (dist / step).ceil() as usize;
                     for s in 1..steps {
@@ -4036,14 +4098,14 @@ pub fn draw_brush_preview(
         if let Some(cursor) = cursor_doc {
             let cursor_screen = viewport.doc_to_screen(cursor, origin);
             let r_screen = (heavy * 60.0) as f32 * viewport.zoom;
-            
+
             // Draw stabilizer circle (faint semi-transparent gray)
             painter.circle_stroke(
                 cursor_screen,
                 r_screen,
                 egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(200, 200, 200, 80)),
             );
-            
+
             // Draw pull string line from cursor to last stabilized point
             if let Some(&(last_pos, _, _)) = points.last() {
                 let last_screen = viewport.doc_to_screen((last_pos[0], last_pos[1]), origin);
@@ -4067,7 +4129,10 @@ pub fn draw_preview_line(
         viewport.doc_to_screen(a, origin),
         viewport.doc_to_screen(b, origin),
     ];
-    painter.add(Shape::line(pts.to_vec(), Stroke::new(2.0, Color32::from_rgb(0, 120, 215))));
+    painter.add(Shape::line(
+        pts.to_vec(),
+        Stroke::new(2.0, Color32::from_rgb(0, 120, 215)),
+    ));
     for p in pts {
         painter.circle_filled(p, 4.0, Color32::from_rgb(0, 120, 215));
     }
@@ -4102,8 +4167,12 @@ pub fn draw_preview_bezier(
                     let mut prev_t = s_prev;
                     for step in 1..=8 {
                         let t = step as f32 / 8.0;
-                        let x = (1.0 - t).powi(2) * s_prev.x + 2.0 * (1.0 - t) * t * s_p1.x + t.powi(2) * s_p2.x;
-                        let y = (1.0 - t).powi(2) * s_prev.y + 2.0 * (1.0 - t) * t * s_p1.y + t.powi(2) * s_p2.y;
+                        let x = (1.0 - t).powi(2) * s_prev.x
+                            + 2.0 * (1.0 - t) * t * s_p1.x
+                            + t.powi(2) * s_p2.x;
+                        let y = (1.0 - t).powi(2) * s_prev.y
+                            + 2.0 * (1.0 - t) * t * s_p1.y
+                            + t.powi(2) * s_p2.y;
                         let curr_t = Pos2::new(x, y);
                         painter.line_segment([prev_t, curr_t], stroke);
                         prev_t = curr_t;
@@ -4121,8 +4190,14 @@ pub fn draw_preview_bezier(
                     for step in 1..=12 {
                         let t = step as f32 / 12.0;
                         let mt = 1.0 - t;
-                        let x = mt.powi(3) * s_prev.x + 3.0 * mt.powi(2) * t * s_p1.x + 3.0 * mt * t.powi(2) * s_p2.x + t.powi(3) * s_p3.x;
-                        let y = mt.powi(3) * s_prev.y + 3.0 * mt.powi(2) * t * s_p1.y + 3.0 * mt * t.powi(2) * s_p2.y + t.powi(3) * s_p3.y;
+                        let x = mt.powi(3) * s_prev.x
+                            + 3.0 * mt.powi(2) * t * s_p1.x
+                            + 3.0 * mt * t.powi(2) * s_p2.x
+                            + t.powi(3) * s_p3.x;
+                        let y = mt.powi(3) * s_prev.y
+                            + 3.0 * mt.powi(2) * t * s_p1.y
+                            + 3.0 * mt * t.powi(2) * s_p2.y
+                            + t.powi(3) * s_p3.y;
                         let curr_t = Pos2::new(x, y);
                         painter.line_segment([prev_t, curr_t], stroke);
                         prev_t = curr_t;
@@ -4190,10 +4265,7 @@ pub fn draw_pen_preview(
             let b = viewport.doc_to_screen(cursor, origin);
             painter.add(Shape::line(
                 vec![a, b],
-                Stroke::new(
-                    1.5,
-                    Color32::from_rgba_unmultiplied(120, 180, 255, 120),
-                ),
+                Stroke::new(1.5, Color32::from_rgba_unmultiplied(120, 180, 255, 120)),
             ));
         }
     }
@@ -4303,9 +4375,7 @@ fn draw_text_node(
     let fill_color = sample_fill_at(fill, opacity, 0.5, 0.5);
     let font_id = text_font_id(style, viewport.zoom, painter.ctx());
     let layout_text = style.layout_lines().join("\n");
-    let wrap_px = style
-        .wrap_width()
-        .map(|w| (w * viewport.zoom).max(8.0));
+    let wrap_px = style.wrap_width().map(|w| (w * viewport.zoom).max(8.0));
     if style.bold || style.italic || wrap_px.is_some() {
         let mut job = egui::text::LayoutJob::default();
         let mut fmt = egui::TextFormat::simple(font_id, fill_color);
@@ -4317,7 +4387,13 @@ fn draw_text_node(
         let galley = painter.layout_job(job);
         painter.galley(pos, galley, fill_color);
     } else {
-        painter.text(pos, Align2::LEFT_TOP, layout_text.as_str(), font_id, fill_color);
+        painter.text(
+            pos,
+            Align2::LEFT_TOP,
+            layout_text.as_str(),
+            font_id,
+            fill_color,
+        );
     }
 }
 
@@ -4338,17 +4414,15 @@ pub fn draw_node_handles(
         .filter(|(sid, ..)| sid == &node.id)
         .map(|(_, from, to)| (from, to));
 
-    if let (NodeKind::Path { path }, Some((_, from, to))) =
-        (&node.kind, selected_path_segment.filter(|(s, ..)| s == &node.id))
-    {
+    if let (NodeKind::Path { path }, Some((_, from, to))) = (
+        &node.kind,
+        selected_path_segment.filter(|(s, ..)| s == &node.id),
+    ) {
         let anchors = path.anchor_positions();
         if let (Some(&a), Some(&b)) = (anchors.get(from), anchors.get(to)) {
             let sa = viewport.doc_to_screen(a, origin);
             let sb = viewport.doc_to_screen(b, origin);
-            painter.line_segment(
-                [sa, sb],
-                Stroke::new(3.0, Color32::from_rgb(80, 200, 255)),
-            );
+            painter.line_segment([sa, sb], Stroke::new(3.0, Color32::from_rgb(80, 200, 255)));
         }
     }
 
@@ -4358,20 +4432,38 @@ pub fn draw_node_handles(
     if let NodeKind::Path { path } = &node.kind {
         let anchors = path.anchor_positions();
         for (&k, _f) in &path.corner_fillets {
-            if k >= anchors.len() { continue; }
+            if k >= anchors.len() {
+                continue;
+            }
             let p = anchors[k];
-            let prev = if k > 0 { k - 1 } else if path.is_closed() && anchors.len() > 2 { anchors.len() - 1 } else { continue };
+            let prev = if k > 0 {
+                k - 1
+            } else if path.is_closed() && anchors.len() > 2 {
+                anchors.len() - 1
+            } else {
+                continue;
+            };
             let pa = anchors[prev];
-            let lenp = ((p.0 - pa.0).powi(2) + (p.1 - pa.1).powi(2)).sqrt().max(1e-9);
+            let lenp = ((p.0 - pa.0).powi(2) + (p.1 - pa.1).powi(2))
+                .sqrt()
+                .max(1e-9);
             let uxp = (pa.0 - p.0) / lenp;
             let uyp = (pa.1 - p.1) / lenp;
             let D = path.fillet_tangent_d(k);
             let t1x = p.0 + uxp * D;
             let t1y = p.1 + uyp * D;
             // next leg
-            let nxt = if k + 1 < anchors.len() { k + 1 } else if path.is_closed() && anchors.len() > 2 { 0 } else { continue };
+            let nxt = if k + 1 < anchors.len() {
+                k + 1
+            } else if path.is_closed() && anchors.len() > 2 {
+                0
+            } else {
+                continue;
+            };
             let pb = anchors[nxt];
-            let lenn = ((p.0 - pb.0).powi(2) + (p.1 - pb.1).powi(2)).sqrt().max(1e-9);
+            let lenn = ((p.0 - pb.0).powi(2) + (p.1 - pb.1).powi(2))
+                .sqrt()
+                .max(1e-9);
             let uxn = (pb.0 - p.0) / lenn;
             let uyn = (pb.1 - p.1) / lenn;
             let t2x = p.0 + uxn * D;
@@ -4486,28 +4578,15 @@ pub fn draw_node_handles(
                     Color32::WHITE
                 };
                 painter.circle_filled(s, radius, fill);
-                painter.circle_stroke(
-                    s,
-                    radius,
-                    Stroke::new(1.5, Color32::from_rgb(0, 120, 215)),
-                );
+                painter.circle_stroke(s, radius, Stroke::new(1.5, Color32::from_rgb(0, 120, 215)));
             }
         }
     }
 }
 
-fn gradient_line_screen(
-    r: Rect,
-    line: (f32, f32, f32, f32),
-) -> (Pos2, Pos2, Pos2) {
-    let a = Pos2::new(
-        r.left() + r.width() * line.0,
-        r.top() + r.height() * line.1,
-    );
-    let b = Pos2::new(
-        r.left() + r.width() * line.2,
-        r.top() + r.height() * line.3,
-    );
+fn gradient_line_screen(r: Rect, line: (f32, f32, f32, f32)) -> (Pos2, Pos2, Pos2) {
+    let a = Pos2::new(r.left() + r.width() * line.0, r.top() + r.height() * line.1);
+    let b = Pos2::new(r.left() + r.width() * line.2, r.top() + r.height() * line.3);
     let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
     (a, b, mid)
 }
@@ -4683,11 +4762,7 @@ pub fn draw_eyedropper_magnifier(
     let center = viewport.doc_to_screen(target_doc, origin);
 
     // 1. Draw outer drop shadow / glow
-    painter.circle_filled(
-        center,
-        radius + 6.0,
-        Color32::from_black_alpha(40),
-    );
+    painter.circle_filled(center, radius + 6.0, Color32::from_black_alpha(40));
 
     // 2. Draw zoomed-in grid pattern inside the glass
     let glass_bg = Color32::from_black_alpha(180);
@@ -4698,7 +4773,8 @@ pub fn draw_eyedropper_magnifier(
     let step = 8.0;
     let mut x_offset = -r_grid;
     while x_offset <= r_grid {
-        if x_offset.abs() > 0.01 { // skip center line
+        if x_offset.abs() > 0.01 {
+            // skip center line
             let h = (r_grid * r_grid - x_offset * x_offset).sqrt();
             painter.line_segment(
                 [
@@ -4712,7 +4788,8 @@ pub fn draw_eyedropper_magnifier(
     }
     let mut y_offset = -r_grid;
     while y_offset <= r_grid {
-        if y_offset.abs() > 0.01 { // skip center line
+        if y_offset.abs() > 0.01 {
+            // skip center line
             let w = (r_grid * r_grid - y_offset * y_offset).sqrt();
             painter.line_segment(
                 [
@@ -4739,11 +4816,7 @@ pub fn draw_eyedropper_magnifier(
     );
 
     // Draw thin white border around the outer edge, and thin dark border inside
-    painter.circle_stroke(
-        center,
-        radius,
-        Stroke::new(1.0, Color32::WHITE),
-    );
+    painter.circle_stroke(center, radius, Stroke::new(1.0, Color32::WHITE));
     painter.circle_stroke(
         center,
         radius - ring_thickness,
@@ -4763,12 +4836,8 @@ pub fn draw_eyedropper_magnifier(
     let rect_w = text_galley.size().x + 8.0;
     let rect_h = text_galley.size().y + 4.0;
     let text_rect = Rect::from_center_size(text_pos, Vec2::new(rect_w, rect_h));
-    
-    painter.rect_filled(
-        text_rect,
-        4.0,
-        Color32::from_black_alpha(200),
-    );
+
+    painter.rect_filled(text_rect, 4.0, Color32::from_black_alpha(200));
     painter.rect_stroke(
         text_rect,
         4.0,
@@ -4924,8 +4993,12 @@ pub fn draw_clip_mask_effects(
     selection: &[NodeId],
 ) {
     for cm in clip_masks.values() {
-        let Some(mask_node) = nodes.get(cm.mask_id) else { continue };
-        let Some(source_node) = nodes.get(cm.source_id) else { continue };
+        let Some(mask_node) = nodes.get(cm.mask_id) else {
+            continue;
+        };
+        let Some(source_node) = nodes.get(cm.source_id) else {
+            continue;
+        };
 
         let mask_bounds = mask_node.bounds();
         let tl = viewport.doc_to_screen((mask_bounds.x0, mask_bounds.y0), origin);

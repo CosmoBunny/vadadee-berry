@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use super::{global_cv_cache, CvCacheValue};
+use super::{CvCacheValue, global_cv_cache};
 use uuid::Uuid;
 
 static PENDING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -69,7 +69,10 @@ pub fn remember_last_good(node_id: Uuid, key: impl Into<String>) {
 }
 
 pub fn last_good_key(node_id: Uuid) -> Option<String> {
-    last_good().lock().ok().and_then(|g| g.get(&node_id).cloned())
+    last_good()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&node_id).cloned())
 }
 
 pub fn clear_last_good() {
@@ -170,10 +173,7 @@ pub fn preview_bake_key(node_id: Uuid, desired_key: &str, outcome: &JobOutcome) 
 }
 
 /// For export / tests: run inline if missing (still uses cache).
-pub fn get_or_run_blocking(
-    key: String,
-    work: impl FnOnce() -> CvCacheValue,
-) -> CvCacheValue {
+pub fn get_or_run_blocking(key: String, work: impl FnOnce() -> CvCacheValue) -> CvCacheValue {
     if let Some(v) = global_cv_cache().get(&key) {
         return v;
     }

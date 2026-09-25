@@ -16,9 +16,9 @@ pub mod ops;
 pub mod track;
 // `opencv_face` used from Settings UI for cascade availability.
 pub use jobs::{
-    ensure_black_placeholder, get_or_run_blocking, get_or_schedule, last_good_key,
-    preview_bake_key, remember_last_good, take_dirty, JobOutcome, BLACK_PLACEHOLDER_KEY,
-    FACE_MAX_SIDE, PREVIEW_MAX_SIDE,
+    BLACK_PLACEHOLDER_KEY, FACE_MAX_SIDE, JobOutcome, PREVIEW_MAX_SIDE, ensure_black_placeholder,
+    get_or_run_blocking, get_or_schedule, last_good_key, preview_bake_key, remember_last_good,
+    take_dirty,
 };
 pub use ops::{
     apply_mask_rgba, background_blur_rgba, chroma_key_mask, chroma_key_rgba, detect_face_regions,
@@ -105,23 +105,21 @@ pub fn detect_faces_auto(img: &image::RgbaImage) -> Vec<CvRegion> {
                 }
             }
         }
-        CvFaceBackend::Auto => {
-            match opencv_face::detect_faces_opencv(img) {
-                Some(regs) if !regs.is_empty() => {
-                    log::debug!("[cv] face backend=auto/opencv n={}", regs.len());
-                    regs
-                }
-                _ => {
-                    let regs = detect_face_regions(img);
-                    log::debug!(
-                        "[cv] face backend=auto/native n={} (opencv_avail={})",
-                        regs.len(),
-                        opencv_face::opencv_available()
-                    );
-                    regs
-                }
+        CvFaceBackend::Auto => match opencv_face::detect_faces_opencv(img) {
+            Some(regs) if !regs.is_empty() => {
+                log::debug!("[cv] face backend=auto/opencv n={}", regs.len());
+                regs
             }
-        }
+            _ => {
+                let regs = detect_face_regions(img);
+                log::debug!(
+                    "[cv] face backend=auto/native n={} (opencv_avail={})",
+                    regs.len(),
+                    opencv_face::opencv_available()
+                );
+                regs
+            }
+        },
     }
 }
 
@@ -300,8 +298,7 @@ pub struct CvAnalyzeContext {
 impl CvAnalyzeContext {
     /// Snap time to milliseconds (matches graph media cache snapping).
     pub fn time_ms(&self) -> Option<i64> {
-        self.time_sec
-            .map(|t| ((t * 1000.0).floor() as i64).max(0))
+        self.time_sec.map(|t| ((t * 1000.0).floor() as i64).max(0))
     }
 
     /// Stable string key for [`CvCache`].

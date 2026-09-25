@@ -4,8 +4,8 @@ use kramaframe::keylist::TRES16Bits;
 use kramaframe::prelude::{KeyFrameFunction, KeyList};
 use kramaframe::{BTclasslist, BTframelist, KramaFrame};
 
-use crate::tools::ToolKind;
 use crate::action_tab::ActionTab;
+use crate::tools::ToolKind;
 
 const ID: u32 = 0;
 
@@ -100,7 +100,10 @@ impl UiAnimation {
             ("intro_canvas", KeyFrameFunction::EaseInOut),
             ("tool_pulse", KeyFrameFunction::EaseOut),
             ("tab_fade", KeyFrameFunction::EaseOut),
-            ("tab_slide", KeyFrameFunction::new_cubic_bezier_f32(1.0, 0.0, 0.6, 1.0)),
+            (
+                "tab_slide",
+                KeyFrameFunction::new_cubic_bezier_f32(1.0, 0.0, 0.6, 1.0),
+            ),
             ("status_sign", KeyFrameFunction::EaseInOut),
             ("status_tool_sign", KeyFrameFunction::EaseInOut),
             ("coords_sign", KeyFrameFunction::EaseInOut),
@@ -134,20 +137,29 @@ impl UiAnimation {
                 "intro_canvas",
                 KeyList::new(ID, TRES16Bits::from_millis(520)),
             ),
-            (
-                "tool_pulse",
-                KeyList::new(ID, TRES16Bits::from_millis(260)),
-            ),
+            ("tool_pulse", KeyList::new(ID, TRES16Bits::from_millis(260))),
             ("tab_fade", KeyList::new(ID, TRES16Bits::from_millis(200))),
             ("tab_slide", KeyList::new(ID, TRES16Bits::from_millis(220))),
-            ("status_sign", KeyList::new(ID, TRES16Bits::from_millis(360))),
+            (
+                "status_sign",
+                KeyList::new(ID, TRES16Bits::from_millis(360)),
+            ),
             (
                 "status_tool_sign",
                 KeyList::new(ID, TRES16Bits::from_millis(360)),
             ),
-            ("coords_sign", KeyList::new(ID, TRES16Bits::from_millis(360))),
-            ("coords_presence", KeyList::new(ID, TRES16Bits::from_millis(300))),
-            ("on_path_offer", KeyList::new(ID, TRES16Bits::from_millis(320))),
+            (
+                "coords_sign",
+                KeyList::new(ID, TRES16Bits::from_millis(360)),
+            ),
+            (
+                "coords_presence",
+                KeyList::new(ID, TRES16Bits::from_millis(300)),
+            ),
+            (
+                "on_path_offer",
+                KeyList::new(ID, TRES16Bits::from_millis(320)),
+            ),
             (
                 "on_path_container",
                 KeyList::new(ID, TRES16Bits::from_millis(380)),
@@ -218,8 +230,7 @@ impl UiAnimation {
 
     pub fn tick(&mut self, ctx: &Context) {
         let dt_ms = (ctx.input(|i| i.stable_dt) * 1000.0).clamp(1.0, 48.0) as u16;
-        self.engine
-            .update_progress(TRES16Bits::from_millis(dt_ms));
+        self.engine.update_progress(TRES16Bits::from_millis(dt_ms));
 
         if !self.engine.is_animating("status_sign", ID) {
             self.status_msg_width_settled = if self.status_msg_target_in {
@@ -262,8 +273,8 @@ impl UiAnimation {
             return;
         }
         let raw_dt = ctx.input(|i| i.unstable_dt).max(0.0);
-        let steps = ((raw_dt / ACTION_BAR_MAX_DT).ceil() as u32)
-            .clamp(1, ACTION_BAR_MAX_STEPS_PER_FRAME);
+        let steps =
+            ((raw_dt / ACTION_BAR_MAX_DT).ceil() as u32).clamp(1, ACTION_BAR_MAX_STEPS_PER_FRAME);
         for _ in 0..steps {
             self.timeline_elapsed += ACTION_BAR_MAX_DT;
             self.apply_timeline_pose();
@@ -275,8 +286,7 @@ impl UiAnimation {
 
     fn apply_timeline_pose(&mut self) {
         let u = (self.timeline_elapsed / ACTION_BAR_SLIDE_SECS).min(1.0);
-        self.timeline_t =
-            self.timeline_from + (self.timeline_to - self.timeline_from) * u;
+        self.timeline_t = self.timeline_from + (self.timeline_to - self.timeline_from) * u;
         if u >= 1.0 {
             self.timeline_t = self.timeline_to;
             self.timeline_running = false;
@@ -303,8 +313,8 @@ impl UiAnimation {
             return;
         }
         let raw_dt = ctx.input(|i| i.unstable_dt).max(0.0);
-        let steps = ((raw_dt / ACTION_BAR_MAX_DT).ceil() as u32)
-            .clamp(1, ACTION_BAR_MAX_STEPS_PER_FRAME);
+        let steps =
+            ((raw_dt / ACTION_BAR_MAX_DT).ceil() as u32).clamp(1, ACTION_BAR_MAX_STEPS_PER_FRAME);
         for _ in 0..steps {
             self.video_editor_elapsed += ACTION_BAR_MAX_DT;
             self.apply_video_editor_pose();
@@ -395,8 +405,8 @@ impl UiAnimation {
             return;
         }
         let raw_dt = ctx.input(|i| i.unstable_dt).max(0.0);
-        let steps = ((raw_dt / ACTION_BAR_MAX_DT).ceil() as u32)
-            .clamp(1, ACTION_BAR_MAX_STEPS_PER_FRAME);
+        let steps =
+            ((raw_dt / ACTION_BAR_MAX_DT).ceil() as u32).clamp(1, ACTION_BAR_MAX_STEPS_PER_FRAME);
         for _ in 0..steps {
             self.action_bar_elapsed += ACTION_BAR_MAX_DT;
             self.apply_action_bar_pose();
@@ -409,8 +419,7 @@ impl UiAnimation {
     fn apply_action_bar_pose(&mut self) {
         let u = (self.action_bar_elapsed / ACTION_BAR_SLIDE_SECS).min(1.0);
         // Linear travel so the panel fully clears the work area (easing only for fade).
-        self.action_bar_t =
-            self.action_bar_from + (self.action_bar_to - self.action_bar_from) * u;
+        self.action_bar_t = self.action_bar_from + (self.action_bar_to - self.action_bar_from) * u;
         if u >= 1.0 {
             self.action_bar_t = self.action_bar_to;
             self.action_bar_running = false;
@@ -482,8 +491,10 @@ impl UiAnimation {
             self.prev_action_tab = action_tab;
         }
         if status_message != self.prev_status_message {
-            let is_anim_frame_update = (status_message.starts_with("Playing animation") && self.prev_status_message.starts_with("Playing animation"))
-                || (status_message.starts_with("Recording keyframes") && self.prev_status_message.starts_with("Recording keyframes"));
+            let is_anim_frame_update = (status_message.starts_with("Playing animation")
+                && self.prev_status_message.starts_with("Playing animation"))
+                || (status_message.starts_with("Recording keyframes")
+                    && self.prev_status_message.starts_with("Recording keyframes"));
 
             if is_anim_frame_update {
                 self.status_msg_incoming = status_message.to_owned();
@@ -495,7 +506,8 @@ impl UiAnimation {
                 self.status_msg_incoming = status_message.to_owned();
                 self.status_msg_width_out = self.status_msg_width_settled;
                 self.status_msg_width_in = status_message_width;
-                self.status_slide_distance = self.status_msg_width_out.max(status_message_width) + 40.0;
+                self.status_slide_distance =
+                    self.status_msg_width_out.max(status_message_width) + 40.0;
                 self.engine.restart_progress("status_sign", ID);
                 self.status_msg_target_in = true;
                 self.prev_status_message = status_message.to_owned();
@@ -523,7 +535,11 @@ impl UiAnimation {
         }
         let has_coords = coords_width > 1.0;
         if has_coords != self.prev_has_coords {
-            self.coords_from_w = if has_coords { 0.0 } else { self.coords_width_settled.max(self.coords_to_w) };
+            self.coords_from_w = if has_coords {
+                0.0
+            } else {
+                self.coords_width_settled.max(self.coords_to_w)
+            };
             self.coords_to_w = if has_coords { coords_width } else { 0.0 };
             self.engine.restart_progress("coords_presence", ID);
             self.prev_has_coords = has_coords;
@@ -612,7 +628,9 @@ impl UiAnimation {
             "on_path_offer",
             "on_path_container",
         ];
-        TRACKS.iter().any(|class| self.engine.is_animating(class, ID))
+        TRACKS
+            .iter()
+            .any(|class| self.engine.is_animating(class, ID))
     }
 
     pub fn action_bar_slide_running(&self) -> bool {
@@ -629,8 +647,7 @@ impl UiAnimation {
     }
 
     fn range_inclusive(&self, class: &'static str, lo: f32, hi: f32) -> f32 {
-        self.engine
-            .get_value_byrange_inclusive(class, ID, lo..=hi)
+        self.engine.get_value_byrange_inclusive(class, ID, lo..=hi)
     }
 
     pub fn menubar_alpha(&self) -> f32 {
@@ -797,10 +814,7 @@ pub fn left_dock_panel_rect(work: Rect, card_w: f32, open_t: f32, toolbar_right:
     let open_left = toolbar_right + gap;
     let t = open_t.clamp(0.0, 1.0);
     let left = open_left - (1.0 - t) * (card_w + gap);
-    Rect::from_min_size(
-        egui::pos2(left, inset.top()),
-        egui::vec2(card_w, max_h),
-    )
+    Rect::from_min_size(egui::pos2(left, inset.top()), egui::vec2(card_w, max_h))
 }
 
 pub fn action_bar_overlay_rect(work: Rect, card_w: f32, open_t: f32) -> Rect {

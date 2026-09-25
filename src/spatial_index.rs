@@ -32,11 +32,7 @@ impl SpatialIndex {
         self.enabled
     }
 
-    pub fn rebuild(
-        project: &ProjectFile,
-        hidden: &HashSet<NodeId>,
-        revision: u64,
-    ) -> Self {
+    pub fn rebuild(project: &ProjectFile, hidden: &HashSet<NodeId>, revision: u64) -> Self {
         let flat_order: Vec<NodeId> = project.document.ordered_node_ids();
         if flat_order.len() < MIN_NODES_FOR_SPATIAL {
             return Self::disabled(revision);

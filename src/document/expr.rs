@@ -61,10 +61,7 @@ pub fn eval_expr_vars(expr: &str, vars: ExprVars) -> Result<f64, ExprError> {
     let v = parse_expr(bytes, &mut i, vars)?;
     skip_ws(bytes, &mut i);
     if i < bytes.len() {
-        return Err(ExprError(format!(
-            "unexpected trailing input: {}",
-            &s[i..]
-        )));
+        return Err(ExprError(format!("unexpected trailing input: {}", &s[i..])));
     }
     if !v.is_finite() {
         return Err(ExprError("result is not finite".into()));

@@ -107,11 +107,7 @@ pub fn should_cache_layer(
     if dragging || text_editing || bulk_insert_active {
         return false;
     }
-    let visible_count = layer
-        .nodes
-        .iter()
-        .filter(|id| !hidden.contains(id))
-        .count();
+    let visible_count = layer.nodes.iter().filter(|id| !hidden.contains(id)).count();
     if visible_count < MIN_NODES_FOR_CACHE {
         return false;
     }
@@ -124,11 +120,7 @@ pub fn should_cache_layer(
     true
 }
 
-pub fn cache_entry_valid(
-    entry: &LayerRasterCacheEntry,
-    revision: u64,
-    anim_frame: usize,
-) -> bool {
+pub fn cache_entry_valid(entry: &LayerRasterCacheEntry, revision: u64, anim_frame: usize) -> bool {
     entry.revision == revision && entry.anim_frame == anim_frame
 }
 
@@ -361,7 +353,12 @@ pub fn install_cache_result(
     }
     let color_image = ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
     let texture = ctx.load_texture(
-        format!("layer-cache-{}-{}-{}", layer_id.as_simple(), revision, anim_frame),
+        format!(
+            "layer-cache-{}-{}-{}",
+            layer_id.as_simple(),
+            revision,
+            anim_frame
+        ),
         color_image,
         TextureOptions::LINEAR,
     );

@@ -50,11 +50,8 @@ impl OutlineBuilder for GlyphOutline<'_> {
     }
 
     fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-        self.builder.cubic_bezier_to(
-            self.map(x1, y1),
-            self.map(x2, y2),
-            self.map(x, y),
-        );
+        self.builder
+            .cubic_bezier_to(self.map(x1, y1), self.map(x2, y2), self.map(x, y));
     }
 
     fn close(&mut self) {
@@ -338,7 +335,9 @@ pub fn draw_text_glyphs(
         let (path, bbox) = build_text_path_relative(&face, viewport.zoom, style)?;
         let tolerance = (0.15 / viewport.zoom.max(0.2)).clamp(0.02, 0.15);
 
-        let mut stroke_mesh = if let Some(sw) = stroke_width_screen.filter(|w| stroke_style.is_visible() && *w > 0.01) {
+        let mut stroke_mesh = if let Some(sw) =
+            stroke_width_screen.filter(|w| stroke_style.is_visible() && *w > 0.01)
+        {
             tessellate_stroke_mesh(
                 &path,
                 stroke_style,

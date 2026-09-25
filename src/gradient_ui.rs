@@ -2,8 +2,8 @@
 use egui::{Color32, Id, Key, Mesh, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 
 use crate::document::{
-    linear_angle_from_line, linear_line_spanning_bbox, translate_linear_line,
-    FillKind, GradientStop, Paint, sample_stops,
+    FillKind, GradientStop, Paint, linear_angle_from_line, linear_line_spanning_bbox, sample_stops,
+    translate_linear_line,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,14 +50,17 @@ pub fn gradient_strip_editor(
             ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::hover());
         paint_smooth_gradient_bar(ui, rect, stops);
         let painter = ui.painter_at(rect);
-        painter.rect_stroke(rect, 4.0, Stroke::new(1.0, colors::BORDER), egui::StrokeKind::Inside);
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, colors::BORDER),
+            egui::StrokeKind::Inside,
+        );
 
         for (i, stop) in stops.iter_mut().enumerate() {
             let x = rect.left() + rect.width() * stop.pos;
-            let handle = Rect::from_center_size(
-                Pos2::new(x, rect.center().y),
-                Vec2::new(10.0, h - 4.0),
-            );
+            let handle =
+                Rect::from_center_size(Pos2::new(x, rect.center().y), Vec2::new(10.0, h - 4.0));
             let r = ui.interact(handle, ui.id().with(i), Sense::click_and_drag());
             if r.clicked() {
                 *selected = i;
@@ -74,11 +77,7 @@ pub fn gradient_strip_editor(
             painter.rect_filled(
                 handle,
                 2.0,
-                if sel {
-                    colors::ACCENT
-                } else {
-                    Color32::WHITE
-                },
+                if sel { colors::ACCENT } else { Color32::WHITE },
             );
             painter.rect_stroke(
                 handle,
@@ -180,8 +179,7 @@ pub fn linear_gradient_angle_dial(ui: &mut Ui, dial_id: Id, angle_deg: &mut f32)
     let size = 80.0;
     ui.push_id(dial_id, |ui| {
         ui.label("Angle");
-        let (rect, response) =
-            ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
         let center = rect.center();
         let radius = size * 0.38;
         let painter = ui.painter_at(rect);
@@ -207,8 +205,14 @@ pub fn linear_gradient_angle_dial(ui: &mut Ui, dial_id: Id, angle_deg: &mut f32)
 }
 
 fn line_to_screen(rect: Rect, x0: f32, y0: f32, x1: f32, y1: f32) -> (Pos2, Pos2, Pos2) {
-    let a = Pos2::new(rect.left() + rect.width() * x0, rect.top() + rect.height() * y0);
-    let b = Pos2::new(rect.left() + rect.width() * x1, rect.top() + rect.height() * y1);
+    let a = Pos2::new(
+        rect.left() + rect.width() * x0,
+        rect.top() + rect.height() * y0,
+    );
+    let b = Pos2::new(
+        rect.left() + rect.width() * x1,
+        rect.top() + rect.height() * y1,
+    );
     let mid = Pos2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
     (a, b, mid)
 }
@@ -238,7 +242,12 @@ pub fn gradient_flow_line_editor(
         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, Color32::from_gray(35));
-        painter.rect_stroke(rect, 4.0, Stroke::new(1.0, colors::BORDER), egui::StrokeKind::Inside);
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, colors::BORDER),
+            egui::StrokeKind::Inside,
+        );
 
         match kind {
             FillKind::LinearGradient => {
@@ -317,8 +326,8 @@ pub fn gradient_flow_line_editor(
                     }
                 }
                 if drag_mid.dragged() {
-                    if let Some((start_line, start_norm)) = ui
-                        .data(|d| d.get_temp::<((f32, f32, f32, f32), (f32, f32))>(mid_store))
+                    if let Some((start_line, start_norm)) =
+                        ui.data(|d| d.get_temp::<((f32, f32, f32, f32), (f32, f32))>(mid_store))
                     {
                         if let Some(p) = drag_mid.interact_pointer_pos() {
                             let (nx, ny) = norm_in_rect(rect, p);
@@ -345,11 +354,7 @@ pub fn gradient_flow_line_editor(
                 for stop in stops {
                     let rad = (stop.pos / 1.25).clamp(0.0, 1.0) * max_r;
                     if rad > 2.0 {
-                        painter.circle_stroke(
-                            focal,
-                            rad,
-                            Stroke::new(1.5, stop.color.to_egui()),
-                        );
+                        painter.circle_stroke(focal, rad, Stroke::new(1.5, stop.color.to_egui()));
                     }
                 }
                 painter.circle_filled(focal, 7.0, colors::ACCENT);
@@ -438,7 +443,9 @@ pub fn solid_color_editor(ui: &mut Ui, stops: &mut Vec<GradientStop>) -> bool {
 pub fn paint_kind_selector(ui: &mut Ui, kind: &mut FillKind) -> bool {
     let mut ch = false;
     ui.horizontal(|ui| {
-        ch |= ui.selectable_value(kind, FillKind::Solid, "Solid").clicked();
+        ch |= ui
+            .selectable_value(kind, FillKind::Solid, "Solid")
+            .clicked();
         ch |= ui
             .selectable_value(kind, FillKind::LinearGradient, "Linear")
             .clicked();

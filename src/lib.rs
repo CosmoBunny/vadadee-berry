@@ -1,49 +1,49 @@
 #![warn(clippy::all, rust_2018_idioms)]
 
 pub mod action_tab;
-pub mod av_ui;
-pub mod node_editor_ui;
 pub mod animation;
-pub mod blend;
 pub mod app;
+pub mod audio_extract;
+pub mod av_ui;
+pub mod blend;
 pub mod canvas;
+pub mod collab;
 pub mod commands;
+pub mod cv;
 pub mod document;
+pub mod export_audio;
+pub mod export_render;
+pub mod export_types;
+pub mod export_worker;
 pub mod fonts;
 pub mod gradient_ui;
 pub mod history;
 pub mod icons;
 pub mod io;
 pub mod layer_cache;
-pub mod selection;
-pub mod state;
+pub mod left_dock;
+#[cfg(not(target_os = "android"))]
+pub mod mcp;
+pub mod node_editor_ui;
+pub mod path_physics;
 pub mod perf;
+pub mod platform;
+pub mod raster;
+pub mod recorder;
+pub mod render;
+pub mod render_pipeline;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod screen_capture;
+pub mod selection;
 pub mod shading;
 pub mod spatial_index;
-pub mod left_dock;
-pub mod render;
+pub mod state;
+pub mod sys_stats;
 pub mod text_glyph;
 pub mod theme;
 pub mod tools;
-pub mod raster;
-pub mod path_physics;
-pub mod platform;
 pub mod ui;
 pub mod video_decode;
-pub mod cv;
-pub mod export_worker;
-pub mod export_audio;
-pub mod export_render;
-pub mod render_pipeline;
-pub mod export_types;
-pub mod recorder;
-pub mod audio_extract;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub mod screen_capture;
-pub mod collab;
-pub mod sys_stats;
-#[cfg(not(target_os = "android"))]
-pub mod mcp;
 
 use app::VadadeeBerryApp;
 
@@ -133,7 +133,8 @@ pub fn run_desktop() -> eframe::Result<()> {
 }
 
 #[cfg(target_os = "android")]
-pub static ANDROID_APP: std::sync::OnceLock<winit::platform::android::activity::AndroidApp> = std::sync::OnceLock::new();
+pub static ANDROID_APP: std::sync::OnceLock<winit::platform::android::activity::AndroidApp> =
+    std::sync::OnceLock::new();
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]

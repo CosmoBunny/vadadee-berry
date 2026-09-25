@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::document::septic::{MouseSample, SepticMeta, SepticSession, SEPSCRR_VERSION};
+use crate::document::septic::{MouseSample, SEPSCRR_VERSION, SepticMeta, SepticSession};
 use crate::recorder::{Frame, RecorderConfig, SyncRecorder};
 
 /// Shared capture timeline: mouse + video both use the **encoder** media clock.
@@ -462,9 +462,7 @@ fn run_pipewire_audio_capture(
             }
             let rate = user_data.format.rate();
             if rate > 0 {
-                user_data
-                    .sample_rate_out
-                    .store(rate, Ordering::Relaxed);
+                user_data.sample_rate_out.store(rate, Ordering::Relaxed);
             }
             log::info!(
                 "[screen] pw audio format: {} Hz, {} ch, {:?}",
@@ -650,7 +648,11 @@ fn run_pipewire_audio_capture(
 }
 
 /// Encode stereo PCM as AAC (libav) and remux onto the video file (libav). No CLI.
-fn mux_pcm_into_video_libav(video: &Path, pcm_stereo_i16: &[i16], sample_rate: u32) -> Result<(), String> {
+fn mux_pcm_into_video_libav(
+    video: &Path,
+    pcm_stereo_i16: &[i16],
+    sample_rate: u32,
+) -> Result<(), String> {
     if !crate::video_decode::is_libav_available() {
         return Err("libav not available for audio mux".into());
     }
@@ -742,11 +744,7 @@ fn finalize_session(
             duration_sec: duration,
             normalized: true,
             cursor_in_pixels: sess.capture_cursor,
-            video_path: if video_ok {
-                video_name
-            } else {
-                String::new()
-            },
+            video_path: if video_ok { video_name } else { String::new() },
             source_label: match sess.backend {
                 CaptureBackend::X11Grab => "x11grab".into(),
                 CaptureBackend::WaylandPortalRust => "portal-pipewire".into(),
@@ -758,9 +756,7 @@ fn finalize_session(
 
     if !video_ok {
         let hint = video_err.unwrap_or_else(|| "video file missing".into());
-        return Err(format!(
-            "Mouse saved · video failed: {hint}"
-        ));
+        return Err(format!("Mouse saved · video failed: {hint}"));
     }
     log::info!(
         "[screen] wrote {} ({} mouse, {:.1}s, {:?})",
@@ -905,10 +901,7 @@ fn spawn_mouse_thread(
                 std::thread::sleep(poll_dt);
             }
             // Final sample at stop (encoder timeline).
-            if let Some(t) = clock
-                .last_frame_media_sec()
-                .or_else(|| clock.media_sec())
-            {
+            if let Some(t) = clock.last_frame_media_sec().or_else(|| clock.media_sec()) {
                 let (x, y, down) = live
                     .lock()
                     .map(|g| (g.x, g.y, g.button_down))
@@ -1127,8 +1120,7 @@ impl MouseTracker {
         }
 
         let abs_moving = abs_ok && self.abs_is_moving();
-        let abs_frozen_mid =
-            abs_ok && !abs_moving && is_likely_frozen_mid(ax, ay);
+        let abs_frozen_mid = abs_ok && !abs_moving && is_likely_frozen_mid(ax, ay);
 
         if abs_moving {
             // Live absolute — matches on-screen pointer under X11/XWayland.
@@ -1266,7 +1258,12 @@ impl MouseTracker {
                 }
             }
         }
-        (dx, dy, btn, any && (dx != 0.0 || dy != 0.0 || btn.is_some()))
+        (
+            dx,
+            dy,
+            btn,
+            any && (dx != 0.0 || dy != 0.0 || btn.is_some()),
+        )
     }
 }
 
@@ -1369,11 +1366,7 @@ fn probe_x11_screen_size() -> Option<(u32, u32)> {
                 let tok = rest.split_whitespace().next()?;
                 let (a, b) = tok.split_once('x')?;
                 let w: u32 = a.parse().ok()?;
-                let h: u32 = b
-                    .trim_end_matches("pixels")
-                    .trim()
-                    .parse()
-                    .ok()?;
+                let h: u32 = b.trim_end_matches("pixels").trim().parse().ok()?;
                 if w >= 320 && h >= 240 {
                     return Some((w, h));
                 }
@@ -1609,8 +1602,7 @@ fn scale_rgba(rgba: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Result<Vec<u8>, 
     }
     let src = image::RgbaImage::from_raw(w, h, rgba.to_vec())
         .ok_or_else(|| "bad rgba buffer".to_string())?;
-    let resized =
-        image::imageops::resize(&src, tw, th, image::imageops::FilterType::Triangle);
+    let resized = image::imageops::resize(&src, tw, th, image::imageops::FilterType::Triangle);
     Ok(resized.into_raw())
 }
 
@@ -1650,7 +1642,10 @@ struct PortalCursor {
 
 /// Open ScreenCast session → PipeWire node id + remote FD.
 /// Keeps the portal session alive for the duration of the recording thread.
-#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_os = "android", target_os = "ios"))
+))]
 struct PortalPwRemote {
     /// Dropping this ends the screencast on some portals.
     _session: ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>,
@@ -1660,7 +1655,10 @@ struct PortalPwRemote {
     size_hint: Option<(u32, u32)>,
 }
 
-#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_os = "android", target_os = "ios"))
+))]
 async fn open_screencast_remote(capture_cursor: bool) -> Result<PortalPwRemote, String> {
     use ashpd::desktop::{
         PersistMode,
@@ -1749,7 +1747,10 @@ async fn open_screencast_remote(capture_cursor: bool) -> Result<PortalPwRemote, 
 }
 
 /// Convert a mapped PipeWire video buffer to tightly-packed RGBA.
-#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_os = "android", target_os = "ios"))
+))]
 fn pw_buffer_to_rgba(
     src: &[u8],
     width: u32,
@@ -1856,8 +1857,15 @@ const SPA_META_CURSOR: u32 = 5;
 ///
 /// `spa_meta_cursor.position` is the hotspot on the stream surface (matches embedded
 /// cursor tip). Half-pixel centering avoids a consistent ~0.5px left/up bias.
-#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
-fn extract_spa_meta_cursor(spa_buf: *mut std::ffi::c_void, stream_w: u32, stream_h: u32) -> Option<(f64, f64)> {
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_os = "android", target_os = "ios"))
+))]
+fn extract_spa_meta_cursor(
+    spa_buf: *mut std::ffi::c_void,
+    stream_w: u32,
+    stream_h: u32,
+) -> Option<(f64, f64)> {
     if spa_buf.is_null() || stream_w < 2 || stream_h < 2 {
         return None;
     }
@@ -1897,7 +1905,10 @@ fn extract_spa_meta_cursor(spa_buf: *mut std::ffi::c_void, stream_w: u32, stream
 }
 
 /// Run PipeWire mainloop: connect to portal FD, MAP_BUFFERS, push RGBA + cursor into slots.
-#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_os = "android", target_os = "ios"))
+))]
 fn run_pipewire_capture(
     node_id: u32,
     fd: std::os::fd::OwnedFd,
@@ -1920,8 +1931,7 @@ fn run_pipewire_capture(
     pw::init();
 
     let mainloop = pw::main_loop::MainLoop::new(None).map_err(|e| format!("pw mainloop: {e}"))?;
-    let context =
-        pw::context::Context::new(&mainloop).map_err(|e| format!("pw context: {e}"))?;
+    let context = pw::context::Context::new(&mainloop).map_err(|e| format!("pw context: {e}"))?;
     let core = context
         .connect_fd(fd, None)
         .map_err(|e| format!("pw connect_fd: {e}"))?;
@@ -1956,11 +1966,10 @@ fn run_pipewire_capture(
             if id != spa::param::ParamType::Format.as_raw() {
                 return;
             }
-            let (media_type, media_subtype) =
-                match spa::param::format_utils::parse_format(param) {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
+            let (media_type, media_subtype) = match spa::param::format_utils::parse_format(param) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
             if media_type != spa::param::format::MediaType::Video
                 || media_subtype != spa::param::format::MediaSubtype::Raw
             {
@@ -2096,10 +2105,7 @@ fn run_pipewire_capture(
             Choice,
             Range,
             Fraction,
-            spa::utils::Fraction {
-                num: fr,
-                denom: 1
-            },
+            spa::utils::Fraction { num: fr, denom: 1 },
             spa::utils::Fraction { num: 0, denom: 1 },
             spa::utils::Fraction {
                 num: 1000,
@@ -2153,7 +2159,10 @@ fn run_pipewire_capture(
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", not(any(target_os = "android", target_os = "ios"))))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_os = "android", target_os = "ios"))
+))]
 fn start_wayland_portal_rust(cfg: ScreenCaptureStart) -> Result<ScreenCaptureSession, String> {
     if let Some(parent) = cfg.sepscrr_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
@@ -2415,7 +2424,10 @@ fn start_wayland_portal_rust(cfg: ScreenCaptureStart) -> Result<ScreenCaptureSes
     })
 }
 
-#[cfg(all(not(target_os = "linux"), not(any(target_os = "android", target_os = "ios"))))]
+#[cfg(all(
+    not(target_os = "linux"),
+    not(any(target_os = "android", target_os = "ios"))
+))]
 fn start_wayland_portal_rust(_cfg: ScreenCaptureStart) -> Result<ScreenCaptureSession, String> {
     Err("ScreenCast PipeWire capture is only available on Linux".into())
 }

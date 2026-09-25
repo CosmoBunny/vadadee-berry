@@ -1,5 +1,5 @@
 use std::fs;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct SysStats {
@@ -72,7 +72,11 @@ impl SysStats {
             if let Ok(entries) = fs::read_dir("/sys/class/thermal") {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.file_name().and_then(|s| s.to_str()).map_or(false, |s| s.starts_with("thermal_zone")) {
+                    if path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map_or(false, |s| s.starts_with("thermal_zone"))
+                    {
                         if let Ok(temp_str) = fs::read_to_string(path.join("temp")) {
                             if let Ok(temp_val) = temp_str.trim().parse::<i32>() {
                                 let temp_c = temp_val as f32 / 1000.0;
@@ -93,7 +97,13 @@ impl SysStats {
                         if let Ok(hw_entries) = fs::read_dir(&path) {
                             for hw_entry in hw_entries.flatten() {
                                 let hw_path = hw_entry.path();
-                                if hw_path.file_name().and_then(|s| s.to_str()).map_or(false, |s| s.starts_with("temp") && s.ends_with("_input")) {
+                                if hw_path
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .map_or(false, |s| {
+                                        s.starts_with("temp") && s.ends_with("_input")
+                                    })
+                                {
                                     if let Ok(temp_str) = fs::read_to_string(hw_path) {
                                         if let Ok(temp_val) = temp_str.trim().parse::<i32>() {
                                             let temp_c = temp_val as f32 / 1000.0;
@@ -152,7 +162,8 @@ impl SysStats {
 
             // Update GPU usage
             let mut gpu_busy = -1;
-            if let Ok(val_str) = fs::read_to_string("/sys/class/drm/card0/device/gpu_busy_percent") {
+            if let Ok(val_str) = fs::read_to_string("/sys/class/drm/card0/device/gpu_busy_percent")
+            {
                 if let Ok(val) = val_str.trim().parse::<i32>() {
                     gpu_busy = val;
                 }
@@ -269,7 +280,13 @@ pub fn parse_jokes(content: &str) -> Vec<JokeRule> {
     rules
 }
 
-pub fn evaluate_condition(cond: &str, cpu_usage: f32, ram_sys_used_gb: f32, sec_per_frame: f32, cpu_temp: f32) -> bool {
+pub fn evaluate_condition(
+    cond: &str,
+    cpu_usage: f32,
+    ram_sys_used_gb: f32,
+    sec_per_frame: f32,
+    cpu_temp: f32,
+) -> bool {
     let cond = cond.trim();
     if cond.eq_ignore_ascii_case("DEFAULT") {
         return true;
@@ -360,23 +377,36 @@ pub fn choose_joke(
         if !platform_ok || rule.message.is_empty() {
             continue;
         }
-        if !evaluate_condition(&rule.condition, cpu_usage, ram_sys_used_gb, sec_per_frame, cpu_temp) {
+        if !evaluate_condition(
+            &rule.condition,
+            cpu_usage,
+            ram_sys_used_gb,
+            sec_per_frame,
+            cpu_temp,
+        ) {
             continue;
         }
 
-        let cat = rule.condition.split_whitespace().next()
+        let cat = rule
+            .condition
+            .split_whitespace()
+            .next()
             .unwrap_or("DEFAULT")
             .to_ascii_uppercase();
 
         if !matching_by_cat.contains_key(&cat) {
             cat_order.push(cat.clone());
         }
-        matching_by_cat.entry(cat).or_default().push(rule.message.as_str());
+        matching_by_cat
+            .entry(cat)
+            .or_default()
+            .push(rule.message.as_str());
     }
 
     if matching_by_cat.is_empty() {
         // Nothing specific matched — fall back to any DEFAULTs (they always match)
-        let defaults: Vec<&str> = rules.iter()
+        let defaults: Vec<&str> = rules
+            .iter()
             .filter(|r| {
                 let p_ok = match &r.platform {
                     JokePlatform::All => true,
@@ -540,10 +570,9 @@ mod tests {
 
     #[test]
     fn joke_cycling_sequence_demo() {
-        let content = std::fs::read_to_string("jokes_export.txt")
-            .unwrap_or_else(|_| {
-                // embedded fallback subset for CI
-                r#"[CPU 80..]
+        let content = std::fs::read_to_string("jokes_export.txt").unwrap_or_else(|_| {
+            // embedded fallback subset for CI
+            r#"[CPU 80..]
 CPU working hard.
 [CPU ..2]
 CPU sleeping.
@@ -557,8 +586,9 @@ RAM low.
 Mediocre fps range.
 [DEFAULT]
 Default joke here.
-"#.to_string()
-            });
+"#
+            .to_string()
+        });
         let rules = parse_jokes(&content);
 
         println!("\n=== Joke sequence (desktop, cycle 0..12) ===");
@@ -582,9 +612,14 @@ Default joke here.
         assert!(!evaluate_condition("CPU_TEMP ..40", 0., 0., 0., 80.));
         // fps 1..=10 range (sec 0.1..=1)
         assert!(evaluate_condition("SEC_PER_FRAME 0.1..=1", 0., 0., 0.5, 0.));
-        assert!(!evaluate_condition("SEC_PER_FRAME 0.1..=1", 0., 0., 2.0, 0.));
+        assert!(!evaluate_condition(
+            "SEC_PER_FRAME 0.1..=1",
+            0.,
+            0.,
+            2.0,
+            0.
+        ));
         assert!(evaluate_condition("CPU 80..", 85., 0., 0., 0.));
         assert!(evaluate_condition("CPU ..2", 1., 0., 0., 0.));
     }
 }
-

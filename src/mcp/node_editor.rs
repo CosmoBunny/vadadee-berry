@@ -1,6 +1,6 @@
 //! MCP tools for Node Editor graph layers (add/edit/connect nodes).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::document::{GraphNodeKind, GraphParam, PortDir};
@@ -476,20 +476,22 @@ pub fn node_fields_json(kind: &GraphNodeKind) -> Value {
 
 pub fn ports_json(kind: &GraphNodeKind) -> Value {
     let ports = kind.ports();
-    json!(ports
-        .iter()
-        .map(|p| {
-            json!({
-                "id": p.id,
-                "name": p.name,
-                "type": p.ty.label(),
-                "dir": match p.dir {
-                    PortDir::Input => "in",
-                    PortDir::Output => "out",
-                }
+    json!(
+        ports
+            .iter()
+            .map(|p| {
+                json!({
+                    "id": p.id,
+                    "name": p.name,
+                    "type": p.ty.label(),
+                    "dir": match p.dir {
+                        PortDir::Input => "in",
+                        PortDir::Output => "out",
+                    }
+                })
             })
-        })
-        .collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    )
 }
 
 /// Create GraphParam for param_* kinds; returns updated kind with real param_id.
@@ -552,11 +554,17 @@ pub fn list_kinds_json() -> String {
         ("object_video", "File video source"),
         ("object_audio", "File audio source"),
         ("object_from_app", "Document object reference"),
-        ("video_player", "Video + Time + Start/Duration → Image; Audio→Sound"),
+        (
+            "video_player",
+            "Video + Time + Start/Duration → Image; Audio→Sound",
+        ),
         ("object_septic", "Septic session (.sepscrr)"),
         ("object_mouse", "Mouse object — needs Mouse Encoder"),
         ("septic_player", "Septic + Time → Video, Mouse, truth Time"),
-        ("mouse_encoder", "Mouse → Pos, Shakiness (threshold+gain), Event 0/1"),
+        (
+            "mouse_encoder",
+            "Mouse → Pos, Shakiness (threshold+gain), Event 0/1",
+        ),
         ("visualizer", "Audio + Freq → Level 0..1"),
         ("param_real", "Animatable real parameter"),
         ("param_color", "Animatable color parameter"),

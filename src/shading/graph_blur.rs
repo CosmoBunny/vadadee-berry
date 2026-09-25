@@ -424,12 +424,7 @@ pub fn register_or_update_native(
     let device = &render_state.device;
     let mut renderer = render_state.renderer.write();
     if let Some(id) = existing {
-        renderer.update_egui_texture_from_wgpu_texture(
-            device,
-            view,
-            wgpu::FilterMode::Linear,
-            id,
-        );
+        renderer.update_egui_texture_from_wgpu_texture(device, view, wgpu::FilterMode::Linear, id);
         Some(id)
     } else {
         Some(renderer.register_native_texture(device, view, wgpu::FilterMode::Linear))

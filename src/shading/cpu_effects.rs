@@ -50,11 +50,7 @@ fn draw_shading_passes_cpu(
         draw_starfield_shader(painter, page_rect, time_secs, pass);
     } else if is_water {
         // No CPU mirror — solid tint so the layer isn't blank if GPU is off.
-        painter.rect_filled(
-            page_rect,
-            0.0,
-            Color32::from_rgb(12, 72, 110),
-        );
+        painter.rect_filled(page_rect, 0.0, Color32::from_rgb(12, 72, 110));
     } else if name.contains("crt") || wgsl.contains("scan") {
         draw_crt(painter, page_rect);
     } else if name.contains("vignette") {
@@ -138,7 +134,6 @@ fn draw_galaxy_shader(painter: &Painter, page: Rect, time_secs: f32, pass: &Shad
     painter.add(Shape::mesh(mesh));
 }
 
-
 fn draw_blackhole_shader(painter: &Painter, page: Rect, time_secs: f32, pass: &ShadingPass) {
     let mut u = BlackholeParams::default();
     if pass.uniforms.len() >= 3 {
@@ -166,10 +161,7 @@ fn draw_blackhole_shader(painter: &Painter, page: Rect, time_secs: f32, pass: &S
             let v0 = row as f32 / rows as f32;
             let u1 = (col + 1) as f32 / cols as f32;
             let v1 = (row + 1) as f32 / rows as f32;
-            let rgb = sample(
-                ((u0 + u1) * 0.5, (v0 + v1) * 0.5),
-                &u,
-            );
+            let rgb = sample(((u0 + u1) * 0.5, (v0 + v1) * 0.5), &u);
             let color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
             append_quad(&mut mesh, x0, y0, x1, y1, color);
         }
@@ -215,7 +207,13 @@ fn draw_vignette(painter: &Painter, page: Rect, strength: f32) {
         let r0 = radius * t0;
         let r1 = radius * t1;
         let mut mesh = Mesh::default();
-        append_ring(&mut mesh, center, r0, r1, Color32::from_black_alpha((alpha * 255.0) as u8));
+        append_ring(
+            &mut mesh,
+            center,
+            r0,
+            r1,
+            Color32::from_black_alpha((alpha * 255.0) as u8),
+        );
         painter.add(Shape::mesh(mesh));
     }
 }
@@ -224,10 +222,7 @@ fn draw_crt(painter: &Painter, page: Rect) {
     let mut y = page.top();
     while y < page.bottom() {
         painter.line_segment(
-            [
-                Pos2::new(page.left(), y),
-                Pos2::new(page.right(), y),
-            ],
+            [Pos2::new(page.left(), y), Pos2::new(page.right(), y)],
             Stroke::new(1.0, Color32::from_black_alpha(28)),
         );
         y += 3.0;

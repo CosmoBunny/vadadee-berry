@@ -5,8 +5,8 @@ use kurbo::BezPath;
 use thiserror::Error;
 
 use crate::document::{
-    ArcJoin, Document, Fill, LineCap, LineJoin, Node, NodeId, NodeKind, NodeStore, PageUnit,
-    Paint, PathData, ProjectFile, Stroke, regular_polygon_vertices,
+    ArcJoin, Document, Fill, LineCap, LineJoin, Node, NodeId, NodeKind, NodeStore, PageUnit, Paint,
+    PathData, ProjectFile, Stroke, regular_polygon_vertices,
 };
 
 /// Decoded video layer pixels for one export frame.
@@ -18,7 +18,6 @@ pub struct VideoLayerBuffer {
 }
 
 pub type VideoFrameMap = rustc_hash::FxHashMap<uuid::Uuid, VideoLayerBuffer>;
-
 
 /// Native project file extension (e.g. `drawing.vadadee-berry.json`).
 pub const PROJECT_FILE_EXTENSION: &str = "vadadee-berry.json";
@@ -39,7 +38,11 @@ pub fn default_project_filename(title: &str) -> String {
         .collect::<String>()
         .trim_matches(|c: char| c == '-' || c == '_')
         .to_string();
-    let stem = if stem.is_empty() { "untitled" } else { stem.as_str() };
+    let stem = if stem.is_empty() {
+        "untitled"
+    } else {
+        stem.as_str()
+    };
     format!("{stem}.{PROJECT_FILE_EXTENSION}")
 }
 
@@ -170,7 +173,11 @@ fn path_from_usvg(path: &usvg::Path) -> Option<Node> {
 }
 
 pub fn export_svg(path: &Path, project: &ProjectFile) -> Result<(), IoError> {
-    fs::write(path, document_svg_string(project, 0, &std::collections::HashMap::new())).map_err(|e| IoError::Msg(e.to_string()))
+    fs::write(
+        path,
+        document_svg_string(project, 0, &std::collections::HashMap::new()),
+    )
+    .map_err(|e| IoError::Msg(e.to_string()))
 }
 
 /// Full document SVG (for raster export / video frames).
@@ -227,7 +234,9 @@ pub fn document_svg_string(
                     if mask_set.contains(id) {
                         continue;
                     }
-                    let Some(node) = project.nodes.get(*id) else { continue };
+                    let Some(node) = project.nodes.get(*id) else {
+                        continue;
+                    };
                     let node_svg = node_to_svg_fragment(node, &project.nodes);
                     if let Some(cm) = clip_map.get(id) {
                         svg.push_str(&format!(
@@ -260,14 +269,14 @@ pub fn document_svg_string(
                             rot = r;
                         }
                     }
-                    
+
                     let mut aspect = 1.0;
                     if let Ok(dyn_img) = image::load_from_memory(bytes) {
                         if dyn_img.height() > 0 {
                             aspect = dyn_img.width() as f32 / dyn_img.height() as f32;
                         }
                     }
-                    
+
                     let mut w = layer.width;
                     let mut h = layer.height;
                     if layer.aspect_ratio_locked {
@@ -277,16 +286,16 @@ pub fn document_svg_string(
                             h = w / aspect;
                         }
                     }
-                    
+
                     let cx = dx + w as f64 / 2.0;
                     let cy = dy + h as f64 / 2.0;
-                    
+
                     let transform_attr = if rot != 0.0 {
                         format!(" transform=\"rotate({}, {}, {})\"", rot, cx, cy)
                     } else {
                         String::new()
                     };
-                    
+
                     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
                     svg.push_str(&format!(
                         r#"<image href="data:image/png;base64,{b64}" x="{dx}" y="{dy}" width="{w}" height="{h}" opacity="{opacity}"{transform_attr}/>"#,
@@ -327,7 +336,11 @@ pub fn document_svg_string(
 }
 
 /// Rasterize a single node into a tight SVG view box (transparent background).
-pub fn node_svg_for_bounds(node: &Node, bounds: kurbo::Rect, nodes: &crate::document::NodeStore) -> String {
+pub fn node_svg_for_bounds(
+    node: &Node,
+    bounds: kurbo::Rect,
+    nodes: &crate::document::NodeStore,
+) -> String {
     let w = bounds.width().max(1.0);
     let h = bounds.height().max(1.0);
     let x0 = bounds.x0;
@@ -359,11 +372,12 @@ pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> 
     } else {
         fill_svg(&node.style.fill, &fill_grad_id)
     };
-    let (stroke, stroke_defs) = if node.style.stroke.width > 0.0 && node.style.stroke.style.is_visible() {
-        stroke_svg(&node.style.stroke, &stroke_grad_id)
-    } else {
-        (r#"stroke="none""#.into(), String::new())
-    };
+    let (stroke, stroke_defs) =
+        if node.style.stroke.width > 0.0 && node.style.stroke.style.is_visible() {
+            stroke_svg(&node.style.stroke, &stroke_grad_id)
+        } else {
+            (r#"stroke="none""#.into(), String::new())
+        };
     let defs = format!("{fill_defs}{stroke_defs}");
     let op = node.style.opacity;
     let blend = node.style.blend_mode.svg_value();
@@ -371,7 +385,15 @@ pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> 
         NodeKind::Rect { x, y, w, h, rx } => format!(
             r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" {fill} {stroke} opacity="{op}"/>"#,
         ),
-        NodeKind::Plotter { x, y, w, h, plot_stroke_rgba, plot_stroke_width, .. } => {
+        NodeKind::Plotter {
+            x,
+            y,
+            w,
+            h,
+            plot_stroke_rgba,
+            plot_stroke_width,
+            ..
+        } => {
             let mut s = format!(
                 r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" {fill} {stroke} opacity="{op}"/>"#
             );
@@ -494,8 +516,22 @@ pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> 
                 img_el
             }
         }
-        NodeKind::Arc { cx, cy, radius, start_angle_rad, sweep_angle_rad, join } => {
-            let bez = crate::document::build_arc_bez(*cx, *cy, *radius, *start_angle_rad, *sweep_angle_rad, *join);
+        NodeKind::Arc {
+            cx,
+            cy,
+            radius,
+            start_angle_rad,
+            sweep_angle_rad,
+            join,
+        } => {
+            let bez = crate::document::build_arc_bez(
+                *cx,
+                *cy,
+                *radius,
+                *start_angle_rad,
+                *sweep_angle_rad,
+                *join,
+            );
             let d = bez.to_svg();
             format!(r#"<path d="{d}" {fill} {stroke} opacity="{op}"/>"#)
         }
@@ -504,26 +540,49 @@ pub fn node_to_svg_fragment(node: &Node, nodes: &crate::document::NodeStore) -> 
             for (pos, width) in points {
                 let r = width / 2.0;
                 if r > 0.1 {
-                    svg.push_str(&format!(r#"<circle cx="{}" cy="{}" r="{}" {fill} opacity="{op}"/>"#, pos[0], pos[1], r));
+                    svg.push_str(&format!(
+                        r#"<circle cx="{}" cy="{}" r="{}" {fill} opacity="{op}"/>"#,
+                        pos[0], pos[1], r
+                    ));
                 }
             }
             svg
         }
-        NodeKind::FlowchartNode { cx, cy, w, h, corner_rx, .. } => {
-            format!(r#"<rect x="{}" y="{}" width="{}" height="{}" rx="{}" {fill} {stroke} opacity="{op}"/>"#, cx - w/2.0, cy - h/2.0, w, h, corner_rx)
+        NodeKind::FlowchartNode {
+            cx,
+            cy,
+            w,
+            h,
+            corner_rx,
+            ..
+        } => {
+            format!(
+                r#"<rect x="{}" y="{}" width="{}" height="{}" rx="{}" {fill} {stroke} opacity="{op}"/>"#,
+                cx - w / 2.0,
+                cy - h / 2.0,
+                w,
+                h,
+                corner_rx
+            )
         }
         NodeKind::FlowchartPath { path } => {
             if path.points.is_empty() {
                 String::new()
             } else {
-                let pts: Vec<String> = path.points.iter().map(|(px, py)| format!("{px},{py}")).collect();
-                format!(r#"<polyline points="{}" {fill} {stroke} opacity="{op}"/>"#, pts.join(" "))
+                let pts: Vec<String> = path
+                    .points
+                    .iter()
+                    .map(|(px, py)| format!("{px},{py}"))
+                    .collect();
+                format!(
+                    r#"<polyline points="{}" {fill} {stroke} opacity="{op}"/>"#,
+                    pts.join(" ")
+                )
             }
         }
     };
     format!(r#"<g style="mix-blend-mode:{blend}">{defs}{body}</g>"#)
 }
-
 
 fn stops_svg(stops: &[crate::document::GradientStop]) -> String {
     stops
@@ -677,7 +736,11 @@ pub fn selection_paint_order(project: &ProjectFile, selection: &[NodeId]) -> Vec
         .collect()
 }
 
-pub fn export_selected_svg_string(project: &ProjectFile, selection: &[NodeId], bounds: Rect) -> String {
+pub fn export_selected_svg_string(
+    project: &ProjectFile,
+    selection: &[NodeId],
+    bounds: Rect,
+) -> String {
     let ordered = selection_paint_order(project, selection);
     let w = bounds.width();
     let h = bounds.height();
@@ -690,7 +753,9 @@ pub fn export_selected_svg_string(project: &ProjectFile, selection: &[NodeId], b
         ty = -bounds.y0
     );
     for id in &ordered {
-        let Some(node) = project.nodes.get(*id) else { continue };
+        let Some(node) = project.nodes.get(*id) else {
+            continue;
+        };
         svg.push_str(&node_to_svg_fragment(node, &project.nodes));
     }
     svg.push_str("</g>\n</svg>\n");
@@ -839,11 +904,7 @@ pub fn export_document_raster(
             }
             match layer.kind {
                 crate::document::LayerKind::Shading => {
-                    apply_shading_passes_skia_public(
-                        &mut pixmap,
-                        &layer.shading_passes,
-                        0.0,
-                    );
+                    apply_shading_passes_skia_public(&mut pixmap, &layer.shading_passes, 0.0);
                 }
                 crate::document::LayerKind::NodeEditor => {
                     composite_ne_file_output(&mut pixmap, project, layer, &target, bake_side);
@@ -872,8 +933,6 @@ pub fn export_selection_raster(
     write_image_file(path, format, w, h, &rgba)
 }
 
-
-
 /// Document SVG cropped to a document-space rectangle (`viewBox`).
 pub fn document_svg_for_view(
     project: &ProjectFile,
@@ -889,8 +948,7 @@ pub fn document_svg_for_view(
             let end = start + rel + 1;
             let head = format!(
                 r#"<svg xmlns="http://www.w3.org/2000/svg" width="{vw}" height="{vh}" viewBox="{} {} {vw} {vh}""#,
-                view.x0,
-                view.y0,
+                view.x0, view.y0,
             );
             svg.replace_range(start..end, &(head + ">"));
         }
@@ -899,12 +957,7 @@ pub fn document_svg_for_view(
 }
 
 pub fn default_document_view(project: &ProjectFile) -> kurbo::Rect {
-    kurbo::Rect::new(
-        0.0,
-        0.0,
-        project.document.width,
-        project.document.height,
-    )
+    kurbo::Rect::new(0.0, 0.0, project.document.width, project.document.height)
 }
 
 pub fn resolve_capture_view(
@@ -997,16 +1050,16 @@ pub fn render_svg_to_rgba(svg_data: &str, scale: f32) -> Option<(u32, u32, Vec<u
     let pixmap_size = tree.size().to_int_size();
     let pixel_w = (pixmap_size.width() as f32 * scale).round() as u32;
     let pixel_h = (pixmap_size.height() as f32 * scale).round() as u32;
-    
+
     if pixel_w == 0 || pixel_h == 0 {
         return None;
     }
-    
+
     let mut pixmap = resvg::tiny_skia::Pixmap::new(pixel_w, pixel_h)?;
-    
+
     let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-    
+
     Some((pixel_w, pixel_h, pixmap.take()))
 }
 
@@ -1036,7 +1089,11 @@ pub(crate) fn layer_anim_transform(
     (dx, dy, rot, opacity)
 }
 
-pub(crate) fn video_layer_dest_size(layer: &crate::document::Layer, frame_w: u32, frame_h: u32) -> (f32, f32) {
+pub(crate) fn video_layer_dest_size(
+    layer: &crate::document::Layer,
+    frame_w: u32,
+    frame_h: u32,
+) -> (f32, f32) {
     let aspect = if frame_h > 0 {
         frame_w as f32 / frame_h as f32
     } else {
@@ -1116,8 +1173,7 @@ pub fn composite_export_frame(
                 };
                 blit_av_layer(&mut pixmap, target, project, layer, buf, ctx)?;
             }
-            crate::document::LayerKind::Image
-            | crate::document::LayerKind::Flowchart => {
+            crate::document::LayerKind::Image | crate::document::LayerKind::Flowchart => {
                 // Static vector content: painter segment, NOT svg→resvg.
                 // (Flowchart previously rendered nothing here — now matches preview.)
                 pending_static.extend(layer.nodes.iter().copied());
@@ -1160,7 +1216,13 @@ pub fn composite_export_frame(
             }
         }
     }
-    flush_static_segment(&mut pixmap, project, &mut pending_static, target, &mut session);
+    flush_static_segment(
+        &mut pixmap,
+        project,
+        &mut pending_static,
+        target,
+        &mut session,
+    );
 
     // NE AppObjects: base segments hide these sources (painted at the NE
     // slot instead), so composite them here — same painter as preview, same
@@ -1183,9 +1245,7 @@ pub fn composite_export_frame(
         if ids.is_empty() {
             continue;
         }
-        if let Some(rgba) =
-            session.render_ne_appobjects(project, ids, target)
-        {
+        if let Some(rgba) = session.render_ne_appobjects(project, ids, target) {
             blit_transparent_full_frame(&mut pixmap, pixel_w, pixel_h, &rgba);
         }
     }
@@ -1221,8 +1281,7 @@ pub(crate) fn composite_ne_file_output(
     ) {
         return false;
     }
-    let Some(rgba) =
-        crate::document::bake_graph_eval_rgba(&eval, bake_max_side, 1.0, None, None)
+    let Some(rgba) = crate::document::bake_graph_eval_rgba(&eval, bake_max_side, 1.0, None, None)
     else {
         return false;
     };
@@ -1230,8 +1289,7 @@ pub(crate) fn composite_ne_file_output(
     let Some(src) = straight_rgba_to_pixmap(tw, th, &rgba) else {
         return false;
     };
-    let (dx, dy, mut w, mut h, rot_rad) =
-        layer.ne_output_paint_geom(&project.nodes, &eval);
+    let (dx, dy, mut w, mut h, rot_rad) = layer.ne_output_paint_geom(&project.nodes, &eval);
     let doc_w = project.document.width;
     let doc_h = project.document.height;
     let def_w = layer.width as f64;
@@ -1295,11 +1353,7 @@ pub(crate) fn straight_rgba_to_pixmap(
         return None;
     }
     let mut px = resvg::tiny_skia::Pixmap::new(w, h)?;
-    for (d, s) in px
-        .data_mut()
-        .chunks_exact_mut(4)
-        .zip(rgba.chunks_exact(4))
-    {
+    for (d, s) in px.data_mut().chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
         let a = s[3] as u32;
         d[0] = ((s[0] as u32 * a + 127) / 255) as u8;
         d[1] = ((s[1] as u32 * a + 127) / 255) as u8;
@@ -1324,14 +1378,7 @@ pub(crate) fn blit_av_layer(
     let (dx, dy, rot, opacity) = layer_anim_transform(layer, project, ctx.frame);
     let (dw, dh) = video_layer_dest_size(layer, buf.width, buf.height);
     let transform = crate::render_pipeline::pixmap_transform(
-        target,
-        dx,
-        dy,
-        dw as f64,
-        dh as f64,
-        rot as f32,
-        buf.width,
-        buf.height,
+        target, dx, dy, dw as f64, dh as f64, rot as f32, buf.width, buf.height,
     );
     let mut paint = resvg::tiny_skia::PixmapPaint::default();
     paint.opacity = opacity;
@@ -1412,11 +1459,7 @@ fn apply_shading_passes_skia(
                 for x in 0..w {
                     let u_val = (x as f32 + 0.5) / w as f32;
                     let rgb = if is_galaxy {
-                        crate::shading::procedural_blackhole::sample_galaxy(
-                            (u_val, v),
-                            t,
-                            aspect,
-                        )
+                        crate::shading::procedural_blackhole::sample_galaxy((u_val, v), t, aspect)
                     } else {
                         crate::shading::procedural_blackhole::sample_starfield(
                             (u_val, v),
@@ -1434,7 +1477,7 @@ fn apply_shading_passes_skia(
         } else if is_blackhole {
             let w = pixmap.width() as f32;
             let h = pixmap.height() as f32;
-            
+
             let mut u = crate::shading::procedural_blackhole::BlackholeParams::default();
             if pass.uniforms.len() >= 3 {
                 u.time = pass.uniforms[0] + time_secs;
@@ -1444,33 +1487,40 @@ fn apply_shading_passes_skia(
                 u.time = time_secs;
             }
             u.aspect = (w / h.max(1.0)).max(0.25);
-            
+
             let cols = 160usize;
             let rows = ((cols as f32 * h / w).ceil() as usize).clamp(90, 200);
             let cw = w / cols as f32;
             let ch = h / rows as f32;
-            
+
             for row in 0..rows {
                 for col in 0..cols {
                     let x0 = col as f32 * cw;
                     let y0 = row as f32 * ch;
                     let x1 = x0 + cw;
                     let y1 = y0 + ch;
-                    
+
                     let u0 = col as f32 / cols as f32;
                     let v0 = row as f32 / rows as f32;
                     let u1 = (col + 1) as f32 / cols as f32;
                     let v1 = (row + 1) as f32 / rows as f32;
-                    
+
                     let rgb = crate::shading::procedural_blackhole::sample(
                         ((u0 + u1) * 0.5, (v0 + v1) * 0.5),
                         &u,
                     );
-                    
+
                     if let Some(r_rect) = resvg::tiny_skia::Rect::from_ltrb(x0, y0, x1, y1) {
                         let mut paint = resvg::tiny_skia::Paint::default();
-                        paint.set_color(resvg::tiny_skia::Color::from_rgba8(rgb[0], rgb[1], rgb[2], 255));
-                        pixmap.fill_rect(r_rect, &paint, resvg::tiny_skia::Transform::identity(), None);
+                        paint.set_color(resvg::tiny_skia::Color::from_rgba8(
+                            rgb[0], rgb[1], rgb[2], 255,
+                        ));
+                        pixmap.fill_rect(
+                            r_rect,
+                            &paint,
+                            resvg::tiny_skia::Transform::identity(),
+                            None,
+                        );
                     }
                 }
             }
@@ -1478,7 +1528,7 @@ fn apply_shading_passes_skia(
             let w = pixmap.width() as usize;
             let h = pixmap.height() as usize;
             let data = pixmap.data_mut();
-            
+
             for y in 0..h {
                 if y % 3 == 0 {
                     let row_offset = y * w * 4;
@@ -1504,7 +1554,7 @@ fn apply_vignette_pixels(pixmap: &mut resvg::tiny_skia::Pixmap, strength: f32) {
     let cy = h as f32 * 0.5;
     let radius = w.max(h) as f32 * 0.55;
     let data = pixmap.data_mut();
-    
+
     for y in 0..h {
         let dy = y as f32 - cy;
         let row_offset = y * w * 4;
@@ -1554,11 +1604,15 @@ mod tests {
     #[test]
     fn text_svg_export_includes_transform_rotation() {
         use crate::document::{Node, NodeStore, TextStyle};
-        let mut node = Node::text(10.0, 20.0, TextStyle {
-            content: "hello".into(),
-            font_size: 24.0,
-            ..Default::default()
-        });
+        let mut node = Node::text(
+            10.0,
+            20.0,
+            TextStyle {
+                content: "hello".into(),
+                font_size: 24.0,
+                ..Default::default()
+            },
+        );
         node.set_rotation(std::f64::consts::FRAC_PI_4); // 45°
         let store = NodeStore::default();
         let svg = node_to_svg_fragment(&node, &store);
@@ -1614,8 +1668,14 @@ mod tests {
                 .filter(|c| c[0] < 250 || c[1] < 250 || c[2] < 250)
                 .count()
         };
-        assert!(ink(&upright) > 50, "upright text not painted (font/fill broken)");
-        assert!(ink(&rotated) > 50, "rotated text not painted (font/fill broken)");
+        assert!(
+            ink(&upright) > 50,
+            "upright text not painted (font/fill broken)"
+        );
+        assert!(
+            ink(&rotated) > 50,
+            "rotated text not painted (font/fill broken)"
+        );
         // Pixel footprints must differ — proves rotation is not dropped before resvg.
         assert_ne!(
             upright.data(),
@@ -1658,8 +1718,7 @@ mod tests {
         project.document.append_to_active_layer(text_id);
 
         let (w, h, still) =
-            crate::export_render::render_document_rgba(&project, 1.0)
-                .expect("still export");
+            crate::export_render::render_document_rgba(&project, 1.0).expect("still export");
         let vf = VideoFrameMap::default();
         let target = crate::render_pipeline::RenderTarget::for_video(
             project.document.width,
@@ -1669,8 +1728,7 @@ mod tests {
         .expect("target");
         let ctx = crate::render_pipeline::RenderContext::new(0, 0.0);
         let (fw, fh, frame) =
-            composite_export_frame(&project, &ctx, &vf, &target)
-                .expect("frame composite");
+            composite_export_frame(&project, &ctx, &vf, &target).expect("frame composite");
         // Video encoders need even dims: odd page sides shave one row/col.
         // The overlap must still be the same render (scale 1.0, origin ZERO).
         assert_eq!(fw, w - w % 2);
@@ -1699,9 +1757,7 @@ mod tests {
     /// lose the content that preview and video export show.
     #[test]
     fn frame_composite_keeps_ne_appobjects_content() {
-        use crate::document::{
-            Document, Fill, GraphNodeKind, Layer, Node, NodeGraph, Paint,
-        };
+        use crate::document::{Document, Fill, GraphNodeKind, Layer, Node, NodeGraph, Paint};
 
         let mut project = Document::new_empty_project();
         let red = Fill::Solid(Paint::from_hex(0xc0392b, 1.0));
@@ -1744,8 +1800,8 @@ mod tests {
         )
         .expect("target");
         let ctx = crate::render_pipeline::RenderContext::new(0, 0.0);
-        let (w, h, rgba) = composite_export_frame(&project, &ctx, &vf, &target)
-            .expect("frame composite");
+        let (w, h, rgba) =
+            composite_export_frame(&project, &ctx, &vf, &target).expect("frame composite");
         assert_eq!((w, h), (target.width, target.height));
         let px = |x: u32, y: u32| -> [u8; 4] {
             let i = ((y * w + x) * 4) as usize;
@@ -1756,7 +1812,10 @@ mod tests {
         let diff = (ink[0] as i32 - bg[0] as i32).abs()
             + (ink[1] as i32 - bg[1] as i32).abs()
             + (ink[2] as i32 - bg[2] as i32).abs();
-        assert!(diff > 60, "AppObjects content must survive, got {ink:?} vs {bg:?}");
+        assert!(
+            diff > 60,
+            "AppObjects content must survive, got {ink:?} vs {bg:?}"
+        );
     }
 
     fn ink_pixels(rgba: &[u8]) -> usize {

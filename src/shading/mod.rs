@@ -8,9 +8,9 @@ pub mod wgpu_pass;
 
 pub use cpu_effects::draw_shading_passes;
 pub use wgpu_pass::{
-    composite_shading_layers_into_rgba, init_callback_resources, probe_compile_shading_wgsl,
-    queue_shading_input, render_shading_pass_to_rgba, shading_passes_need_input,
-    validate_shading_wgsl, ShadingRenderer,
+    ShadingRenderer, composite_shading_layers_into_rgba, init_callback_resources,
+    probe_compile_shading_wgsl, queue_shading_input, render_shading_pass_to_rgba,
+    shading_passes_need_input, validate_shading_wgsl,
 };
 
 /// Load WGSL text from a filesystem path (desktop / host tooling).

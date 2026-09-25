@@ -85,10 +85,7 @@ pub enum ExportBackground {
 /// [`crate::render_pipeline::full_document_paint_plan`]). Pixel/GPU overlays
 /// (AV, WGSL shading, NE FilePath/bakes) are composited by the frame paths
 /// and by `io::export_document_raster`, not here.
-pub fn render_document_rgba(
-    project: &ProjectFile,
-    scale: f32,
-) -> Option<(u32, u32, Vec<u8>)> {
+pub fn render_document_rgba(project: &ProjectFile, scale: f32) -> Option<(u32, u32, Vec<u8>)> {
     PainterSession::new().render_document(project, scale)
 }
 
@@ -204,8 +201,7 @@ impl PainterSession {
             scale,
         )?;
         let (w, h) = (target.width, target.height);
-        let (order, hidden) =
-            crate::render_pipeline::full_document_paint_plan(project);
+        let (order, hidden) = crate::render_pipeline::full_document_paint_plan(project);
         let loft = crate::render_pipeline::loft_form_paths(&project.document);
         let viewport = Viewport {
             pan: Vec2::ZERO,
@@ -237,8 +233,7 @@ impl PainterSession {
         if selection.is_empty() {
             return None;
         }
-        let target =
-            crate::render_pipeline::RenderTarget::for_selection(bounds, scale)?;
+        let target = crate::render_pipeline::RenderTarget::for_selection(bounds, scale)?;
         let (w, h) = (target.width, target.height);
         let order = crate::io::selection_paint_order(project, selection);
         // screen = origin + pan + doc * zoom → pan puts bounds at origin, via
@@ -574,7 +569,11 @@ fn rasterize_primitives(
             Some(atlas)
         };
         for tri in mesh.indices.chunks_exact(3) {
-            let v = [mesh.vertices[tri[0] as usize], mesh.vertices[tri[1] as usize], mesh.vertices[tri[2] as usize]];
+            let v = [
+                mesh.vertices[tri[0] as usize],
+                mesh.vertices[tri[1] as usize],
+                mesh.vertices[tri[2] as usize],
+            ];
             fill_triangle(&mut buf, w, h, v, image, min_x, min_y, max_x, max_y);
         }
     }
@@ -630,10 +629,18 @@ fn fill_triangle(
             let b1 = w1 / area;
             let b2 = w2 / area;
             // Interpolated vertex color (straight sRGBA).
-            let r = b0 * v[0].color.r() as f32 + b1 * v[1].color.r() as f32 + b2 * v[2].color.r() as f32;
-            let g = b0 * v[0].color.g() as f32 + b1 * v[1].color.g() as f32 + b2 * v[2].color.g() as f32;
-            let bl = b0 * v[0].color.b() as f32 + b1 * v[1].color.b() as f32 + b2 * v[2].color.b() as f32;
-            let a = b0 * v[0].color.a() as f32 + b1 * v[1].color.a() as f32 + b2 * v[2].color.a() as f32;
+            let r = b0 * v[0].color.r() as f32
+                + b1 * v[1].color.r() as f32
+                + b2 * v[2].color.r() as f32;
+            let g = b0 * v[0].color.g() as f32
+                + b1 * v[1].color.g() as f32
+                + b2 * v[2].color.g() as f32;
+            let bl = b0 * v[0].color.b() as f32
+                + b1 * v[1].color.b() as f32
+                + b2 * v[2].color.b() as f32;
+            let a = b0 * v[0].color.a() as f32
+                + b1 * v[1].color.a() as f32
+                + b2 * v[2].color.a() as f32;
             let (sr, sg, sb, sa) = match image {
                 None => (r, g, bl, a),
                 Some(img) => {
@@ -765,7 +772,18 @@ mod preview_export_consistency_tests {
     }
 
     fn plain_project() -> ProjectFile {
-        text_project("Hello", 50.0, 60.0, 24.0, None, false, false, 0.0, 0.0, (1.0, 1.0))
+        text_project(
+            "Hello",
+            50.0,
+            60.0,
+            24.0,
+            None,
+            false,
+            false,
+            0.0,
+            0.0,
+            (1.0, 1.0),
+        )
     }
 
     fn render(project: &ProjectFile, scale: f32) -> (u32, u32, Vec<u8>) {
@@ -773,7 +791,8 @@ mod preview_export_consistency_tests {
     }
 
     /// Ink bounding box vs the corner-pixel background.
-    fn ink_bbox(w: u32, h: u32, rgba: &[u8]) -> Option<(u32, u32, u32, u32)> {        let bg = [rgba[0] as i32, rgba[1] as i32, rgba[2] as i32];
+    fn ink_bbox(w: u32, h: u32, rgba: &[u8]) -> Option<(u32, u32, u32, u32)> {
+        let bg = [rgba[0] as i32, rgba[1] as i32, rgba[2] as i32];
         let mut min_x = w;
         let mut min_y = h;
         let mut max_x = 0u32;
@@ -879,8 +898,30 @@ mod preview_export_consistency_tests {
     #[test]
     fn wrapped_text_box_wraps() {
         let long = "word ".repeat(40);
-        let auto_p = text_project(&long, 20.0, 20.0, 20.0, None, false, false, 0.0, 0.0, (1.0, 1.0));
-        let wrap_p = text_project(&long, 20.0, 20.0, 20.0, None, false, false, 200.0, 0.0, (1.0, 1.0));
+        let auto_p = text_project(
+            &long,
+            20.0,
+            20.0,
+            20.0,
+            None,
+            false,
+            false,
+            0.0,
+            0.0,
+            (1.0, 1.0),
+        );
+        let wrap_p = text_project(
+            &long,
+            20.0,
+            20.0,
+            20.0,
+            None,
+            false,
+            false,
+            200.0,
+            0.0,
+            (1.0, 1.0),
+        );
         let (w1, h1, r1) = render(&auto_p, 1.0);
         let (w2, h2, r2) = render(&wrap_p, 1.0);
         let ha = ink_bbox(w1, h1, &r1).map(|b| b.3 - b.1).unwrap_or(0);
@@ -898,7 +939,18 @@ mod preview_export_consistency_tests {
             .find(|f| *f != &fonts.default_family())
             .cloned()
             .unwrap_or_else(|| fonts.default_family());
-        let p = text_project("Ag", 50.0, 60.0, 24.0, Some(&fam), false, false, 0.0, 0.0, (1.0, 1.0));
+        let p = text_project(
+            "Ag",
+            50.0,
+            60.0,
+            24.0,
+            Some(&fam),
+            false,
+            false,
+            0.0,
+            0.0,
+            (1.0, 1.0),
+        );
         let (w, h, rgba) = render(&p, 1.0);
         assert!(ink_count(w, h, &rgba) > 20, "family {fam} must render");
     }
@@ -906,9 +958,42 @@ mod preview_export_consistency_tests {
     /// 4. Bold/italic render ink without panic.
     #[test]
     fn bold_italic_render_ink() {
-        let reg = text_project("Bold?", 50.0, 60.0, 28.0, None, false, false, 0.0, 0.0, (1.0, 1.0));
-        let bold = text_project("Bold?", 50.0, 60.0, 28.0, None, true, false, 0.0, 0.0, (1.0, 1.0));
-        let it = text_project("Bold?", 50.0, 60.0, 28.0, None, false, true, 0.0, 0.0, (1.0, 1.0));
+        let reg = text_project(
+            "Bold?",
+            50.0,
+            60.0,
+            28.0,
+            None,
+            false,
+            false,
+            0.0,
+            0.0,
+            (1.0, 1.0),
+        );
+        let bold = text_project(
+            "Bold?",
+            50.0,
+            60.0,
+            28.0,
+            None,
+            true,
+            false,
+            0.0,
+            0.0,
+            (1.0, 1.0),
+        );
+        let it = text_project(
+            "Bold?",
+            50.0,
+            60.0,
+            28.0,
+            None,
+            false,
+            true,
+            0.0,
+            0.0,
+            (1.0, 1.0),
+        );
         let (w, h, r_reg) = render(&reg, 1.0);
         let (_, _, r_bold) = render(&bold, 1.0);
         let (_, _, r_it) = render(&it, 1.0);
@@ -924,13 +1009,32 @@ mod preview_export_consistency_tests {
     #[test]
     fn rotated_text_keeps_ink() {
         let p = text_project(
-            "Rotate me", 200.0, 200.0, 28.0, None, false, false, 0.0,
-            std::f64::consts::FRAC_PI_6, (1.0, 1.0),
+            "Rotate me",
+            200.0,
+            200.0,
+            28.0,
+            None,
+            false,
+            false,
+            0.0,
+            std::f64::consts::FRAC_PI_6,
+            (1.0, 1.0),
         );
         let (w, h, rgba) = render(&p, 1.0);
         let n = ink_count(w, h, &rgba);
         assert!(n > 50, "rotated text must leave ink, got {n}");
-        let flat = text_project("Rotate me", 200.0, 200.0, 28.0, None, false, false, 0.0, 0.0, (1.0, 1.0));
+        let flat = text_project(
+            "Rotate me",
+            200.0,
+            200.0,
+            28.0,
+            None,
+            false,
+            false,
+            0.0,
+            0.0,
+            (1.0, 1.0),
+        );
         let (_, _, r_flat) = render(&flat, 1.0);
         assert_ne!(rgba, r_flat, "rotation must move pixels");
     }
@@ -940,19 +1044,55 @@ mod preview_export_consistency_tests {
     /// exactly rather than inventing its own scaling.
     #[test]
     fn scaled_transform_matches_preview_behavior() {
-        let p1 = text_project("Big", 100.0, 100.0, 24.0, None, false, false, 0.0, 0.0, (1.0, 1.0));
-        let p2 = text_project("Big", 100.0, 100.0, 24.0, None, false, false, 0.0, 0.0, (2.0, 2.0));
+        let p1 = text_project(
+            "Big",
+            100.0,
+            100.0,
+            24.0,
+            None,
+            false,
+            false,
+            0.0,
+            0.0,
+            (1.0, 1.0),
+        );
+        let p2 = text_project(
+            "Big",
+            100.0,
+            100.0,
+            24.0,
+            None,
+            false,
+            false,
+            0.0,
+            0.0,
+            (2.0, 2.0),
+        );
         let (w, h, r1) = render(&p1, 1.0);
         let b1 = ink_bbox(w, h, &r1).expect("ink");
         let (_, _, r2) = render(&p2, 1.0);
         let b2 = ink_bbox(w, h, &r2).expect("ink scaled");
-        assert_eq!(b1, b2, "transform.scale must behave identically: {b1:?} vs {b2:?}");
+        assert_eq!(
+            b1, b2,
+            "transform.scale must behave identically: {b1:?} vs {b2:?}"
+        );
     }
 
     /// 7. Fractional coordinates render without panic and leave ink.
     #[test]
     fn fractional_coords_render() {
-        let p = text_project("Frac", 50.33, 60.67, 23.5, None, false, false, 0.0, 0.0, (1.0, 1.0));
+        let p = text_project(
+            "Frac",
+            50.33,
+            60.67,
+            23.5,
+            None,
+            false,
+            false,
+            0.0,
+            0.0,
+            (1.0, 1.0),
+        );
         for scale in [1.0f32, 1.5] {
             let (w, h, rgba) = render(&p, scale);
             assert!(ink_count(w, h, &rgba) > 20, "ink at scale {scale}");
@@ -969,8 +1109,7 @@ mod preview_export_consistency_tests {
         let (fw, _fh, full) = render_document_rgba(&p, 1.0).unwrap();
         let ids: Vec<_> = p.document.layers[0].nodes.clone();
         let bounds = kurbo::Rect::new(40.0, 50.0, 220.0, 110.0);
-        let (sw, sh, sel) =
-            render_selection_rgba(&p, &ids, bounds, 1.0).unwrap();
+        let (sw, sh, sel) = render_selection_rgba(&p, &ids, bounds, 1.0).unwrap();
         assert_eq!(sw, bounds.width().round() as u32);
         assert_eq!(sh, bounds.height().round() as u32);
         // Pixel-compare the crop region of the full render, restricted to
@@ -1012,19 +1151,15 @@ mod preview_export_consistency_tests {
         };
         let order: Vec<_> = p.document.layers[0].nodes.clone();
         let base =
-            render_layer_base_rgba(&p, &order, &std::collections::HashSet::new(), &target)
-                .unwrap();
+            render_layer_base_rgba(&p, &order, &std::collections::HashSet::new(), &target).unwrap();
         // Corner pixel is untouched page background (text lives at 50,60).
         let bg = [full[0] as f32, full[1] as f32, full[2] as f32];
         let mut worst = 0i32;
         for i in (0..(w * h) as usize).map(|px| px * 4) {
             let sa = base[i + 3] as f32 / 255.0;
             for c in 0..3 {
-                let expect =
-                    base[i + c] as f32 * sa + bg[c] * (1.0 - sa);
-                worst = worst.max(
-                    (expect.round() as i32 - full[i + c] as i32).abs(),
-                );
+                let expect = base[i + c] as f32 * sa + bg[c] * (1.0 - sa);
+                worst = worst.max((expect.round() as i32 - full[i + c] as i32).abs());
             }
         }
         assert!(worst <= 2, "cache base must match export, worst {worst}");
@@ -1103,13 +1238,8 @@ mod preview_export_consistency_tests {
         {
             let mut cursor = std::io::Cursor::new(&mut png_bytes);
             let enc = image::codecs::png::PngEncoder::new(&mut cursor);
-            enc.write_image(
-                img.as_raw(),
-                64,
-                64,
-                image::ExtendedColorType::Rgba8,
-            )
-            .unwrap();
+            enc.write_image(img.as_raw(), 64, 64, image::ExtendedColorType::Rgba8)
+                .unwrap();
         }
         let mut project = Document::new_empty_project();
         let src = Node::image(50.0, 50.0, 200.0, 200.0, png_bytes);
@@ -1145,7 +1275,10 @@ mod preview_export_consistency_tests {
         let inside_diff = (inside[0] as i32 - bg[0] as i32).abs()
             + (inside[1] as i32 - bg[1] as i32).abs()
             + (inside[2] as i32 - bg[2] as i32).abs();
-        assert!(inside_diff > 60, "mask interior must show image, got {inside:?} vs bg {bg:?}");
+        assert!(
+            inside_diff > 60,
+            "mask interior must show image, got {inside:?} vs bg {bg:?}"
+        );
         // Inside image but outside mask: must be page background (clipped away).
         let outside = px(60, 60);
         let outside_diff = (outside[0] as i32 - bg[0] as i32).abs()

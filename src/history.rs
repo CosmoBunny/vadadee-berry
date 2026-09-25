@@ -1,18 +1,24 @@
 use undo::{Edit, Record};
 
-use crate::document::{
-    AnimationTimeline, Document, Node, NodeAnimation, NodeId, ProjectFile,
-};
+use crate::document::{AnimationTimeline, Document, Node, NodeAnimation, NodeId, ProjectFile};
 
 pub const DEFAULT_UNDO_LIMIT: usize = 30;
 
 #[derive(Debug, Clone)]
 pub enum ProjectEdit {
-    InsertNode { node: Node },
-    InsertNodes { nodes: Vec<Node> },
+    InsertNode {
+        node: Node,
+    },
+    InsertNodes {
+        nodes: Vec<Node>,
+    },
     /// Nodes already live in the project; history only records undo/redo.
-    InsertNodesApplied { nodes: Vec<Node> },
-    PatchNodes { patches: Vec<(NodeId, Node, Node)> },
+    InsertNodesApplied {
+        nodes: Vec<Node>,
+    },
+    PatchNodes {
+        patches: Vec<(NodeId, Node, Node)>,
+    },
     RemoveNodes {
         removed: Vec<(NodeId, Node)>,
         /// Animation tracks removed with the nodes (restored on undo).
@@ -201,9 +207,7 @@ fn apply_forward(cmd: &ProjectEdit, project: &mut ProjectFile) {
             project.document = after.clone();
         }
         ProjectEdit::ReorderNodes {
-            layer_index,
-            after,
-            ..
+            layer_index, after, ..
         } => {
             if let Some(layer) = project.document.layers.get_mut(*layer_index) {
                 layer.nodes = after.clone();

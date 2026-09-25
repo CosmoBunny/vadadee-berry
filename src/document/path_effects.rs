@@ -153,10 +153,7 @@ impl CircularCloneEffect {
     pub fn placement_xy(&self, i: usize) -> (f64, f64) {
         let r = self.ring_radius();
         let ang = self.copy_angle_rad(i);
-        (
-            self.origin_x + r * ang.cos(),
-            self.origin_y + r * ang.sin(),
-        )
+        (self.origin_x + r * ang.cos(), self.origin_y + r * ang.sin())
     }
 
     /// Rotation applied to the instance after placing at ring position.
@@ -165,9 +162,7 @@ impl CircularCloneEffect {
     pub fn instance_rotation_rad(&self, i: usize) -> f64 {
         match self.rotate_mode {
             CircularRotateMode::Static => 0.0,
-            CircularRotateMode::ReferenceOrigin => {
-                self.copy_angle_rad(i) - self.base_angle_rad()
-            }
+            CircularRotateMode::ReferenceOrigin => self.copy_angle_rad(i) - self.base_angle_rad(),
         }
     }
 
@@ -280,9 +275,7 @@ impl Default for BooleanEffect {
 pub fn is_booleanable_shape(node: &Node) -> bool {
     match &node.kind {
         NodeKind::Path { path } => path.is_closed() || path.to_bez().area().abs() > 1e-3,
-        NodeKind::Rect { .. }
-        | NodeKind::Ellipse { .. }
-        | NodeKind::Polygon { .. } => true,
+        NodeKind::Rect { .. } | NodeKind::Ellipse { .. } | NodeKind::Polygon { .. } => true,
         NodeKind::Arc { join, .. } => !matches!(join, super::ArcJoin::NoJoin),
         _ => false,
     }
@@ -306,22 +299,28 @@ pub fn node_to_multipolygon(node: &Node, tolerance: f64) -> Option<geo::MultiPol
     let mut start: Option<Coord<f64>> = None;
     let mut last = Coord { x: 0.0, y: 0.0 };
 
-    let flush = |cur: &mut Vec<Coord<f64>>, rings: &mut Vec<Vec<Coord<f64>>>, start: Option<Coord<f64>>| {
-        if cur.len() < 3 {
-            cur.clear();
-            return;
-        }
-        if let Some(s) = start {
-            if cur.last().map(|c| (c.x - s.x).hypot(c.y - s.y)).unwrap_or(1.0) > 1e-6 {
-                cur.push(s);
+    let flush =
+        |cur: &mut Vec<Coord<f64>>, rings: &mut Vec<Vec<Coord<f64>>>, start: Option<Coord<f64>>| {
+            if cur.len() < 3 {
+                cur.clear();
+                return;
             }
-        }
-        if cur.len() >= 4 {
-            rings.push(std::mem::take(cur));
-        } else {
-            cur.clear();
-        }
-    };
+            if let Some(s) = start {
+                if cur
+                    .last()
+                    .map(|c| (c.x - s.x).hypot(c.y - s.y))
+                    .unwrap_or(1.0)
+                    > 1e-6
+                {
+                    cur.push(s);
+                }
+            }
+            if cur.len() >= 4 {
+                rings.push(std::mem::take(cur));
+            } else {
+                cur.clear();
+            }
+        };
 
     for el in bez.elements() {
         match el {
@@ -546,7 +545,10 @@ fn flatten_bez(bez: &BezPath, tolerance: f64) -> Vec<(f64, f64)> {
             }
             PathEl::ClosePath => {
                 if let Some(start) = pts.first().copied() {
-                    if pts.last().map_or(true, |p| (p.0 - start.0).hypot(p.1 - start.1) > 1e-4) {
+                    if pts
+                        .last()
+                        .map_or(true, |p| (p.0 - start.0).hypot(p.1 - start.1) > 1e-4)
+                    {
                         pts.push(start);
                     }
                 }
@@ -642,21 +644,35 @@ pub fn effect_placements(
         OnPathMode::GapDuplicate => {
             let gap = effect.gap.max(1.0);
             let mut dist = effect.start_offset.max(0.0);
-            let limit = if effect.cyclic && closed { total } else { total + 1e-6 };
+            let limit = if effect.cyclic && closed {
+                total
+            } else {
+                total + 1e-6
+            };
             while dist <= limit + 1e-6 {
                 let (x, y, ang) = path.sample_at(dist, tolerance);
                 raw.push((x, y, ang, 1.0, 1.0));
                 dist += gap;
-                if !effect.cyclic && dist > total { break; }
-                if effect.cyclic && closed && dist >= total { break; }
-                if raw.len() > 512 { break; }
+                if !effect.cyclic && dist > total {
+                    break;
+                }
+                if effect.cyclic && closed && dist >= total {
+                    break;
+                }
+                if raw.len() > 512 {
+                    break;
+                }
             }
         }
         OnPathMode::Loft => {
             let desired = 300f64;
             let gap = (total / desired).clamp(0.05, 1.5);
             let mut dist = effect.start_offset.max(0.0);
-            let limit = if effect.cyclic && closed { total } else { total + 1e-6 };
+            let limit = if effect.cyclic && closed {
+                total
+            } else {
+                total + 1e-6
+            };
             while dist <= limit + 1e-6 {
                 let t = (dist / total).clamp(0.0, 1.0) as f32;
                 let (x, y, ang) = path.sample_at(dist, tolerance);
@@ -664,9 +680,15 @@ pub fn effect_placements(
                 let shade = 1.0 + (effect.loft_end_opacity - 1.0) * t;
                 raw.push((x, y, ang, scale, shade));
                 dist += gap;
-                if !effect.cyclic && dist > total { break; }
-                if effect.cyclic && closed && dist >= total { break; }
-                if raw.len() > 4096 { break; }
+                if !effect.cyclic && dist > total {
+                    break;
+                }
+                if effect.cyclic && closed && dist >= total {
+                    break;
+                }
+                if raw.len() > 4096 {
+                    break;
+                }
             }
             // end point guarantee
             let (ex, ey, eang) = path.sample_at(total, tolerance);
@@ -755,7 +777,8 @@ pub fn compute_tiling_whole_bounds(source: &Node, effect: &TilingEffect) -> kurb
             let top = first_top + iy as f64 * effect.gap_y;
             let cx = left + w / 2.0;
             let cy = top + h / 2.0;
-            let rot = (ix as f64 * effect.row_rotation + iy as f64 * effect.col_rotation).to_radians();
+            let rot =
+                (ix as f64 * effect.row_rotation + iy as f64 * effect.col_rotation).to_radians();
             let pl = PathPlacement {
                 x: cx,
                 y: cy,
@@ -865,10 +888,7 @@ pub fn build_path_effect_form_node(
         if b.width() < 1e-6 && b.height() < 1e-6 {
             return None;
         }
-        let mut n = Node::path_from_bez(
-            bez_path_from_rect(b),
-            format!("{} on path", source.name),
-        );
+        let mut n = Node::path_from_bez(bez_path_from_rect(b), format!("{} on path", source.name));
         n.style = source.style.clone();
         n
     };
@@ -887,7 +907,8 @@ pub fn sync_path_effect_form_geometry(
     let Some(fresh) = build_path_effect_form_node(source, effect, path, tolerance) else {
         return;
     };
-    if let (NodeKind::Path { path: dst }, NodeKind::Path { path: src }) = (&mut form.kind, &fresh.kind)
+    if let (NodeKind::Path { path: dst }, NodeKind::Path { path: src }) =
+        (&mut form.kind, &fresh.kind)
     {
         *dst = src.clone();
     }
@@ -902,10 +923,7 @@ pub fn path_effect_by_form_node<'a>(
 }
 
 /// Ids that should move together when dragging a path-magic selection (source, spine path, form).
-pub fn path_effect_move_bundle(
-    document: &super::Document,
-    id: NodeId,
-) -> Vec<NodeId> {
+pub fn path_effect_move_bundle(document: &super::Document, id: NodeId) -> Vec<NodeId> {
     if let Some(eff) = path_effect_by_form_node(&document.path_effects, id) {
         return vec![eff.form_node_id.unwrap_or(id), eff.source_id, eff.path_id];
     }
@@ -924,9 +942,11 @@ pub fn path_effect_move_bundle(
     }
     // Boolean: moving the *result* moves A+B+result together.
     // Moving a ghost operand (A or B alone) must NOT drag the other operand.
-    if let Some(eff) = document.boolean_effects.values().find(|e| {
-        e.a_id == id || e.b_id == id || e.result_node_id == Some(id)
-    }) {
+    if let Some(eff) = document
+        .boolean_effects
+        .values()
+        .find(|e| e.a_id == id || e.b_id == id || e.result_node_id == Some(id))
+    {
         if eff.result_node_id == Some(id) {
             let mut v = vec![eff.a_id, eff.b_id, id];
             v.sort_by_key(|a| a.as_u128());
@@ -947,10 +967,7 @@ pub fn path_effect_move_bundle(
 }
 
 pub fn path_effect_form_node_ids(effects: &IndexMap<Uuid, ObjectOnPathEffect>) -> HashSet<NodeId> {
-    effects
-        .values()
-        .filter_map(|e| e.form_node_id)
-        .collect()
+    effects.values().filter_map(|e| e.form_node_id).collect()
 }
 
 pub fn node_uses_extended_pick_bounds(document: &super::Document, id: NodeId) -> bool {
@@ -991,24 +1008,28 @@ pub fn get_effective_bounds(
 ) -> kurbo::Rect {
     // Groups have bounds() == ZERO; always walk children via store.
     let mut b = node.bounds_with_store(nodes);
-    if let Some(e) = document.tiling_effects.values().find(|e| e.source_id == node.id) {
+    if let Some(e) = document
+        .tiling_effects
+        .values()
+        .find(|e| e.source_id == node.id)
+    {
         let whole = compute_tiling_whole_bounds(node, e);
         // Hidden source must not keep a "stuck" original bbox edge in the selection box.
-        b = if e.hide_source {
-            whole
-        } else {
-            b.union(whole)
-        };
+        b = if e.hide_source { whole } else { b.union(whole) };
     }
-    if let Some(e) = document.circular_effects.values().find(|e| e.source_id == node.id) {
+    if let Some(e) = document
+        .circular_effects
+        .values()
+        .find(|e| e.source_id == node.id)
+    {
         let whole = compute_circular_whole_bounds(node, e);
-        b = if e.hide_source {
-            whole
-        } else {
-            b.union(whole)
-        };
+        b = if e.hide_source { whole } else { b.union(whole) };
     }
-    if let Some(e) = document.path_effects.values().find(|e| e.source_id == node.id) {
+    if let Some(e) = document
+        .path_effects
+        .values()
+        .find(|e| e.source_id == node.id)
+    {
         if let Some(path) = path_data_for_id(nodes, e.path_id) {
             b = b.union(compute_whole_object_bounds(node, e, &path, 0.5));
         }
@@ -1037,13 +1058,7 @@ pub fn get_effective_bounds(
     b
 }
 
-fn transform_profile_point(
-    p: (f64, f64),
-    cx: f64,
-    cy: f64,
-    ang: f64,
-    scale: f32,
-) -> (f64, f64) {
+fn transform_profile_point(p: (f64, f64), cx: f64, cy: f64, ang: f64, scale: f32) -> (f64, f64) {
     let sx = p.0 * scale as f64;
     let sy = p.1 * scale as f64;
     let rx = sx * ang.cos() - sy * ang.sin();
@@ -1299,9 +1314,9 @@ pub fn find_effect_for_pair<'a>(
     a: NodeId,
     b: NodeId,
 ) -> Option<&'a ObjectOnPathEffect> {
-    effects.values().find(|e| {
-        (e.source_id == a && e.path_id == b) || (e.source_id == b && e.path_id == a)
-    })
+    effects
+        .values()
+        .find(|e| (e.source_id == a && e.path_id == b) || (e.source_id == b && e.path_id == a))
 }
 
 /// Source objects replaced on canvas by an active object-on-path effect.
@@ -1344,7 +1359,11 @@ mod tests {
             ..ObjectOnPathEffect::default()
         };
         let placements = effect_placements(&effect, &path as &dyn PathMagic, 0.5);
-        assert!(placements.len() >= 18, "expected dense loft slices, got {}", placements.len());
+        assert!(
+            placements.len() >= 18,
+            "expected dense loft slices, got {}",
+            placements.len()
+        );
         assert!((placements.last().unwrap().opacity_mul - 0.8).abs() < 0.05);
         assert!((placements.first().unwrap().opacity_mul - 1.0).abs() < 0.05);
     }
@@ -1391,4 +1410,3 @@ mod tests {
         assert!(gap >= 2.0 && gap <= 24.0);
     }
 }
-

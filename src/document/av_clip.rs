@@ -26,7 +26,11 @@ pub struct AvClip {
 }
 
 impl AvClip {
-    pub fn new_from_media(name: impl Into<String>, path: impl Into<String>, timeline_start: f32) -> Self {
+    pub fn new_from_media(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        timeline_start: f32,
+    ) -> Self {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
@@ -168,10 +172,17 @@ pub fn assign_free_track_row(
     let mut row = 0u32;
     loop {
         let av_overlap = av_clips.iter().any(|c| {
-            c.track_row == row && ranges_overlap(start_sec, end_sec, c.video_timeline_start, c.timeline_end_secs())
+            c.track_row == row
+                && ranges_overlap(
+                    start_sec,
+                    end_sec,
+                    c.video_timeline_start,
+                    c.timeline_end_secs(),
+                )
         });
         let music_overlap = music_clips.iter().any(|c| {
-            c.track_row == row && ranges_overlap(start_sec, end_sec, c.timeline_start_sec, c.end_sec())
+            c.track_row == row
+                && ranges_overlap(start_sec, end_sec, c.timeline_start_sec, c.end_sec())
         });
         if !av_overlap && !music_overlap {
             return row;

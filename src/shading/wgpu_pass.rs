@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use egui::epaint::PaintCallbackInfo;
 use egui::{Painter, Rect, Shape};
 use egui_wgpu::wgpu;
-use egui::epaint::PaintCallbackInfo;
 use egui_wgpu::{Callback, CallbackResources, CallbackTrait, RenderState, ScreenDescriptor};
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
@@ -55,7 +55,10 @@ struct CompiledShadingPipeline {
 
 pub fn init_callback_resources(render_state: &RenderState, msaa_samples: u32) {
     let mut renderer = render_state.renderer.write();
-    if renderer.callback_resources.contains::<ShadingGpuResources>() {
+    if renderer
+        .callback_resources
+        .contains::<ShadingGpuResources>()
+    {
         return;
     }
     let resources = ShadingGpuResources::new(
@@ -114,12 +117,10 @@ pub fn validate_shading_wgsl(wgsl: &str) -> Result<(), String> {
 
     // Common GLSL leftovers that compile-fail only on GPU (white canvas + Validation Error).
     if src.contains("mod(") || src.contains("mod (") {
-        return Err(
-            "WGSL has no GLSL-style `mod(a, b)` function.\n\
+        return Err("WGSL has no GLSL-style `mod(a, b)` function.\n\
              Use remainder: `a % b` (same-type floats/vecs), or:\n\
                fn mod2(x: vec2<f32>, y: vec2<f32>) -> vec2<f32> { return x - y * floor(x / y); }"
-                .into(),
-        );
+            .into());
     }
     if src.contains("texture2D(") || src.contains("gl_FragColor") || src.contains("varying ") {
         return Err(
@@ -149,11 +150,9 @@ pub fn validate_shading_wgsl(wgsl: &str) -> Result<(), String> {
                  Add:\n  @fragment\n  fn {entry}(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {{ ... }}"
             ));
         }
-        return Err(
-            "Missing `@fragment` on the entry function.\n\
+        return Err("Missing `@fragment` on the entry function.\n\
              Shading layers use a render pipeline (vertex + fragment), not compute."
-                .into(),
-        );
+            .into());
     }
     let entry = fragment_entry(src);
     // Require the chosen entry to appear near @fragment (best-effort).
@@ -219,9 +218,11 @@ pub fn probe_compile_shading_wgsl(
     // Ensure callback resources exist (first shading paint also does this).
     {
         let mut renderer = rs.renderer.write();
-        if !renderer.callback_resources.contains::<ShadingGpuResources>() {
-            let resources =
-                ShadingGpuResources::new(rs.device.clone(), rs.target_format, 1);
+        if !renderer
+            .callback_resources
+            .contains::<ShadingGpuResources>()
+        {
+            let resources = ShadingGpuResources::new(rs.device.clone(), rs.target_format, 1);
             renderer.callback_resources.insert(resources);
         }
         let res = renderer
@@ -252,11 +253,10 @@ fn compile_pipeline(
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
     let module_src = assemble_module(wgsl);
-    let module = device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("vadadee_shading_pass"),
-            source: wgpu::ShaderSource::Wgsl(module_src.into()),
-        });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("vadadee_shading_pass"),
+        source: wgpu::ShaderSource::Wgsl(module_src.into()),
+    });
 
     let bind_group_layout = if compose {
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -362,7 +362,11 @@ fn compile_pipeline(
 }
 
 impl ShadingGpuResources {
-    pub fn new(device: wgpu::Device, target_format: wgpu::TextureFormat, msaa_samples: u32) -> Self {
+    pub fn new(
+        device: wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        msaa_samples: u32,
+    ) -> Self {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shading_input_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -733,8 +737,8 @@ fn offscreen_pipeline(
             return hit.clone();
         }
     }
-    let compiled = compile_pipeline(device, wgpu::TextureFormat::Rgba8Unorm, 1, wgsl, false)
-        .map(Arc::new);
+    let compiled =
+        compile_pipeline(device, wgpu::TextureFormat::Rgba8Unorm, 1, wgsl, false).map(Arc::new);
     let mut guard = cache.lock().map_err(|e| e.to_string())?;
     // Another thread may have filled it; prefer existing.
     if let Some(hit) = guard.get(&key) {
@@ -845,7 +849,9 @@ pub fn render_shading_pass_to_rgba(
     let pipeline = offscreen_pipeline(device, wgsl)?;
 
     let mut pool_guard = OffscreenShadePool::ensure(device, width, height)?;
-    let pool = pool_guard.as_mut().ok_or_else(|| "shade pool missing".to_string())?;
+    let pool = pool_guard
+        .as_mut()
+        .ok_or_else(|| "shade pool missing".to_string())?;
 
     let mut ubuf = [0u8; UNIFORM_BUFFER_SIZE as usize];
     let n = uniforms.len().min(UNIFORM_BUFFER_SIZE as usize / 4);
@@ -929,8 +935,7 @@ pub fn render_shading_pass_to_rgba(
     for y in 0..height as usize {
         let src = y * padded as usize;
         let dst = y * unpadded as usize;
-        rgba[dst..dst + unpadded as usize]
-            .copy_from_slice(&data[src..src + unpadded as usize]);
+        rgba[dst..dst + unpadded as usize].copy_from_slice(&data[src..src + unpadded as usize]);
     }
     drop(data);
     pool.out_buf.unmap();

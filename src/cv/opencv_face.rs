@@ -55,7 +55,7 @@ fn cascade_paths() -> Vec<std::path::PathBuf> {
 
 #[cfg(feature = "opencv")]
 fn detect_faces_opencv_inner(img: &RgbaImage) -> Option<Vec<CvRegion>> {
-    use opencv::core::{Mat, Size, Vector, CV_8UC1};
+    use opencv::core::{CV_8UC1, Mat, Size, Vector};
     use opencv::imgproc;
     use opencv::objdetect::CascadeClassifier;
     use opencv::prelude::*;
@@ -77,7 +77,9 @@ fn detect_faces_opencv_inner(img: &RgbaImage) -> Option<Vec<CvRegion>> {
         let r = px.0[0] as f32;
         let g = px.0[1] as f32;
         let b = px.0[2] as f32;
-        gray_buf[i] = (0.299 * r + 0.587 * g + 0.114 * b).round().clamp(0.0, 255.0) as u8;
+        gray_buf[i] = (0.299 * r + 0.587 * g + 0.114 * b)
+            .round()
+            .clamp(0.0, 255.0) as u8;
     }
 
     let mut gray = Mat::new_rows_cols_with_default(

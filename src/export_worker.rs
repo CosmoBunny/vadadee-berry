@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use rustc_hash::FxHashMap;
 
-use crate::export_types::{ExportFxQuality, ExportPowerLevel, VideoFormat};
 use crate::document::{Fill, NodeId, ProjectFile};
+use crate::export_types::{ExportFxQuality, ExportPowerLevel, VideoFormat};
 use crate::io::{self, VideoFrameMap, VideoLayerBuffer};
 use crate::recorder::{Frame, RecorderConfig, SyncRecorder};
 use crate::video_decode::VideoStream;
@@ -22,7 +22,6 @@ use egui::Context;
 
 /// How often progress events are emitted (frames). Every frame floods the UI channel.
 const PROGRESS_EVERY_N_FRAMES: usize = 5;
-
 
 #[derive(Debug, Clone)]
 pub struct ExportJobConfig {
@@ -129,7 +128,14 @@ pub fn spawn_export_worker(
     match std::thread::Builder::new()
         .name("vadadee-video-export".into())
         .spawn(move || {
-            if let Err(e) = run_export(&mut project, &config, &cancel, &tx, wgpu_render, renderer_reclaim) {
+            if let Err(e) = run_export(
+                &mut project,
+                &config,
+                &cancel,
+                &tx,
+                wgpu_render,
+                renderer_reclaim,
+            ) {
                 let _ = tx.send(ExportWorkerEvent::Finished {
                     success: false,
                     message: e,
@@ -160,10 +166,7 @@ struct ColorAdjust {
 
 impl ColorAdjust {
     fn active(&self) -> bool {
-        self.hue != 0.0
-            || self.saturation != 1.0
-            || self.brightness != 1.0
-            || self.contrast != 1.0
+        self.hue != 0.0 || self.saturation != 1.0 || self.brightness != 1.0 || self.contrast != 1.0
     }
 }
 
@@ -354,8 +357,7 @@ impl<'a> ExportSession<'a> {
 
         let doc_w = self.project.document.width;
         let doc_h = self.project.document.height;
-        let target =
-            crate::render_pipeline::RenderTarget::for_video(doc_w, doc_h, self.scale)?;
+        let target = crate::render_pipeline::RenderTarget::for_video(doc_w, doc_h, self.scale)?;
         let (pixel_w, pixel_h) = (target.width, target.height);
 
         let mut pixmap = Pixmap::new(pixel_w, pixel_h)?;
@@ -406,15 +408,8 @@ impl<'a> ExportSession<'a> {
                     };
                     // Shared AV overlay (same geometry/opacity as io fallback).
                     let project = &self.project;
-                    if crate::io::blit_av_layer(
-                        &mut pixmap,
-                        &target,
-                        project,
-                        layer,
-                        buf,
-                        ctx,
-                    )
-                    .is_none()
+                    if crate::io::blit_av_layer(&mut pixmap, &target, project, layer, buf, ctx)
+                        .is_none()
                     {
                         continue;
                     }
@@ -435,12 +430,7 @@ impl<'a> ExportSession<'a> {
                     // Prefer **real WGSL** via GPU offscreen (same module as live canvas paint
                     // callback) — not the painter's full scene buffer, but the same shader.
                     // CPU hex is only a last-resort fallback (looks "fake").
-                    let Some(pass) = layer
-                        .shading_passes
-                        .iter()
-                        .rev()
-                        .find(|p| p.enabled)
-                    else {
+                    let Some(pass) = layer.shading_passes.iter().rev().find(|p| p.enabled) else {
                         continue;
                     };
                     let name = pass.name.to_ascii_lowercase();
@@ -543,12 +533,7 @@ impl<'a> ExportSession<'a> {
             let session = &mut self.painter;
             // Un-hides sources for the NE-slot paint (mirrors canvas).
             if let Some(rgba) = session.render_ne_appobjects(project, ids, &target) {
-                crate::io::blit_transparent_full_frame(
-                    &mut pixmap,
-                    pixel_w,
-                    pixel_h,
-                    &rgba,
-                );
+                crate::io::blit_transparent_full_frame(&mut pixmap, pixel_w, pixel_h, &rgba);
             }
             let _ = ctx.time_secs;
         }
@@ -562,7 +547,9 @@ impl<'a> ExportSession<'a> {
                     .layers
                     .iter()
                     .filter(|l| {
-                        l.visible && l.is_renderer && l.kind == crate::document::LayerKind::NodeEditor
+                        l.visible
+                            && l.is_renderer
+                            && l.kind == crate::document::LayerKind::NodeEditor
                     })
                     .filter_map(|l| {
                         let g = l.node_graph.as_ref()?;
@@ -592,13 +579,7 @@ impl<'a> ExportSession<'a> {
                 // Sticky last_ne_bake_rgba is enough for the current frame.
                 // Force CV jobs (face/privacy) to run sync so export is complete.
                 let baked = crate::cv::jobs::with_sync_cv(|| {
-                    crate::document::bake_graph_eval_rgba(
-                        &eval,
-                        max_side,
-                        blur_step,
-                        None,
-                        None,
-                    )
+                    crate::document::bake_graph_eval_rgba(&eval, max_side, blur_step, None, None)
                 })?;
                 self.last_ne_bake_key = Some(fx_key);
                 self.last_ne_bake_rgba = Some(baked);
@@ -639,9 +620,8 @@ impl<'a> ExportSession<'a> {
                 h = nh.max(1.0);
             }
             let rot_deg = rot_rad.to_degrees() as f32;
-            let transform = crate::render_pipeline::pixmap_transform(
-                &target, dx, dy, w, h, rot_deg, tw, th,
-            );
+            let transform =
+                crate::render_pipeline::pixmap_transform(&target, dx, dy, w, h, rot_deg, tw, th);
             let paint = PixmapPaint::default();
             pixmap.draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
             let _ = ctx.time_secs;
@@ -713,10 +693,8 @@ impl<'a> ExportSession<'a> {
             None,
         )?;
         let (tw, th) = rgba.dimensions();
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-            [tw as usize, th as usize],
-            &rgba.into_raw(),
-        );
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &rgba.into_raw());
         // Free previous texture for this layer before allocating a new one.
         if let Some(old) = self.image_textures.remove(&layer_id) {
             let _ = old; // drop TextureHandle → frees egui GPU tex
@@ -812,7 +790,8 @@ impl<'a> ExportSession<'a> {
                 self.export_fps,
             ) {
                 if layer.color.active() {
-                    if let Some(mut img) = image::RgbaImage::from_raw(w, h, std::mem::take(&mut rgba))
+                    if let Some(mut img) =
+                        image::RgbaImage::from_raw(w, h, std::mem::take(&mut rgba))
                     {
                         apply_color_controls(
                             &mut img,
@@ -963,8 +942,8 @@ impl<'a> ExportSession<'a> {
             let cycle_len = self.config.cycle_frame_count.max(1);
             let f_in_cycle = f % cycle_len;
             let timeline_sec = f_in_cycle as f32 / self.export_fps;
-            let anim_frame = ((timeline_sec * self.anim_fps).round() as usize)
-                .min(self.config.max_anim_frame);
+            let anim_frame =
+                ((timeline_sec * self.anim_fps).round() as usize).min(self.config.max_anim_frame);
             apply_animation_for_frame_project(self.project, anim_frame, self.anim_fps);
 
             let t_dec0 = Instant::now();
@@ -976,15 +955,12 @@ impl<'a> ExportSession<'a> {
             // raster path below (GPU, CPU fallback, io fallback).
             let doc_w = self.project.document.width;
             let doc_h = self.project.document.height;
-            let Some(target) = crate::render_pipeline::RenderTarget::for_video(
-                doc_w,
-                doc_h,
-                self.scale,
-            ) else {
+            let Some(target) =
+                crate::render_pipeline::RenderTarget::for_video(doc_w, doc_h, self.scale)
+            else {
                 return Err("Zero width or height for export".to_string());
             };
-            let ctx =
-                crate::render_pipeline::RenderContext::new(anim_frame, timeline_sec);
+            let ctx = crate::render_pipeline::RenderContext::new(anim_frame, timeline_sec);
 
             // Prefer CPU path — GPU/egui was 8–15s/frame for NE FilePath.
             let t_rast0 = Instant::now();
@@ -1045,8 +1021,7 @@ impl<'a> ExportSession<'a> {
         });
         self.finish_encoder()?;
 
-        let duration_secs =
-            self.config.total_frames as f32 / self.config.fps.max(1) as f32;
+        let duration_secs = self.config.total_frames as f32 / self.config.fps.max(1) as f32;
         // Reset NE Time to 0 before sound resolve. After the last encode frame,
         // playhead is at the end → VideoPlayer reports silent → "no sound path".
         for layer in self.project.document.layers.iter_mut() {
@@ -1089,7 +1064,8 @@ fn run_export(
     wgpu_render: Option<egui_wgpu::RenderState>,
     renderer_reclaim: Arc<Mutex<Vec<egui_wgpu::Renderer>>>,
 ) -> Result<(), String> {
-    let mut session = ExportSession::new(project, config, cancel, tx, wgpu_render, renderer_reclaim);
+    let mut session =
+        ExportSession::new(project, config, cancel, tx, wgpu_render, renderer_reclaim);
     if let Err(e) = session.prepare().and_then(|_| session.encode_all_frames()) {
         // Reclaim the offscreen renderer BEFORE the session is dropped, so GPU
         // pipeline teardown happens on the main thread rather than here.
@@ -1132,10 +1108,7 @@ fn run_export(
 fn collect_export_video_layers(project: &ProjectFile) -> Vec<ExportVideoLayer> {
     let mut out = Vec::new();
     for layer in &project.document.layers {
-        if !layer.visible
-            || !layer.is_renderer
-            || layer.kind != crate::document::LayerKind::AV
-        {
+        if !layer.visible || !layer.is_renderer || layer.kind != crate::document::LayerKind::AV {
             continue;
         }
         let mut layer_clone = layer.clone();
@@ -1210,7 +1183,13 @@ fn decode_layer_frame_rgba(
     }
 }
 
-fn apply_color_controls(img: &mut image::RgbaImage, hue: f32, sat: f32, bright: f32, contrast: f32) {
+fn apply_color_controls(
+    img: &mut image::RgbaImage,
+    hue: f32,
+    sat: f32,
+    bright: f32,
+    contrast: f32,
+) {
     for pixel in img.pixels_mut() {
         let [r, g, b, _a] = pixel.0;
         let mut rf = r as f32 / 255.0;
@@ -1350,9 +1329,10 @@ pub fn apply_animation_for_frame_project(project: &mut ProjectFile, frame: usize
         };
 
         let need_geom = track.geom_tracks.iter().any(|t| !t.keyframes.is_empty())
-            || track.stack_functions.iter().any(|sf| {
-                sf.channels.iter().any(|c| c.track.starts_with("geom_"))
-            });
+            || track
+                .stack_functions
+                .iter()
+                .any(|sf| sf.channels.iter().any(|c| c.track.starts_with("geom_")));
         let geom = if need_geom {
             // Grow geom track slots if stack targets higher indices.
             for ch in &track.stack_functions {
@@ -1363,9 +1343,7 @@ pub fn apply_animation_for_frame_project(project: &mut ProjectFile, frame: usize
                         .and_then(|s| s.parse::<usize>().ok())
                     {
                         if track.geom_tracks.len() <= idx {
-                            track
-                                .geom_tracks
-                                .resize_with(idx + 1, Default::default);
+                            track.geom_tracks.resize_with(idx + 1, Default::default);
                         }
                     }
                 }
@@ -1498,9 +1476,12 @@ pub fn apply_animation_for_frame_project(project: &mut ProjectFile, frame: usize
             if let Some(geom) = target_geom {
                 set_node_geom_floats_project(project, node_id, &geom);
             }
-        } else if let Some(layer) = project.document.layers.iter_mut().find(|l| {
-            l.id == node_id && l.kind == crate::document::LayerKind::AV
-        }) {
+        } else if let Some(layer) = project
+            .document
+            .layers
+            .iter_mut()
+            .find(|l| l.id == node_id && l.kind == crate::document::LayerKind::AV)
+        {
             if let Some(x) = target_x {
                 layer.x = x as f32;
             }
@@ -1716,7 +1697,10 @@ impl<'a> ExportSession<'a> {
         use egui_wgpu::wgpu;
 
         let mut input = egui::RawInput::default();
-        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, height as f32)));
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(width as f32, height as f32),
+        ));
 
         // Decode Image nodes once per export; update AV layer textures each frame.
         self.ensure_node_image_textures();
@@ -1740,15 +1724,15 @@ impl<'a> ExportSession<'a> {
             .document
             .layers
             .iter()
-            .filter(|l| l.visible && l.is_renderer && l.kind == crate::document::LayerKind::NodeEditor)
+            .filter(|l| {
+                l.visible && l.is_renderer && l.kind == crate::document::LayerKind::NodeEditor
+            })
             .filter_map(|l| {
                 let g = l.node_graph.as_ref()?;
                 let eval = g.resolve_output_image();
                 match &eval.image {
                     crate::document::GraphImageSource::FilePath(_)
-                    | crate::document::GraphImageSource::BakedCache { .. } => {
-                        Some((l.id, eval))
-                    }
+                    | crate::document::GraphImageSource::BakedCache { .. } => Some((l.id, eval)),
                     _ => None,
                 }
             })
@@ -1760,8 +1744,7 @@ impl<'a> ExportSession<'a> {
         // Canvas parity: the full hidden set (effect sources, group
         // children, NE AppObjects originals) — NOT just AppObjects. A narrow
         // set double-paints clipped/grouped/tiled sources in base + effects.
-        let hidden_sources =
-            crate::render_pipeline::hidden_effect_sources(self.project);
+        let hidden_sources = crate::render_pipeline::hidden_effect_sources(self.project);
 
         let origin = egui::Pos2::ZERO;
         let viewport = crate::canvas::Viewport {
@@ -1784,12 +1767,11 @@ impl<'a> ExportSession<'a> {
         let fonts = &self.fonts;
 
         let output = self.export_ctx.run(input, |ctx| {
-            let clip_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, height as f32));
-            let painter = egui::Painter::new(
-                ctx.clone(),
-                egui::LayerId::background(),
-                clip_rect,
+            let clip_rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width as f32, height as f32),
             );
+            let painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), clip_rect);
 
             let bg_color = egui::Color32::from_rgba_unmultiplied(
                 (self.project.document.page_color[0] * 255.0) as u8,
@@ -1805,7 +1787,8 @@ impl<'a> ExportSession<'a> {
                 }
                 match layer.kind {
                     crate::document::LayerKind::Image | crate::document::LayerKind::Flowchart => {
-                        let layer_set: std::collections::HashSet<uuid::Uuid> = layer.nodes.iter().copied().collect();
+                        let layer_set: std::collections::HashSet<uuid::Uuid> =
+                            layer.nodes.iter().copied().collect();
                         let layer_draw_order: Vec<uuid::Uuid> = draw_order
                             .iter()
                             .copied()
@@ -1834,11 +1817,8 @@ impl<'a> ExportSession<'a> {
                         } else if let Some(tex) = image_textures.get(&layer.id) {
                             // Shared geometry helpers (same numbers as the
                             // CPU fallback path, not a second computation).
-                            let (dx, dy, rot, opacity) = io::layer_anim_transform(
-                                layer,
-                                self.project,
-                                current_frame,
-                            );
+                            let (dx, dy, rot, opacity) =
+                                io::layer_anim_transform(layer, self.project, current_frame);
                             let tex_size = tex.size();
                             let (w, h) = io::video_layer_dest_size(
                                 layer,
@@ -1846,10 +1826,7 @@ impl<'a> ExportSession<'a> {
                                 tex_size[1] as u32,
                             );
                             let tl = viewport.doc_to_screen((dx, dy), origin);
-                            let br = viewport.doc_to_screen(
-                                (dx + w as f64, dy + h as f64),
-                                origin,
-                            );
+                            let br = viewport.doc_to_screen((dx + w as f64, dy + h as f64), origin);
                             let rect = egui::Rect::from_min_max(tl, br);
                             let rot_rad = (rot as f32).to_radians();
                             paint_rotated_image(&painter, tex.id(), rect, rot_rad, opacity);
@@ -1916,50 +1893,32 @@ impl<'a> ExportSession<'a> {
                                 crate::document::GraphImageSource::BakedCache { .. } => {
                                     // Same as FilePath: texture pre-baked into image_textures[layer.id].
                                     if let Some(tex) = image_textures.get(&layer.id) {
-                                        let (tw, th) = (
-                                            tex.size()[0] as f64,
-                                            tex.size()[1] as f64,
-                                        );
-                                        let (dx, dy, mut w, mut h, rot_rad) = layer
-                                            .ne_output_paint_geom(
-                                                &self.project.nodes,
-                                                &eval,
-                                            );
+                                        let (tw, th) = (tex.size()[0] as f64, tex.size()[1] as f64);
+                                        let (dx, dy, mut w, mut h, rot_rad) =
+                                            layer.ne_output_paint_geom(&self.project.nodes, &eval);
                                         let def_w = layer.width as f64;
                                         let def_h = layer.height as f64;
-                                        let near_default = (w - def_w).abs() < 2.0
-                                            && (h - def_h).abs() < 2.0;
-                                        let near_a4 = (w
-                                            - crate::document::A4_WIDTH_PX)
-                                            .abs()
+                                        let near_default =
+                                            (w - def_w).abs() < 2.0 && (h - def_h).abs() < 2.0;
+                                        let near_a4 = (w - crate::document::A4_WIDTH_PX).abs()
                                             < 2.0
-                                            && (h - crate::document::A4_HEIGHT_PX)
-                                                .abs()
-                                                < 2.0;
+                                            && (h - crate::document::A4_HEIGHT_PX).abs() < 2.0;
                                         if near_default || near_a4 {
-                                            let page_w =
-                                                self.project.document.width.max(1.0);
-                                            let page_h =
-                                                self.project.document.height.max(1.0);
+                                            let page_w = self.project.document.width.max(1.0);
+                                            let page_h = self.project.document.height.max(1.0);
                                             let mut nw = tw;
                                             let mut nh = th;
                                             if nw > page_w || nh > page_h {
-                                                let s = (page_w / nw)
-                                                    .min(page_h / nh);
+                                                let s = (page_w / nw).min(page_h / nh);
                                                 nw *= s;
                                                 nh *= s;
                                             }
                                             w = nw.max(1.0);
                                             h = nh.max(1.0);
                                         }
-                                        let tl = viewport
-                                            .doc_to_screen((dx, dy), origin);
-                                        let br = viewport.doc_to_screen(
-                                            (dx + w, dy + h),
-                                            origin,
-                                        );
-                                        let rect =
-                                            egui::Rect::from_min_max(tl, br);
+                                        let tl = viewport.doc_to_screen((dx, dy), origin);
+                                        let br = viewport.doc_to_screen((dx + w, dy + h), origin);
+                                        let rect = egui::Rect::from_min_max(tl, br);
                                         paint_rotated_image(
                                             &painter,
                                             tex.id(),
@@ -1972,50 +1931,32 @@ impl<'a> ExportSession<'a> {
                                 crate::document::GraphImageSource::FilePath(_path) => {
                                     // Texture pre-baked into image_textures[layer.id].
                                     if let Some(tex) = image_textures.get(&layer.id) {
-                                        let (tw, th) = (
-                                            tex.size()[0] as f64,
-                                            tex.size()[1] as f64,
-                                        );
-                                        let (dx, dy, mut w, mut h, rot_rad) = layer
-                                            .ne_output_paint_geom(
-                                                &self.project.nodes,
-                                                &eval,
-                                            );
+                                        let (tw, th) = (tex.size()[0] as f64, tex.size()[1] as f64);
+                                        let (dx, dy, mut w, mut h, rot_rad) =
+                                            layer.ne_output_paint_geom(&self.project.nodes, &eval);
                                         let def_w = layer.width as f64;
                                         let def_h = layer.height as f64;
-                                        let near_default = (w - def_w).abs() < 2.0
-                                            && (h - def_h).abs() < 2.0;
-                                        let near_a4 = (w
-                                            - crate::document::A4_WIDTH_PX)
-                                            .abs()
+                                        let near_default =
+                                            (w - def_w).abs() < 2.0 && (h - def_h).abs() < 2.0;
+                                        let near_a4 = (w - crate::document::A4_WIDTH_PX).abs()
                                             < 2.0
-                                            && (h - crate::document::A4_HEIGHT_PX)
-                                                .abs()
-                                                < 2.0;
+                                            && (h - crate::document::A4_HEIGHT_PX).abs() < 2.0;
                                         if near_default || near_a4 {
-                                            let page_w =
-                                                self.project.document.width.max(1.0);
-                                            let page_h =
-                                                self.project.document.height.max(1.0);
+                                            let page_w = self.project.document.width.max(1.0);
+                                            let page_h = self.project.document.height.max(1.0);
                                             let mut nw = tw;
                                             let mut nh = th;
                                             if nw > page_w || nh > page_h {
-                                                let s = (page_w / nw)
-                                                    .min(page_h / nh);
+                                                let s = (page_w / nw).min(page_h / nh);
                                                 nw *= s;
                                                 nh *= s;
                                             }
                                             w = nw.max(1.0);
                                             h = nh.max(1.0);
                                         }
-                                        let tl = viewport
-                                            .doc_to_screen((dx, dy), origin);
-                                        let br = viewport.doc_to_screen(
-                                            (dx + w, dy + h),
-                                            origin,
-                                        );
-                                        let rect =
-                                            egui::Rect::from_min_max(tl, br);
+                                        let tl = viewport.doc_to_screen((dx, dy), origin);
+                                        let br = viewport.doc_to_screen((dx + w, dy + h), origin);
+                                        let rect = egui::Rect::from_min_max(tl, br);
                                         paint_rotated_image(
                                             &painter,
                                             tex.id(),
@@ -2139,7 +2080,11 @@ impl<'a> ExportSession<'a> {
             });
 
             let mut static_render_pass = render_pass.forget_lifetime();
-            offscreen_renderer.render(&mut static_render_pass, &clipped_primitives, &screen_descriptor);
+            offscreen_renderer.render(
+                &mut static_render_pass,
+                &clipped_primitives,
+                &screen_descriptor,
+            );
             drop(static_render_pass);
         }
 
@@ -2237,10 +2182,26 @@ fn paint_rotated_image(
             *pt = center + egui::vec2(rx, ry);
         }
     }
-    mesh.vertices.push(egui::epaint::Vertex { pos: points[0], uv: egui::pos2(0.0, 0.0), color });
-    mesh.vertices.push(egui::epaint::Vertex { pos: points[1], uv: egui::pos2(1.0, 0.0), color });
-    mesh.vertices.push(egui::epaint::Vertex { pos: points[2], uv: egui::pos2(1.0, 1.0), color });
-    mesh.vertices.push(egui::epaint::Vertex { pos: points[3], uv: egui::pos2(0.0, 1.0), color });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[0],
+        uv: egui::pos2(0.0, 0.0),
+        color,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[1],
+        uv: egui::pos2(1.0, 0.0),
+        color,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[2],
+        uv: egui::pos2(1.0, 1.0),
+        color,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: points[3],
+        uv: egui::pos2(0.0, 1.0),
+        color,
+    });
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
     painter.add(mesh);

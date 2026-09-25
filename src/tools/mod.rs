@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use egui::{Key, Pos2, Ui, Vec2};
 
-use crate::document::{Node, NodeId, PathData, PathEditTarget, FillKind, GradientStop, Paint};
+use crate::document::{FillKind, GradientStop, Node, NodeId, Paint, PathData, PathEditTarget};
 
 pub mod weight_flow;
 pub use weight_flow::{
@@ -140,22 +140,22 @@ pub struct BrushSession {
     pub input_mode: BrushInputMode,
 
     // Mouse mode settings
-    pub mouse_pressure_sensitivity: f32,  // 0..2
-    pub mouse_speed_sensitivity: f32,     // 0..2
+    pub mouse_pressure_sensitivity: f32, // 0..2
+    pub mouse_speed_sensitivity: f32,    // 0..2
     pub mouse_rotate_by_direction: bool,
 
     // Stylus mode settings
-    pub stylus_tilt_angle: f32,           // degrees 0..90
-    pub stylus_pen_angle: f32,            // degrees 0..360
-    pub stylus_pressure: f32,             // 0..1
+    pub stylus_tilt_angle: f32, // degrees 0..90
+    pub stylus_pen_angle: f32,  // degrees 0..360
+    pub stylus_pressure: f32,   // 0..1
 
     // Pen type settings
-    pub pen_roundness: f32,               // 0..1  (1 = fully round, 0 = flat)
-    pub pen_press_on_paper: f32,          // 0..1  (how hard the pen presses)
+    pub pen_roundness: f32,      // 0..1  (1 = fully round, 0 = flat)
+    pub pen_press_on_paper: f32, // 0..1  (how hard the pen presses)
 
     // Calligraphy type settings
     pub calli_rotate_tip: bool,
-    pub calli_fountain_size: f32,         // nib width multiplier 0.1..3.0
+    pub calli_fountain_size: f32, // nib width multiplier 0.1..3.0
     pub calli_dynamic: bool,
 
     /// Pixel brush: stamp size in grid cells (1 = one box).
@@ -180,8 +180,14 @@ impl Default for BrushSession {
             heavy: 0.2,
             fill_kind: FillKind::Solid,
             fill_stops: vec![
-                GradientStop { pos: 0.0, color: Paint::from_hex(0x000000, 1.0) },
-                GradientStop { pos: 1.0, color: Paint::from_hex(0x000000, 1.0) },
+                GradientStop {
+                    pos: 0.0,
+                    color: Paint::from_hex(0x000000, 1.0),
+                },
+                GradientStop {
+                    pos: 1.0,
+                    color: Paint::from_hex(0x000000, 1.0),
+                },
             ],
             fill_stop_sel: 0,
             gradient_angle: 0.0,
@@ -238,10 +244,7 @@ pub fn pixel_stamp_at(
 pub fn pixel_cell_index(doc: (f64, f64), step_x: f64, step_y: f64) -> (i64, i64) {
     let gx = step_x.max(0.5);
     let gy = step_y.max(0.5);
-    (
-        (doc.0 / gx).floor() as i64,
-        (doc.1 / gy).floor() as i64,
-    )
+    ((doc.0 / gx).floor() as i64, (doc.1 / gy).floor() as i64)
 }
 
 /// Fill every grid stamp from `from` → `to` (inclusive).
@@ -270,17 +273,13 @@ pub fn pixel_stamps_along(
         let x = from.0 + (to.0 - from.0) * t;
         let y = from.1 + (to.1 - from.1) * t;
         let (cx, cy, w, h) = pixel_stamp_at((x, y), gx, gy, cells);
-        let key = (
-            (cx * 1000.0).round() as i64,
-            (cy * 1000.0).round() as i64,
-        );
+        let key = ((cx * 1000.0).round() as i64, (cy * 1000.0).round() as i64);
         if seen.insert(key) {
             out.push((cx, cy, w, h));
         }
     }
     out
 }
-
 
 #[derive(Debug, Clone, Default)]
 pub struct DragNewShape {
@@ -1191,12 +1190,7 @@ pub fn doc_point_from_screen(
     (x, y)
 }
 
-pub fn screen_from_doc(
-    doc: (f64, f64),
-    canvas_origin: Pos2,
-    pan: Vec2,
-    zoom: f32,
-) -> Pos2 {
+pub fn screen_from_doc(doc: (f64, f64), canvas_origin: Pos2, pan: Vec2, zoom: f32) -> Pos2 {
     Pos2::new(
         canvas_origin.x + pan.x + doc.0 as f32 * zoom,
         canvas_origin.y + pan.y + doc.1 as f32 * zoom,
@@ -1244,20 +1238,16 @@ impl Default for ToolAction {
     }
 }
 
-pub fn resize_bounds(
-    anchor: kurbo::Rect,
-    handle: ResizeHandle,
-    doc: (f64, f64),
-) -> kurbo::Rect {
+pub fn resize_bounds(anchor: kurbo::Rect, handle: ResizeHandle, doc: (f64, f64)) -> kurbo::Rect {
     let mut x0 = anchor.x0;
     let mut y0 = anchor.y0;
     let mut x1 = anchor.x1;
     let mut y1 = anchor.y1;
     let (px, py) = doc;
-    
+
     let orig_w = anchor.width();
     let orig_h = anchor.height();
-    
+
     match handle {
         ResizeHandle::Nw => {
             if orig_w > 0.0 && orig_h > 0.0 {
@@ -1378,8 +1368,7 @@ mod pixel_brush_tests {
             );
             let expected = pixel_stamp_at(doc, gx, gy, cells);
             assert!(
-                (stamps[0].0 - expected.0).abs() < 1e-9
-                    && (stamps[0].1 - expected.1).abs() < 1e-9,
+                (stamps[0].0 - expected.0).abs() < 1e-9 && (stamps[0].1 - expected.1).abs() < 1e-9,
                 "cells={cells}: stamp must match cursor cell"
             );
         }

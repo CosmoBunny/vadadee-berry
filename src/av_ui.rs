@@ -6,7 +6,6 @@ use uuid::Uuid;
 use crate::document::{AvClip, Layer, LayerKind, MusicClip, ProjectFile};
 use crate::icons;
 
-
 /// Wider handles so trim start/end are easy to grab.
 const TRIM_HANDLE_W: f32 = 14.0;
 
@@ -191,7 +190,8 @@ pub fn hit_test_clip(clip_rect: Rect, pos: egui::Pos2, music_id: Option<Uuid>) -
         return AvClipHit::None;
     }
     let handle = TRIM_HANDLE_W.min(clip_rect.width() * 0.35).max(10.0);
-    let left = Rect::from_min_size(clip_rect.min, egui::vec2(handle, clip_rect.height())).expand2(egui::vec2(2.0, 2.0));
+    let left = Rect::from_min_size(clip_rect.min, egui::vec2(handle, clip_rect.height()))
+        .expand2(egui::vec2(2.0, 2.0));
     let right = Rect::from_min_size(
         egui::pos2(clip_rect.max.x - handle, clip_rect.min.y),
         egui::vec2(handle, clip_rect.height()),
@@ -226,10 +226,7 @@ pub fn hit_test_clip(clip_rect: Rect, pos: egui::Pos2, music_id: Option<Uuid>) -
 }
 
 /// Map sticky drag to a new start / length / offset.
-pub fn apply_sticky_drag(
-    drag: &AvTimelineDrag,
-    pointer_x: f32,
-) -> (f32, f32, f32) {
+pub fn apply_sticky_drag(drag: &AvTimelineDrag, pointer_x: f32) -> (f32, f32, f32) {
     let track_w = drag.origin_track_w.max(1.0);
     let dx_sec = (pointer_x - drag.origin_pointer_x) / track_w * drag.origin_visible_sec;
     match drag.mode {
@@ -271,13 +268,16 @@ pub fn av_clip_rect(
 ) -> Rect {
     let clip_start_frame = clip.video_timeline_start * fps;
     let clip_end_frame = clip.timeline_end_secs() * fps;
-    let clip_start_x =
-        track_rect.left() + ((clip_start_frame - start_frame) / visible_frames) * track_rect.width();
+    let clip_start_x = track_rect.left()
+        + ((clip_start_frame - start_frame) / visible_frames) * track_rect.width();
     let clip_end_x =
         track_rect.left() + ((clip_end_frame - start_frame) / visible_frames) * track_rect.width();
     Rect::from_min_max(
         egui::pos2(clip_start_x, track_rect.top() + 4.0),
-        egui::pos2(clip_end_x.max(clip_start_x + 10.0), track_rect.bottom() - 4.0),
+        egui::pos2(
+            clip_end_x.max(clip_start_x + 10.0),
+            track_rect.bottom() - 4.0,
+        ),
     )
 }
 
@@ -287,18 +287,18 @@ pub fn piano_roll_panel(mut view: PianoRollView<'_>, ui: &mut Ui, ctx: &Context)
     };
 
     // Search all layers — DAW clips live on DAW-role layers, not only the active one.
-    let Some((layer_idx, clip_name)) = view
-        .project
-        .document
-        .layers
-        .iter()
-        .enumerate()
-        .find_map(|(i, l)| {
-            l.music_clips
-                .iter()
-                .find(|c| c.id == clip_id)
-                .map(|c| (i, c.name.clone()))
-        })
+    let Some((layer_idx, clip_name)) =
+        view.project
+            .document
+            .layers
+            .iter()
+            .enumerate()
+            .find_map(|(i, l)| {
+                l.music_clips
+                    .iter()
+                    .find(|c| c.id == clip_id)
+                    .map(|c| (i, c.name.clone()))
+            })
     else {
         *view.clip = None;
         return;
@@ -307,19 +307,35 @@ pub fn piano_roll_panel(mut view: PianoRollView<'_>, ui: &mut Ui, ctx: &Context)
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{} DAW Piano — {}", icons::MUSIC, clip_name)).strong());
         ui.separator();
-        if ui.selectable_label(*view.tool == PianoTool::Add, format!("{} Add", icons::ADD)).clicked() {
+        if ui
+            .selectable_label(*view.tool == PianoTool::Add, format!("{} Add", icons::ADD))
+            .clicked()
+        {
             *view.tool = PianoTool::Add;
         }
         if ui
-            .selectable_label(*view.tool == PianoTool::Remove, format!("{} Remove", icons::REMOVE))
+            .selectable_label(
+                *view.tool == PianoTool::Remove,
+                format!("{} Remove", icons::REMOVE),
+            )
             .clicked()
         {
             *view.tool = PianoTool::Remove;
         }
-        if ui.selectable_label(*view.tool == PianoTool::Grab, format!("{} Grab", icons::GRAB)).clicked() {
+        if ui
+            .selectable_label(
+                *view.tool == PianoTool::Grab,
+                format!("{} Grab", icons::GRAB),
+            )
+            .clicked()
+        {
             *view.tool = PianoTool::Grab;
         }
-        ui.label(RichText::new("Ctrl+Scroll = zoom | Scroll = pitch").small().weak());
+        ui.label(
+            RichText::new("Ctrl+Scroll = zoom | Scroll = pitch")
+                .small()
+                .weak(),
+        );
         if ui.button(format!("{} Close", icons::CLOSE)).clicked() {
             *view.clip = None;
         }
@@ -343,19 +359,27 @@ pub fn piano_roll_panel(mut view: PianoRollView<'_>, ui: &mut Ui, ctx: &Context)
         .max_height(viewport_h)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            let (resp, painter) =
-                ui.allocate_painter(egui::vec2(grid_w, keys_visible as f32 * row_h + 18.0), egui::Sense::click_and_drag());
+            let (resp, painter) = ui.allocate_painter(
+                egui::vec2(grid_w, keys_visible as f32 * row_h + 18.0),
+                egui::Sense::click_and_drag(),
+            );
             let rect = resp.rect;
             painter.rect_filled(rect, 4.0, Color32::from_rgb(18, 20, 28));
 
             let grid_top = rect.top() + 18.0;
-            let grid_rect = Rect::from_min_max(egui::pos2(rect.left() + 36.0, grid_top), rect.right_bottom());
+            let grid_rect = Rect::from_min_max(
+                egui::pos2(rect.left() + 36.0, grid_top),
+                rect.right_bottom(),
+            );
             let pitch_base = 60 + *view.pitch_scroll as i32;
 
             for i in 0..=ticks_visible.min(64) {
                 let x = grid_rect.left() + (i as f32 / ticks_visible as f32) * grid_rect.width();
                 painter.line_segment(
-                    [egui::pos2(x, grid_rect.top()), egui::pos2(x, grid_rect.bottom())],
+                    [
+                        egui::pos2(x, grid_rect.top()),
+                        egui::pos2(x, grid_rect.bottom()),
+                    ],
                     egui::Stroke::new(1.0, Color32::from_gray(40)),
                 );
             }
@@ -369,7 +393,10 @@ pub fn piano_roll_panel(mut view: PianoRollView<'_>, ui: &mut Ui, ctx: &Context)
                     Color32::from_rgb(220, 222, 230)
                 };
                 painter.rect_filled(
-                    Rect::from_min_max(egui::pos2(rect.left() + 2.0, y), egui::pos2(rect.left() + 34.0, y + row_h)),
+                    Rect::from_min_max(
+                        egui::pos2(rect.left() + 2.0, y),
+                        egui::pos2(rect.left() + 34.0, y + row_h),
+                    ),
                     1.0,
                     key_bg,
                 );
@@ -386,7 +413,10 @@ pub fn piano_roll_panel(mut view: PianoRollView<'_>, ui: &mut Ui, ctx: &Context)
                     label_col,
                 );
                 painter.line_segment(
-                    [egui::pos2(grid_rect.left(), y), egui::pos2(grid_rect.right(), y)],
+                    [
+                        egui::pos2(grid_rect.left(), y),
+                        egui::pos2(grid_rect.right(), y),
+                    ],
                     egui::Stroke::new(1.0, Color32::from_gray(35)),
                 );
             }
@@ -407,7 +437,8 @@ pub fn piano_roll_panel(mut view: PianoRollView<'_>, ui: &mut Ui, ctx: &Context)
                 let x0 = grid_rect.left()
                     + (note.start_tick as f32 / ticks_visible as f32) * grid_rect.width();
                 let x1 = grid_rect.left()
-                    + ((note.start_tick + note.duration_ticks) as f32 / ticks_visible as f32) * grid_rect.width();
+                    + ((note.start_tick + note.duration_ticks) as f32 / ticks_visible as f32)
+                        * grid_rect.width();
                 let y_final = grid_rect.top() + row as f32 * row_h;
                 let nr = Rect::from_min_max(
                     egui::pos2(x0, y_final + 1.0),
@@ -436,18 +467,23 @@ pub fn piano_roll_panel(mut view: PianoRollView<'_>, ui: &mut Ui, ctx: &Context)
                     if grid_rect.contains(pos) {
                         match *view.tool {
                             PianoTool::Add => {
-                                let rel_x = ((pos.x - grid_rect.left()) / grid_rect.width()).clamp(0.0, 1.0);
+                                let rel_x = ((pos.x - grid_rect.left()) / grid_rect.width())
+                                    .clamp(0.0, 1.0);
                                 let tick = (rel_x * ticks_visible as f32) as u32;
                                 let row = ((pos.y - grid_rect.top()) / row_h).floor() as i32;
-                                let pitch = (pitch_base + keys_visible - 1 - row).clamp(0, 127) as u8;
+                                let pitch =
+                                    (pitch_base + keys_visible - 1 - row).clamp(0, 127) as u8;
                                 if let Some(clip) = view
                                     .project
                                     .document
                                     .layers
                                     .get_mut(layer_idx)
-                                    .and_then(|l| l.music_clips.iter_mut().find(|c| c.id == clip_id))
+                                    .and_then(|l| {
+                                        l.music_clips.iter_mut().find(|c| c.id == clip_id)
+                                    })
                                 {
-                                    clip.notes.push(crate::document::MusicNote::new(pitch, tick, 4));
+                                    clip.notes
+                                        .push(crate::document::MusicNote::new(pitch, tick, 4));
                                 }
                             }
                             PianoTool::Remove => {
@@ -456,7 +492,9 @@ pub fn piano_roll_panel(mut view: PianoRollView<'_>, ui: &mut Ui, ctx: &Context)
                                     .document
                                     .layers
                                     .get_mut(layer_idx)
-                                    .and_then(|l| l.music_clips.iter_mut().find(|c| c.id == clip_id))
+                                    .and_then(|l| {
+                                        l.music_clips.iter_mut().find(|c| c.id == clip_id)
+                                    })
                                 {
                                     clip.notes.retain(|n| {
                                         let row = keys_visible - 1 - (n.pitch as i32 - pitch_base);
@@ -486,12 +524,15 @@ pub fn music_clip_rect(
 ) -> Rect {
     let clip_start_frame = clip.timeline_start_sec * fps;
     let clip_end_frame = clip.end_sec() * fps;
-    let clip_start_x =
-        track_rect.left() + ((clip_start_frame - start_frame) / visible_frames) * track_rect.width();
+    let clip_start_x = track_rect.left()
+        + ((clip_start_frame - start_frame) / visible_frames) * track_rect.width();
     let clip_end_x =
         track_rect.left() + ((clip_end_frame - start_frame) / visible_frames) * track_rect.width();
     Rect::from_min_max(
         egui::pos2(clip_start_x, track_rect.top() + 4.0),
-        egui::pos2(clip_end_x.max(clip_start_x + 10.0), track_rect.bottom() - 4.0),
+        egui::pos2(
+            clip_end_x.max(clip_start_x + 10.0),
+            track_rect.bottom() - 4.0,
+        ),
     )
 }

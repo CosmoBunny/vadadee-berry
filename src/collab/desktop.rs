@@ -285,10 +285,16 @@ impl CollabSession {
         self.last_project_hash = 0;
         if self.ui_config.role == CollabRole::Server {
             let bind = self.ui_config.server_bind_addr();
-            let _ = self.cmd_tx.send(NetCommand::StartServer { bind: bind.clone() });
-            let _ = self.cmd_tx.send(NetCommand::Connect(self.ui_config.clone()));
+            let _ = self
+                .cmd_tx
+                .send(NetCommand::StartServer { bind: bind.clone() });
+            let _ = self
+                .cmd_tx
+                .send(NetCommand::Connect(self.ui_config.clone()));
         } else {
-            let _ = self.cmd_tx.send(NetCommand::Connect(self.ui_config.clone()));
+            let _ = self
+                .cmd_tx
+                .send(NetCommand::Connect(self.ui_config.clone()));
         }
     }
 
@@ -371,7 +377,8 @@ impl CollabSession {
     }
 
     pub fn send_canvas_if_changed(&mut self, project_json: &str, force: bool) {
-        if !self.ui_config.live_canvas_sync || !self.is_connected() || !self.canvas_outbound_enabled {
+        if !self.ui_config.live_canvas_sync || !self.is_connected() || !self.canvas_outbound_enabled
+        {
             return;
         }
         let hash = fx_hash_str(project_json);
@@ -594,7 +601,7 @@ fn spawn_collab_thread(event_tx: Sender<CollabEvent>, cmd_rx: Receiver<NetComman
 async fn collab_network_loop(event_tx: Sender<CollabEvent>, cmd_rx: Receiver<NetCommand>) {
     use futures_util::{SinkExt, StreamExt};
     use std::sync::Arc;
-    use tokio::sync::{mpsc as tokio_mpsc, Mutex};
+    use tokio::sync::{Mutex, mpsc as tokio_mpsc};
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -629,7 +636,8 @@ async fn collab_network_loop(event_tx: Sender<CollabEvent>, cmd_rx: Receiver<Net
                     relay_handle = Some(tokio::spawn(async move {
                         let url = format!("ws://{bind2}/ws/{{room}}");
                         let _ = event_tx2.send(CollabEvent::Status(CollabStatus::Hosting(url)));
-                        let _ = crate::collab::relay::run_relay_until_stopped(&bind2, stop_rx).await;
+                        let _ =
+                            crate::collab::relay::run_relay_until_stopped(&bind2, stop_rx).await;
                     }));
                 }
                 NetCommand::Disconnect => {
@@ -659,7 +667,8 @@ async fn collab_network_loop(event_tx: Sender<CollabEvent>, cmd_rx: Receiver<Net
                         let _ = event_tx2.send(CollabEvent::Status(CollabStatus::Connecting));
                         match connect_async(&url).await {
                             Ok((ws, _)) => {
-                                let _ = event_tx2.send(CollabEvent::Status(CollabStatus::Connected));
+                                let _ =
+                                    event_tx2.send(CollabEvent::Status(CollabStatus::Connected));
                                 let (mut write, mut read) = ws.split();
                                 loop {
                                     tokio::select! {
@@ -694,18 +703,16 @@ async fn collab_network_loop(event_tx: Sender<CollabEvent>, cmd_rx: Receiver<Net
                                     }
                                 }
                                 let status = if is_client {
-                                    CollabStatus::Error(
-                                        "Host disconnected — session ended".into(),
-                                    )
+                                    CollabStatus::Error("Host disconnected — session ended".into())
                                 } else {
                                     CollabStatus::Disconnected
                                 };
                                 let _ = event_tx2.send(CollabEvent::Status(status));
                             }
                             Err(e) => {
-                                let _ = event_tx2.send(CollabEvent::Status(CollabStatus::Error(format!(
-                                    "WebSocket handshake failed: {e}"
-                                ))));
+                                let _ = event_tx2.send(CollabEvent::Status(CollabStatus::Error(
+                                    format!("WebSocket handshake failed: {e}"),
+                                )));
                             }
                         }
                     }));

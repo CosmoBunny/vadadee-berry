@@ -2,12 +2,12 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub mod drawing;
 pub mod node_editor;
@@ -30,14 +30,18 @@ pub struct McpAppSnapshot {
 #[derive(Debug)]
 pub enum McpHostRequest {
     Snapshot,
-    SaveProject { path: Option<String> },
+    SaveProject {
+        path: Option<String>,
+    },
     SetTitle(String),
     GetCollabText,
     SetCollabText(String),
     ProjectJson,
     ListObjects,
     ListAllObjects,
-    GetObject { id: String },
+    GetObject {
+        id: String,
+    },
     /// create_*, set_object_*, add_layer (see `drawing` module tool list).
     DrawingTool {
         name: String,
@@ -55,15 +59,21 @@ pub enum McpHostRequest {
         h: Option<f64>,
         save_path: Option<String>,
     },
-    DeleteObject { id: String },
+    DeleteObject {
+        id: String,
+    },
     UiHealth,
 }
 
 #[derive(Debug)]
 pub enum McpHostResponse {
     Snapshot(McpAppSnapshot),
-    Ok { message: String },
-    Err { message: String },
+    Ok {
+        message: String,
+    },
+    Err {
+        message: String,
+    },
     Text(String),
     RasterPreview {
         meta_json: String,
@@ -121,10 +131,7 @@ impl McpBridge {
 
     pub fn drain_pending(
         &mut self,
-    ) -> Vec<(
-        McpHostRequest,
-        std::sync::mpsc::Sender<McpHostResponse>,
-    )> {
+    ) -> Vec<(McpHostRequest, std::sync::mpsc::Sender<McpHostResponse>)> {
         let mut pending = Vec::new();
         loop {
             match self.request_rx.try_recv() {
@@ -216,39 +223,79 @@ pub fn mcp_initialize_result() -> Value {
 
 pub fn mcp_tools_list_result() -> Value {
     let mut tools: Vec<Value> = vec![
-        mcp_tool("get_project_snapshot", "Title, path, status, timeline, collab text", empty_tool_schema()),
-        mcp_tool("get_project_json", "Full project file as JSON (for AI editing)", empty_tool_schema()),
-        mcp_tool("save_project", "Save current project (optional path param)", json!({
-            "type": "object",
-            "properties": { "path": { "type": "string" } }
-        })),
-        mcp_tool("set_document_title", "Set document title string", json!({
-            "type": "object",
-            "properties": { "title": { "type": "string" } },
-            "required": ["title"]
-        })),
-        mcp_tool("get_collab_text", "Live collaboration chat log ([user]: message lines)", empty_tool_schema()),
-        mcp_tool("set_collab_text", "Send a chat message to the collaboration room", json!({
-            "type": "object",
-            "properties": { "text": { "type": "string" } },
-            "required": ["text"]
-        })),
-        mcp_tool("list_objects", "List objects on the active layer (id, name, kind, bounds)", empty_tool_schema()),
-        mcp_tool("get_object", "Get one object as JSON by UUID", json!({
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"]
-        })),
-        mcp_tool("update_object", "Legacy patch: name, style colors, transform, and geometry fields", json!({
-            "type": "object",
-            "properties": { "id": { "type": "string" }, "patch": { "type": "object" } },
-            "required": ["id", "patch"]
-        })),
-        mcp_tool("delete_object", "Delete object by UUID", json!({
-            "type": "object",
-            "properties": { "id": { "type": "string" } },
-            "required": ["id"]
-        })),
+        mcp_tool(
+            "get_project_snapshot",
+            "Title, path, status, timeline, collab text",
+            empty_tool_schema(),
+        ),
+        mcp_tool(
+            "get_project_json",
+            "Full project file as JSON (for AI editing)",
+            empty_tool_schema(),
+        ),
+        mcp_tool(
+            "save_project",
+            "Save current project (optional path param)",
+            json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }),
+        ),
+        mcp_tool(
+            "set_document_title",
+            "Set document title string",
+            json!({
+                "type": "object",
+                "properties": { "title": { "type": "string" } },
+                "required": ["title"]
+            }),
+        ),
+        mcp_tool(
+            "get_collab_text",
+            "Live collaboration chat log ([user]: message lines)",
+            empty_tool_schema(),
+        ),
+        mcp_tool(
+            "set_collab_text",
+            "Send a chat message to the collaboration room",
+            json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "required": ["text"]
+            }),
+        ),
+        mcp_tool(
+            "list_objects",
+            "List objects on the active layer (id, name, kind, bounds)",
+            empty_tool_schema(),
+        ),
+        mcp_tool(
+            "get_object",
+            "Get one object as JSON by UUID",
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }),
+        ),
+        mcp_tool(
+            "update_object",
+            "Legacy patch: name, style colors, transform, and geometry fields",
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" }, "patch": { "type": "object" } },
+                "required": ["id", "patch"]
+            }),
+        ),
+        mcp_tool(
+            "delete_object",
+            "Delete object by UUID",
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }),
+        ),
         mcp_tool(
             "capture_canvas_raster",
             "Raster preview of canvas region for AI vision (PNG base64 + optional save_path). Runs async up to 60s. Prefer resolution_percent 15-40 for large pages. Does not flatten or lock objects.",
@@ -272,7 +319,11 @@ pub fn mcp_tools_list_result() -> Value {
             "All editable objects on every visible image layer with style/transform summary",
             empty_tool_schema(),
         ),
-        mcp_tool("get_ui_health", "UI health metrics: current FPS (smoothed), object count, current frame. Use to diagnose lag with many objects (e.g. pixel art).", empty_tool_schema()),
+        mcp_tool(
+            "get_ui_health",
+            "UI health metrics: current FPS (smoothed), object count, current frame. Use to diagnose lag with many objects (e.g. pixel art).",
+            empty_tool_schema(),
+        ),
         mcp_tool(
             "add_shading_layer",
             "Set shading WGSL. By default **edits the active/first shading layer in place** (no stack spam). Pass new:true to always create a new layer. Optional layer_id / layer_index to target a specific layer. **After apply: static + GPU pipeline compile is probed; on failure the document is unchanged and the tool returns the compile error (no white blank canvas).** Success message includes \"GPU compile OK\".",
@@ -340,14 +391,19 @@ pub fn try_answer_stdio_line(line: &str) -> Option<Option<String>> {
         "tools/list" => mcp_tools_list_result(),
         "tools/call" => return None,
         _ => {
-            return Some(Some(json!({
-                "jsonrpc": "2.0",
-                "error": { "code": -32601, "message": "method not found" },
-                "id": id
-            }).to_string()));
+            return Some(Some(
+                json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32601, "message": "method not found" },
+                    "id": id
+                })
+                .to_string(),
+            ));
         }
     };
-    Some(Some(json!({ "jsonrpc": "2.0", "result": result, "id": id }).to_string()))
+    Some(Some(
+        json!({ "jsonrpc": "2.0", "result": result, "id": id }).to_string(),
+    ))
 }
 
 fn handle_jsonrpc(shared: &McpShared, req: JsonRpcRequest) -> Option<Value> {
@@ -360,13 +416,20 @@ fn handle_jsonrpc(shared: &McpShared, req: JsonRpcRequest) -> Option<Value> {
         "initialize" => mcp_initialize_result(),
         "tools/list" => mcp_tools_list_result(),
         "tools/call" => {
-            let name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let name = req
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
             match name {
                 "get_project_snapshot" => host_call(shared, McpHostRequest::Snapshot),
                 "get_project_json" => host_call(shared, McpHostRequest::ProjectJson),
                 "save_project" => {
-                    let path = args.get("path").and_then(|v| v.as_str()).map(str::to_string);
+                    let path = args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
                     host_call(shared, McpHostRequest::SaveProject { path })
                 }
                 "set_document_title" => {
@@ -448,7 +511,9 @@ fn handle_jsonrpc(shared: &McpShared, req: JsonRpcRequest) -> Option<Value> {
                     host_call(shared, McpHostRequest::DeleteObject { id })
                 }
                 "get_ui_health" => host_call(shared, McpHostRequest::UiHealth),
-                _ => json!({ "isError": true, "content": [{ "type": "text", "text": "unknown tool" }] }),
+                _ => {
+                    json!({ "isError": true, "content": [{ "type": "text", "text": "unknown tool" }] })
+                }
             }
         }
         _ => {
@@ -552,7 +617,10 @@ fn host_call(shared: &McpShared, req: McpHostRequest) -> Value {
         Ok(McpHostResponse::Text(t)) => json!({
             "content": [{ "type": "text", "text": t }]
         }),
-        Ok(McpHostResponse::RasterPreview { meta_json, png_base64 }) => json!({
+        Ok(McpHostResponse::RasterPreview {
+            meta_json,
+            png_base64,
+        }) => json!({
             "content": [
                 { "type": "text", "text": meta_json },
                 { "type": "image", "data": png_base64, "mimeType": "image/png" }

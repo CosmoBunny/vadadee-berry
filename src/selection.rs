@@ -9,8 +9,8 @@
 //! (delete/reorder/transform selection) stay on the
 //! [`crate::commands::EditorCommand`] path.
 
-use crate::document::{LayerKind, Node, NodeId, ProjectFile};
 use crate::document::NodeKind;
+use crate::document::{LayerKind, Node, NodeId, ProjectFile};
 use crate::document::{has_effect_for_objects, path_effect_by_form_node};
 
 /// Union of geometric bounds of the selected nodes.
@@ -60,10 +60,7 @@ pub fn selection_bounds_for_raster(
 }
 
 /// Kind of the layer when exactly one layer is selected.
-pub fn selected_layer_kind(
-    project: &ProjectFile,
-    selection: &[NodeId],
-) -> Option<LayerKind> {
+pub fn selected_layer_kind(project: &ProjectFile, selection: &[NodeId]) -> Option<LayerKind> {
     if selection.len() != 1 {
         return None;
     }
@@ -214,10 +211,7 @@ pub fn object_on_path_panel_context(
 }
 
 /// True when the panel-context objects already carry an on-path effect.
-pub fn selection_has_object_on_path_effect(
-    project: &ProjectFile,
-    selection: &[NodeId],
-) -> bool {
+pub fn selection_has_object_on_path_effect(project: &ProjectFile, selection: &[NodeId]) -> bool {
     let Some((objects, path_id)) = object_on_path_panel_context(project, selection) else {
         return false;
     };
