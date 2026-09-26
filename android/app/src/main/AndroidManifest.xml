@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- GameActivity host: the Java side is ONLY this launcher entry. The
+     editor is Rust/eframe, entered via android_main() in
+     libvadadee_berry.so (android.app.lib_name takes the library name
+     without "lib" prefix or ".so" suffix). No custom Activity, no JNI
+     bootstrap of our own — the supported GameActivity architecture. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+        android:extractNativeLibs="true">
+        <activity
+            android:name="com.google.androidgamesdk.GameActivity"
+            android:exported="true"
+            android:launchMode="standard"
+            android:configChanges="keyboardHidden|keyboard|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|mcc|mnc|density|fontScale"
+            android:screenOrientation="unspecified">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="vadadee_berry" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -1,9 +1,19 @@
-# Android release: Rust core (Android targets) -> native libs -> Gradle APK/AAB.
+# Android release: Rust core -> native libs -> Gradle APK/AAB -> Release.
 # Separate pipeline from desktop release: mobile signing problems must never
-# block desktop artifacts. This workflow BUILDS (never merely `cargo check`):
-# three release cdylib/rlib targets staged per architecture, plus release
-# APK/AAB when the android/ Gradle host exists. Artifacts are named
-# vadadee-berry-android-*, never placed under release/*.tar.gz|zip.
+# block desktop artifacts.
+#
+# Flow:
+#   cargo build (3 targets, --no-default-features)
+#     -> android/app/src/main/jniLibs/<abi>/libvadadee_berry.so
+#     -> assembleDebug + bundleDebug (every run; debug-signed dev check)
+#     -> [tag only] assembleRelease + bundleRelease (secrets-signed)
+#     -> verify (unzip contents, aapt package id) -> upload
+#     -> [tag only] attach APK/AAB to the GitHub Release.
+#
+# Signing secrets (repo Settings -> Secrets, never committed):
+#   ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD /
+#   ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD
+# Without them, tag release signing fails loudly instead of faking output.
 name: Android
 
 on:
@@ -13,7 +23,7 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -103,43 +113,108 @@ jobs:
           cargo build --lib --release --no-default-features --target armv7-linux-androideabi
           cargo build --lib --release --no-default-features --target x86_64-linux-android
 
-      - name: Stage native artifacts
+      - name: Stage native libraries into jniLibs
+        # Only the runtime .so belongs in the APK — never .rlib.
         run: |
           set -euo pipefail
           echo "=== Cargo outputs ==="
           find target/aarch64-linux-android/release -maxdepth 1 -type f -print
           find target/armv7-linux-androideabi/release -maxdepth 1 -type f -print
           find target/x86_64-linux-android/release -maxdepth 1 -type f -print
-          rm -rf android-artifacts
-          mkdir -p android-artifacts/aarch64-linux-android android-artifacts/armv7-linux-androideabi android-artifacts/x86_64-linux-android
-          cp target/aarch64-linux-android/release/*.so android-artifacts/aarch64-linux-android/ 2>/dev/null || true
-          cp target/aarch64-linux-android/release/*.rlib android-artifacts/aarch64-linux-android/ 2>/dev/null || true
-          cp target/armv7-linux-androideabi/release/*.so android-artifacts/armv7-linux-androideabi/ 2>/dev/null || true
-          cp target/armv7-linux-androideabi/release/*.rlib android-artifacts/armv7-linux-androideabi/ 2>/dev/null || true
-          cp target/x86_64-linux-android/release/*.so android-artifacts/x86_64-linux-android/ 2>/dev/null || true
-          cp target/x86_64-linux-android/release/*.rlib android-artifacts/x86_64-linux-android/ 2>/dev/null || true
-          echo "=== Staged ==="
-          find android-artifacts -type f -print
+          rm -rf android/app/src/main/jniLibs android-artifacts
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a \
+                   android/app/src/main/jniLibs/armeabi-v7a \
+                   android/app/src/main/jniLibs/x86_64 \
+                   android-artifacts/aarch64-linux-android \
+                   android-artifacts/armv7-linux-androideabi \
+                   android-artifacts/x86_64-linux-android
+          cp target/aarch64-linux-android/release/libvadadee_berry.so android/app/src/main/jniLibs/arm64-v8a/
+          cp target/aarch64-linux-android/release/libvadadee_berry.so android-artifacts/aarch64-linux-android/
+          cp target/armv7-linux-androideabi/release/libvadadee_berry.so android/app/src/main/jniLibs/armeabi-v7a/
+          cp target/armv7-linux-androideabi/release/libvadadee_berry.so android-artifacts/armv7-linux-androideabi/
+          cp target/x86_64-linux-android/release/libvadadee_berry.so android/app/src/main/jniLibs/x86_64/
+          cp target/x86_64-linux-android/release/libvadadee_berry.so android-artifacts/x86_64-linux-android/
+          echo "=== jniLibs ==="
+          find android/app/src/main/jniLibs -type f -print
 
       - name: Set up Java for Gradle
-        if: ${{ hashFiles('android/**') != '' }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Build Android APK (release)
-        if: ${{ hashFiles('android/**') != '' }}
+      - name: Build debug APK/AAB (every run)
+        # Debug-signed dev check: proves the full Gradle path (manifest,
+        # GameActivity, jniLibs packaging) without release secrets.
+        # NOTE: abi splits apply to debug too, so outputs are per-ABI
+        # (+ universal), not app-debug.apk.
         run: |
           set -euo pipefail
           chmod +x android/gradlew
-          ./android/gradlew -p android assembleRelease
+          ./android/gradlew -p android assembleDebug bundleDebug
+          test -f android/app/build/outputs/apk/universal/app-universal-debug.apk
+          test -f android/app/build/outputs/bundle/debug/app-debug.aab
 
-      - name: Build Android AAB (release)
-        if: ${{ hashFiles('android/**') != '' }}
+      - name: Require Android signing secrets (tags only)
+        # Release signing needs repo secrets (Settings -> Secrets and
+        # variables -> Actions). Fail here — loudly, naming each secret —
+        # instead of producing an unsigned/fake release artifact.
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          ./android/gradlew -p android bundleRelease
+          missing=0
+          for v in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::missing secret $v — tag releases need Android signing secrets (repo Settings -> Secrets and variables -> Actions)."
+              missing=1
+            fi
+          done
+          test "$missing" = "0" || exit 1
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > /tmp/vadadee-release.keystore
+          test -s /tmp/vadadee-release.keystore
+          {
+            echo "ANDROID_KEYSTORE_PATH=/tmp/vadadee-release.keystore"
+            echo "ANDROID_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD"
+            echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS"
+            echo "ANDROID_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "signing secrets present"
+
+      - name: Build release APK/AAB (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          ./android/gradlew -p android assembleRelease bundleRelease
+          VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          echo "Cargo version: $VER"
+          mkdir -p android-release
+          cp android/app/build/outputs/apk/arm64-v8a/app-arm64-v8a-release.apk "android-release/vadadee-berry-$VER-android-arm64.apk"
+          cp android/app/build/outputs/apk/armeabi-v7a/app-armeabi-v7a-release.apk "android-release/vadadee-berry-$VER-android-armeabi-v7a.apk"
+          cp android/app/build/outputs/apk/x86_64/app-x86_64-release.apk "android-release/vadadee-berry-$VER-android-x86_64.apk"
+          cp android/app/build/outputs/apk/universal/app-universal-release.apk "android-release/vadadee-berry-$VER-android-universal.apk"
+          cp android/app/build/outputs/bundle/release/app-release.aab "android-release/vadadee-berry-$VER-android.aab"
+          (cd android-release && sha256sum ./*.apk ./*.aab > SHA256SUMS.txt) || (cd android-release && shasum -a 256 ./*.apk ./*.aab > SHA256SUMS.txt)
+          ls -lah android-release/
+
+      - name: Verify release APK/AAB (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          AAPT="$ANDROID_SDK_ROOT/build-tools/35.0.0/aapt"
+          test -x "$AAPT"
+          for apk in android-release/*.apk; do
+            echo "=== $apk ==="
+            unzip -l "$apk" | grep -E "lib/(arm64-v8a|armeabi-v7a|x86_64)/libvadadee_berry.so|AndroidManifest.xml|classes.dex"
+            "$AAPT" dump badging "$apk" | grep -o "package: name='com.cosmobunny.vadadeeberry'" | head -1
+          done
+          test -f android-release/*.aab
+          unzip -l android-release/*.aab | grep -E "lib/arm64-v8a/libvadadee_berry.so|AndroidManifest.xml"
+          echo "apk/aab verification OK"
 
       - name: Generate build manifest
         run: |
@@ -148,36 +223,85 @@ jobs:
             echo "Vadadee Berry Android Build"
             echo
             echo "Commit: $GITHUB_SHA"
+            echo "Ref: $GITHUB_REF"
             echo "Targets:"
-            echo "  aarch64-linux-android"
-            echo "  armv7-linux-androideabi"
-            echo "  x86_64-linux-android"
+            echo "  aarch64-linux-android -> arm64-v8a"
+            echo "  armv7-linux-androideabi -> armeabi-v7a"
+            echo "  x86_64-linux-android -> x86_64"
             echo
-            echo "Artifacts:"
-            find android-artifacts -type f -print 2>/dev/null || true
+            echo "Native libraries:"
+            find android/app/src/main/jniLibs -type f -print 2>/dev/null || true
+            echo
+            echo "APK/AAB:"
             find android -type f \( -name "*.apk" -o -name "*.aab" \) -print 2>/dev/null || true
+            find android-release -type f -print 2>/dev/null || true
           } > android-artifacts/BUILD-MANIFEST.txt
           cat android-artifacts/BUILD-MANIFEST.txt
 
-      - name: Upload Android artifacts
+      - name: Upload Android native libraries (dev artifact)
         uses: actions/upload-artifact@v4
         with:
           name: vadadee-berry-android
           path: |
             android-artifacts/**
-            android/**/build/outputs/apk/release/*.apk
-            android/**/build/outputs/bundle/release/*.aab
           if-no-files-found: error
 
-      - name: Report APK/AAB packaging status
-        # No Android Gradle host project exists yet, so there is nothing to
-        # package — and no fake APK is produced. The vadadee-berry-android
-        # artifact above holds the Rust native libraries only; it is NOT an
-        # installable APK. When a real android/ host lands, the Gradle steps
-        # above run automatically and this notice goes quiet.
-        if: ${{ hashFiles('android/**') == '' }}
+      - name: Upload Android debug APK/AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-android-debug
+          path: |
+            android/app/build/outputs/apk/**/*.apk
+            android/app/build/outputs/bundle/debug/*.aab
+          if-no-files-found: error
+
+      - name: Upload Android release APK
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-android-apk
+          path: |
+            android-release/*.apk
+            android-release/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Upload Android release AAB
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-android-aab
+          path: |
+            android-release/*.aab
+            android-release/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            android-release/*.apk
+            android-release/*.aab
+            android-release/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Final CI report
+        if: always()
         run: |
-          echo "Android Rust native libraries built successfully."
-          echo "No Android Gradle host project exists yet."
-          echo "APK/AAB packaging skipped because no Android Gradle host project exists."
-          exit 0
+          echo "========================================"
+          echo "Vadadee Berry Mobile Release"
+          echo "========================================"
+          echo
+          echo "Android:"
+          ls android-release/*.apk 2>/dev/null || echo "  APK: (debug-only run — release APKs build on tags)"
+          ls android-release/*.aab 2>/dev/null || echo "  AAB: (debug-only run — release AAB builds on tags)"
+          echo
+          echo "Native artifacts:"
+          find android/app/src/main/jniLibs -type f 2>/dev/null || echo "  MISSING"
+          echo
+          echo "Packaging:"
+          echo "  Android Gradle: OK"
+          echo "========================================"

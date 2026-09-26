@@ -1,0 +1,87 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Version: single source of truth is the workspace Cargo.toml.
+// versionCode derives deterministically: major*1000000 + minor*1000 + patch.
+def cargoToml = rootProject.file('../../Cargo.toml').text
+def appVersion = (cargoToml =~ /(?m)^version\s*=\s*"([^"]+)"/)[0][1]
+def parts = appVersion.tokenize('.').collect { it.toInteger() }
+def appVersionCode = parts[0] * 1000000 + parts[1] * 1000 + parts[2]
+
+android {
+    namespace "com.cosmobunny.vadadeeberry"
+    compileSdk 35
+    // Must match the NDK installed by CI (.github/workflows/android.yml).
+    ndkVersion "27.0.12077973"
+
+    defaultConfig {
+        applicationId "com.cosmobunny.vadadeeberry"
+        // 26+: Vulkan-capable baseline for the wgpu renderer, modern
+        // storage semantics, no legacy multidex needed.
+        minSdk 26
+        targetSdk 35
+        versionCode appVersionCode
+        versionName appVersion
+    }
+
+    signingConfigs {
+        // Release signing comes from CI secrets (see android.yml:
+        // ANDROID_KEYSTORE_PATH/PASSWORD, ANDROID_KEY_ALIAS/PASSWORD).
+        // Without them the config stays empty and release assembly fails
+        // with a clear missing-storeFile error — never a fake signature.
+        release {
+            if (System.getenv("ANDROID_KEYSTORE_PATH")) {
+                storeFile file(System.getenv("ANDROID_KEYSTORE_PATH"))
+                storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix ".debug"
+        }
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+
+    // Per-ABI release APKs + universal APK; the AAB carries all ABIs for
+    // Play delivery. Distinct versionCodes per split (Play requirement).
+    splits {
+        abi {
+            enable true
+            reset()
+            include 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+            universalApk true
+        }
+    }
+    android.applicationVariants.all { variant ->
+        variant.outputs.each { output ->
+            def abi = output.getFilter(com.android.build.OutputFile.ABI)
+            def codes = ['arm64-v8a': 1, 'armeabi-v7a': 2, 'x86_64': 3]
+            if (abi != null) {
+                output.versionCodeOverride = appVersionCode * 10 + (codes.get(abi, 0))
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // GameActivity 4.4.0: the exact Java counterpart of the Rust
+    // android-activity 0.6.1 glue (see its README). Do NOT enable the
+    // upstream prefab C++ layer — android-activity ships its own native
+    // glue that integrates with Rust; the Java side here is only the
+    // launcher declared in AndroidManifest.xml.
+    implementation 'androidx.games:games-activity:4.4.0'
+}

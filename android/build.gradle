@@ -1,0 +1,6 @@
+// Top-level build file: Android Gradle Plugin version in one place.
+// Pinned (not newest): AGP 8.7.x + Gradle 8.9 + JDK 17 is the proven
+// combo for compileSdk 35. CI installs the matching SDK packages.
+plugins {
+    id 'com.android.application' version '8.7.3' apply false
+}

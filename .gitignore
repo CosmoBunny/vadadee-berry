@@ -7,9 +7,17 @@
 # Android / Gradle app directory and build artifacts
 /app/
 .gradle/
+build/
 local.properties
 *.apk
 *.aab
+
+# CI-staged mobile outputs (regenerated every run; ExportOptions.plist is
+# generated from signing secrets and must never be committed)
+android-artifacts/
+android-release/
+ios-artifacts/
+ios/ExportOptions.plist
 
 # Native libs copied from Rust builds (regenerated on compile)
 app/src/main/jniLibs/**/*.so

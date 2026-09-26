@@ -1,11 +1,13 @@
-# iOS release: Rust core (iOS targets) -> native libs -> Xcode archive.
+# iOS release: Rust core -> staticlib -> Xcode archive -> signed IPA.
 # Separate pipeline from desktop release: mobile signing problems must never
-# block desktop artifacts. This workflow BUILDS (never merely `cargo check`):
-# three release targets staged as device/simulator binaries, plus an Xcode
-# archive of the ios/ host (Swift shell + Rust staticlib) when it exists.
-# Must run on macOS runners. Archive is unsigned (CODE_SIGNING_ALLOWED=NO);
-# no IPA is produced until signing/export is configured. Signing uses CI
-# secrets only — never commit keys or provisioning profiles.
+# block desktop artifacts. Unsigned archive validates every run; the signed
+# IPA exports on tags only, and only when signing secrets exist (repo
+# Settings -> Secrets and variables -> Actions):
+#   APPLE_CERTIFICATE_BASE64 / APPLE_CERTIFICATE_PASSWORD /
+#   APPLE_PROVISIONING_PROFILE_BASE64 / APPLE_PROVISIONING_PROFILE_NAME /
+#   APPLE_KEYCHAIN_PASSWORD / APPLE_TEAM_ID
+# (optional: APPLE_EXPORT_METHOD, default app-store).
+# Never commit certificates or profiles. Must run on macOS runners.
 name: iOS
 
 on:
@@ -15,7 +17,7 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -108,3 +110,131 @@ jobs:
           name: vadadee-berry-ios-xcarchive
           path: build/VadadeeBerry.xcarchive
           if-no-files-found: error
+
+      - name: Require iOS signing secrets (tags only)
+        # IPA export needs repo secrets. Fail here — loudly, naming each
+        # secret — instead of producing an unsigned/fake release artifact.
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_PROVISIONING_PROFILE_NAME: ${{ secrets.APPLE_PROVISIONING_PROFILE_NAME }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for v in APPLE_CERTIFICATE_BASE64 APPLE_CERTIFICATE_PASSWORD APPLE_PROVISIONING_PROFILE_BASE64 APPLE_PROVISIONING_PROFILE_NAME APPLE_KEYCHAIN_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::missing secret $v — tag releases need iOS signing secrets (repo Settings -> Secrets and variables -> Actions)."
+              missing=1
+            fi
+          done
+          test "$missing" = "0" || exit 1
+          echo "signing secrets present"
+
+      - name: Export signed IPA (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_PROVISIONING_PROFILE_NAME: ${{ secrets.APPLE_PROVISIONING_PROFILE_NAME }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_EXPORT_METHOD: ${{ secrets.APPLE_EXPORT_METHOD }}
+        run: |
+          set -euo pipefail
+          # Temporary CI keychain (nothing persists on the runner).
+          security create-keychain -p "$APPLE_KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security unlock-keychain -p "$APPLE_KEYCHAIN_PASSWORD" build.keychain
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 -d > /tmp/vadadee-cert.p12
+          security import /tmp/vadadee-cert.p12 -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$APPLE_KEYCHAIN_PASSWORD" build.keychain
+          security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d '"')
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 -d \
+            > ~/Library/MobileDevice/Provisioning\ Profiles/vadadee.mobileprovision
+          # ExportOptions are generated from secrets — never hard-code a
+          # profile or team into the repo.
+          cat > ios/ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>${APPLE_EXPORT_METHOD:-app-store}</string>
+              <key>teamID</key>
+              <string>$APPLE_TEAM_ID</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>com.cosmobunny.VadadeeBerry</key>
+                  <string>$APPLE_PROVISIONING_PROFILE_NAME</string>
+              </dict>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath build/VadadeeBerry.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist ios/ExportOptions.plist
+          ls -lah build/export/
+
+      - name: Verify IPA (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          ipa="$(echo build/export/*.ipa)"
+          test -f "$ipa"
+          echo "=== $ipa ==="
+          unzip -l "$ipa" | grep -E "Payload/VadadeeBerry.app/|Payload/VadadeeBerry.app/Info.plist"
+          app="$PWD/build/export/Payload/VadadeeBerry.app"
+          test -f "$app/VadadeeBerry"
+          test -f "$app/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$app/Info.plist" | grep -qx "com.cosmobunny.VadadeeBerry"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=4 "$app" 2>&1 | head -8
+          echo "ipa verification OK"
+
+      - name: Upload iOS IPA
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-ios-ipa
+          path: |
+            build/export/*.ipa
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/export/*.ipa
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Final CI report
+        if: always()
+        run: |
+          echo "========================================"
+          echo "Vadadee Berry Mobile Release"
+          echo "========================================"
+          echo
+          echo "iOS:"
+          ls build/export/*.ipa 2>/dev/null || echo "  IPA: (unsigned-archive run — signed IPA exports on tags with secrets)"
+          echo
+          echo "Native artifacts:"
+          find ios-artifacts -type f 2>/dev/null || echo "  MISSING"
+          echo
+          echo "Packaging:"
+          echo "  iOS Xcode archive: OK"
+          echo "========================================"
