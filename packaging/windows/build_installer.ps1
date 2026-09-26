@@ -54,62 +54,40 @@ foreach ($f in @($wxs, $ico)) {
 }
 
 # WiX v5 as a dotnet tool (windows-latest runners ship dotnet).
-# Pinned to v5 on purpose: v7 gates usage behind an OSMF EULA acceptance
-# step (WIX7015) that has no place in unattended CI, while v5 uses the same
-# v4 wxs schema this package is authored in.
+# Pinned to exactly 5.0.2 on purpose (never a floating 5.* range): v7 gates
+# usage behind an OSMF EULA acceptance step (WIX7015) that has no place in
+# unattended CI, while v5 uses the same v4 wxs schema this package is
+# authored in.
 $wix = (Get-Command wix -ErrorAction SilentlyContinue)?.Source
 if (-not $wix) {
-    Write-Host 'Installing WiX Toolset v5 (needs network)...'
-    dotnet tool install --global wix --version '5.*'
+    Write-Host 'Installing WiX Toolset 5.0.2 (needs network)...'
+    dotnet tool install --global wix --version 5.0.2
     $wix = (Get-Command wix -ErrorAction SilentlyContinue)?.Source
 }
 if (-not $wix) {
-    Write-Error 'WiX v4 CLI not found after install. Ensure dotnet is on PATH.'
+    Write-Error 'WiX CLI not found after install. Ensure dotnet is on PATH.'
     exit 1
 }
-& $wix --version
 
-# Bal extension (provides WixStdBA for the Bundle; the v5 package is still
-# named WixToolset.Bal.wixext — the BootstrapperApplications rename landed
-# in v6/v7).
-# Pinned to the installed WiX major (5.0.2): the -ext flag alone does NOT
-# fetch it, and the build fails with WIX0144 without it. Installed GLOBAL
-# (-g): a directory-local install is invisible to `wix build` when it runs
-# from another directory (the Bundle build runs from packaging/windows).
-# The list check below is the real gate (the add itself is best-effort:
-# the extension may already be cached, e.g. when CI pre-installs it).
-& $wix extension add -g WixToolset.Bal.wixext/5.0.2
-# NOTE: list takes the same -g scope — a bare `extension list` only shows
-# the current directory's local cache and would wrongly report an empty
-# global install as missing.
-# Known wix issue: a fresh add can leave a "(damaged)" (empty) cache entry.
-# Repair is remove + nuke the cache dir + re-add, so do that once here.
-function Get-WixBalExtensionList {
-    (& $wix extension list -g) -join "`n"
+Write-Host "=== WiX ==="
+$wixVersion = ((& $wix --version) | Out-String).Trim()
+# NOTE: the CLI appends build metadata (e.g. 5.0.2+aa65968c), so match the
+# 5.0.2 prefix rather than the whole string.
+if ($wixVersion -notmatch '^5\.0\.2') {
+    Write-Error "Expected WiX 5.0.2, got: $wixVersion"
+    exit 1
 }
-function Test-WixBalExtensionHealthy([string]$list) {
-    ($list -match 'WixToolset\.Bal\.wixext') -and ($list -notmatch '\(damaged\)')
-}
-$extCache = Join-Path $HOME '.wix\extensions\WixToolset.Bal.wixext'
-$extList = Get-WixBalExtensionList
-if (-not (Test-WixBalExtensionHealthy $extList)) {
-    if (Test-Path $extCache) { Remove-Item -Recurse -Force $extCache }
-    & $wix extension add -g WixToolset.Bal.wixext/5.0.2
-    # Upstream packaging defect (cf. wixtoolset/issues#8919): the v5
-    # Bal nupkg ships its payload as
-    # WixToolset.BootstrapperApplications.wixext.dll, but the CLI health
-    # check looks for WixToolset.Bal.wixext.dll and reports (damaged)
-    # otherwise. Stage the expected filename alongside it.
-    $dllDir = Join-Path $extCache '5.0.2\wixext5'
-    $shipped = Join-Path $dllDir 'WixToolset.BootstrapperApplications.wixext.dll'
-    $expected = Join-Path $dllDir 'WixToolset.Bal.wixext.dll'
-    if ((Test-Path $shipped) -and (-not (Test-Path $expected))) {
-        Copy-Item $shipped $expected
-    }
-    $extList = Get-WixBalExtensionList
-}
-if (-not (Test-WixBalExtensionHealthy $extList)) {
-    Write-Error 'Failed to install a healthy WixToolset.Bal.wixext (5.0.2) required by VadadeeBerry.Bundle.wxs.'
+
+# BootstrapperApplications extension (provides WixStdBA for the Bundle).
+# Installed GLOBAL (-g) so `wix build` finds it regardless of working
+# directory. The -ext flag alone does NOT fetch it (WIX0144 otherwise).
+& $wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
+
+Write-Host "=== Extensions ==="
+$extensions = (& $wix extension list -g) | Out-String
+Write-Host $extensions
+if ($extensions -notmatch 'WixToolset\.BootstrapperApplications\.wixext') {
+    Write-Error 'WixToolset.BootstrapperApplications.wixext 5.0.2 is not installed'
     exit 1
 }
 
@@ -140,7 +118,7 @@ try {
     & $wix build VadadeeBerry.Bundle.wxs `
         -d "Version=$version" `
         -d "MsiPath=$msiPath" `
-        -ext WixToolset.Bal.wixext `
+        -ext WixToolset.BootstrapperApplications.wixext/5.0.2 `
         -o "$outPath"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {

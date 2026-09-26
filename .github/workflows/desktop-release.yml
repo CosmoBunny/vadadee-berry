@@ -293,18 +293,18 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          # Explicit CI-level extension setup (defense in depth: the ps1
-          # verifies this again itself). Ensures the CLI first — fresh
-          # runners have no wix until dotnet installs it. Installed GLOBAL
-          # (-g) so `wix build` finds it regardless of working directory;
-          # list takes the same -g scope. A stale cache dir is nuked first
-          # (known wix "(damaged)" empty-download issue).
+          # Explicit CI-level WiX setup (the ps1 verifies this again
+          # itself). Pinned CLI + extension; global scope so the build
+          # finds the extension regardless of working directory.
+          $ErrorActionPreference = 'Stop'
           if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
-            dotnet tool install --global wix --version '5.*'
+            dotnet tool install --global wix --version 5.0.2
           }
-          $extCache = Join-Path $HOME '.wix\extensions\WixToolset.Bal.wixext'
-          if (Test-Path $extCache) { Remove-Item -Recurse -Force $extCache }
-          wix extension add -g WixToolset.Bal.wixext/5.0.2
+          wix --version
+          if ((wix --version).Trim() -notmatch '^5\.0\.2') {
+            throw "Expected WiX 5.0.2"
+          }
+          wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
           wix extension list -g
           .\packaging\windows\build_installer.ps1
           Get-ChildItem release\*-setup.exe
