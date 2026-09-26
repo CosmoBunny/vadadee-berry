@@ -76,10 +76,10 @@ if (-not $wix) {
 # from another directory (the Bundle build runs from packaging/windows).
 # The list check below is the real gate (the add itself is best-effort:
 # the extension may already be cached, e.g. when CI pre-installs it).
-& $wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
+& $wix extension add -g WixToolset.Bal.wixext/5.0.2
 $extList = (& $wix extension list) -join "`n"
-if ($extList -notmatch 'WixToolset\.BootstrapperApplications\.wixext') {
-    Write-Error 'Failed to install WixToolset.BootstrapperApplications.wixext required by VadadeeBerry.Bundle.wxs.'
+if ($extList -notmatch 'WixToolset\.Bal\.wixext') {
+    Write-Error 'Failed to install WixToolset.Bal.wixext required by VadadeeBerry.Bundle.wxs.'
     exit 1
 }
 
@@ -110,7 +110,7 @@ try {
     & $wix build VadadeeBerry.Bundle.wxs `
         -d "Version=$version" `
         -d "MsiPath=$msiPath" `
-        -ext WixToolset.BootstrapperApplications.wixext `
+        -ext WixToolset.Bal.wixext `
         -o "$outPath"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
