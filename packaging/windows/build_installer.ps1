@@ -69,7 +69,9 @@ if (-not $wix) {
 }
 & $wix --version
 
-# BootstrapperApplications extension (provides WixStdBA for the Bundle).
+# Bal extension (provides WixStdBA for the Bundle; the v5 package is still
+# named WixToolset.Bal.wixext — the BootstrapperApplications rename landed
+# in v6/v7).
 # Pinned to the installed WiX major (5.0.2): the -ext flag alone does NOT
 # fetch it, and the build fails with WIX0144 without it. Installed GLOBAL
 # (-g): a directory-local install is invisible to `wix build` when it runs
@@ -93,6 +95,17 @@ $extList = Get-WixBalExtensionList
 if (-not (Test-WixBalExtensionHealthy $extList)) {
     if (Test-Path $extCache) { Remove-Item -Recurse -Force $extCache }
     & $wix extension add -g WixToolset.Bal.wixext/5.0.2
+    # Upstream packaging defect (cf. wixtoolset/issues#8919): the v5
+    # Bal nupkg ships its payload as
+    # WixToolset.BootstrapperApplications.wixext.dll, but the CLI health
+    # check looks for WixToolset.Bal.wixext.dll and reports (damaged)
+    # otherwise. Stage the expected filename alongside it.
+    $dllDir = Join-Path $extCache '5.0.2\wixext5'
+    $shipped = Join-Path $dllDir 'WixToolset.BootstrapperApplications.wixext.dll'
+    $expected = Join-Path $dllDir 'WixToolset.Bal.wixext.dll'
+    if ((Test-Path $shipped) -and (-not (Test-Path $expected))) {
+        Copy-Item $shipped $expected
+    }
     $extList = Get-WixBalExtensionList
 }
 if (-not (Test-WixBalExtensionHealthy $extList)) {
