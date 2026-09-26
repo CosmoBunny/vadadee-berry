@@ -2,12 +2,12 @@
 # Separate pipeline from desktop release: mobile signing problems must never
 # block desktop artifacts.
 #
-# Flow:
+# Flow (every run builds REAL release packages — no debug fallback):
 #   cargo build (3 targets, --no-default-features)
 #     -> android/app/src/main/jniLibs/<abi>/libvadadee_berry.so
-#     -> assembleDebug + bundleDebug (every run; debug-signed dev check)
-#     -> [tag only] assembleRelease + bundleRelease (secrets-signed)
-#     -> verify (unzip contents, aapt package id) -> upload
+#     -> assembleRelease + bundleRelease (secrets-signed)
+#     -> verify (unzip contents, aapt package id, apksigner release check)
+#     -> upload APK/AAB artifacts
 #     -> [tag only] attach APK/AAB to the GitHub Release.
 #
 # Signing secrets (repo Settings -> Secrets, never committed):
@@ -143,72 +143,11 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Build debug APK/AAB (every run)
-        # Debug-signed dev check: proves the full Gradle path (manifest,
-        # GameActivity, jniLibs packaging) without release secrets.
-        # Outputs are discovered, never assumed: split layout differs
-        # across AGP versions, so hardcoded paths fail a green build.
-        run: |
-          set -euo pipefail
-          echo "Android Gradle root:"
-          pwd
-          echo "Workspace parent:"
-          realpath ..
-          echo "Cargo.toml as seen by the Gradle root project:"
-          realpath android/../Cargo.toml
-          test -f android/../Cargo.toml
-          chmod +x android/gradlew
-          ./android/gradlew -p android assembleDebug bundleDebug
-          echo "=== APK outputs ==="
-          find android/app/build/outputs/apk -type f -name '*.apk' -print | sort
-          echo "=== AAB outputs ==="
-          find android/app/build/outputs/bundle -type f -name '*.aab' -print | sort
-          echo "=== Complete build outputs ==="
-          find android/app/build/outputs -type f \
-            \( -name '*.apk' -o -name '*.aab' \) \
-            -print | sort
-          UNIVERSAL_APK="$(find android/app/build/outputs/apk \
-            -type f \
-            -name '*universal*debug*.apk' \
-            -print -quit)"
-          test -n "$UNIVERSAL_APK"
-          test -f "$UNIVERSAL_APK"
-          DEBUG_AAB="$(find android/app/build/outputs/bundle \
-            -type f \
-            -name '*debug*.aab' \
-            -print -quit)"
-          test -n "$DEBUG_AAB"
-          test -f "$DEBUG_AAB"
-          if [ -z "$UNIVERSAL_APK" ]; then
-            echo "::error::Universal debug APK was not produced."
-            exit 1
-          fi
-          if [ -z "$DEBUG_AAB" ]; then
-            echo "::error::Debug AAB was not produced."
-            exit 1
-          fi
-          echo "=== Universal APK contents ==="
-          unzip -l "$UNIVERSAL_APK" | grep 'lib/.*libvadadee_berry.so'
-          unzip -l "$UNIVERSAL_APK" | \
-            grep -q 'lib/arm64-v8a/libvadadee_berry.so'
-          echo "=== Debug AAB native libraries ==="
-          unzip -l "$DEBUG_AAB" | \
-            grep 'lib/.*libvadadee_berry.so'
-          unzip -l "$DEBUG_AAB" | \
-            grep -q 'lib/arm64-v8a/libvadadee_berry.so'
-          echo "=== Android debug artifacts ==="
-          ls -lah "$UNIVERSAL_APK"
-          ls -lah "$DEBUG_AAB"
-          echo "=== All APKs ==="
-          find android/app/build/outputs/apk -type f -name '*.apk' -print | sort
-          echo "=== All AABs ==="
-          find android/app/build/outputs/bundle -type f -name '*.aab' -print | sort
-
-      - name: Require Android signing secrets (tags only)
-        # Release signing needs repo secrets (Settings -> Secrets and
+      - name: Require Android signing secrets
+        # Release builds always need repo secrets (Settings -> Secrets and
         # variables -> Actions). Fail here — loudly, naming each secret —
-        # instead of producing an unsigned/fake release artifact.
-        if: startsWith(github.ref, 'refs/tags/v')
+        # instead of producing an unsigned/fake release artifact. There is
+        # no debug fallback: every run ships real release packages.
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -219,7 +158,7 @@ jobs:
           missing=0
           for v in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
             if [ -z "${!v:-}" ]; then
-              echo "::error::missing secret $v — tag releases need Android signing secrets (repo Settings -> Secrets and variables -> Actions)."
+              echo "::error::missing secret $v — release builds need Android signing secrets (repo Settings -> Secrets and variables -> Actions)."
               missing=1
             fi
           done
@@ -234,11 +173,22 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "signing secrets present"
 
-      - name: Build release APK/AAB (tags only)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Build release APK/AAB
         run: |
           set -euo pipefail
+          echo "Android Gradle root:"
+          pwd
+          echo "Workspace parent:"
+          realpath ..
+          echo "Cargo.toml as seen by the Gradle root project:"
+          realpath android/../Cargo.toml
+          test -f android/../Cargo.toml
+          chmod +x android/gradlew
           ./android/gradlew -p android assembleRelease bundleRelease
+          echo "=== APK outputs ==="
+          find android/app/build/outputs/apk -type f -name '*.apk' -print | sort
+          echo "=== AAB outputs ==="
+          find android/app/build/outputs/bundle -type f -name '*.aab' -print | sort
           VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           echo "Cargo version: $VER"
           mkdir -p android-release
@@ -250,19 +200,34 @@ jobs:
           (cd android-release && sha256sum ./*.apk ./*.aab > SHA256SUMS.txt) || (cd android-release && shasum -a 256 ./*.apk ./*.aab > SHA256SUMS.txt)
           ls -lah android-release/
 
-      - name: Verify release APK/AAB (tags only)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Verify release APK/AAB
         run: |
           set -euo pipefail
           AAPT="$ANDROID_SDK_ROOT/build-tools/35.0.0/aapt"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner"
           test -x "$AAPT"
-          for apk in android-release/*.apk; do
+          test -x "$APKSIGNER"
+          check_apk() {
+            apk="$1"; abi="$2"
             echo "=== $apk ==="
-            unzip -l "$apk" | grep -E "lib/(arm64-v8a|armeabi-v7a|x86_64)/libvadadee_berry.so|AndroidManifest.xml|classes.dex"
+            unzip -l "$apk" | grep -E "lib/$abi/libvadadee_berry.so|AndroidManifest.xml|classes.dex"
             "$AAPT" dump badging "$apk" | grep -o "package: name='com.cosmobunny.vadadeeberry'" | head -1
-          done
+            echo "--- signature ---"
+            "$APKSIGNER" verify --print-certs "$apk" 2>&1 | head -6
+            if "$APKSIGNER" verify --print-certs "$apk" 2>&1 | grep -qi 'android debug'; then
+              echo "::error::$apk is debug-signed, expected release signature."
+              exit 1
+            fi
+          }
+          check_apk android-release/*-android-arm64.apk arm64-v8a
+          check_apk android-release/*-android-armeabi-v7a.apk armeabi-v7a
+          check_apk android-release/*-android-x86_64.apk x86_64
+          echo "=== universal APK (all ABIs) ==="
+          unzip -l android-release/*-android-universal.apk | grep -E "lib/(arm64-v8a|armeabi-v7a|x86_64)/libvadadee_berry.so"
+          check_apk android-release/*-android-universal.apk arm64-v8a
+          echo "=== release AAB ==="
           test -f android-release/*.aab
-          unzip -l android-release/*.aab | grep -E "lib/arm64-v8a/libvadadee_berry.so|AndroidManifest.xml"
+          unzip -l android-release/*.aab | grep -E "lib/(arm64-v8a|armeabi-v7a|x86_64)/libvadadee_berry.so|AndroidManifest.xml"
           echo "apk/aab verification OK"
 
       - name: Generate build manifest
@@ -295,17 +260,7 @@ jobs:
             android-artifacts/**
           if-no-files-found: error
 
-      - name: Upload Android debug APK/AAB
-        uses: actions/upload-artifact@v4
-        with:
-          name: vadadee-berry-android-debug
-          path: |
-            android/app/build/outputs/apk/**/*.apk
-            android/app/build/outputs/bundle/debug/*.aab
-          if-no-files-found: error
-
       - name: Upload Android release APK
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: vadadee-berry-android-apk
@@ -315,7 +270,6 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Android release AAB
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: vadadee-berry-android-aab
@@ -345,12 +299,14 @@ jobs:
           echo "========================================"
           echo
           echo "Android:"
-          ls android-release/*.apk 2>/dev/null || echo "  APK: (debug-only run — release APKs build on tags)"
-          ls android-release/*.aab 2>/dev/null || echo "  AAB: (debug-only run — release AAB builds on tags)"
+          ls android-release/*.apk 2>/dev/null || echo "  APK: MISSING"
+          ls android-release/*.aab 2>/dev/null || echo "  AAB: MISSING"
           echo
           echo "Native artifacts:"
           find android/app/src/main/jniLibs -type f 2>/dev/null || echo "  MISSING"
           echo
           echo "Packaging:"
           echo "  Android Gradle: OK"
+          echo "  Android APK (release-signed): OK"
+          echo "  Android AAB (release-signed): OK"
           echo "========================================"
