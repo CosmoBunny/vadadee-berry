@@ -77,7 +77,10 @@ if (-not $wix) {
 # The list check below is the real gate (the add itself is best-effort:
 # the extension may already be cached, e.g. when CI pre-installs it).
 & $wix extension add -g WixToolset.Bal.wixext/5.0.2
-$extList = (& $wix extension list) -join "`n"
+# NOTE: list takes the same -g scope — a bare `extension list` only shows
+# the current directory's local cache and would wrongly report an empty
+# global install as missing.
+$extList = (& $wix extension list -g) -join "`n"
 if ($extList -notmatch 'WixToolset\.Bal\.wixext') {
     Write-Error 'Failed to install WixToolset.Bal.wixext required by VadadeeBerry.Bundle.wxs.'
     exit 1
