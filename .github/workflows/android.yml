@@ -150,6 +150,13 @@ jobs:
         # (+ universal), not app-debug.apk.
         run: |
           set -euo pipefail
+          echo "Android Gradle root:"
+          pwd
+          echo "Workspace parent:"
+          realpath ..
+          echo "Cargo.toml as seen by the Gradle root project:"
+          realpath android/../Cargo.toml
+          test -f android/../Cargo.toml
           chmod +x android/gradlew
           ./android/gradlew -p android assembleDebug bundleDebug
           test -f android/app/build/outputs/apk/universal/app-universal-debug.apk

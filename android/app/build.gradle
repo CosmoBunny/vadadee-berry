@@ -2,9 +2,10 @@ plugins {
     id 'com.android.application'
 }
 
-// Version: single source of truth is the workspace Cargo.toml.
+// Version: single source of truth is the workspace Cargo.toml, resolved
+// relative to the Gradle root project (android/), i.e. ../Cargo.toml.
 // versionCode derives deterministically: major*1000000 + minor*1000 + patch.
-def cargoToml = rootProject.file('../../Cargo.toml').text
+def cargoToml = rootProject.file('../Cargo.toml').text
 def appVersion = (cargoToml =~ /(?m)^version\s*=\s*"([^"]+)"/)[0][1]
 def parts = appVersion.tokenize('.').collect { it.toInteger() }
 def appVersionCode = parts[0] * 1000000 + parts[1] * 1000 + parts[2]
