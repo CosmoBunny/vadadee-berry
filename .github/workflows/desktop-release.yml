@@ -295,11 +295,12 @@ jobs:
         run: |
           # Explicit CI-level extension setup (defense in depth: the ps1
           # verifies this again itself). Ensures the CLI first — fresh
-          # runners have no wix until dotnet installs it.
+          # runners have no wix until dotnet installs it. Installed GLOBAL
+          # (-g) so `wix build` finds it regardless of working directory.
           if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
             dotnet tool install --global wix --version '5.*'
           }
-          wix extension add WixToolset.BootstrapperApplications.wixext/5.0.2
+          wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
           wix extension list
           .\packaging\windows\build_installer.ps1
           Get-ChildItem release\*-setup.exe

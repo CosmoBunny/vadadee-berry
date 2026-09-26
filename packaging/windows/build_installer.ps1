@@ -71,10 +71,12 @@ if (-not $wix) {
 
 # BootstrapperApplications extension (provides WixStdBA for the Bundle).
 # Pinned to the installed WiX major (5.0.2): the -ext flag alone does NOT
-# fetch it, and the build fails with WIX0144 without it. The list check
-# below is the real gate (the add itself is best-effort: the extension may
-# already be cached, e.g. when CI pre-installs it at the workflow level).
-& $wix extension add WixToolset.BootstrapperApplications.wixext/5.0.2
+# fetch it, and the build fails with WIX0144 without it. Installed GLOBAL
+# (-g): a directory-local install is invisible to `wix build` when it runs
+# from another directory (the Bundle build runs from packaging/windows).
+# The list check below is the real gate (the add itself is best-effort:
+# the extension may already be cached, e.g. when CI pre-installs it).
+& $wix extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
 $extList = (& $wix extension list) -join "`n"
 if ($extList -notmatch 'WixToolset\.BootstrapperApplications\.wixext') {
     Write-Error 'Failed to install WixToolset.BootstrapperApplications.wixext required by VadadeeBerry.Bundle.wxs.'
