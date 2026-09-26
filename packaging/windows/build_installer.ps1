@@ -80,9 +80,23 @@ if (-not $wix) {
 # NOTE: list takes the same -g scope — a bare `extension list` only shows
 # the current directory's local cache and would wrongly report an empty
 # global install as missing.
-$extList = (& $wix extension list -g) -join "`n"
-if ($extList -notmatch 'WixToolset\.Bal\.wixext') {
-    Write-Error 'Failed to install WixToolset.Bal.wixext required by VadadeeBerry.Bundle.wxs.'
+# Known wix issue: a fresh add can leave a "(damaged)" (empty) cache entry.
+# Repair is remove + nuke the cache dir + re-add, so do that once here.
+function Get-WixBalExtensionList {
+    (& $wix extension list -g) -join "`n"
+}
+function Test-WixBalExtensionHealthy([string]$list) {
+    ($list -match 'WixToolset\.Bal\.wixext') -and ($list -notmatch '\(damaged\)')
+}
+$extCache = Join-Path $HOME '.wix\extensions\WixToolset.Bal.wixext'
+$extList = Get-WixBalExtensionList
+if (-not (Test-WixBalExtensionHealthy $extList)) {
+    if (Test-Path $extCache) { Remove-Item -Recurse -Force $extCache }
+    & $wix extension add -g WixToolset.Bal.wixext/5.0.2
+    $extList = Get-WixBalExtensionList
+}
+if (-not (Test-WixBalExtensionHealthy $extList)) {
+    Write-Error 'Failed to install a healthy WixToolset.Bal.wixext (5.0.2) required by VadadeeBerry.Bundle.wxs.'
     exit 1
 }
 

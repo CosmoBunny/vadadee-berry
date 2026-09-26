@@ -296,10 +296,14 @@ jobs:
           # Explicit CI-level extension setup (defense in depth: the ps1
           # verifies this again itself). Ensures the CLI first — fresh
           # runners have no wix until dotnet installs it. Installed GLOBAL
-          # (-g) so `wix build` finds it regardless of working directory.
+          # (-g) so `wix build` finds it regardless of working directory;
+          # list takes the same -g scope. A stale cache dir is nuked first
+          # (known wix "(damaged)" empty-download issue).
           if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
             dotnet tool install --global wix --version '5.*'
           }
+          $extCache = Join-Path $HOME '.wix\extensions\WixToolset.Bal.wixext'
+          if (Test-Path $extCache) { Remove-Item -Recurse -Force $extCache }
           wix extension add -g WixToolset.Bal.wixext/5.0.2
           wix extension list -g
           .\packaging\windows\build_installer.ps1
