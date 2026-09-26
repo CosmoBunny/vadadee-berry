@@ -146,8 +146,8 @@ jobs:
       - name: Build debug APK/AAB (every run)
         # Debug-signed dev check: proves the full Gradle path (manifest,
         # GameActivity, jniLibs packaging) without release secrets.
-        # NOTE: abi splits apply to debug too, so outputs are per-ABI
-        # (+ universal), not app-debug.apk.
+        # Outputs are discovered, never assumed: split layout differs
+        # across AGP versions, so hardcoded paths fail a green build.
         run: |
           set -euo pipefail
           echo "Android Gradle root:"
@@ -159,8 +159,50 @@ jobs:
           test -f android/../Cargo.toml
           chmod +x android/gradlew
           ./android/gradlew -p android assembleDebug bundleDebug
-          test -f android/app/build/outputs/apk/universal/app-universal-debug.apk
-          test -f android/app/build/outputs/bundle/debug/app-debug.aab
+          echo "=== APK outputs ==="
+          find android/app/build/outputs/apk -type f -name '*.apk' -print | sort
+          echo "=== AAB outputs ==="
+          find android/app/build/outputs/bundle -type f -name '*.aab' -print | sort
+          echo "=== Complete build outputs ==="
+          find android/app/build/outputs -type f \
+            \( -name '*.apk' -o -name '*.aab' \) \
+            -print | sort
+          UNIVERSAL_APK="$(find android/app/build/outputs/apk \
+            -type f \
+            -name '*universal*debug*.apk' \
+            -print -quit)"
+          test -n "$UNIVERSAL_APK"
+          test -f "$UNIVERSAL_APK"
+          DEBUG_AAB="$(find android/app/build/outputs/bundle \
+            -type f \
+            -name '*debug*.aab' \
+            -print -quit)"
+          test -n "$DEBUG_AAB"
+          test -f "$DEBUG_AAB"
+          if [ -z "$UNIVERSAL_APK" ]; then
+            echo "::error::Universal debug APK was not produced."
+            exit 1
+          fi
+          if [ -z "$DEBUG_AAB" ]; then
+            echo "::error::Debug AAB was not produced."
+            exit 1
+          fi
+          echo "=== Universal APK contents ==="
+          unzip -l "$UNIVERSAL_APK" | grep 'lib/.*libvadadee_berry.so'
+          unzip -l "$UNIVERSAL_APK" | \
+            grep -q 'lib/arm64-v8a/libvadadee_berry.so'
+          echo "=== Debug AAB native libraries ==="
+          unzip -l "$DEBUG_AAB" | \
+            grep 'lib/.*libvadadee_berry.so'
+          unzip -l "$DEBUG_AAB" | \
+            grep -q 'lib/arm64-v8a/libvadadee_berry.so'
+          echo "=== Android debug artifacts ==="
+          ls -lah "$UNIVERSAL_APK"
+          ls -lah "$DEBUG_AAB"
+          echo "=== All APKs ==="
+          find android/app/build/outputs/apk -type f -name '*.apk' -print | sort
+          echo "=== All AABs ==="
+          find android/app/build/outputs/bundle -type f -name '*.aab' -print | sort
 
       - name: Require Android signing secrets (tags only)
         # Release signing needs repo secrets (Settings -> Secrets and
