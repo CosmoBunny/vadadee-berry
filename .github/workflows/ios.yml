@@ -1,13 +1,13 @@
 # iOS release: Rust core -> staticlib -> Xcode archive -> signed IPA.
-# Separate pipeline from desktop release: mobile signing problems must never
-# block desktop artifacts. Unsigned archive validates every run; the signed
-# IPA exports on tags only, and only when signing secrets exist (repo
-# Settings -> Secrets and variables -> Actions):
-#   APPLE_CERTIFICATE_BASE64 / APPLE_CERTIFICATE_PASSWORD /
-#   APPLE_PROVISIONING_PROFILE_BASE64 / APPLE_PROVISIONING_PROFILE_NAME /
-#   APPLE_KEYCHAIN_PASSWORD / APPLE_TEAM_ID
-# (optional: APPLE_EXPORT_METHOD, default app-store).
-# Never commit certificates or profiles. Must run on macOS runners.
+# Two jobs keep unsigned validation separate from signed distribution:
+#   ios-validate (every run): Rust release builds, device/simulator
+#     staging, unsigned device archive. Green means the code is shippable.
+#   ios-release (tags only): downloads the validated archive, then the
+#     signing-gated export (temp keychain, generated ExportOptions.plist).
+#     Red here with "missing secret ..." means exactly one thing: Apple
+#     signing is not configured — not a code failure.
+# Signing uses CI secrets only — never commit keys or provisioning
+# profiles. Must run on macOS runners.
 name: iOS
 
 on:
@@ -24,8 +24,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  ios-build:
-    name: iOS Release
+  ios-validate:
+    name: iOS Validate (unsigned archive)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -111,10 +111,63 @@ jobs:
           path: build/VadadeeBerry.xcarchive
           if-no-files-found: error
 
-      - name: Require iOS signing secrets (tags only)
+      - name: Final CI report
+        if: always()
+        run: |
+          echo "========================================"
+          echo "Vadadee Berry Mobile Release"
+          echo "========================================"
+          echo
+          echo "iOS:"
+          ls build/export/*.ipa 2>/dev/null || echo "  IPA: (unsigned-archive run — signed IPA exports on tags with secrets)"
+          echo
+          echo "Native artifacts:"
+          find ios-artifacts -type f 2>/dev/null || echo "  MISSING"
+          echo
+          echo "Packaging:"
+          echo "  iOS Xcode archive: OK"
+          echo "========================================"
+
+  ios-release:
+    name: iOS Release (signed IPA)
+    needs: [ios-validate]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Xcode archive
+        uses: actions/download-artifact@v4
+        with:
+          name: vadadee-berry-ios-xcarchive
+          path: xcarchive-download/
+
+      - name: Reconstruct archive bundle
+        # upload-artifact stores a directory's *contents* rooted at the
+        # given path, so the wrapper layout is normalized back into
+        # build/VadadeeBerry.xcarchive explicitly instead of assumed.
+        run: |
+          set -euo pipefail
+          if [ -d "build/VadadeeBerry.xcarchive" ]; then
+            echo "archive bundle present"
+          elif [ -f "xcarchive-download/Info.plist" ]; then
+            mkdir -p build/VadadeeBerry.xcarchive
+            cp -R xcarchive-download/. build/VadadeeBerry.xcarchive/
+            rm -rf xcarchive-download
+          elif [ -d "xcarchive-download/VadadeeBerry.xcarchive" ]; then
+            mkdir -p build
+            mv xcarchive-download/VadadeeBerry.xcarchive build/VadadeeBerry.xcarchive
+            rm -rf xcarchive-download
+          else
+            echo "::error::VadadeeBerry.xcarchive not recoverable from vadadee-berry-ios-xcarchive artifact."
+            find xcarchive-download build -maxdepth 3 2>/dev/null || true
+            exit 1
+          fi
+          test -d build/VadadeeBerry.xcarchive
+
+      - name: Require iOS signing secrets
         # IPA export needs repo secrets. Fail here — loudly, naming each
         # secret — instead of producing an unsigned/fake release artifact.
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -134,8 +187,7 @@ jobs:
           test "$missing" = "0" || exit 1
           echo "signing secrets present"
 
-      - name: Export signed IPA (tags only)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Export signed IPA
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -186,8 +238,7 @@ jobs:
             -exportOptionsPlist ios/ExportOptions.plist
           ls -lah build/export/
 
-      - name: Verify IPA (tags only)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Verify IPA
         run: |
           set -euo pipefail
           ipa="$(echo build/export/*.ipa)"
@@ -203,7 +254,6 @@ jobs:
           echo "ipa verification OK"
 
       - name: Upload iOS IPA
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: vadadee-berry-ios-ipa
@@ -211,8 +261,7 @@ jobs:
             build/export/*.ipa
           if-no-files-found: error
 
-      - name: Attach to GitHub Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -221,20 +270,3 @@ jobs:
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Final CI report
-        if: always()
-        run: |
-          echo "========================================"
-          echo "Vadadee Berry Mobile Release"
-          echo "========================================"
-          echo
-          echo "iOS:"
-          ls build/export/*.ipa 2>/dev/null || echo "  IPA: (unsigned-archive run — signed IPA exports on tags with secrets)"
-          echo
-          echo "Native artifacts:"
-          find ios-artifacts -type f 2>/dev/null || echo "  MISSING"
-          echo
-          echo "Packaging:"
-          echo "  iOS Xcode archive: OK"
-          echo "========================================"
