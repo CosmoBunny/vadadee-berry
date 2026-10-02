@@ -85,4 +85,12 @@ dependencies {
     // glue that integrates with Rust; the Java side here is only the
     // launcher declared in AndroidManifest.xml.
     implementation 'androidx.games:games-activity:4.4.0'
+    // games-activity 4.4.0 ships a dependency-less POM (no .module
+    // metadata either), so its Jetpack requirements must be declared
+    // here. Without them GameActivity dies at launch: its
+    // AppCompatActivity superclass is missing from dex
+    // (ClassNotFoundException, killed the 0.0.2 preview on device).
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.core:core:1.13.1'
+    implementation 'androidx.annotation:annotation:1.8.2'
 }

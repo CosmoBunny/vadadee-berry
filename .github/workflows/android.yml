@@ -467,6 +467,13 @@ jobs:
             echo "::error::GameActivity missing from classes.dex — broken APK, refusing to publish."
             exit 1
           fi
+          echo "=== Jetpack presence gate (AppCompat must be packaged, not just referenced) ==="
+          ANDX=$(unzip -p android-preview/*-preview-universal.apk 'classes*.dex' | strings | grep -c 'Landroidx/' || true)
+          echo "androidx string refs in dex: $ANDX"
+          if [ "${ANDX:-0}" -lt 100 ]; then
+            echo "::error::only $ANDX androidx refs — Jetpack libs missing from dex, refusing to publish."
+            exit 1
+          fi
           echo "=== native libs ==="
           unzip -l android-preview/*-preview-universal.apk | grep -E "lib/(arm64-v8a|armeabi-v7a|x86_64)/libvadadee_berry.so"
           echo "preview verification OK"
