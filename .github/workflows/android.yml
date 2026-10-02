@@ -3,10 +3,11 @@
 #   android-validate (every run): Rust release builds, jniLibs staging,
 #     manifest, native upload. Green means the code is shippable.
 #   android-release (tags only): downloads the validated natives, then
-#     the signing-gated Gradle build (assembleRelease + bundleRelease),
-#     verification, uploads, and Release attach. Red here with
-#     "missing secret ..." means exactly one thing: Android signing is
-#     not configured — not a code failure.
+#     the Gradle build (assembleRelease + bundleRelease), verification,
+#     uploads, and Release attach. Real secrets -> true release
+#     signature; without them an ephemeral per-run key signs instead
+#     (files suffixed -testsigned, Play rejects them). Never unsigned:
+#     unsigned APKs are uninstallable, so no-secrets means test-signed.
 #   android-preview (dispatch only): assembleRelease signed with an
 #     ephemeral per-run key, dex/manifest verified (real applicationId,
 #     GameActivity present), published to a rolling public
@@ -237,11 +238,14 @@ jobs:
           test -x "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
           echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
 
-      - name: Require Android signing secrets
-        # Release builds always need repo secrets (Settings -> Secrets and
-        # variables -> Actions). Fail here — loudly, naming each secret —
-        # instead of producing an unsigned/fake release artifact. There is
-        # no debug fallback: tags ship real release packages.
+      - name: Set up signing (real key or ephemeral fallback)
+        # Real secrets present -> true release signature. Absent -> a
+        # throwaway per-run key so tag builds still produce installable
+        # test artifacts instead of failing. Pure unsigned APKs are
+        # uninstallable (Android rejects them), so ephemeral signing is
+        # the no-secrets fallback, never unsigned. Ephemeral files are
+        # suffixed -testsigned and Play will reject them; each build has
+        # a fresh certificate, so uninstall the previous one first.
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -252,20 +256,39 @@ jobs:
           missing=0
           for v in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
             if [ -z "${!v:-}" ]; then
-              echo "::error::missing secret $v — release builds need Android signing secrets (repo Settings -> Secrets and variables -> Actions)."
+              echo "::warning::secret $v not set."
               missing=1
             fi
           done
-          test "$missing" = "0" || exit 1
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > /tmp/vadadee-release.keystore
-          test -s /tmp/vadadee-release.keystore
-          {
-            echo "ANDROID_KEYSTORE_PATH=/tmp/vadadee-release.keystore"
-            echo "ANDROID_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD"
-            echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS"
-            echo "ANDROID_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
-          } >> "$GITHUB_ENV"
-          echo "signing secrets present"
+          if [ "$missing" = "0" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > /tmp/vadadee-release.keystore
+            test -s /tmp/vadadee-release.keystore
+            {
+              echo "ANDROID_KEYSTORE_PATH=/tmp/vadadee-release.keystore"
+              echo "ANDROID_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD"
+              echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS"
+              echo "ANDROID_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
+              echo "RELEASE_KEY_KIND=real"
+            } >> "$GITHUB_ENV"
+            echo "real release key configured"
+          else
+            echo "::warning::No complete signing secrets — tag build falls back to an ephemeral test certificate (NOT a Play release)."
+            keytool -genkeypair \
+              -keystore /tmp/vadadee-tagfallback.keystore \
+              -alias vadadeetagtest \
+              -keyalg RSA -keysize 2048 -validity 30 \
+              -storepass tagtest -keypass tagtest \
+              -dname "CN=Vadadee Berry Tag Test,O=CosmoBunny,C=US"
+            test -s /tmp/vadadee-tagfallback.keystore
+            {
+              echo "ANDROID_KEYSTORE_PATH=/tmp/vadadee-tagfallback.keystore"
+              echo "ANDROID_KEYSTORE_PASSWORD=tagtest"
+              echo "ANDROID_KEY_ALIAS=vadadeetagtest"
+              echo "ANDROID_KEY_PASSWORD=tagtest"
+              echo "RELEASE_KEY_KIND=ephemeral"
+            } >> "$GITHUB_ENV"
+            echo "ephemeral fallback key configured (single-run use)"
+          fi
 
       - name: Build release APK/AAB
         run: |
@@ -284,13 +307,19 @@ jobs:
           echo "=== AAB outputs ==="
           find android/app/build/outputs/bundle -type f -name '*.aab' -print | sort
           VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          echo "Cargo version: $VER"
+          echo "Cargo version: $VER (key: ${RELEASE_KEY_KIND:-unknown})"
+          if [ "${RELEASE_KEY_KIND:-ephemeral}" = "real" ]; then TAG=""; else TAG="-testsigned"; fi
           mkdir -p android-release
-          cp android/app/build/outputs/apk/release/app-arm64-v8a-release.apk "android-release/vadadee-berry-$VER-android-arm64.apk"
-          cp android/app/build/outputs/apk/release/app-armeabi-v7a-release.apk "android-release/vadadee-berry-$VER-android-armeabi-v7a.apk"
-          cp android/app/build/outputs/apk/release/app-x86_64-release.apk "android-release/vadadee-berry-$VER-android-x86_64.apk"
-          cp android/app/build/outputs/apk/release/app-universal-release.apk "android-release/vadadee-berry-$VER-android-universal.apk"
-          cp android/app/build/outputs/bundle/release/app-release.aab "android-release/vadadee-berry-$VER-android.aab"
+          cp android/app/build/outputs/apk/release/app-arm64-v8a-release.apk "android-release/vadadee-berry-$VER-android${TAG}-arm64.apk"
+          cp android/app/build/outputs/apk/release/app-armeabi-v7a-release.apk "android-release/vadadee-berry-$VER-android${TAG}-armeabi-v7a.apk"
+          cp android/app/build/outputs/apk/release/app-x86_64-release.apk "android-release/vadadee-berry-$VER-android${TAG}-x86_64.apk"
+          cp android/app/build/outputs/apk/release/app-universal-release.apk "android-release/vadadee-berry-$VER-android${TAG}-universal.apk"
+          cp android/app/build/outputs/bundle/release/app-release.aab "android-release/vadadee-berry-$VER-android${TAG}.aab"
+          {
+            echo "key kind: ${RELEASE_KEY_KIND:-unknown}"
+            keytool -list -v -keystore "$ANDROID_KEYSTORE_PATH" -storepass "$ANDROID_KEYSTORE_PASSWORD" 2>/dev/null | grep -E 'Alias name|SHA256' || true
+          } > android-release/SIGNING-STATUS.txt
+          cat android-release/SIGNING-STATUS.txt
           (cd android-release && sha256sum ./*.apk ./*.aab > SHA256SUMS.txt) || (cd android-release && shasum -a 256 ./*.apk ./*.aab > SHA256SUMS.txt)
           ls -lah android-release/
 
@@ -313,12 +342,12 @@ jobs:
               exit 1
             fi
           }
-          check_apk android-release/*-android-arm64.apk arm64-v8a
-          check_apk android-release/*-android-armeabi-v7a.apk armeabi-v7a
-          check_apk android-release/*-android-x86_64.apk x86_64
+          check_apk android-release/*-arm64.apk arm64-v8a
+          check_apk android-release/*-armeabi-v7a.apk armeabi-v7a
+          check_apk android-release/*-x86_64.apk x86_64
           echo "=== universal APK (all ABIs) ==="
-          unzip -l android-release/*-android-universal.apk | grep -E "lib/(arm64-v8a|armeabi-v7a|x86_64)/libvadadee_berry.so"
-          check_apk android-release/*-android-universal.apk arm64-v8a
+          unzip -l android-release/*-universal.apk | grep -E "lib/(arm64-v8a|armeabi-v7a|x86_64)/libvadadee_berry.so"
+          check_apk android-release/*-universal.apk arm64-v8a
           echo "=== release AAB ==="
           test -f android-release/*.aab
           unzip -l android-release/*.aab | grep -E "lib/(arm64-v8a|armeabi-v7a|x86_64)/libvadadee_berry.so|AndroidManifest.xml"
