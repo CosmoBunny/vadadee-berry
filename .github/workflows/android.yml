@@ -135,6 +135,34 @@ jobs:
           echo "=== jniLibs ==="
           find android/app/src/main/jniLibs -type f -print
 
+      - name: Set up Java for TEMPORARY debug build
+        # TEMPORARY — revert after on-device test. Dispatch-only so tags
+        # never see a debug path.
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: TEMPORARY debug APK for device testing
+        # TEMPORARY — revert after on-device test. Proves the current tree
+        # packages GameActivity; NOT part of the release policy.
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          chmod +x android/gradlew
+          ./android/gradlew -p android assembleDebug
+          find android/app/build/outputs/apk -type f -name '*.apk' -print | sort
+          test -n "$(find android/app/build/outputs/apk -type f -name '*universal*debug*.apk' -print -quit)"
+
+      - name: TEMPORARY upload debug APK
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-android-debug-tmp
+          path: android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
       - name: Generate build manifest
         run: |
           set -euo pipefail
