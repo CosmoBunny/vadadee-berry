@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Fullscreen host theme. MUST descend from an AppCompat theme:
+     GameActivity extends AppCompatActivity and crashes at launch on any
+     framework theme. windowFullscreen hides the status bar (time,
+     notifications) so the editor owns the whole display. -->
+<resources>
+    <style name="Theme.VadadeeBerry" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+</resources>
