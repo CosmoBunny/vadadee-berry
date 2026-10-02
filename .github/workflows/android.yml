@@ -1,5 +1,5 @@
 # Android release: Rust core -> native libs -> Gradle APK/AAB -> Release.
-# Two jobs keep unsigned validation separate from signed distribution:
+# Three jobs keep unsigned validation separate from signed distribution:
 #   android-validate (every run): Rust release builds, jniLibs staging,
 #     manifest, native upload. Green means the code is shippable.
 #   android-release (tags only): downloads the validated natives, then
@@ -7,6 +7,11 @@
 #     verification, uploads, and Release attach. Red here with
 #     "missing secret ..." means exactly one thing: Android signing is
 #     not configured — not a code failure.
+#   android-preview (dispatch only): assembleRelease signed with an
+#     ephemeral per-run key, dex/manifest verified (real applicationId,
+#     GameActivity present), published to a rolling public
+#     `android-preview` GitHub Release. No secrets, no .debug suffix.
+#     Uninstall the previous preview before installing the next one.
 #
 # Signing secrets (repo Settings -> Secrets, never committed):
 #   ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD /
@@ -344,6 +349,152 @@ jobs:
             android-release/*.apk
             android-release/*.aab
             android-release/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  android-preview:
+    name: Android Preview (public test APK)
+    needs: [android-validate]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download native libraries
+        uses: actions/download-artifact@v4
+        with:
+          name: vadadee-berry-android
+          path: .
+
+      - name: Verify staged jniLibs
+        run: |
+          set -euo pipefail
+          test -f android/app/src/main/jniLibs/arm64-v8a/libvadadee_berry.so
+          test -f android/app/src/main/jniLibs/armeabi-v7a/libvadadee_berry.so
+          test -f android/app/src/main/jniLibs/x86_64/libvadadee_berry.so
+          find android/app/src/main/jniLibs -type f -print | sort
+
+      - name: Set up Java for Gradle
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Create ephemeral preview signing key
+        # Public test builds must never touch the real release key. This
+        # throwaway keystore is born and dies inside this one run: made
+        # here, used once below, destroyed with the runner. No secrets,
+        # nothing to leak. Price: every preview build gets a fresh
+        # certificate, so uninstall the previous preview before
+        # installing the next one.
+        run: |
+          set -euo pipefail
+          keytool -genkeypair \
+            -keystore /tmp/vadadee-preview.keystore \
+            -alias vadadeepreview \
+            -keyalg RSA -keysize 2048 -validity 30 \
+            -storepass previewtest -keypass previewtest \
+            -dname "CN=Vadadee Berry Preview,O=CosmoBunny,C=US"
+          test -s /tmp/vadadee-preview.keystore
+          {
+            echo "ANDROID_KEYSTORE_PATH=/tmp/vadadee-preview.keystore"
+            echo "ANDROID_KEYSTORE_PASSWORD=previewtest"
+            echo "ANDROID_KEY_ALIAS=vadadeepreview"
+            echo "ANDROID_KEY_PASSWORD=previewtest"
+          } >> "$GITHUB_ENV"
+          echo "ephemeral preview key created (single-run use)"
+
+      - name: Build preview APK
+        # assembleRelease: real applicationId, no .debug suffix (that
+        # suffix lives only in the debug buildType, which never runs
+        # here). Signed with the ephemeral key above.
+        run: |
+          set -euo pipefail
+          chmod +x android/gradlew
+          ./android/gradlew -p android assembleRelease
+          echo "=== APK outputs ==="
+          find android/app/build/outputs/apk -type f -name '*.apk' -print | sort
+          VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          echo "Cargo version: $VER"
+          mkdir -p android-preview
+          cp android/app/build/outputs/apk/arm64-v8a/app-arm64-v8a-release.apk "android-preview/vadadee-berry-$VER-android-preview-arm64.apk"
+          cp android/app/build/outputs/apk/armeabi-v7a/app-armeabi-v7a-release.apk "android-preview/vadadee-berry-$VER-android-preview-armeabi-v7a.apk"
+          cp android/app/build/outputs/apk/x86_64/app-x86_64-release.apk "android-preview/vadadee-berry-$VER-android-preview-x86_64.apk"
+          cp android/app/build/outputs/apk/universal/app-universal-release.apk "android-preview/vadadee-berry-$VER-android-preview-universal.apk"
+          (cd android-preview && sha256sum ./*.apk > SHA256SUMS.txt) || (cd android-preview && shasum -a 256 ./*.apk > SHA256SUMS.txt)
+          ls -lah android-preview/
+
+      - name: Verify preview APK
+        run: |
+          set -euo pipefail
+          AAPT="$ANDROID_SDK_ROOT/build-tools/35.0.0/aapt"
+          test -x "$AAPT"
+          fail=0
+          for apk in android-preview/*-preview-*.apk; do
+            echo "=== $apk ==="
+            "$AAPT" dump badging "$apk" > /tmp/badging.txt
+            grep "package:" /tmp/badging.txt
+            if ! grep -q "package: name='com.cosmobunny.vadadeeberry'" /tmp/badging.txt; then
+              echo "::error::$apk has wrong package id (expected com.cosmobunny.vadadeeberry)."
+              fail=1
+            fi
+            if grep -q '\.debug' /tmp/badging.txt; then
+              echo "::error::$apk contains a .debug id — refusing to publish."
+              fail=1
+            fi
+          done
+          test "$fail" = "0"
+          echo "=== GameActivity dex gate (the Sep-26 defect must never ship again) ==="
+          DEXCOUNT=$(unzip -p android-preview/*-preview-universal.apk 'classes*.dex' | strings | grep -c -F 'Lcom/google/androidgamesdk/GameActivity;' || true)
+          echo "GameActivity class refs in dex: $DEXCOUNT"
+          if [ "$DEXCOUNT" = "0" ]; then
+            echo "::error::GameActivity missing from classes.dex — broken APK, refusing to publish."
+            exit 1
+          fi
+          echo "=== native libs ==="
+          unzip -l android-preview/*-preview-universal.apk | grep -E "lib/(arm64-v8a|armeabi-v7a|x86_64)/libvadadee_berry.so"
+          echo "preview verification OK"
+
+      - name: Upload preview APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: vadadee-berry-android-preview
+          path: |
+            android-preview/*.apk
+            android-preview/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish to rolling preview release
+        # Public download: one rolling `android-preview` GitHub Release,
+        # overwritten on every dispatch. No secrets involved.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-preview
+          name: Android Preview (public test build)
+          body: |
+            Public test APK for Vadadee Berry (phone testing, not Play).
+            Package: com.cosmobunny.vadadeeberry — no .debug suffix.
+            Signed with an ephemeral per-build certificate: uninstall any
+            previous preview before installing this one.
+          files: |
+            android-preview/*.apk
+            android-preview/SHA256SUMS.txt
           fail_on_unmatched_files: true
           generate_release_notes: false
         env:
