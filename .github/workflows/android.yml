@@ -286,10 +286,10 @@ jobs:
           VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           echo "Cargo version: $VER"
           mkdir -p android-release
-          cp android/app/build/outputs/apk/arm64-v8a/app-arm64-v8a-release.apk "android-release/vadadee-berry-$VER-android-arm64.apk"
-          cp android/app/build/outputs/apk/armeabi-v7a/app-armeabi-v7a-release.apk "android-release/vadadee-berry-$VER-android-armeabi-v7a.apk"
-          cp android/app/build/outputs/apk/x86_64/app-x86_64-release.apk "android-release/vadadee-berry-$VER-android-x86_64.apk"
-          cp android/app/build/outputs/apk/universal/app-universal-release.apk "android-release/vadadee-berry-$VER-android-universal.apk"
+          cp android/app/build/outputs/apk/release/app-arm64-v8a-release.apk "android-release/vadadee-berry-$VER-android-arm64.apk"
+          cp android/app/build/outputs/apk/release/app-armeabi-v7a-release.apk "android-release/vadadee-berry-$VER-android-armeabi-v7a.apk"
+          cp android/app/build/outputs/apk/release/app-x86_64-release.apk "android-release/vadadee-berry-$VER-android-x86_64.apk"
+          cp android/app/build/outputs/apk/release/app-universal-release.apk "android-release/vadadee-berry-$VER-android-universal.apk"
           cp android/app/build/outputs/bundle/release/app-release.aab "android-release/vadadee-berry-$VER-android.aab"
           (cd android-release && sha256sum ./*.apk ./*.aab > SHA256SUMS.txt) || (cd android-release && shasum -a 256 ./*.apk ./*.aab > SHA256SUMS.txt)
           ls -lah android-release/
@@ -433,10 +433,10 @@ jobs:
           VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           echo "Cargo version: $VER"
           mkdir -p android-preview
-          cp android/app/build/outputs/apk/arm64-v8a/app-arm64-v8a-release.apk "android-preview/vadadee-berry-$VER-android-preview-arm64.apk"
-          cp android/app/build/outputs/apk/armeabi-v7a/app-armeabi-v7a-release.apk "android-preview/vadadee-berry-$VER-android-preview-armeabi-v7a.apk"
-          cp android/app/build/outputs/apk/x86_64/app-x86_64-release.apk "android-preview/vadadee-berry-$VER-android-preview-x86_64.apk"
-          cp android/app/build/outputs/apk/universal/app-universal-release.apk "android-preview/vadadee-berry-$VER-android-preview-universal.apk"
+          cp android/app/build/outputs/apk/release/app-arm64-v8a-release.apk "android-preview/vadadee-berry-$VER-android-preview-arm64.apk"
+          cp android/app/build/outputs/apk/release/app-armeabi-v7a-release.apk "android-preview/vadadee-berry-$VER-android-preview-armeabi-v7a.apk"
+          cp android/app/build/outputs/apk/release/app-x86_64-release.apk "android-preview/vadadee-berry-$VER-android-preview-x86_64.apk"
+          cp android/app/build/outputs/apk/release/app-universal-release.apk "android-preview/vadadee-berry-$VER-android-preview-universal.apk"
           (cd android-preview && sha256sum ./*.apk > SHA256SUMS.txt) || (cd android-preview && shasum -a 256 ./*.apk > SHA256SUMS.txt)
           ls -lah android-preview/
 
