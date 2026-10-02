@@ -94,3 +94,13 @@ dependencies {
     implementation 'androidx.core:core:1.13.1'
     implementation 'androidx.annotation:annotation:1.8.2'
 }
+
+// kotlin-stdlib 1.8+ absorbed the legacy -jdk7/-jdk8 split artifacts,
+// but an older transitive dep still drags in 1.6.21 copies of both,
+// whose classes duplicate stdlib's (checkReleaseDuplicateClasses
+// failure). Drop the legacy jars — the standard fix, safe because
+// everything they contained now lives in kotlin-stdlib itself.
+configurations.all {
+    exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk7"
+    exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk8"
+}
