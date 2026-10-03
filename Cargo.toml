@@ -66,6 +66,13 @@ rayon = "1.10"
 default = ["opencv"]
 opencv = ["dep:opencv"]
 
+# VBLua: embedded Lua scripting (vendored Lua 5.4 — no system Lua needed).
+# Cross-platform: Linux / Windows / macOS / Android / iOS (pure C via cc).
+# Traya (sibling project) uses the same recipe: mlua 0.10 + lua54 + vendored.
+[dependencies.mlua]
+version = "0.10"
+features = ["lua54", "vendored"]
+
 [dependencies.opencv]
 version = "0.100"
 optional = true

@@ -43,6 +43,7 @@ pub mod text_glyph;
 pub mod theme;
 pub mod tools;
 pub mod ui;
+pub mod vblua;
 pub mod video_decode;
 
 use app::VadadeeBerryApp;
