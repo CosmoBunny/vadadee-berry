@@ -34,10 +34,64 @@ pub enum VbluaError {
     Internal(String),
 }
 
+impl VbluaError {
+    /// UI-facing hint per failure class (Phase 25 error experience).
+    pub fn suggestion(&self) -> &'static str {
+        match self {
+            VbluaError::Syntax { .. } => "Check the reported line: unclosed bracket, string, or block.",
+            VbluaError::Runtime { .. } => {
+                "A value was nil or an id unknown. Log values before the failing call."
+            }
+            VbluaError::Api { .. } => {
+                "Wrong argument type or unknown key — the message lists what fits."
+            }
+            VbluaError::Permission { .. } => {
+                "The manifest/policy lacks this capability. Declare it or degrade gracefully."
+            }
+            VbluaError::Timeout { .. } => {
+                "Loop without progress? Batch the work (vblua.batch) instead of per-item calls."
+            }
+            VbluaError::Resource { .. } => {
+                "Lower the batch size or free large tables; budgets guard the host."
+            }
+            VbluaError::Internal(_) => "Binding bug — please report with the script attached.",
+        }
+    }
+
+    /// Multi-line UI rendering: kind, detail (with interpreter line info
+    /// when present), suggestion. The console pushes this verbatim.
+    pub fn render(&self) -> String {
+        let kind = match self {
+            VbluaError::Syntax { .. } => "Syntax",
+            VbluaError::Runtime { .. } => "Runtime",
+            VbluaError::Api { .. } => "API",
+            VbluaError::Permission { .. } => "Permission",
+            VbluaError::Timeout { .. } => "Timeout",
+            VbluaError::Resource { .. } => "Resource",
+            VbluaError::Internal(_) => "Internal",
+        };
+        format!("VBLua Error [{kind}]\n{self}\nSuggestion: {}", self.suggestion())
+    }
+}
+
 /// Classify an `mlua::Error` into [`VbluaError`] without losing the message.
 pub fn from_mlua(script: &str, err: mlua::Error) -> VbluaError {
     use mlua::Error as E;
     let message = err.to_string();
+    // Instruction-budget kills carry the sentinel (sandbox::arm_execution_limits).
+    if message.contains(super::sandbox::TIMEOUT_SENTINEL) {
+        // Extract the budget from "... (N instructions)".
+        let budget = message
+            .rsplit('(')
+            .next()
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        return VbluaError::Timeout {
+            script: script.to_string(),
+            budget_instructions: budget,
+        };
+    }
     match err {
         E::SyntaxError { .. } => VbluaError::Syntax {
             script: script.to_string(),
@@ -87,5 +141,15 @@ mod tests {
             from_mlua("a.lua", err),
             VbluaError::Runtime { .. }
         ));
+    }
+
+    #[test]
+    fn render_includes_kind_and_suggestion() {
+        let e = VbluaError::Timeout {
+            script: "a.lua".into(),
+            budget_instructions: 7,
+        };
+        let r = e.render();
+        assert!(r.contains("Timeout") && r.contains("Suggestion:") && r.contains("a.lua"));
     }
 }

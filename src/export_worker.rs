@@ -1130,7 +1130,7 @@ fn collect_export_video_layers(project: &ProjectFile) -> Vec<ExportVideoLayer> {
                 )
             });
             for clip in clips {
-                if clip.media_path.is_empty() || clip.is_audio_only() {
+                if clip.media_path.is_empty() || clip.is_audio_only() || clip.muted {
                     continue;
                 }
                 let play_secs = clip.timeline_play_secs();

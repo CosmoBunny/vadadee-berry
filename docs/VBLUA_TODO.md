@@ -1,0 +1,55 @@
+# VBLua TODO
+
+Rule: implement sequentially — compile → test → verify → next phase.
+Do NOT commit until told to (`git commit` is currently forbidden).
+
+## Done
+- [x] Phase 0 — architecture audit (document/node/video/asset ownership, platform gates)
+- [x] Phase 1 — foundation (`src/vblua/`: runtime, error, value, api, sandbox, context)
+- [x] Phase 2 — lifecycle (Create/Ready/Pause/Resume/Reset/Shutdown, `VbluaError`)
+- [x] Phase 3 — stdlib (`vblua.version/platform/log`, `vblua.math.*`)
+- [x] Phase 4 — document API (snapshot + batched `DocumentCommand`, undo-ready)
+- [x] Docs + examples (`docs/vblua.md`, `examples/vblua/{hello,document}.lua`)
+
+## In progress
+- [x] Dev console — `VbluaConsole` window + View-menu toggle (implemented, uncommitted; boots clean headless — menu interaction is manual)
+
+## Up next (in order)
+- [x] Phase 5 — node graph API (create/delete/duplicate/connect, stable Uuid ids; implemented, uncommitted)
+- [x] Phase 6 — node parameters (set/get via VbValue, clamped/truncated; implemented, uncommitted)
+- [x] Phase 7 — animation API (keyframes/tracks/sample, PatchTimeline undo; implemented, uncommitted)
+- [x] Phase 8 — kinematics (FK/CCD/analytic IK, damp/spring/look-at/orbit; implemented, uncommitted)
+- [x] Phase 9 — shader API (safe WGSL abstraction, host validation; implemented, uncommitted)
+- [x] Phase 10 — video API (clip orchestration, no new media refs; implemented, uncommitted)
+- [x] Phase 11 — asset API (inventory + opaque handles, import pending picker; implemented, uncommitted)
+- [x] Phase 12 — file handler + picker integration (hook boundary, desktop rfd wired; implemented, uncommitted)
+- [x] Phase 13 — UI scripting (panels/widgets/callbacks, host-rendered; implemented, uncommitted)
+- [x] Phase 14 — scripted node types (template recipes, engine-owned; implemented, uncommitted)
+- [x] Phase 15 — procedural systems (bulk creates/keyframes/layout; implemented, uncommitted)
+- [x] Phase 16 — editor automation (transactions, node ops, precise undo; implemented, uncommitted)
+- [x] Phase 17 — VBLua sandbox (budgets enforced, manifest permissions; implemented, uncommitted)
+- [x] Phase 18/19 — addon format + local lifecycle + `.vbaddon` bundles (implemented, uncommitted)
+- [ ] Phase 20 — native Rust addons (stable ABI, after Lua API is stable)
+- [x] Phase 21 — mobile restrictions (`vblua.has` probes, fs audit; implemented, uncommitted)
+- [x] Phase 22 — Android validation (aarch64 `cargo check` green incl. vendored Lua; implemented, uncommitted)
+- [ ] Phase 23 — iOS validation on real IPA (needs CI/Xcode; no local target)
+- [ ] Phase 22b — Android runtime validation on real APK (CI dispatch/tag per policy)
+- [x] Phase 24 — performance (`vblua_bench`, no hotspots; implemented, uncommitted)
+- [x] Phase 25 — script error experience (`VbluaError::render`; implemented, uncommitted)
+- [x] Phase 27/28 — hot-reload-lite (`addons.reload`) + one-level events incl. `document-open`/`before-export` dispatch (implemented, uncommitted)
+- [x] Phase 26 — tracing debugger (trace/breakpoints, no locals by design; implemented, uncommitted)
+- [ ] Phase 29 — render/export automation (blocked: needs filesystem.write decision)
+- [x] Phase 30 — VBLua API versioning (`api_version`/`maturity`, manifest majors; implemented, uncommitted)
+- [x] Phase 31/32 — docs (`vblua.md` + full `vblua-api.md`) + 13 verified examples; implemented, uncommitted
+- [x] Phase 33 — test suite (70 unit + 4 integration + 1 examples harness; implemented, uncommitted)
+- [x] Phase 35 — release channels (`experimental`; implemented, uncommitted)
+- [x] Phase 34 — security review (boundary caps, strip asserts; implemented, uncommitted)
+- [x] GPU milestone 1 (image analysis CPU+GPU, kernel validate; implemented, uncommitted)
+- [x] GPU milestone 2 (custom kernel execution, pipeline cache, reference kernel; implemented, uncommitted)
+- [x] Timeline milestone 1 (TimeMap, Speed fix, Reverse, ZoomVideo, split undo; implemented, uncommitted)
+- [x] TimeOffset + FreezeFrame (affine-native; implemented, uncommitted)
+- [x] Transform + Crop + FlipH/V (shared geo impl, UV/export parity; implemented, uncommitted)
+- [x] Rustdoc site (`cargo doc`: landing page, module Input/Output/Errors, doc-tests, CI docs-gate; implemented, uncommitted)
+- [x] LSP core (`vblua::lsp` + `vblua_lsp` stdio server: sync/diagnostics/completion/hover, live-verified; implemented, uncommitted)
+- [x] Timeline markers (document-level sorted bookmarks, snap targets for move/trim drags, VBLua `markers/add_marker/rename/move/remove`, undoable; implemented, uncommitted)
+- [x] TimeRemap curves (`TimeMap` warp stack: PWL lookup after affine, exact downstream composition, node `curve` param + VBLua/batch create support, neutral warped audio rate; implemented, uncommitted)

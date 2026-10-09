@@ -23,6 +23,12 @@ pub struct AvClip {
     /// Live link to document object(s). When set, the track re-rasterizes when those nodes change.
     #[serde(default)]
     pub source_node_ids: Vec<Uuid>,
+    /// Muted clips are skipped by preview and export (audition without delete).
+    #[serde(default)]
+    pub muted: bool,
+    /// Locked clips refuse move/trim/delete/split (must unlock first).
+    #[serde(default)]
+    pub locked: bool,
 }
 
 impl AvClip {
@@ -41,6 +47,8 @@ impl AvClip {
             media_source_duration: None,
             track_row: 0,
             source_node_ids: Vec::new(),
+            muted: false,
+            locked: false,
         }
     }
 
@@ -55,6 +63,8 @@ impl AvClip {
             media_source_duration: None,
             track_row: 0,
             source_node_ids: Vec::new(),
+            muted: false,
+            locked: false,
         }
     }
 
@@ -77,6 +87,8 @@ impl AvClip {
             media_source_duration,
             track_row: 0,
             source_node_ids: Vec::new(),
+            muted: false,
+            locked: false,
         }
     }
 
@@ -193,4 +205,86 @@ pub fn assign_free_track_row(
 
 fn ranges_overlap(a0: f32, a1: f32, b0: f32, b1: f32) -> bool {
     a0 < b1 && b0 < a1
+}
+
+/// Snap a timeline time to the nearest candidate within `threshold`.
+/// Candidates: 0, every clip start/end on any row. Returns snapped time.
+/// Pure function (no document mutation) — UI drags and scripts share it.
+pub fn snap_time(t: f32, clips: &[AvClip], threshold: f32) -> f32 {
+    snap_time_with_markers(t, clips, &[], threshold)
+}
+
+/// [`snap_time`] plus timeline-marker candidates.
+pub fn snap_time_with_markers(
+    t: f32,
+    clips: &[AvClip],
+    markers: &[super::TimelineMarker],
+    threshold: f32,
+) -> f32 {
+    if !t.is_finite() || threshold <= 0.0 {
+        return t;
+    }
+    let mut best = t;
+    let mut best_dist = threshold;
+    let mut consider = |c: f32| {
+        let d = (t - c).abs();
+        if d < best_dist {
+            best_dist = d;
+            best = c;
+        }
+    };
+    consider(0.0);
+    for clip in clips {
+        consider(clip.video_timeline_start);
+        consider(clip.timeline_end_secs());
+    }
+    for m in markers {
+        consider(m.time_sec);
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip_at(start: f32, len: f32) -> AvClip {
+        AvClip {
+            id: Uuid::new_v4(),
+            name: "c".into(),
+            media_path: "m.mp4".into(),
+            video_start_offset: 0.0,
+            video_play_length: len,
+            video_timeline_start: start,
+            media_source_duration: None,
+            track_row: 0,
+            source_node_ids: vec![],
+            muted: false,
+            locked: false,
+        }
+    }
+
+    #[test]
+    fn snap_prefers_nearest_edge() {
+        let clips = vec![clip_at(5.0, 10.0)];
+        assert_eq!(snap_time(5.2, &clips, 0.5), 5.0);
+        assert_eq!(snap_time(14.8, &clips, 0.5), 15.0);
+        assert_eq!(snap_time(7.0, &clips, 0.5), 7.0);
+        assert_eq!(snap_time(0.2, &clips, 0.5), 0.0);
+        assert_eq!(snap_time(f32::NAN, &clips, 0.5).is_finite(), false);
+    }
+
+    #[test]
+    fn snap_considers_markers() {
+        use super::super::TimelineMarker;
+        let clips = vec![clip_at(5.0, 10.0)];
+        let markers = vec![TimelineMarker::new("Intro", 20.0)];
+        // Marker wins over clip end (15.0) when closer.
+        assert_eq!(
+            snap_time_with_markers(19.8, &clips, &markers, 0.5),
+            20.0
+        );
+        // Out of threshold: untouched.
+        assert_eq!(snap_time_with_markers(19.0, &clips, &markers, 0.5), 19.0);
+    }
 }

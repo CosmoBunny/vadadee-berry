@@ -73,6 +73,17 @@ opencv = ["dep:opencv"]
 version = "0.10"
 features = ["lua54", "vendored"]
 
+# VBLua Phase 19: `.vbaddon` bundles are Stored (uncompressed) zips —
+# pure Rust, no compression backends, mobile-safe.
+[dependencies.zip]
+version = "2"
+default-features = false
+
+# VBLua LSP (editor adapter): protocol types only — the server loop is
+# hand-rolled sync stdio (no async runtime), pure data, mobile-safe.
+[dependencies.lsp-types]
+version = "0.97"
+
 [dependencies.opencv]
 version = "0.100"
 optional = true

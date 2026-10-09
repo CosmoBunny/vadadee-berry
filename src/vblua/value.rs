@@ -1,5 +1,19 @@
 //! `Lua Value <-> VBLua Value <-> Rust Value` conversion layer (Phase 6 groundwork).
 //!
+//! ## Input
+//!
+//! `mlua::Value` from script arguments.
+//!
+//! ## Output
+//!
+//! [`VbValue`] (or a typed shape via `as_vec2`/`as_vec3`). Depth capped at
+//! 64, breadth at 4096 tables entries.
+//!
+//! ## Errors
+//!
+//! Functions, threads, and userdata are rejected: they cannot cross the
+//! boundary ([`VbluaError::Api`](super::error::VbluaError::Api)).
+//!
 //! The boundary is deliberate: Lua never sees raw Rust pointers. IDs cross as
 //! strings (`Uuid`), numeric vectors as tables, everything else as scalars.
 //! Conversions are total where possible and return `VbluaError::Api` otherwise.
@@ -79,10 +93,35 @@ impl VbValue {
 
     /// Best-effort read of an `mlua::Value`. Tables become `List` unless they
     /// carry string keys (then `Map`). Use the typed helpers (`as_vec2`, ...)
-    /// when the shape matters.
+    /// when the shape matters. Depth (64) and breadth (4096) caps bound
+    /// hostile tables: Rust-side loops don't consume the Lua instruction
+    /// budget, so the boundary enforces its own.
     pub fn from_lua(value: mlua::Value, lua: &mlua::Lua) -> Result<Self, VbluaError> {
+        Self::from_lua_depth(value, lua, 0)
+    }
+
+    /// Recursion depth of `from_lua` (Rust stack guard).
+    pub const MAX_VALUE_DEPTH: usize = 64;
+    /// Entries per table (host-CPU guard for Rust-side iteration).
+    pub const MAX_VALUE_ITEMS: usize = 4096;
+
+    fn from_lua_depth(
+        value: mlua::Value,
+        lua: &mlua::Lua,
+        depth: usize,
+    ) -> Result<Self, VbluaError> {
         use mlua::Value as L;
         let _ = lua;
+        if depth > Self::MAX_VALUE_DEPTH {
+            return Err(VbluaError::Api {
+                api: "value".into(),
+                message: "table nesting too deep (max 64)".into(),
+            });
+        }
+        let too_many = || VbluaError::Api {
+            api: "value".into(),
+            message: "table too large (max 4096 entries)".into(),
+        };
         Ok(match value {
             L::Nil => VbValue::Nil,
             L::Boolean(b) => VbValue::Bool(b),
@@ -97,9 +136,14 @@ impl VbValue {
                     })?,
             ),
             L::Table(t) => {
-                // Peek: any string key -> Map, else List.
+                // Peek: any string key -> Map, else List (scan capped).
                 let mut saw_string_key = false;
+                let mut scanned = 0;
                 for pair in t.clone().pairs::<mlua::Value, mlua::Value>() {
+                    scanned += 1;
+                    if scanned > Self::MAX_VALUE_ITEMS {
+                        return Err(too_many());
+                    }
                     if let Ok((k, _)) = pair
                         && matches!(k, L::String(_))
                     {
@@ -110,15 +154,21 @@ impl VbValue {
                 if saw_string_key {
                     let mut pairs = Vec::new();
                     for pair in t.pairs::<String, mlua::Value>() {
+                        if pairs.len() >= Self::MAX_VALUE_ITEMS {
+                            return Err(too_many());
+                        }
                         let Ok((k, v)) = pair else { continue };
-                        pairs.push((k.clone(), VbValue::from_lua(v, lua)?));
+                        pairs.push((k.clone(), VbValue::from_lua_depth(v, lua, depth + 1)?));
                     }
                     VbValue::Map(pairs)
                 } else {
                     let mut items = Vec::new();
                     for v in t.sequence_values::<mlua::Value>() {
+                        if items.len() >= Self::MAX_VALUE_ITEMS {
+                            return Err(too_many());
+                        }
                         let Ok(v) = v else { continue };
-                        items.push(VbValue::from_lua(v, lua)?);
+                        items.push(VbValue::from_lua_depth(v, lua, depth + 1)?);
                     }
                     VbValue::List(items)
                 }
@@ -193,5 +243,22 @@ mod tests {
         let lua = Lua::new();
         let f: mlua::Value = lua.load("return print").eval().unwrap();
         assert!(VbValue::from_lua(f, &lua).is_err());
+    }
+
+    #[test]
+    fn hostile_tables_are_bounded() {
+        let lua = Lua::new();
+        // Deep nesting dies at the boundary, not the Rust stack.
+        let deep: mlua::Value = lua
+            .load("local t = 1; for i = 1, 200 do t = { t } end return t")
+            .eval()
+            .unwrap();
+        assert!(VbValue::from_lua(deep, &lua).is_err());
+        // Breadth bomb dies too.
+        let wide: mlua::Value = lua
+            .load("local t = {}; for i = 1, 5000 do t[i] = i end return t")
+            .eval()
+            .unwrap();
+        assert!(VbValue::from_lua(wide, &lua).is_err());
     }
 }

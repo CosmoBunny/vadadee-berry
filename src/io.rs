@@ -85,6 +85,8 @@ pub fn import_svg(path: &Path) -> Result<ProjectFile, IoError> {
         boolean_effects: Default::default(),
         page_color: [1.0, 1.0, 1.0, 1.0],
         page_unit: PageUnit::Px,
+        timeline_markers: Vec::new(),
+        timeline_scripts: Vec::new(),
     };
     let mut nodes = NodeStore::default();
     let mut layer_nodes = Vec::new();

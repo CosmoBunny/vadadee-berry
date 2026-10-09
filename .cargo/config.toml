@@ -2,3 +2,9 @@
 # Override in your environment if needed: export LIBCLANG_PATH=...
 [env]
 LIBCLANG_PATH = { value = "/usr/lib/llvm-18/lib", force = false }
+
+# mold: much faster linking than GNU ld (large Rust workspace benefit).
+# Linux host only — never applied to Android/iOS/Windows targets.
+# Uses the default cc driver (gcc accepts -fuse-ld=mold).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

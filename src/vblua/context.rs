@@ -15,6 +15,8 @@ pub struct DocumentSnapshot {
     pub width: f64,
     pub height: f64,
     pub layers: Vec<LayerInfo>,
+    /// Active layer id (import targets prefer it).
+    pub active_layer_id: Option<String>,
 }
 
 /// Read-only layer row.
@@ -52,6 +54,10 @@ impl DocumentSnapshot {
                     node_count: l.nodes.len(),
                 })
                 .collect(),
+            active_layer_id: doc
+                .layers
+                .get(doc.active_layer_index)
+                .map(|l| l.id.to_string()),
         }
     }
 
@@ -84,6 +90,30 @@ pub enum DocumentCommand {
     Rename { title: String },
     Resize { width: f64, height: f64 },
     SetLayerVisible { layer_id: String, visible: bool },
+    CreateLayer {
+        layer_id: uuid::Uuid,
+        name: String,
+        kind: LayerKind,
+    },
+}
+
+/// Parse a script layer `type` into `(LayerKind, canonical name)`.
+/// Canonical names match the snapshot `kind` strings, so idempotency
+/// checks compare like with like.
+pub fn parse_layer_kind(s: &str) -> Option<(LayerKind, &'static str)> {
+    match s.trim().to_lowercase().as_str() {
+        "image" | "images" => Some((LayerKind::Image, "image")),
+        "av" | "video" | "audio" | "media" => Some((LayerKind::AV, "av")),
+        "shading" | "shader" => Some((LayerKind::Shading, "shading")),
+        "flowchart" | "flow" | "diagram" => Some((LayerKind::Flowchart, "flowchart")),
+        "node_editor" | "nodeeditor" | "nodes" | "graph" => {
+            Some((LayerKind::NodeEditor, "node_editor"))
+        }
+        "screen_record" | "screenrecord" | "record" | "capture" => {
+            Some((LayerKind::ScreenRecord, "screen_record"))
+        }
+        _ => None,
+    }
 }
 
 impl DocumentCommand {
@@ -118,6 +148,36 @@ impl DocumentCommand {
                 l.visible = *visible;
                 true
             }
+            DocumentCommand::CreateLayer { layer_id, name, kind } => {
+                if doc.layers.iter().any(|l| l.id == *layer_id) {
+                    return false;
+                }
+                let name: String = name.chars().take(128).collect();
+                if name.is_empty() {
+                    return false;
+                }
+                doc.layers.push(match kind {
+                    LayerKind::Image => {
+                        crate::document::Layer::new_image(*layer_id, name, true, false, vec![])
+                    }
+                    LayerKind::AV => {
+                        crate::document::Layer::new_empty_av_layer(*layer_id, name)
+                    }
+                    LayerKind::Shading => {
+                        crate::document::Layer::new_shading_layer(*layer_id, name)
+                    }
+                    LayerKind::Flowchart => {
+                        crate::document::Layer::new_flowchart_layer(*layer_id, name)
+                    }
+                    LayerKind::NodeEditor => {
+                        crate::document::Layer::new_node_editor_layer(*layer_id, name)
+                    }
+                    LayerKind::ScreenRecord => {
+                        crate::document::Layer::new_screen_record_layer(*layer_id, name)
+                    }
+                });
+                true
+            }
         }
     }
 }
@@ -141,6 +201,8 @@ mod tests {
             boolean_effects: Default::default(),
             page_color: [1.0, 1.0, 1.0, 1.0],
             page_unit: Default::default(),
+            timeline_markers: Vec::new(),
+            timeline_scripts: Vec::new(),
         }
     }
 
@@ -151,6 +213,48 @@ mod tests {
         assert_eq!(d.title, "n");
         assert!(DocumentCommand::Resize { width: 50.0, height: 60.0 }.apply_to(&mut d));
         assert_eq!((d.width, d.height), (50.0, 60.0));
+    }
+
+    #[test]
+    fn create_layer_apply_is_idempotent_by_id() {
+        let mut d = test_doc();
+        let id = uuid::Uuid::new_v4();
+        assert!(DocumentCommand::CreateLayer {
+            layer_id: id,
+            name: "Images".into(),
+            kind: LayerKind::Image,
+        }
+        .apply_to(&mut d));
+        assert_eq!(d.layers.len(), 1);
+        assert_eq!(d.layers[0].name, "Images");
+        // Same id twice: second apply is a no-op (same-run double create).
+        assert!(!DocumentCommand::CreateLayer {
+            layer_id: id,
+            name: "Images".into(),
+            kind: LayerKind::Image,
+        }
+        .apply_to(&mut d));
+        assert_eq!(d.layers.len(), 1);
+        // Empty name refused.
+        assert!(!DocumentCommand::CreateLayer {
+            layer_id: uuid::Uuid::new_v4(),
+            name: "".into(),
+            kind: LayerKind::AV,
+        }
+        .apply_to(&mut d));
+    }
+
+    #[test]
+    fn parse_layer_kind_aliases() {
+        assert_eq!(
+            parse_layer_kind("VIDEO"),
+            Some((LayerKind::AV, "av"))
+        );
+        assert_eq!(
+            parse_layer_kind("graph"),
+            Some((LayerKind::NodeEditor, "node_editor"))
+        );
+        assert_eq!(parse_layer_kind("nope"), None);
     }
 
     #[test]

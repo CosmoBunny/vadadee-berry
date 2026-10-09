@@ -46,6 +46,65 @@ pub enum PageUnit {
     Mm,
 }
 
+/// Named timeline bookmark (multimedia-editor markers). Document-level: shared
+/// by the AV timeline, snap, and scripts. Sorted by `time_sec`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimelineMarker {
+    pub id: Uuid,
+    pub name: String,
+    pub time_sec: f32,
+}
+
+impl TimelineMarker {
+    pub fn new(name: impl Into<String>, time_sec: f32) -> Self {
+        Self::with_id(Uuid::new_v4(), name, time_sec)
+    }
+
+    pub fn with_id(id: Uuid, name: impl Into<String>, time_sec: f32) -> Self {
+        let name: String = name.into().chars().take(128).collect();
+        Self {
+            id,
+            name: if name.is_empty() { "Marker".into() } else { name },
+            time_sec: if time_sec.is_finite() {
+                time_sec.clamp(0.0, 36_000.0)
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
+/// Timeline Lua script (R3): persisted playback-evaluation source.
+/// The schedule (`start`/`end`/`unit`) is the host-side plan; a script's
+/// `timeline.range()` call declares its domain per run and updates the
+/// runtime-side record (never a document write during evaluation).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimelineScript {
+    pub id: Uuid,
+    pub name: String,
+    pub source: String,
+    #[serde(default = "default_script_enabled")]
+    pub enabled: bool,
+}
+
+fn default_script_enabled() -> bool {
+    true
+}
+
+impl TimelineScript {
+    /// Source cap (64 KiB) + name cap (128 chars); empty name gets a default.
+    pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
+        let name: String = name.into().chars().take(128).collect();
+        let source: String = source.into().chars().take(65536).collect();
+        Self {
+            id: Uuid::new_v4(),
+            name: if name.is_empty() { "Script".into() } else { name },
+            source,
+            enabled: true,
+        }
+    }
+}
+
 /// Inkscape-like document: page size + layer stack of drawable nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
@@ -77,6 +136,12 @@ pub struct Document {
     /// Display unit for page size fields in the UI (stored width/height are always px).
     #[serde(default)]
     pub page_unit: PageUnit,
+    /// Timeline bookmarks, kept sorted by `time_sec`.
+    #[serde(default)]
+    pub timeline_markers: Vec<TimelineMarker>,
+    /// Timeline Lua scripts (R3 evaluation registry).
+    #[serde(default)]
+    pub timeline_scripts: Vec<TimelineScript>,
 }
 
 fn default_page_color() -> [f32; 4] {
@@ -924,8 +989,62 @@ impl Document {
             boolean_effects: IndexMap::new(),
             page_color: default_page_color(),
             page_unit: PageUnit::Px,
+            timeline_markers: Vec::new(),
+            timeline_scripts: Vec::new(),
         };
         ProjectFile::new(document, NodeStore::default())
+    }
+
+    /// Add a timeline marker (sorted by time). Returns the new id.
+    pub fn add_timeline_marker(&mut self, name: impl Into<String>, time_sec: f32) -> Uuid {
+        let m = TimelineMarker::new(name, time_sec);
+        let id = m.id;
+        self.timeline_markers.push(m);
+        self.sort_timeline_markers();
+        id
+    }
+
+    /// Remove a marker; `true` when one existed.
+    pub fn remove_timeline_marker(&mut self, id: Uuid) -> bool {
+        let n0 = self.timeline_markers.len();
+        self.timeline_markers.retain(|m| m.id != id);
+        self.timeline_markers.len() != n0
+    }
+
+    /// Rename a marker; `false` on unknown id or empty name.
+    pub fn rename_timeline_marker(&mut self, id: Uuid, name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        if let Some(m) = self.timeline_markers.iter_mut().find(|m| m.id == id) {
+            m.name = name.chars().take(128).collect();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move a marker in time (clamped, NaN → 0); re-sorts. `false` on unknown id.
+    pub fn move_timeline_marker(&mut self, id: Uuid, time_sec: f32) -> bool {
+        if let Some(m) = self.timeline_markers.iter_mut().find(|m| m.id == id) {
+            m.time_sec = if time_sec.is_finite() {
+                time_sec.clamp(0.0, 36_000.0)
+            } else {
+                0.0
+            };
+            self.sort_timeline_markers();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn sort_timeline_markers(&mut self) {
+        self.timeline_markers.sort_by(|a, b| {
+            a.time_sec
+                .partial_cmp(&b.time_sec)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     pub fn page_color_egui(&self) -> egui::Color32 {
@@ -1268,5 +1387,24 @@ mod p7_proxy_tests {
         let mut pf = Document::new_empty_project();
         let id = pf.document.layers[0].ensure_ne_output_proxy(&mut pf.nodes);
         assert!(id.is_none());
+    }
+
+    #[test]
+    fn timeline_markers_sorted_clamped() {
+        let mut pf = Document::new_empty_project();
+        let b = pf.document.add_timeline_marker("B", 20.0);
+        let a = pf.document.add_timeline_marker("A", 5.0);
+        // Sorted by time regardless of insertion order.
+        assert_eq!(pf.document.timeline_markers[0].id, a);
+        assert_eq!(pf.document.timeline_markers[1].id, b);
+        // Move + clamp + rename + remove.
+        assert!(pf.document.move_timeline_marker(b, -3.0));
+        assert_eq!(pf.document.timeline_markers[0].id, b);
+        assert_eq!(pf.document.timeline_markers[0].time_sec, 0.0);
+        assert!(!pf.document.rename_timeline_marker(a, ""));
+        assert!(pf.document.rename_timeline_marker(a, "Intro"));
+        assert!(pf.document.remove_timeline_marker(a));
+        assert_eq!(pf.document.timeline_markers.len(), 1);
+        assert!(!pf.document.remove_timeline_marker(a));
     }
 }

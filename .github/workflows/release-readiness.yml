@@ -166,3 +166,35 @@ jobs:
           set -euo pipefail
           cargo check --lib --no-default-features
           cargo test --lib --no-default-features
+
+  docs-gate:
+    name: VBLua Rustdoc + doc-tests (docs are build-tested code)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux system deps (same minimal set as code-gate)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-3-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev \
+            libasound2-dev libpipewire-0.3-dev libspa-0.2-dev clang libclang-dev llvm-dev
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: readiness-${{ runner.os }}
+      - name: Doc-tests + Rustdoc (VBLua docs must compile as a site)
+        run: |
+          set -euo pipefail
+          cargo test --doc --no-default-features vblua
+          cargo test --no-default-features --test vblua_api --test vblua_examples
+          # Site must build; no NEW vblua warnings allowed (the wider crate
+          # has pre-existing doc debt tracked separately).
+          cargo doc --no-deps --no-default-features -p vadadee-berry 2>&1 | tee /tmp/vblua-doc.log
+          if grep -E "warning|error" /tmp/vblua-doc.log | grep -q "vblua"; then
+            echo "ERROR: Rustdoc warnings inside src/vblua (see above)."
+            exit 1
+          fi
+          echo "docs gate OK"

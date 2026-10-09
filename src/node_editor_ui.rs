@@ -861,6 +861,62 @@ fn add_menu_strip(view: &mut NodeEditorView<'_>, ui: &mut Ui, layer_idx: usize) 
                 ui.close();
             }
             if ui
+                .button("Reverse")
+                .on_hover_text("Mirror playback around the player window (out-of-window blanks)")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::Reverse);
+                ui.close();
+            }
+            if ui
+                .button("Time Offset")
+                .on_hover_text("Shift source time by a constant (out-of-window blanks)")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::TimeOffset);
+                ui.close();
+            }
+            if ui
+                .button("Freeze Frame")
+                .on_hover_text("Hold one source timestamp for all output times")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::FreezeFrame);
+                ui.close();
+            }
+            if ui
+                .button("Time Remap")
+                .on_hover_text("Piecewise-linear time curve (set points via script curve param)")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::TimeRemap { points: Vec::new() });
+                ui.close();
+            }
+            if ui
+                .button("Transform")
+                .on_hover_text("Position + Scale + Rotation in one node")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::Transform);
+                ui.close();
+            }
+            if ui
+                .button("Crop")
+                .on_hover_text("Normalized rect crop (preview UV + export bake agree)")
+                .clicked()
+            {
+                spawn = Some(GraphNodeKind::Crop);
+                ui.close();
+            }
+            if ui.button("Flip H").clicked() {
+                spawn = Some(GraphNodeKind::FlipHorizontal);
+                ui.close();
+            }
+            if ui.button("Flip V").clicked() {
+                spawn = Some(GraphNodeKind::FlipVertical);
+                ui.close();
+            }
+            if ui
                 .button("Visualizer")
                 .on_hover_text("Audio + Freq (Hz) + Gain → Level 0..1")
                 .clicked()

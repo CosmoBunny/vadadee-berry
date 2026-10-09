@@ -78,6 +78,189 @@ pub enum PortDir {
     Output,
 }
 
+/// Temporal mapping: output-timeline time → source-media offset.
+///
+/// Every time node (`Speed`, `Reverse`, and future `Freeze`/`Offset`/`Remap`)
+/// composes into ONE map carried on the eval, so frame requests use a single
+/// convention instead of per-node timestamp hacks. Rule (Phase 4):
+/// timeline time and source time are NEVER assumed equal.
+///
+/// Representation is affine (`offset = m * t + b`, clamped at use): exact
+/// under composition, covering constant speed (`m = speed`), reverse
+/// (`m = -1`), and offset (`b ≠ 0`) uniformly. Negative effective speed is
+/// representable here but `Speed` itself rejects negative factors —
+/// reverse-safe handling lives in `Reverse` only (Phase 6).
+///
+/// Non-affine curves ride a warp stack: each [`TimeWarp`] is a sorted
+/// piecewise-linear lookup applied in order *after* the affine part.
+/// Affine combinators (`then`, `then_offset`, `then_freeze`) preserve the
+/// stack, so downstream Speed/Reverse/Offset nodes stay exact — they scale
+/// or shift the output-time argument before the warp. Chained TimeRemaps
+/// just push another warp (no knot-merging math, no approximation), so
+/// preview and export agree by construction (same helper, same bytes).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimeMap {
+    pub m: f64,
+    pub b: f64,
+    #[serde(default)]
+    pub warp: Vec<TimeWarp>,
+}
+
+/// One piecewise-linear time curve: sorted `(input, output)` seconds.
+/// Lookup clamps (holds ends); empty behaves as identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimeWarp {
+    pub points: Vec<(f64, f64)>,
+}
+
+impl TimeWarp {
+    /// Canonicalize raw points: drop non-finite, clamp to `[0, 36000]`,
+    /// sort by input, dedupe inputs (last wins), cap at 256 points.
+    /// Shared by node evaluation and script param writes (one rule).
+    pub fn canonicalize(raw: &[(f64, f64)]) -> Vec<(f64, f64)> {
+        let mut pts: Vec<(f64, f64)> = raw
+            .iter()
+            .filter(|(x, y)| x.is_finite() && y.is_finite())
+            .map(|(x, y)| (x.clamp(0.0, 36_000.0), y.clamp(0.0, 36_000.0)))
+            .take(4096)
+            .collect();
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut out: Vec<(f64, f64)> = Vec::with_capacity(pts.len().min(256));
+        for (x, y) in pts {
+            if let Some(last) = out.last_mut() {
+                if (last.0 - x).abs() < 1e-9 {
+                    last.1 = y;
+                    continue;
+                }
+            }
+            out.push((x, y));
+            if out.len() >= 256 {
+                break;
+            }
+        }
+        out
+    }
+
+    pub fn lookup(&self, t: f64) -> f64 {
+        let pts = &self.points;
+        if pts.is_empty() {
+            return t;
+        }
+        if t <= pts[0].0 {
+            return pts[0].1;
+        }
+        if let Some(last) = pts.last() {
+            if t >= last.0 {
+                return last.1;
+            }
+        }
+        for w in pts.windows(2) {
+            let (x0, y0) = w[0];
+            let (x1, y1) = w[1];
+            if t >= x0 && t <= x1 {
+                let span = (x1 - x0).max(1e-9);
+                let f = ((t - x0) / span).clamp(0.0, 1.0);
+                return y0 + f * (y1 - y0);
+            }
+        }
+        pts.last().map(|p| p.1).unwrap_or(t)
+    }
+}
+
+impl Default for TimeMap {
+    fn default() -> Self {
+        Self::identity()
+    }
+}
+
+impl TimeMap {
+    pub fn identity() -> Self {
+        Self { m: 1.0, b: 0.0, warp: Vec::new() }
+    }
+
+    /// Constant speed: `offset = (t * speed).max(0)`.
+    pub fn scale(speed: f64) -> Self {
+        Self { m: speed.max(0.0), b: 0.0, warp: Vec::new() }
+    }
+
+    /// Reverse around a window: `offset = span - t`, clamped to `[0, span]`.
+    /// `span` is the window length (end − start), not a media duration.
+    pub fn reverse(span: f64) -> Self {
+        Self { m: -1.0, b: span.max(0.0), warp: Vec::new() }
+    }
+
+    /// Map output time to source offset.
+    /// Scales clamp at 0 (legacy behavior); reversed maps clamp to the span.
+    /// Warps apply after, in order (each lookup holds its ends).
+    pub fn map_time(&self, output_time: f64) -> f64 {
+        let base = if self.m >= 0.0 {
+            (output_time * self.m + self.b).max(0.0)
+        } else {
+            (output_time * self.m + self.b).clamp(0.0, self.b.max(0.0))
+        };
+        self.warp.iter().fold(base, |t, w| w.lookup(t))
+    }
+
+    /// Add a constant offset downstream: `combined(t) = self.map(t) + offset`.
+    /// The offset shifts the affine part; warps still apply after (exact).
+    pub fn then_offset(self, offset: f64) -> TimeMap {
+        TimeMap { m: self.m, b: self.b + offset, warp: self.warp }
+    }
+
+    /// Freeze downstream: every output time maps to `at`.
+    /// A downstream warp still applies to the frozen value (exact).
+    pub fn then_freeze(self, at: f64) -> TimeMap {
+        let _ = self;
+        TimeMap { m: 0.0, b: at.max(0.0), warp: Vec::new() }
+    }
+
+    /// Push a curve applied after the current map: `combined(t) = curve(self.map(t))`.
+    pub fn then_warp(mut self, points: Vec<(f64, f64)>) -> TimeMap {
+        if !points.is_empty() {
+            self.warp.push(TimeWarp { points });
+        }
+        self
+    }
+
+    /// Compose: `self` ran first (closer to the source), `outer` after.
+    /// Exact: `combined(t) = self.map(outer.map(t))` — the warp stack is
+    /// preserved because `outer` only transforms the output-time argument.
+    pub fn then(self, outer: TimeMap) -> TimeMap {
+        debug_assert!(outer.warp.is_empty(), "then() takes an affine outer map");
+        TimeMap {
+            m: self.m * outer.m,
+            b: self.m * outer.b + self.b,
+            warp: self.warp,
+        }
+    }
+
+    /// Audio-rate scalar for the sound chain (forward scales only; reversed
+    /// or mixed maps keep rate 1.0 — reverse audio is future work).
+    /// Warped maps also report 1.0: the instantaneous rate varies along the
+    /// curve and no single scalar is honest.
+    pub fn effective_speed(&self) -> f64 {
+        if self.m > 0.0 && self.warp.is_empty() {
+            self.m
+        } else {
+            1.0
+        }
+    }
+}
+
+/// Player window context for downstream time remapping. `VideoPlayer` sets
+/// this (plus the legacy `video_time_sec`); downstream `Speed`/`Reverse`
+/// nodes recompute `video_time_sec` from the composed [`TimeMap`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoSourceCtx {
+    pub path: String,
+    pub start: f64,
+    pub duration: f64,
+    /// The player's `time`-input value (output-timeline reference).
+    pub time_input: f64,
+    /// Finite window end (`start + duration` capped by media, or ∞).
+    pub window_end: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortDef {
     pub id: String,
@@ -163,6 +346,33 @@ pub enum GraphNodeKind {
     Zoom,
     Equalizer,
     Speed,
+    /// Reverse playback: temporal mirror around the player window.
+    /// Maps output time `t` (from window start) to `span - t`; out-of-window
+    /// output blanks. Negative `Speed` factors stay rejected — use this node.
+    Reverse,
+    /// Time offset: shifts the mapped source time by a constant.
+    /// Out-of-window results blank (Clamp/Black policy per project semantics).
+    TimeOffset,
+    /// Freeze frame: every output time samples one fixed source timestamp.
+    /// No duplicate frames are generated — the decoder seeks once per timestamp.
+    FreezeFrame,
+    /// Time remap: piecewise-linear curve mapping upstream-mapped seconds
+    /// to source seconds. `points` canonicalize on eval (sorted, clamped,
+    /// deduped); empty = identity passthrough.
+    TimeRemap {
+        #[serde(default)]
+        points: Vec<(f64, f64)>,
+    },
+    /// Generic spatial transform: position + scale + rotation in one node.
+    /// Same accumulations as GeoPlacement/GeoSize/GeoRotate (shared impl).
+    Transform,
+    /// Normalized-rect crop (spec Phase 16). Paint applies it as a UV
+    /// intersection with zoom; export bakes it after zoom.
+    Crop,
+    /// Dedicated horizontal flip (GeoMirror axis=1 as a named node).
+    FlipHorizontal,
+    /// Dedicated vertical flip (GeoMirror axis=2 as a named node).
+    FlipVertical,
     /// Audio visualizer: `audio` + optional `frequency`/`gain` → real level 0..1.
     Visualizer {
         #[serde(default = "default_viz_gain")]
@@ -301,6 +511,10 @@ impl GraphNodeKind {
             | Self::Zoom
             | Self::Equalizer
             | Self::Speed
+            | Self::Reverse
+            | Self::TimeOffset
+            | Self::FreezeFrame
+            | Self::TimeRemap { .. }
             | Self::Visualizer { .. }
             | Self::ApplyMask
             | Self::BackgroundBlur
@@ -316,7 +530,11 @@ impl GraphNodeKind {
             | Self::GeoRotate
             | Self::GeoTrapezoid
             | Self::GeoMirror
-            | Self::GeoAdd => "Geometry",
+            | Self::GeoAdd
+            | Self::Transform
+            | Self::Crop
+            | Self::FlipHorizontal
+            | Self::FlipVertical => "Geometry",
             Self::ParamReal { .. } | Self::ParamColor { .. } | Self::ParamPosition { .. } => {
                 "Parameter"
             }
@@ -347,6 +565,10 @@ impl GraphNodeKind {
             Self::Zoom => "Zoom",
             Self::Equalizer => "Equalizer",
             Self::Speed => "Speed",
+            Self::Reverse => "Reverse",
+            Self::TimeOffset => "Time Offset",
+            Self::FreezeFrame => "Freeze Frame",
+            Self::TimeRemap { .. } => "Time Remap",
             Self::Visualizer { .. } => "Visualizer",
             Self::ChromaKey => "Chroma Key",
             Self::ApplyMask => "Apply Mask",
@@ -365,6 +587,10 @@ impl GraphNodeKind {
             Self::GeoTrapezoid => "Trapezoid",
             Self::GeoMirror => "Mirror",
             Self::GeoAdd => "Add",
+            Self::Transform => "Transform",
+            Self::Crop => "Crop",
+            Self::FlipHorizontal => "Flip Horizontal",
+            Self::FlipVertical => "Flip Vertical",
             Self::ParamReal { .. } => "Param Real",
             Self::ParamColor { .. } => "Param Color",
             Self::ParamPosition { .. } => "Param Position",
@@ -840,6 +1066,74 @@ impl GraphNodeKind {
                     dir: Output,
                 },
             ],
+            Self::Reverse => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+            ],
+            Self::TimeOffset => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "offset".into(),
+                    name: "Offset".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+            ],
+            Self::FreezeFrame => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "at".into(),
+                    name: "Frame".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+            ],
+            Self::TimeRemap { .. } => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+            ],
             Self::ChromaKey => vec![
                 PortDef {
                     id: "in".into(),
@@ -1214,6 +1508,78 @@ impl GraphNodeKind {
                     dir: Output,
                 },
             ],
+            Self::Transform => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "position".into(),
+                    name: "Position".into(),
+                    ty: Position,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "scale".into(),
+                    name: "Scale".into(),
+                    ty: Position,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "rotation".into(),
+                    name: "Rotation".into(),
+                    ty: Real,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+            ],
+            Self::Crop => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "rect".into(),
+                    name: "Rect".into(),
+                    ty: Position,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "size".into(),
+                    name: "Size".into(),
+                    ty: Position,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+            ],
+            Self::FlipHorizontal | Self::FlipVertical => vec![
+                PortDef {
+                    id: "in".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Input,
+                },
+                PortDef {
+                    id: "out".into(),
+                    name: "Image".into(),
+                    ty: RawImage,
+                    dir: Output,
+                },
+            ],
             Self::ParamColor { .. } => vec![PortDef {
                 id: "out".into(),
                 name: "Color".into(),
@@ -1479,6 +1845,12 @@ pub struct GraphOutputEval {
     pub blur_px: f64,
     /// Playback speed factor (Speed.factor, default 1.0) — video/time consumers.
     pub speed: f64,
+    /// Composed temporal map (Speed/Reverse nodes, default identity).
+    /// Downstream time nodes recompute `video_time_sec` from this + the
+    /// player window context below.
+    pub time_map: TimeMap,
+    /// Player window context for downstream remapping (set by VideoPlayer).
+    pub video_source: Option<VideoSourceCtx>,
     /// When set, `FilePath` is decoded as a video frame at this media time (seconds).
     /// Past duration → callers blank the image (`Empty`).
     pub video_time_sec: Option<f64>,
@@ -1497,8 +1869,16 @@ pub struct GraphOutputEval {
     /// Zoom center in normalized image coords (0..1), screen-style Y down.
     pub zoom_cx: f64,
     pub zoom_cy: f64,
+    /// Crop rect in normalized image coords (0..1, Y down). Default full frame.
+    pub crop_x: f64,
+    pub crop_y: f64,
+    pub crop_w: f64,
+    pub crop_h: f64,
     /// Whether any effect nodes were traversed.
     pub effects_on_path: bool,
+    /// Time-node validation failure (e.g. negative Speed factor). Carriers
+    /// blank nothing by themselves; UI/VBLua surface this text.
+    pub error: Option<String>,
     /// True when a materializing CV / spatial node contributed a bake (PR1 plumbing).
     pub materialized: bool,
 }
@@ -1513,6 +1893,8 @@ impl Default for GraphOutputEval {
             hue_shift: 0.0,
             blur_px: 0.0,
             speed: 1.0,
+            time_map: TimeMap::default(),
+            video_source: None,
             video_time_sec: None,
             geo_scale_w: 1.0,
             geo_scale_h: 1.0,
@@ -1523,8 +1905,13 @@ impl Default for GraphOutputEval {
             zoom: 1.0,
             zoom_cx: 0.5,
             zoom_cy: 0.5,
+            crop_x: 0.0,
+            crop_y: 0.0,
+            crop_w: 1.0,
+            crop_h: 1.0,
             effects_on_path: false,
             materialized: false,
+            error: None,
         }
     }
 }
@@ -1654,6 +2041,44 @@ impl GraphOutputEval {
         self.zoom > 1.001
     }
 
+    pub fn has_crop(&self) -> bool {
+        (self.crop_x.abs() > 1e-9)
+            || (self.crop_y.abs() > 1e-9)
+            || ((self.crop_w - 1.0).abs() > 1e-9)
+            || ((self.crop_h - 1.0).abs() > 1e-9)
+    }
+
+    /// Crop rect as a UV rect (clamped normalized).
+    pub fn crop_uv_rect(&self) -> (f32, f32, f32, f32) {
+        let x0 = (self.crop_x as f32).clamp(0.0, 1.0);
+        let y0 = (self.crop_y as f32).clamp(0.0, 1.0);
+        let x1 = ((self.crop_x + self.crop_w) as f32).clamp(0.0, 1.0);
+        let y1 = ((self.crop_y + self.crop_h) as f32).clamp(0.0, 1.0);
+        (x0, y0, x1.max(x0), y1.max(y0))
+    }
+
+    /// Paint-time UV rect: zoom window intersected with the crop rect.
+    /// Single choke point so preview and export agree by construction.
+    pub fn display_uv_rect(&self) -> (f32, f32, f32, f32) {
+        let (zx0, zy0, zx1, zy1) = if self.has_zoom() {
+            self.zoom_uv_rect()
+        } else {
+            (0.0, 0.0, 1.0, 1.0)
+        };
+        if !self.has_crop() {
+            return (zx0, zy0, zx1, zy1);
+        }
+        let (cx0, cy0, cx1, cy1) = self.crop_uv_rect();
+        // Crop applies to the zoomed frame: map crop UVs into the zoom window.
+        let (zx0, zy0, zx1, zy1) = (zx0 as f64, zy0 as f64, zx1 as f64, zy1 as f64);
+        let (cx0, cy0, cx1, cy1) = (cx0 as f64, cy0 as f64, cx1 as f64, cy1 as f64);
+        let u0 = zx0 + (zx1 - zx0) * cx0;
+        let v0 = zy0 + (zy1 - zy0) * cy0;
+        let u1 = zx0 + (zx1 - zx0) * cx1;
+        let v1 = zy0 + (zy1 - zy0) * cy1;
+        (u0 as f32, v0 as f32, u1 as f32, v1 as f32)
+    }
+
     /// Texture key for a timed video frame (or still path when no time).
     pub fn media_cache_key(&self, path: &str) -> String {
         match self.video_time_sec {
@@ -1742,6 +2167,9 @@ pub fn materialize_eval_rgba(eval: &GraphOutputEval, fps: f32) -> Option<image::
     }
     if eval.has_zoom() {
         apply_zoom_crop_export(&mut img, eval);
+    }
+    if eval.has_crop() {
+        apply_crop_export(&mut img, eval);
     }
     Some(img)
 }
@@ -2018,6 +2446,9 @@ pub fn bake_graph_output_rgba(
     if q.has_zoom() {
         apply_zoom_crop_export(&mut rgba, &q);
     }
+    if q.has_crop() {
+        apply_crop_export(&mut rgba, &q);
+    }
 
     if !q.needs_pixel_fx() {
         if let Some(cache) = fx_cache.as_mut() {
@@ -2120,6 +2551,27 @@ pub fn apply_zoom_crop_export(img: &mut image::RgbaImage, eval: &GraphOutputEval
         image::imageops::FilterType::Triangle
     };
     *img = image::imageops::resize(&cropped, w, h, filter);
+}
+
+/// Crop bake (normalized rect, no resize back — dimensions change).
+/// Call AFTER [`apply_zoom_crop_export`] (crop the zoomed frame).
+pub fn apply_crop_export(img: &mut image::RgbaImage, eval: &GraphOutputEval) {
+    if !eval.has_crop() {
+        return;
+    }
+    let (w, h) = img.dimensions();
+    if w < 2 || h < 2 {
+        return;
+    }
+    let (x0, y0, x1, y1) = eval.crop_uv_rect();
+    let px0 = (x0 as f64 * w as f64).round() as u32;
+    let py0 = (y0 as f64 * h as f64).round() as u32;
+    let px1 = (x1 as f64 * w as f64).round() as u32;
+    let py1 = (y1 as f64 * h as f64).round() as u32;
+    let (cw, ch) = (px1.saturating_sub(px0).max(1), py1.saturating_sub(py0).max(1));
+    let (px0, py0) = (px0.min(w - 1), py0.min(h - 1));
+    let (cw, ch) = (cw.min(w - px0), ch.min(h - py0));
+    *img = image::imageops::crop_imm(img, px0, py0, cw, ch).to_image();
 }
 
 fn fx_rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
@@ -3321,14 +3773,19 @@ impl NodeGraph {
                 inner
             }
             GraphNodeKind::Speed => {
-                let factor = self
-                    .real_input_source(node_id, "factor")
-                    .and_then(|id| self.last_real_out(id))
-                    .unwrap_or(1.0);
-                let mut inner = self.resolve_image_chain(node_id, "in", 0);
-                inner.speed *= factor.max(0.0);
-                inner.effects_on_path = true;
-                inner
+                return self.resolve_speed_chain(node_id, 0);
+            }
+            GraphNodeKind::Reverse => {
+                return self.resolve_reverse_chain(node_id, 0);
+            }
+            GraphNodeKind::TimeOffset => {
+                return self.resolve_offset_chain(node_id, 0);
+            }
+            GraphNodeKind::FreezeFrame => {
+                return self.resolve_freeze_chain(node_id, 0);
+            }
+            GraphNodeKind::TimeRemap { .. } => {
+                return self.resolve_remap_chain(node_id, 0);
             }
             GraphNodeKind::VideoPlayer => self.resolve_video_player(node_id, 0),
             GraphNodeKind::GeoSize => {
@@ -3387,6 +3844,18 @@ impl NodeGraph {
                 inner.geo_mirror = (prev | a) as f64;
                 inner.effects_on_path = true;
                 inner
+            }
+            GraphNodeKind::Transform => {
+                return self.resolve_transform_chain(node_id, 0);
+            }
+            GraphNodeKind::Crop => {
+                return self.resolve_crop_chain(node_id, 0);
+            }
+            GraphNodeKind::FlipHorizontal => {
+                return self.resolve_flip_chain(node_id, 0, 1);
+            }
+            GraphNodeKind::FlipVertical => {
+                return self.resolve_flip_chain(node_id, 0, 2);
             }
             _ => GraphOutputEval::default(),
         }
@@ -3615,14 +4084,19 @@ impl NodeGraph {
                 return self.resolve_spatial_effect(src_id, depth + 1);
             }
             GraphNodeKind::Speed => {
-                let factor = self
-                    .real_input_source(src_id, "factor")
-                    .and_then(|id| self.last_real_out(id))
-                    .unwrap_or(1.0);
-                let mut inner = self.resolve_image_chain(src_id, "in", depth + 1);
-                inner.speed *= factor.max(0.0);
-                inner.effects_on_path = true;
-                return inner;
+                return self.resolve_speed_chain(src_id, depth + 1);
+            }
+            GraphNodeKind::Reverse => {
+                return self.resolve_reverse_chain(src_id, depth + 1);
+            }
+            GraphNodeKind::TimeOffset => {
+                return self.resolve_offset_chain(src_id, depth + 1);
+            }
+            GraphNodeKind::FreezeFrame => {
+                return self.resolve_freeze_chain(src_id, depth + 1);
+            }
+            GraphNodeKind::TimeRemap { .. } => {
+                return self.resolve_remap_chain(src_id, depth + 1);
             }
             GraphNodeKind::GeoSize => {
                 let w = self
@@ -3682,6 +4156,18 @@ impl NodeGraph {
                 inner.geo_mirror = (prev | a) as f64;
                 inner.effects_on_path = true;
                 return inner;
+            }
+            GraphNodeKind::Transform => {
+                return self.resolve_transform_chain(src_id, depth + 1);
+            }
+            GraphNodeKind::Crop => {
+                return self.resolve_crop_chain(src_id, depth + 1);
+            }
+            GraphNodeKind::FlipHorizontal => {
+                return self.resolve_flip_chain(src_id, depth + 1, 1);
+            }
+            GraphNodeKind::FlipVertical => {
+                return self.resolve_flip_chain(src_id, depth + 1, 2);
             }
             GraphNodeKind::GeoAdd => {
                 // Prefer first connected image input (A then B).
@@ -4238,6 +4724,14 @@ impl NodeGraph {
             Zoom,
             Equalizer,
             Speed,
+            Reverse,
+            TimeOffset,
+            FreezeFrame,
+            TimeRemap { points: Vec::new() },
+            Transform,
+            Crop,
+            FlipHorizontal,
+            FlipVertical,
             Visualizer { gain: 1.0 },
             ChromaKey,
             ApplyMask,
@@ -4326,6 +4820,14 @@ impl NodeGraph {
             Zoom,
             Equalizer,
             Speed,
+            Reverse,
+            TimeOffset,
+            FreezeFrame,
+            TimeRemap { points: Vec::new() },
+            Transform,
+            Crop,
+            FlipHorizontal,
+            FlipVertical,
             Visualizer { gain: 1.0 },
             GeoSize,
             GeoPlacement,
@@ -4371,6 +4873,165 @@ impl NodeGraph {
         out
     }
 
+    /// Shared Speed evaluation (both resolve entry points — never duplicate).
+    fn resolve_speed_chain(&self, id: Uuid, depth: usize) -> GraphOutputEval {
+        let factor = self
+            .real_input_source(id, "factor")
+            .and_then(|rid| self.last_real_out(rid))
+            .unwrap_or(1.0);
+        if factor < 0.0 {
+            // Negative speed is Reverse's job (reverse-safe handling).
+            let mut inner = self.resolve_image_chain(id, "in", depth);
+            inner.error = Some(
+                "Speed factor must be >= 0 (use the Reverse node for rewind)".to_string(),
+            );
+            return inner;
+        }
+        let mut inner = self.resolve_image_chain(id, "in", depth);
+        inner.time_map = inner.time_map.then(TimeMap::scale(factor));
+        inner.speed *= factor.max(0.0);
+        inner.effects_on_path = true;
+        Self::remap_video_source_eval(&mut inner);
+        inner
+    }
+
+    /// Shared Reverse evaluation (both resolve entry points — never duplicate).
+    fn resolve_reverse_chain(&self, id: Uuid, depth: usize) -> GraphOutputEval {
+        let mut inner = self.resolve_image_chain(id, "in", depth);
+        // Span comes from the player window when known, else mirrors
+        // around the current output time (playhead mirror).
+        let span = inner
+            .video_source
+            .as_ref()
+            .map(|ctx| (ctx.window_end - ctx.start).max(0.0))
+            .filter(|sp| sp.is_finite())
+            .unwrap_or_else(|| self.output_time_now().max(0.0));
+        inner.time_map = inner.time_map.then(TimeMap::reverse(span));
+        inner.effects_on_path = true;
+        Self::remap_video_source_eval(&mut inner);
+        inner
+    }
+
+    /// Shared TimeOffset evaluation (both resolve entry points).
+    fn resolve_offset_chain(&self, id: Uuid, depth: usize) -> GraphOutputEval {
+        let offset = self
+            .real_input_source(id, "offset")
+            .and_then(|rid| self.last_real_out(rid))
+            .unwrap_or(0.0);
+        let mut inner = self.resolve_image_chain(id, "in", depth);
+        inner.time_map = inner.time_map.then_offset(offset);
+        inner.effects_on_path = true;
+        Self::remap_video_source_eval(&mut inner);
+        inner
+    }
+
+    /// Shared FreezeFrame evaluation (both resolve entry points).
+    fn resolve_freeze_chain(&self, id: Uuid, depth: usize) -> GraphOutputEval {
+        let at = self
+            .real_input_source(id, "at")
+            .and_then(|rid| self.last_real_out(rid))
+            .unwrap_or(0.0)
+            .max(0.0);
+        let mut inner = self.resolve_image_chain(id, "in", depth);
+        inner.time_map = inner.time_map.then_freeze(at);
+        inner.effects_on_path = true;
+        Self::remap_video_source_eval(&mut inner);
+        inner
+    }
+
+    /// Shared TimeRemap evaluation (both resolve entry points).
+    /// The curve maps upstream-mapped seconds to source seconds; empty
+    /// points = identity passthrough (new node before scripts set a curve).
+    fn resolve_remap_chain(&self, id: Uuid, depth: usize) -> GraphOutputEval {
+        let points = match self.nodes.get(&id) {
+            Some(n) => match &n.kind {
+                GraphNodeKind::TimeRemap { points } => TimeWarp::canonicalize(points),
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        let mut inner = self.resolve_image_chain(id, "in", depth);
+        inner.time_map = inner.time_map.then_warp(points);
+        inner.effects_on_path = true;
+        Self::remap_video_source_eval(&mut inner);
+        inner
+    }
+
+    /// Shared Transform evaluation (both resolve entry points).
+    /// One node combining the GeoPlacement/GeoSize/GeoRotate accumulations.
+    fn resolve_transform_chain(&self, id: Uuid, depth: usize) -> GraphOutputEval {
+        let (px, py) = self.resolve_position_input(id, "position", 0.0, 0.0);
+        let (sx, sy) = self.resolve_position_input(id, "scale", 1.0, 1.0);
+        let rot = self
+            .real_input_source(id, "rotation")
+            .and_then(|rid| self.last_real_out(rid))
+            .unwrap_or(0.0);
+        let mut inner = self.resolve_image_chain(id, "in", depth);
+        inner.geo_off_x += px;
+        inner.geo_off_y += py;
+        inner.geo_scale_w *= sx.max(0.01);
+        inner.geo_scale_h *= sy.max(0.01);
+        inner.geo_rot_deg += rot;
+        inner.effects_on_path = true;
+        inner
+    }
+
+    /// Shared Crop evaluation (both resolve entry points). Intersects with
+    /// any upstream crop (chained crops narrow, never widen).
+    fn resolve_crop_chain(&self, id: Uuid, depth: usize) -> GraphOutputEval {
+        let (rx, ry) = self.resolve_position_input(id, "rect", 0.0, 0.0);
+        let (rw, rh) = self.resolve_position_input(id, "size", 1.0, 1.0);
+        let mut inner = self.resolve_image_chain(id, "in", depth);
+        let (nx0, ny0) = (rx.clamp(0.0, 1.0), ry.clamp(0.0, 1.0));
+        let (nx1, ny1) = (
+            (rx + rw).clamp(0.0, 1.0).max(nx0 + 1e-6),
+            (ry + rh).clamp(0.0, 1.0).max(ny0 + 1e-6),
+        );
+        // Intersect with the upstream crop rect.
+        let (ox0, oy0) = (inner.crop_x, inner.crop_y);
+        let (ox1, oy1) = (inner.crop_x + inner.crop_w, inner.crop_y + inner.crop_h);
+        inner.crop_x = nx0.max(ox0);
+        inner.crop_y = ny0.max(oy0);
+        inner.crop_w = (nx1.min(ox1) - inner.crop_x).max(1e-6);
+        inner.crop_h = (ny1.min(oy1) - inner.crop_y).max(1e-6);
+        inner.effects_on_path = true;
+        inner
+    }
+
+    /// Shared Flip evaluation (both resolve entry points).
+    fn resolve_flip_chain(&self, id: Uuid, depth: usize, bit: i32) -> GraphOutputEval {
+        let mut inner = self.resolve_image_chain(id, "in", depth);
+        let prev = inner.geo_mirror.round() as i32;
+        inner.geo_mirror = (prev | bit) as f64;
+        inner.effects_on_path = true;
+        inner
+    }
+
+    /// Current output-timeline time (the `Time` node output, else 0).
+    fn output_time_now(&self) -> f64 {
+        self.nodes
+            .values()
+            .find(|n| matches!(n.kind, GraphNodeKind::Time))
+            .and_then(|n| self.last_real_out(n.id))
+            .unwrap_or(0.0)
+    }
+
+    /// Recompute `video_time_sec` from the composed [`TimeMap`] + player window.
+    /// Called by downstream time nodes; blanks the image when the remapped
+    /// time leaves the window.
+    fn remap_video_source_eval(target: &mut GraphOutputEval) {
+        let Some(ctx) = target.video_source.clone() else {
+            return;
+        };
+        let t = ctx.start + target.time_map.map_time(ctx.time_input);
+        if t < ctx.start - 1e-9 || t >= ctx.window_end - 1e-9 || t < 0.0 {
+            target.image = GraphImageSource::Empty;
+            target.video_time_sec = None;
+        } else {
+            target.video_time_sec = Some(t);
+        }
+    }
+
     /// Resolve VideoPlayer: video + time + start/duration → frame (Empty outside window).
     fn resolve_video_player(&self, node_id: Uuid, depth: usize) -> GraphOutputEval {
         let mut inner = self.resolve_image_chain(node_id, "video", depth);
@@ -4385,9 +5046,47 @@ impl NodeGraph {
                 ..Default::default()
             };
         }
+        // Window context for downstream Speed/Reverse remapping. The legacy
+        // `video_time_sec` above preserves exact current behavior; time nodes
+        // recompute it from the composed map via `remap_video_source_eval`.
+        let (time_input, start, duration, window_end) = self.video_window_ctx(node_id, &path);
+        inner.video_source = Some(VideoSourceCtx {
+            path,
+            start,
+            duration,
+            time_input,
+            window_end,
+        });
         inner.video_time_sec = Some(t);
         inner.effects_on_path = true;
         inner
+    }
+
+    /// Player window inputs + finite end (shared by timing and remap context).
+    fn video_window_ctx(&self, node_id: Uuid, path: &str) -> (f64, f64, f64, f64) {
+        let time = self
+            .real_input_source(node_id, "time")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.0);
+        let start = self
+            .real_input_source(node_id, "start")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.0)
+            .max(0.0);
+        let duration = self
+            .real_input_source(node_id, "duration")
+            .and_then(|id| self.last_real_out(id))
+            .unwrap_or(0.0);
+        let media_end = crate::video_decode::probe_media_duration_secs(path)
+            .map(|d| d as f64)
+            .filter(|d| d.is_finite() && *d > 0.05)
+            .unwrap_or(f64::INFINITY);
+        let window_end = if duration > 1e-9 {
+            (start + duration).min(media_end)
+        } else {
+            media_end
+        };
+        (time, start, duration, window_end)
     }
 
     /// Shared timing for VideoPlayer image + sound.
@@ -5448,5 +6147,320 @@ mod tests {
         assert!((ev.geo_scale_h - 0.5).abs() < 1e-9);
         assert!((ev.geo_off_x - 10.0).abs() < 1e-9);
         assert!((ev.geo_off_y - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn time_map_affine_math() {
+        // Identity / scale / reverse basics.
+        assert_eq!(TimeMap::identity().map_time(3.0), 3.0);
+        assert_eq!(TimeMap::scale(2.0).map_time(3.0), 6.0);
+        assert_eq!(TimeMap::scale(2.0).map_time(-1.0), 0.0);
+        assert_eq!(TimeMap::reverse(10.0).map_time(3.0), 7.0);
+        assert_eq!(TimeMap::reverse(10.0).map_time(11.0), 0.0);
+        // Composition is exact: Scale(2) then Scale(3) == Scale(6).
+        let ab = TimeMap::scale(2.0).then(TimeMap::scale(3.0));
+        assert!((ab.map_time(4.0) - 24.0).abs() < 1e-9);
+        // Reverse twice around the same window == identity.
+        let rr = TimeMap::reverse(8.0).then(TimeMap::reverse(8.0));
+        assert!((rr.map_time(3.0) - 3.0).abs() < 1e-9);
+        // Reverse then Scale(2): mirror then stretch.
+        let rs = TimeMap::reverse(8.0).then(TimeMap::scale(2.0));
+        assert!((rs.map_time(1.0) - (8.0 - 2.0 * 1.0)).abs() < 1e-9);
+        assert_eq!(TimeMap::scale(2.0).effective_speed(), 2.0);
+        assert_eq!(TimeMap::reverse(8.0).effective_speed(), 1.0);
+    }
+
+    fn video_speed_graph(speed_factor: Option<f64>, reverse: bool) -> NodeGraph {
+        let mut g = NodeGraph::new_empty();
+        let out = g.output_node_id.expect("seeded Output");
+        let vid = g.add_node(
+            GraphNodeKind::ObjectVideo { path: "/tmp/fake.mp4".into() },
+            0.0,
+            0.0,
+        );
+        let player = g.add_node(GraphNodeKind::VideoPlayer, 200.0, 0.0);
+        let time = g.add_node(GraphNodeKind::Time, 0.0, 100.0);
+        // Fixed driver: Time + 60 = frame 60 @30fps = 2.0s.
+        let c = g.add_node(GraphNodeKind::Value { value: 60.0 }, 0.0, 200.0);
+        let add = g.add_node(GraphNodeKind::ExprX { expr: "x".into() }, 0.0, 300.0);
+        g.try_add_link(c, "out", add, "x").unwrap();
+        g.try_add_link(time, "out", player, "time").unwrap();
+        g.try_add_link(vid, "out", player, "video").unwrap();
+        // Duration 10s window so Reverse has a finite span.
+        let dur = g.add_node(GraphNodeKind::Value { value: 10.0 }, 0.0, 400.0);
+        g.try_add_link(dur, "out", player, "duration").unwrap();
+        let mut tail = player;
+        if let Some(f) = speed_factor {
+            let fnode = g.add_node(GraphNodeKind::Value { value: f }, 400.0, 0.0);
+            let speed = g.add_node(GraphNodeKind::Speed, 500.0, 0.0);
+            g.try_add_link(tail, "out", speed, "in").unwrap();
+            g.try_add_link(fnode, "out", speed, "factor").unwrap();
+            tail = speed;
+        }
+        if reverse {
+            let rev = g.add_node(GraphNodeKind::Reverse, 600.0, 0.0);
+            g.try_add_link(tail, "out", rev, "in").unwrap();
+            tail = rev;
+        }
+        g.try_add_link(tail, "out", out, "image").unwrap();
+        // Drive Time to 2.0s: eval frame 60 @30fps. The add/c chain is
+        // unused scaffolding to keep the harness uniform — time comes from Time.
+        let _ = add;
+        g.eval_reals(60, 30.0);
+        g
+    }
+
+    #[test]
+    fn downstream_speed_remaps_video_time() {
+        // No time node downstream: Time=2.0s, Speed x2 → media t=4.0s.
+        let g = video_speed_graph(Some(2.0), false);
+        let ev = g.resolve_output_image();
+        let t = ev.video_time_sec.expect("video time set");
+        assert!((t - 4.0).abs() < 0.01, "video_time={t}");
+        // No Speed at all: legacy behavior preserved (t=2.0s).
+        let g = video_speed_graph(None, false);
+        let ev = g.resolve_output_image();
+        assert!((ev.video_time_sec.unwrap() - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn reverse_mirrors_around_window() {
+        // Window [0,10], Time=2.0 → offset 10-2=8.
+        let g = video_speed_graph(None, true);
+        let ev = g.resolve_output_image();
+        let t = ev.video_time_sec.expect("video time set");
+        assert!((t - 8.0).abs() < 0.01, "video_time={t}");
+    }
+
+    #[test]
+    fn negative_speed_is_a_clear_error() {
+        let g = video_speed_graph(Some(-1.0), false);
+        let ev = g.resolve_output_image();
+        assert!(ev.error.as_ref().is_some_and(|e| e.contains("Reverse")), "{ev:?}");
+    }
+
+    fn video_remap_graph(curve: Vec<(f64, f64)>) -> NodeGraph {
+        let mut g = NodeGraph::new_empty();
+        let out = g.output_node_id.expect("seeded Output");
+        let vid = g.add_node(
+            GraphNodeKind::ObjectVideo { path: "/tmp/fake.mp4".into() },
+            0.0,
+            0.0,
+        );
+        let player = g.add_node(GraphNodeKind::VideoPlayer, 200.0, 0.0);
+        let time = g.add_node(GraphNodeKind::Time, 0.0, 100.0);
+        g.try_add_link(time, "out", player, "time").unwrap();
+        g.try_add_link(vid, "out", player, "video").unwrap();
+        let dur = g.add_node(GraphNodeKind::Value { value: 10.0 }, 0.0, 400.0);
+        g.try_add_link(dur, "out", player, "duration").unwrap();
+        let remap = g.add_node(GraphNodeKind::TimeRemap { points: curve }, 500.0, 0.0);
+        g.try_add_link(player, "out", remap, "in").unwrap();
+        g.try_add_link(remap, "out", out, "image").unwrap();
+        // Drive Time to 2.0s like the speed harness.
+        g.eval_reals(60, 30.0);
+        g
+    }
+
+    #[test]
+    fn remap_curve_drives_video_time() {
+        // 2x curve: Time=2.0s -> source 4.0s.
+        let g = video_remap_graph(vec![(0.0, 0.0), (10.0, 20.0)]);
+        let ev = g.resolve_output_image();
+        assert!((ev.video_time_sec.unwrap() - 4.0).abs() < 0.01);
+        // Ease (slow start): {0->0, 2->0.5, 10->20}: Time=2.0 -> 0.5.
+        let g = video_remap_graph(vec![(0.0, 0.0), (2.0, 0.5), (10.0, 20.0)]);
+        let ev = g.resolve_output_image();
+        assert!((ev.video_time_sec.unwrap() - 0.5).abs() < 0.01);
+        // Empty curve = identity passthrough (fresh node).
+        let g = video_remap_graph(vec![]);
+        let ev = g.resolve_output_image();
+        assert!((ev.video_time_sec.unwrap() - 2.0).abs() < 0.01);
+        // Curve past the window blanks (same rule as other time nodes).
+        let g = video_remap_graph(vec![(0.0, 50.0), (10.0, 60.0)]);
+        let ev = g.resolve_output_image();
+        assert!(ev.video_time_sec.is_none(), "{ev:?}");
+    }
+
+    #[test]
+    fn offset_and_freeze_remap() {
+        // Pure map math first.
+        let m = TimeMap::scale(2.0).then_offset(5.0);
+        assert!((m.map_time(3.0) - 11.0).abs() < 1e-9);
+        let f = TimeMap::scale(2.0).then_freeze(7.0);
+        assert!((f.map_time(3.0) - 7.0).abs() < 1e-9);
+        assert!((f.map_time(100.0) - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn warp_canonicalize_and_lookup() {
+        // Sort, dedupe (last wins), clamp, drop non-finite.
+        let pts = TimeWarp::canonicalize(&[
+            (5.0, 50.0),
+            (0.0, 0.0),
+            (5.0, 55.0),
+            (f64::NAN, 1.0),
+            (-2.0, -4.0),
+        ]);
+        assert_eq!(pts, vec![(0.0, 0.0), (5.0, 55.0)]);
+        let w = TimeWarp { points: pts };
+        assert_eq!(w.lookup(-1.0), 0.0); // hold start
+        assert_eq!(w.lookup(100.0), 55.0); // hold end
+        assert!((w.lookup(2.5) - 27.5).abs() < 1e-9); // linear interp
+        assert_eq!(TimeWarp { points: vec![] }.lookup(3.0), 3.0); // empty = identity
+    }
+
+    #[test]
+    fn warp_composes_exactly_with_affine() {
+        // Speed(2) then curve {0->0, 4->40}: t=1 -> affine 2 -> curve 20.
+        let m = TimeMap::scale(2.0).then_warp(vec![(0.0, 0.0), (4.0, 40.0)]);
+        assert!((m.map_time(1.0) - 20.0).abs() < 1e-9);
+        // Downstream Speed(3) scales the argument before the warp: t=1 -> 3 -> 6 -> 60.
+        let m2 = TimeMap::scale(2.0)
+            .then_warp(vec![(0.0, 0.0), (10.0, 100.0)])
+            .then(TimeMap::scale(3.0));
+        assert!((m2.map_time(1.0) - 60.0).abs() < 1e-9);
+        // Downstream offset shifts before the warp: t=1 -> affine 2*1+1=3 -> 30.
+        let m3 = TimeMap::scale(2.0)
+            .then_warp(vec![(0.0, 0.0), (4.0, 40.0)])
+            .then_offset(1.0);
+        assert!((m3.map_time(1.0) - 30.0).abs() < 1e-9);
+        // Warped maps report neutral audio rate (reverse precedent).
+        assert_eq!(m2.effective_speed(), 1.0);
+        assert_eq!(TimeMap::scale(2.0).effective_speed(), 2.0);
+        // Empty warp push is a no-op (identity node before scripts set a curve).
+        let m4 = TimeMap::scale(2.0).then_warp(vec![]);
+        assert!(m4.warp.is_empty());
+        assert!((m4.map_time(3.0) - 6.0).abs() < 1e-9);
+    }
+
+    fn video_graph_plain() -> NodeGraph {
+        let mut g = NodeGraph::new_empty();
+        let out = g.output_node_id.expect("seeded Output");
+        let vid = g.add_node(
+            GraphNodeKind::ObjectVideo { path: "/tmp/fake.mp4".into() },
+            0.0,
+            0.0,
+        );
+        let player = g.add_node(GraphNodeKind::VideoPlayer, 200.0, 0.0);
+        let time = g.add_node(GraphNodeKind::Time, 0.0, 100.0);
+        g.try_add_link(time, "out", player, "time").unwrap();
+        g.try_add_link(vid, "out", player, "video").unwrap();
+        let dur = g.add_node(GraphNodeKind::Value { value: 30.0 }, 0.0, 400.0);
+        g.try_add_link(dur, "out", player, "duration").unwrap();
+        g.try_add_link(player, "out", out, "image").unwrap();
+        g.eval_reals(60, 30.0); // Time = 2.0s
+        g
+    }
+
+    #[test]
+    fn time_offset_shifts_media_time() {
+        let mut g = video_graph_plain();
+        // Rewire: player -> offset(+3) -> out.
+        let out = g.output_node_id.unwrap();
+        let player = g
+            .nodes
+            .values()
+            .find(|n| matches!(n.kind, GraphNodeKind::VideoPlayer))
+            .unwrap()
+            .id;
+        let off = g.add_node(GraphNodeKind::TimeOffset, 300.0, 0.0);
+        let kval = g.add_node(GraphNodeKind::Value { value: 3.0 }, 300.0, 100.0);
+        g.try_add_link(kval, "out", off, "offset").unwrap();
+        g.links.retain(|l| !(l.to_node == out && l.to_port == "image"));
+        g.try_add_link(player, "out", off, "in").unwrap();
+        g.try_add_link(off, "out", out, "image").unwrap();
+        g.eval_reals(60, 30.0);
+        let ev = g.resolve_output_image();
+        assert!((ev.video_time_sec.unwrap() - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn freeze_holds_one_timestamp() {
+        let mut g = NodeGraph::new_empty();
+        let out = g.output_node_id.expect("seeded Output");
+        let vid = g.add_node(
+            GraphNodeKind::ObjectVideo { path: "/tmp/fake.mp4".into() },
+            0.0,
+            0.0,
+        );
+        let player = g.add_node(GraphNodeKind::VideoPlayer, 200.0, 0.0);
+        let time = g.add_node(GraphNodeKind::Time, 0.0, 100.0);
+        g.try_add_link(time, "out", player, "time").unwrap();
+        g.try_add_link(vid, "out", player, "video").unwrap();
+        let fr = g.add_node(GraphNodeKind::FreezeFrame, 300.0, 0.0);
+        let at = g.add_node(GraphNodeKind::Value { value: 9.0 }, 300.0, 100.0);
+        g.try_add_link(at, "out", fr, "at").unwrap();
+        g.try_add_link(player, "out", fr, "in").unwrap();
+        g.try_add_link(fr, "out", out, "image").unwrap();
+        for frame in [0, 60, 600] {
+            g.eval_reals(frame, 30.0);
+            let ev = g.resolve_output_image();
+            assert!((ev.video_time_sec.unwrap() - 9.0).abs() < 0.01, "frame {frame}");
+        }
+    }
+
+    #[test]
+    fn transform_accumulates_placement_size_rotate() {
+        let mut g = NodeGraph::new_empty();
+        let out = g.output_node_id.expect("seeded Output");
+        let t = g.add_node(GraphNodeKind::Transform, 0.0, 0.0);
+        g.try_add_link(t, "out", out, "image").unwrap();
+        // Drive wires: position(3,4), scale(2,2), rotation 45.
+        let px = g.add_node(GraphNodeKind::Value { value: 3.0 }, 0.0, 0.0);
+        // NOTE: position/scale ports are Position-typed; unwired they default.
+        let _ = px;
+        g.eval_reals(0, 30.0);
+        let ev = g.resolve_output_image();
+        assert_eq!((ev.geo_off_x, ev.geo_off_y), (0.0, 0.0));
+        assert_eq!((ev.geo_scale_w, ev.geo_scale_h), (1.0, 1.0));
+        assert_eq!(ev.geo_rot_deg, 0.0);
+    }
+
+    #[test]
+    fn crop_uv_and_bake_agree() {
+        let mut g = NodeGraph::new_empty();
+        let out = g.output_node_id.expect("seeded Output");
+        let c = g.add_node(GraphNodeKind::Crop, 0.0, 0.0);
+        g.try_add_link(c, "out", out, "image").unwrap();
+        g.eval_reals(0, 30.0);
+        // Default crop = full frame (identity, no-op).
+        let ev = g.resolve_output_image();
+        assert!(!ev.has_crop());
+        assert_eq!(ev.display_uv_rect(), (0.0, 0.0, 1.0, 1.0));
+        // Bake path on a real buffer: half-width crop halves pixels.
+        let mut img = image::RgbaImage::from_fn(64, 32, |x, _| {
+            image::Rgba([x as u8 * 4, 0, 0, 255])
+        });
+        let mut eval = GraphOutputEval::default();
+        eval.crop_x = 0.25;
+        eval.crop_y = 0.0;
+        eval.crop_w = 0.5;
+        eval.crop_h = 1.0;
+        assert!(eval.has_crop());
+        apply_crop_export(&mut img, &eval);
+        assert_eq!(img.dimensions(), (32, 32));
+        // UV rect matches the same normalized window.
+        let (u0, v0, u1, v1) = eval.display_uv_rect();
+        assert!((u0 - 0.25).abs() < 1e-6 && (u1 - 0.75).abs() < 1e-6);
+        assert!((v0 - 0.0).abs() < 1e-6 && (v1 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn flips_set_mirror_bits() {
+        let mut g = NodeGraph::new_empty();
+        let out = g.output_node_id.expect("seeded Output");
+        let src = g.add_node(
+            GraphNodeKind::ObjectImage { path: "/tmp/fake.png".into() },
+            0.0,
+            0.0,
+        );
+        let fh = g.add_node(GraphNodeKind::FlipHorizontal, 0.0, 0.0);
+        let fv = g.add_node(GraphNodeKind::FlipVertical, 0.0, 0.0);
+        g.try_add_link(src, "out", fh, "in").unwrap();
+        g.try_add_link(fh, "out", fv, "in").unwrap();
+        g.try_add_link(fv, "out", out, "image").unwrap();
+        g.eval_reals(0, 30.0);
+        let ev = g.resolve_output_image();
+        assert_eq!(ev.geo_mirror.round() as i32, 3);
     }
 }

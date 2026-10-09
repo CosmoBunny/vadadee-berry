@@ -90,6 +90,8 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
             timeline_w: &mut app.timeline_container_w,
             video_editor_w: &mut app.video_editor_container_w,
             snap_magnet: &mut app.snap_magnet,
+            show_vblua_console: &mut app.show_vblua_console,
+            show_timeline_scripts: &mut app.show_timeline_scripts,
             doc_label,
         },
         ui,
@@ -153,6 +155,30 @@ pub fn chrome(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     shader_editor_window(
         &mut app.show_shader_editor_window,
         &mut app.project,
+        ui.ctx(),
+    );
+    crate::vblua::VbluaConsole::show_window(
+        &mut app.vblua_console,
+        &mut app.show_vblua_console,
+        &mut app.project,
+        &mut app.history,
+        app.playback.frame,
+        app.playback.fps,
+        ui.ctx(),
+    );
+    app.vblua_console.show_panels(
+        &mut app.project,
+        &mut app.history,
+        ui.ctx(),
+    );
+    app.vblua_console.show_timeline_window(
+        &mut app.show_timeline_scripts,
+        &mut app.project,
+        &mut app.history,
+        &mut app.timeline_eval_states,
+        &app.timeline_eval_errors,
+        app.playback.frame,
+        app.playback.fps,
         ui.ctx(),
     );
     object_rename_dialog(
@@ -336,6 +362,8 @@ pub struct MenuView<'a> {
     pub timeline_w: &'a mut f32,
     pub video_editor_w: &'a mut f32,
     pub snap_magnet: &'a mut bool,
+    pub show_vblua_console: &'a mut bool,
+    pub show_timeline_scripts: &'a mut bool,
     pub doc_label: String,
 }
 
@@ -356,6 +384,8 @@ fn menubar(view: MenuView<'_>, ui: &mut Ui) -> Vec<MenuIntent> {
         timeline_w,
         video_editor_w,
         snap_magnet,
+        show_vblua_console,
+        show_timeline_scripts,
         doc_label,
     } = view;
     egui::Panel::top("menubar")
@@ -580,6 +610,11 @@ fn menubar(view: MenuView<'_>, ui: &mut Ui) -> Vec<MenuIntent> {
                     );
                 });
                 ui.menu_button("View", |ui| {
+                    ui.checkbox(show_vblua_console, "VBLua Console (dev)")
+                        .on_hover_text("Embedded Lua test console — script box, Run, output");
+                    ui.checkbox(show_timeline_scripts, "Timeline Scripts")
+                        .on_hover_text("Registered Lua scripts: ranges, active state, enable");
+                    ui.separator();
                     ui.checkbox(&mut viewport.show_grid, "Show grid lines")
                         .on_hover_text("Draw document grid on the page (View › grid step / cols×rows)");
                     ui.checkbox(&mut viewport.snap_grid, "Snap to grid");
@@ -3837,7 +3872,7 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
     }
 
     let fps = app.playback.fps as f32;
-    let max_frames = crate::document::max_animation_frame(&app.project, app.playback.fps) as f32;
+    let max_frames = app.get_content_max_animation_frame() as f32;
 
     let mut curr_frame = app.playback.frame;
     let mut scroll = app.anim_timeline_scroll;
@@ -4024,7 +4059,64 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
         // Apply sticky drag with absolute pointer mapping (no mid-drag mode flip).
         if let (Some(drag), Some(px)) = (app.av_timeline_drag, pointer_x_now) {
             if pointer_primary_down {
-                let (start, len, offset) = crate::av_ui::apply_sticky_drag(&drag, px);
+                let (raw_start, raw_len, raw_offset) =
+                    crate::av_ui::apply_sticky_drag(&drag, px);
+                // Snap the moved edge to clip edges + timeline markers (0.2s).
+                // TrimStart keeps its end fixed; TrimEnd keeps its start fixed.
+                let (start, len, offset) = match drag.mode {
+                    crate::av_ui::AvDragMode::Move => {
+                        let clips: Vec<crate::document::AvClip> = app
+                            .project
+                            .document
+                            .layers
+                            .iter()
+                            .flat_map(|l| l.av_clips.iter().filter(|c| c.id != drag.clip_id).cloned())
+                            .collect();
+                        let s = crate::document::snap_time_with_markers(
+                            raw_start,
+                            &clips,
+                            &app.project.document.timeline_markers,
+                            0.2,
+                        );
+                        (s, raw_len, raw_offset)
+                    }
+                    crate::av_ui::AvDragMode::TrimStart => {
+                        let end = drag.origin_start_sec + drag.origin_len_sec;
+                        let clips: Vec<crate::document::AvClip> = app
+                            .project
+                            .document
+                            .layers
+                            .iter()
+                            .flat_map(|l| l.av_clips.iter().filter(|c| c.id != drag.clip_id).cloned())
+                            .collect();
+                        let s = crate::document::snap_time_with_markers(
+                            raw_start,
+                            &clips,
+                            &app.project.document.timeline_markers,
+                            0.2,
+                        )
+                        .min(end - 0.1);
+                        let ds = s - drag.origin_start_sec;
+                        (s.max(0.0), (end - s).max(0.1), (drag.origin_offset_sec + ds).max(0.0))
+                    }
+                    crate::av_ui::AvDragMode::TrimEnd => {
+                        let end = crate::document::snap_time_with_markers(
+                            raw_start + raw_len,
+                            &app
+                                .project
+                                .document
+                                .layers
+                                .iter()
+                                .flat_map(|l| {
+                                    l.av_clips.iter().filter(|c| c.id != drag.clip_id).cloned()
+                                })
+                                .collect::<Vec<_>>(),
+                            &app.project.document.timeline_markers,
+                            0.2,
+                        );
+                        (raw_start, (end - raw_start).max(0.1), raw_offset)
+                    }
+                };
                 if let Some(l) = app.project.document.layers.get_mut(drag.layer_idx) {
                     if drag.is_music {
                         if let Some(clip) = l.music_clips.iter_mut().find(|c| c.id == drag.clip_id)
@@ -4034,6 +4126,7 @@ fn video_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui, _layer_po
                             clip.track_row = 0;
                         }
                     } else if let Some(clip) = l.av_clips.iter_mut().find(|c| c.id == drag.clip_id)
+                        && !clip.locked
                     {
                         // Only this clip — never sync length onto other queue items.
                         clip.video_timeline_start = start;
@@ -4896,8 +4989,7 @@ fn status_bar_body(app: &mut VadadeeBerryApp, ui: &mut Ui) {
                 "Play"
             };
 
-            let max_anim_frame =
-                crate::document::max_animation_frame(&app.project, app.playback.fps);
+            let max_anim_frame = app.get_content_max_animation_frame();
             let btn_next = ui.button(RichText::new("").font(nerd_font_id(12.0)));
             if btn_next.clicked() {
                 app.playback.frame = app.playback.frame + 1; // allow beyond to support >100 frames
@@ -10959,7 +11051,7 @@ fn timeline_interior(app: &mut VadadeeBerryApp, ui: &mut Ui) {
     app.sync_stale_media_layer_durations();
     // Ghost End frames come from keyframes on deleted objects.
     let _ = app.prune_orphan_animation_tracks();
-    let content_max_frame = crate::document::max_animation_frame(&app.project, app.playback.fps);
+    let content_max_frame = app.get_content_max_animation_frame();
 
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
@@ -12413,7 +12505,7 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             .chain(stack_fns.iter().map(|sf| sf.end_frame()))
             .max()
             .unwrap_or(0)
-            .max(crate::document::max_animation_frame(&app.project, app.playback.fps))
+            .max(app.get_content_max_animation_frame())
             .max(100);
 
         // Frame-width control (how many frames the graph plot shows).
@@ -12449,6 +12541,39 @@ fn graph_editor_interior(app: &mut VadadeeBerryApp, ui: &mut egui::Ui) {
             }
         });
 
+        // Keys exist but none are inside the current window: say so with a
+        // jump button instead of a bare flat line (auto-fit on open covers
+        // the common case; this covers scrolled-away views).
+        {
+            let frames: Vec<usize> = tracks_to_draw
+                .iter()
+                .flat_map(|(_, _, t, _)| t.keyframes.iter().map(|k| k.frame))
+                .collect();
+            if !frames.is_empty() {
+                let (kmin, kmax) = (
+                    *frames.iter().min().unwrap() as f32,
+                    *frames.iter().max().unwrap() as f32,
+                );
+                let vis_lo = graph_scroll;
+                let vis_hi = graph_scroll + graph_visible;
+                if kmax < vis_lo || kmin > vis_hi {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{} keyframe(s) outside view (frames {}..{})",
+                            frames.len(),
+                            kmin as usize,
+                            kmax as usize
+                        ));
+                        if ui.button("Jump to keys").clicked() {
+                            let pad = ((kmax - kmin) * 0.2).max(10.0);
+                            app.anim_graph_scroll = (kmin - pad).max(0.0);
+                            app.anim_graph_visible_frames =
+                                (kmax - kmin + pad * 2.0).clamp(10.0, 5000.0);
+                        }
+                    });
+                }
+            }
+        }
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width() - 8.0, 136.0),
             egui::Sense::click_and_drag()
@@ -13931,8 +14056,27 @@ fn animation_node_editor_params(app: &mut VadadeeBerryApp, ui: &mut Ui, layer_id
         app.project.anim_timeline.nodes.insert(layer_id, entry);
     }
     if let Some(lbl) = open_graph {
-        app.anim_graph_editor_track = Some((layer_id, lbl));
+        app.anim_graph_editor_track = Some((layer_id, lbl.clone()));
         app.anim_graph_editor_target_track = None;
+        // Fit the view to the opened track's keyframes. The scroll/zoom is
+        // global and sticky — without this, keys outside the old window show
+        // as a flat line with no dots and no "no keyframes" message.
+        if let Some(entry) = app.project.anim_timeline.nodes.get(&layer_id) {
+            if let Some(t) = entry.get_track(&lbl) {
+                if let (Some(&lo), Some(&hi)) = (
+                    t.keyframes.first().map(|kf| &kf.frame),
+                    t.keyframes.last().map(|kf| &kf.frame),
+                ) {
+                    let pad = ((hi - lo) as f32 * 0.2).max(10.0);
+                    app.anim_graph_scroll = (lo as f32 - pad).max(0.0);
+                    app.anim_graph_visible_frames =
+                        (hi as f32 - lo as f32 + pad * 2.0).clamp(10.0, 5000.0);
+                } else {
+                    app.anim_graph_scroll = 0.0;
+                    app.anim_graph_visible_frames = 100.0;
+                }
+            }
+        }
     }
 }
 

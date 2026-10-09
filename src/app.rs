@@ -131,6 +131,14 @@ pub struct VadadeeBerryApp {
     pub piano_pitch_scroll: f32,
     /// Sticky AV timeline clip/trim drag (survives clip moving under the cursor).
     pub av_timeline_drag: Option<crate::av_ui::AvTimelineDrag>,
+    /// Timeline-eval session state (R3a): per-script gating across frames.
+    /// NOT persisted — ranges re-learn on first evaluation after load.
+    pub timeline_eval_states:
+        std::collections::HashMap<uuid::Uuid, crate::vblua::timeline_eval::ScriptEvalState>,
+    /// Last frame-eval errors (name, message) for the timeline panel.
+    pub timeline_eval_errors: Vec<(String, String)>,
+    /// Timeline scripts panel visibility.
+    pub show_timeline_scripts: bool,
     /// Node Editor dialog UI (open layer, tools, selection).
     pub node_editor_ui: crate::node_editor_ui::NodeEditorUiState,
     pub ui_shading_pass_sel: usize,
@@ -235,6 +243,10 @@ pub struct VadadeeBerryApp {
     /// After choosing an object, ignore clicks on others until Esc / empty-space deselect.
     pub selection_sticky: bool,
     pub history: History,
+    /// VBLua dev console (temporary test surface, NOT the Phase 13 UI API).
+    /// Runtime is created lazily on first Run so startup cost is zero.
+    pub vblua_console: crate::vblua::VbluaConsole,
+    pub show_vblua_console: bool,
     pub ui_fill_stops: Vec<GradientStop>,
     pub ui_fill_stop_sel: usize,
     pub ui_fill_edit_gradient_line: bool,
@@ -562,7 +574,7 @@ impl VadadeeBerryApp {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         purge_vadadee_disk_caches(CachePurgeOpts::on_startup());
 
-        let app = Self {
+        let mut app = Self {
             live_snap_guides: Vec::new(),
             snap_magnet: true,
             pixel_art_mode: false,
@@ -579,6 +591,9 @@ impl VadadeeBerryApp {
             piano_scroll_offset: 0.0,
             piano_pitch_scroll: 36.0,
             av_timeline_drag: None,
+            timeline_eval_states: std::collections::HashMap::new(),
+            timeline_eval_errors: Vec::new(),
+            show_timeline_scripts: false,
             node_editor_ui: crate::node_editor_ui::NodeEditorUiState::default(),
             ui_shading_pass_sel: 0,
             anim_last_applied_states: std::collections::HashMap::new(),
@@ -647,6 +662,8 @@ impl VadadeeBerryApp {
             hit_pick_menu: None,
             selection_sticky: false,
             history: History::default(),
+            vblua_console: crate::vblua::VbluaConsole::default(),
+            show_vblua_console: false,
             ui_fill_stops: default_gradient_stops(),
             ui_fill_stop_sel: 0,
             ui_fill_edit_gradient_line: false,
@@ -835,6 +852,29 @@ impl VadadeeBerryApp {
             canvas_focused: false,
             window_was_focused: true,
         };
+        // Phase 12: desktop picker hook for VBLua (rfd dialog → bytes).
+        // Mobile has no hook: vblua.file.status().picker == false there until
+        // SAF / document picker bridges land.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        app.vblua_console.set_picker(Some(std::sync::Arc::new(
+            |filter: &crate::vblua::file::PickFilter| {
+                let mut dialog = rfd::FileDialog::new().set_title(&filter.title);
+                if !filter.filters.is_empty() {
+                    dialog = dialog.add_filter("Images", &filter.filters);
+                }
+                let path = dialog
+                    .pick_file()
+                    .ok_or_else(|| "picker cancelled".to_string())?;
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| format!("failed to read picked file: {e}"))?;
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("picked image")
+                    .to_string();
+                Ok(crate::vblua::file::PickedFile { name, bytes })
+            },
+        )));
         if let Some(rs) = &app.wgpu_render {
             crate::shading::init_callback_resources(rs, crate::VIEWPORT_MSAA_SAMPLES);
         }
@@ -2199,7 +2239,36 @@ impl VadadeeBerryApp {
     /// Highest content frame (keyframes / AV) — does **not** grow with the playhead.
     /// Used for loop length so scrubbing/play doesn't expand the span mid-play.
     pub fn get_content_max_animation_frame(&self) -> usize {
-        crate::document::content_max_animation_frame(&self.project, self.playback.fps)
+        let mut max_f =
+            crate::document::content_max_animation_frame(&self.project, self.playback.fps);
+        // Timeline scripts extend the playable span to cover their recorded
+        // ranges (else a 0..15s script could never play past the ~1s default).
+        // Learned on first evaluation, so a fresh session grows from frame 0.
+        let scripts: Vec<(uuid::Uuid, bool)> = self
+            .project
+            .document
+            .timeline_scripts
+            .iter()
+            .map(|s| (s.id, s.enabled))
+            .collect();
+        max_f = max_f.max(crate::vblua::timeline_eval::recorded_span_end_frame(
+            &scripts,
+            &self.timeline_eval_states,
+            self.playback.fps,
+        ));
+        // Export Duration (0 = Auto): the timeline never plays shorter than
+        // what export will render — max(), never a cap, so longer content
+        // or script ranges stay visible.
+        // Manual export Duration sets the timeline exactly (WYSIWYG with
+        // export): content and script ranges never extend or shrink it.
+        // Auto (0) falls back to max(content, script ranges).
+        if self.video_export.export_duration_secs > 1e-6 {
+            return crate::vblua::timeline_eval::export_duration_end_frame(
+                self.video_export.export_duration_secs,
+                self.playback.fps,
+            );
+        }
+        max_f
     }
 
     pub fn get_max_animation_frame(&self) -> usize {
@@ -2598,6 +2667,47 @@ impl VadadeeBerryApp {
                 }
             }
         }
+    }
+
+    /// True when a geom-float delta is exactly a whole-object translation:
+    /// every anchor shifted by (dx, dy), handles/widths/suffix untouched.
+    /// Layouts: Path = 6-stride (x, y + relative handle offsets),
+    /// BrushStroke = 3-stride (x, y, w). Anything else (or length mismatch)
+    /// returns false so the caller keeps current behavior.
+    fn geom_is_pure_translation(
+        kind: &crate::document::NodeKind,
+        geom: &[f64],
+        last: &[f64],
+        dx: f64,
+        dy: f64,
+    ) -> bool {
+        let (stride, region) = match kind {
+            crate::document::NodeKind::Path { path } => (6usize, path.anchor_positions().len() * 6),
+            crate::document::NodeKind::BrushStroke { points } => (3usize, points.len() * 3),
+            _ => return false,
+        };
+        if region == 0 || geom.len() < region || last.len() < region {
+            return false;
+        }
+        for (i, (a, b)) in geom[..region].iter().zip(&last[..region]).enumerate() {
+            let expected = match i % stride {
+                0 => dx,
+                1 => dy,
+                _ => 0.0,
+            };
+            if (a - b - expected).abs() > 1e-6 {
+                return false;
+            }
+        }
+        // Shared suffix (fill/gradient props) must be untouched.
+        if geom.len() == last.len() {
+            for (a, b) in geom[region..].iter().zip(&last[region..]) {
+                if (a - b).abs() > 1e-9 {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     pub fn get_node_geom_floats(&self, id: NodeId) -> Vec<f64> {
@@ -3703,6 +3813,10 @@ impl VadadeeBerryApp {
             return;
         }
         layer.ensure_av_clips();
+        if layer.av_clips.iter().any(|c| c.id == clip_id && c.locked) {
+            self.status_message = "Clip is locked".into();
+            return;
+        }
         let n0 = layer.av_clips.len() + layer.music_clips.len();
         layer.av_clips.retain(|c| c.id != clip_id);
         layer.music_clips.retain(|c| c.id != clip_id);
@@ -4036,7 +4150,23 @@ impl VadadeeBerryApp {
         }
     }
 
+    /// Pause timeline preview (transport + video streams + rodio audio).
+    /// Used before modal dialogs and export so nothing free-runs while the
+    /// UI thread is blocked. Stays paused afterwards — user presses Play.
+    pub fn pause_timeline_preview(&mut self) {
+        self.playback.playing = false;
+        self.playback.wall_tick = None;
+        self.playback.play_origin = None;
+        self.stop_all_video_streams();
+        for player in self.audio_players.values() {
+            player.pause();
+        }
+    }
+
     pub fn request_video_export(&mut self, ctx: egui::Context) {
+        // Pause BEFORE the blocking save dialog — rodio runs on its own
+        // thread and would otherwise play through the modal.
+        self.pause_timeline_preview();
         #[cfg(all(
             not(target_arch = "wasm32"),
             not(any(target_os = "android", target_os = "ios"))
@@ -4058,6 +4188,8 @@ impl VadadeeBerryApp {
     }
 
     pub fn begin_video_export(&mut self, output: std::path::PathBuf, ctx: egui::Context) {
+        // Defensive pause for programmatic exports that skip the dialog.
+        self.pause_timeline_preview();
         // Refresh media caps only; do not reset user Play Duration (e.g. 10s trim).
         self.sync_stale_media_layer_durations();
         let anim_fps = self.playback.fps.max(1);
@@ -5011,6 +5143,12 @@ impl VadadeeBerryApp {
                             self.fit_view_on_next_frame = true;
                             self.refresh_all_media_layer_durations();
                             self.status_message = format!("Opened project: {}", path.display());
+                            // VBLua document-open hooks (no-op without a runtime).
+                            self.vblua_console.fire_event(
+                                &mut self.project,
+                                &mut self.history,
+                                "document-open",
+                            );
                         }
                         Err(e) => self.status_message = format!("Open project failed: {e}"),
                     }
@@ -5070,6 +5208,12 @@ impl VadadeeBerryApp {
                     .add_filter("SVG", &["svg"])
                     .save_file()
                 {
+                    // VBLua before-export hooks run first so stamps land in the file.
+                    self.vblua_console.fire_event(
+                        &mut self.project,
+                        &mut self.history,
+                        "before-export",
+                    );
                     match io::export_svg(&path, &self.project) {
                         Ok(()) => self.status_message = format!("Exported {}", path.display()),
                         Err(e) => self.status_message = format!("Export failed: {e}"),
@@ -5921,7 +6065,9 @@ impl VadadeeBerryApp {
         let mut after_doc = before_doc.clone();
         for layer in &mut after_doc.layers {
             let initial_av_len = layer.av_clips.len();
-            layer.av_clips.retain(|c| !self.selection.contains(&c.id));
+            layer
+                .av_clips
+                .retain(|c| !self.selection.contains(&c.id) || c.locked);
             if layer.av_clips.len() != initial_av_len {
                 clip_removed = true;
                 layer.sync_legacy_from_primary_clip();
@@ -6191,6 +6337,8 @@ impl VadadeeBerryApp {
         const MIN_SPLIT_SEC: f32 = 0.1;
         let idx = self.project.document.active_layer_index;
         let play_sec = self.playback.frame as f32 / self.playback.fps as f32;
+        // Snapshot first: the layer borrow below conflicts with it.
+        let before = crate::history::snapshot_document(&self.project.document);
         let Some(layer) = self.project.document.layers.get_mut(idx) else {
             return;
         };
@@ -6208,6 +6356,10 @@ impl VadadeeBerryApp {
             return;
         };
         let clip = layer.av_clips[clip_idx].clone();
+        if clip.locked {
+            self.status_message = "Clip is locked".into();
+            return;
+        }
         let left_len = play_sec - clip.video_timeline_start;
         let right_start = play_sec;
         let right_offset = clip.video_start_offset + left_len;
@@ -6221,16 +6373,202 @@ impl VadadeeBerryApp {
         right.video_play_length = right_len.max(MIN_SPLIT_SEC);
         right.track_row = clip.track_row;
 
+        // Undoable like every other timeline mutation (Phase 27).
         if let Some(c) = layer.av_clips.get_mut(clip_idx) {
             c.video_play_length = left_len.max(MIN_SPLIT_SEC);
         }
         layer.av_clips.insert(clip_idx + 1, right);
         layer.sync_legacy_from_primary_clip();
+        let after = crate::history::snapshot_document(&self.project.document);
+        self.history.push(
+            &mut self.project,
+            crate::history::ProjectEdit::PatchDocument { before, after },
+        );
         self.status_message = format!("Split clip at {:.2}s", play_sec);
     }
 
     pub fn create_music_clip_at_playhead(&mut self) {
         self.create_daw_clip_at_playhead();
+    }
+
+    /// Duplicate an AV clip: same media, new id, appended after the original
+    /// (shares the source file — no media duplication). Undoable.
+    pub fn duplicate_av_clip(&mut self, layer_idx: usize, clip_id: uuid::Uuid) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let Some(layer) = after.layers.get_mut(layer_idx) else {
+            return;
+        };
+        if layer.kind != crate::document::LayerKind::AV {
+            return;
+        }
+        let Some(pos) = layer.av_clips.iter().position(|c| c.id == clip_id) else {
+            return;
+        };
+        let mut copy = layer.av_clips[pos].clone();
+        if copy.locked {
+            self.status_message = "Clip is locked".into();
+            return;
+        }
+        copy.id = uuid::Uuid::new_v4();
+        copy.name = format!("{} copy", copy.name.chars().take(100).collect::<String>());
+        copy.video_timeline_start = copy.timeline_end_secs();
+        layer.av_clips.insert(pos + 1, copy);
+        layer.sync_legacy_from_primary_clip();
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+        self.status_message = "Duplicated clip".into();
+    }
+
+    /// Ripple delete: remove the clip and shift later clips on the same row
+    /// left by the removed span (no gap). Undoable. Locked clips refuse.
+    pub fn ripple_delete_av_clip(&mut self, layer_idx: usize, clip_id: uuid::Uuid) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let Some(layer) = after.layers.get_mut(layer_idx) else {
+            return;
+        };
+        if layer.kind != crate::document::LayerKind::AV {
+            return;
+        }
+        let Some(pos) = layer.av_clips.iter().position(|c| c.id == clip_id) else {
+            return;
+        };
+        let gone = layer.av_clips[pos].clone();
+        if gone.locked {
+            self.status_message = "Clip is locked".into();
+            return;
+        }
+        let span = gone.timeline_play_secs().max(0.0);
+        let cut_at = gone.video_timeline_start;
+        layer.av_clips.remove(pos);
+        for c in layer.av_clips.iter_mut() {
+            if c.track_row == gone.track_row && c.video_timeline_start >= cut_at {
+                c.video_timeline_start = (c.video_timeline_start - span).max(0.0);
+            }
+        }
+        if layer.av_clips.is_empty() {
+            layer.video_path.clear();
+            layer.media_source_duration = None;
+        } else {
+            layer.sync_legacy_from_primary_clip();
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+        self.status_message = "Ripple deleted".into();
+    }
+
+    /// Add a timeline marker (undoable). Returns the new id.
+    pub fn add_timeline_marker(&mut self, name: String, time_sec: f32) -> uuid::Uuid {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let id = after.add_timeline_marker(name, time_sec);
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+        self.status_message = "Added marker".into();
+        id
+    }
+
+    /// Remove a timeline marker (undoable). No-op on unknown id.
+    pub fn remove_timeline_marker(&mut self, id: uuid::Uuid) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        if !after.remove_timeline_marker(id) {
+            return;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+        self.status_message = "Removed marker".into();
+    }
+
+    /// Add a timeline script (undoable). Caps: 32 scripts, 64 KiB source.
+    pub fn add_timeline_script(&mut self, name: String, source: String) -> Option<uuid::Uuid> {
+        if self.project.document.timeline_scripts.len() >= 32 {
+            self.status_message = "Too many timeline scripts (max 32)".into();
+            return None;
+        }
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        after
+            .timeline_scripts
+            .push(crate::document::TimelineScript::new(name, source));
+        let id = after.timeline_scripts.last().map(|s| s.id)?;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+        self.status_message = "Added timeline script".into();
+        Some(id)
+    }
+
+    /// Remove a timeline script (undoable). Drops its session eval state too.
+    pub fn remove_timeline_script(&mut self, id: uuid::Uuid) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let n0 = after.timeline_scripts.len();
+        after.timeline_scripts.retain(|s| s.id != id);
+        if after.timeline_scripts.len() == n0 {
+            return;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+        self.timeline_eval_states.remove(&id);
+        self.status_message = "Removed timeline script".into();
+    }
+
+    /// Toggle a timeline script's enabled flag (undoable).
+    pub fn set_timeline_script_enabled(&mut self, id: uuid::Uuid, enabled: bool) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        let Some(s) = after.timeline_scripts.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        s.enabled = enabled;
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
+    }
+
+    /// Evaluate timeline scripts against the current playhead (R3a).
+    /// Applies staged commands with NO undo entries (playback effects).
+    /// Skipped while live-dragging geometry (same rule as animation apply).
+    pub fn evaluate_timeline_scripts(&mut self) {
+        if self.project.document.timeline_scripts.is_empty() {
+            return;
+        }
+        let frame = self.playback.frame;
+        let fps = self.playback.fps.max(1);
+        let report = crate::vblua::timeline_eval::evaluate_frame(
+            &mut self.project,
+            frame,
+            fps,
+            &mut self.timeline_eval_states,
+        );
+        self.timeline_eval_errors = report.errors;
+    }
+
+    /// Move a timeline marker in time (undoable). No-op on unknown id.
+    pub fn move_timeline_marker(&mut self, id: uuid::Uuid, time_sec: f32) {
+        let before = snapshot_document(&self.project.document);
+        let mut after = before.clone();
+        if !after.move_timeline_marker(id, time_sec) {
+            return;
+        }
+        self.history.push(
+            &mut self.project,
+            ProjectEdit::PatchDocument { before, after },
+        );
     }
 
     /// Create a 1s DAW node on a DAW-role AV layer (creates the layer if needed).
@@ -6371,6 +6709,23 @@ impl VadadeeBerryApp {
         (hit, None)
     }
 
+    /// True when `id` is a Node Editor output proxy whose graph currently
+    /// resolves to an Empty image — a phantom A4 rect that must not be
+    /// selectable (paint already skips Empty; pick must mirror it).
+    fn is_empty_output_proxy(&self, id: NodeId) -> bool {
+        let doc = &self.project.document;
+        let Some(li) = doc.ne_output_proxy_layer_index(id) else {
+            return false;
+        };
+        let Some(layer) = doc.layers.get(li) else {
+            return false;
+        };
+        let Some(g) = layer.node_graph.as_ref() else {
+            return true;
+        };
+        g.resolve_output_image().image.is_empty()
+    }
+
     /// All nodes under the pointer (topmost first). Used for multi-object hit picker.
     fn pick_all_nodes_at(&self, doc: (f64, f64), slop: f64, include_ghosts: bool) -> Vec<NodeId> {
         let hidden = if include_ghosts {
@@ -6385,6 +6740,9 @@ impl VadadeeBerryApp {
             if hidden.contains(&id)
                 && !crate::document::is_pickable_effect_source(&self.project.document, id)
             {
+                continue;
+            }
+            if self.is_empty_output_proxy(id) {
                 continue;
             }
             if let Some(node) = self.project.nodes.get(id) {
@@ -9574,7 +9932,7 @@ impl VadadeeBerryApp {
             let mut layer = l.clone();
             layer.ensure_av_clips();
             for c in &layer.av_clips {
-                if c.is_audio_only() || c.media_path.is_empty() {
+                if c.is_audio_only() || c.media_path.is_empty() || c.muted {
                     continue;
                 }
                 let active = c.contains_timeline_sec(t_sec);
@@ -10698,11 +11056,8 @@ impl VadadeeBerryApp {
                                         } else {
                                             1.0
                                         };
-                                        let uv = if eval.has_zoom() {
-                                            eval.zoom_uv_rect()
-                                        } else {
-                                            (0.0, 0.0, 1.0, 1.0)
-                                        };
+                                        // Zoom ∩ crop in one UV rect (preview/export parity).
+                                        let uv = eval.display_uv_rect();
                                         paint_rotated_image_mirrored_tint_uv(
                                             &painter,
                                             tex_id,
@@ -10753,11 +11108,8 @@ impl VadadeeBerryApp {
                                         } else {
                                             1.0
                                         };
-                                        let uv = if eval.has_zoom() {
-                                            eval.zoom_uv_rect()
-                                        } else {
-                                            (0.0, 0.0, 1.0, 1.0)
-                                        };
+                                        // Zoom ∩ crop in one UV rect (preview/export parity).
+                                        let uv = eval.display_uv_rect();
                                         paint_rotated_image_mirrored_tint_uv(
                                             &painter,
                                             tex_id,
@@ -11942,10 +12294,14 @@ impl VadadeeBerryApp {
                 moved_ids.push(id);
             }
         }
+        // Whole-object moves must not mint point keyframes (they fight the
+        // pos tracks on playback). Only a real point/curve edit records geom.
+        let point_edit = self.tools.select.node_edit_target.is_some()
+            || self.tools.select.mid_curve_drag.is_some();
         // Keep animation keyframes in sync so position/path geom does not snap back on apply.
         for id in moved_ids {
             self.sync_anim_transform_from_node(id);
-            if self.anim_keyframing_mode && !self.playback.playing {
+            if self.anim_keyframing_mode && !self.playback.playing && point_edit {
                 // Ensure path-point / weight-adjacent geom is captured even if REC only saw one frame.
                 self.record_geom_keyframes_for_node(id);
             } else {
@@ -16007,9 +16363,14 @@ impl VadadeeBerryApp {
                     } else {
                         self.selection.push(id);
                     }
+                    self.tools.select.pressed_selected_id = None;
                 } else if !self.selection.contains(&id) {
+                    // Same replace rule as object clicks (see above).
                     self.selection = vec![id];
                     self.tools.select.select_rotation_mode = false;
+                    self.tools.select.pressed_selected_id = None;
+                } else {
+                    self.tools.select.pressed_selected_id = Some(id);
                 }
                 if !self.selection.is_empty() {
                     self.tools.select.drag_mode = Some(SelectDrag::Move);
@@ -16049,7 +16410,9 @@ impl VadadeeBerryApp {
                         if !on_current {
                             self.tools.select.last_doc = doc;
                             self.sync_inspector_from_selection();
-                            return;
+                            // Fall through (no return): plain click on another
+                            // object adds it to the selection below instead of
+                            // switching. Drag then moves the whole selection.
                         }
                     }
                 }
@@ -16094,10 +16457,19 @@ impl VadadeeBerryApp {
                         self.selection.push(id);
                     }
                     self.selection_sticky = !self.selection.is_empty();
+                    self.tools.select.pressed_selected_id = None;
                 } else if !self.selection.contains(&id) {
+                    // Plain click switches to exactly this object (standard
+                    // replace). Shift-click adds; click empty space clears.
                     self.selection = vec![id];
                     self.tools.select.select_rotation_mode = false;
                     self.selection_sticky = true;
+                    self.tools.select.pressed_selected_id = None;
+                } else {
+                    // Pressed an already-selected object: keep the whole
+                    // selection armed for a multi-move; a release without
+                    // drag collapses down to this id (see release path).
+                    self.tools.select.pressed_selected_id = Some(id);
                 }
                 if !self.selection.is_empty() {
                     self.tools.select.drag_mode = Some(SelectDrag::Move);
@@ -16491,6 +16863,9 @@ impl VadadeeBerryApp {
                     let picked: Vec<NodeId> = if self.spatial_index.is_enabled() {
                         self.spatial_index
                             .nodes_in_marquee(&self.project, &hidden, rect)
+                            .into_iter()
+                            .filter(|id| !self.is_empty_output_proxy(*id))
+                            .collect()
                     } else {
                         self.project
                             .document
@@ -16506,7 +16881,8 @@ impl VadadeeBerryApp {
                                 {
                                     return false;
                                 }
-                                self.project.nodes.get(*id).is_some_and(|n| {
+                                !self.is_empty_output_proxy(*id)
+                                    && self.project.nodes.get(*id).is_some_and(|n| {
                                     if self.node_uses_extended_bounds(*id) {
                                         let eb = crate::document::get_effective_bounds(
                                             n,
@@ -16602,6 +16978,15 @@ impl VadadeeBerryApp {
                             }
                             self.sync_flowchart_paths_if_active_layer();
                             self.tools.select.drag_snapshot.clear();
+                            // Release without drag on an already-selected object:
+                            // collapse a multi-selection down to the pressed id
+                            // (press-drag still moves the whole selection).
+                            if let Some(pid) = self.tools.select.pressed_selected_id.take() {
+                                if self.selection.len() > 1 && self.selection.contains(&pid) {
+                                    self.selection = vec![pid];
+                                    self.tools.select.select_rotation_mode = false;
+                                }
+                            }
                             // Second click on already-selected object → toggle rotate mode.
                             if self.selection.len() == 1
                                 && self.tools.select.clicked_already_selected
@@ -22174,6 +22559,10 @@ impl eframe::App for VadadeeBerryApp {
 
         // Node Editor algebra (Value / Frame / Time / Expr / ParamReal) every frame.
         self.eval_node_editor_graphs();
+        // Timeline Lua scripts (R3a): same frame-change gating as animation.
+        if (frame_scrubbed || frame_changed) && !dragging {
+            self.evaluate_timeline_scripts();
+        }
 
         // Record keyframes while keyframing: whole-object drag, path node drag, weight-flow sculpt.
         if self.anim_keyframing_mode && !self.playback.playing && self.is_live_geometry_editing() {
@@ -22282,6 +22671,25 @@ impl eframe::App for VadadeeBerryApp {
                             }
                         } else if !geom.is_empty() {
                             geom_really_changed = true;
+                        }
+                        // Whole-object move of a point-based kind shifts every
+                        // anchor by (dx, dy) with handles untouched — that is a
+                        // pos-track move, not a reshape. Suppress the geom keys
+                        // unless a point/curve edit is actually active.
+                        if geom_really_changed {
+                            let point_edit = self.tools.select.node_edit_target.is_some()
+                                || self.tools.select.mid_curve_drag.is_some();
+                            if !point_edit
+                                && Self::geom_is_pure_translation(
+                                    &node.kind,
+                                    &geom,
+                                    &last.geom_floats,
+                                    dx,
+                                    dy,
+                                )
+                            {
+                                geom_really_changed = false;
+                            }
                         }
                         if geom_really_changed {
                             changed_geom = true;
@@ -22985,6 +23393,60 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn test_geom_pure_translation_detection() {
+        use crate::document::{NodeKind, PathData};
+        let path = PathData::from_anchor_data(
+            &[(0.0, 0.0), (10.0, 0.0)],
+            &[],
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            true,
+        );
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "p".to_string(),
+            kind: NodeKind::Path { path },
+            style: crate::document::NodeStyle::default(),
+            transform: crate::document::Transform2D::default(),
+            path_effect_links: Vec::new(),
+        };
+        let before = node.get_geom_floats();
+        let mut moved = node.clone();
+        moved.translate(5.0, -3.0);
+        let after = moved.get_geom_floats();
+        assert!(VadadeeBerryApp::geom_is_pure_translation(
+            &node.kind, &after, &before, 5.0, -3.0
+        ));
+        // A real reshape (one anchor moved extra) is NOT pure translation.
+        let mut reshaped = moved.clone();
+        if let NodeKind::Path { path } = &mut reshaped.kind {
+            if let Some(p0) = path.anchor_positions().first() {
+                let _ = p0;
+            }
+            // Shift only the first anchor's x by nudging floats directly.
+            let mut g = reshaped.get_geom_floats();
+            g[0] += 2.0;
+            reshaped.set_geom_floats(&g);
+        }
+        let rg = reshaped.get_geom_floats();
+        assert!(!VadadeeBerryApp::geom_is_pure_translation(
+            &reshaped.kind,
+            &rg,
+            &before,
+            5.0,
+            -3.0
+        ));
+        // Non-point kinds never qualify (caller keeps current behavior).
+        assert!(!VadadeeBerryApp::geom_is_pure_translation(
+            &NodeKind::Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0, rx: 0.0 },
+            &after,
+            &before,
+            5.0,
+            -3.0
+        ));
+    }
+
     fn test_pure_motion_geometry_equivalence() {
         use crate::document::{NodeKind, PathData};
         let path = PathData::from_anchor_data(
@@ -23053,6 +23515,9 @@ mod tests {
                 piano_scroll_offset: 0.0,
                 piano_pitch_scroll: 36.0,
                 av_timeline_drag: None,
+            timeline_eval_states: std::collections::HashMap::new(),
+            timeline_eval_errors: Vec::new(),
+            show_timeline_scripts: false,
                 node_editor_ui: crate::node_editor_ui::NodeEditorUiState::default(),
                 ui_shading_pass_sel: 0,
                 anim_last_applied_states: std::collections::HashMap::new(),
@@ -23127,6 +23592,8 @@ mod tests {
                 hit_pick_menu: None,
                 selection_sticky: false,
                 history: History::default(),
+            vblua_console: crate::vblua::VbluaConsole::default(),
+            show_vblua_console: false,
                 ui_fill_stops: default_gradient_stops(),
                 ui_fill_stop_sel: 0,
                 ui_fill_edit_gradient_line: false,

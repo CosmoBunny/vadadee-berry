@@ -400,6 +400,10 @@ pub struct SelectSession {
     pub rotate_start_layer_rotation: f32,
     pub drag_start_doc: Option<(f64, f64)>,
     pub clicked_already_selected: bool,
+    /// Object pressed while already selected (plain click): release without
+    /// drag collapses a multi-selection down to this id (deferred deselect).
+    /// `None` for fresh selects, shift-toggles, and non-click gestures.
+    pub pressed_selected_id: Option<NodeId>,
     /// True once pointer moved past click-threshold during SelectDrag::Move.
     pub move_drag_engaged: bool,
     /// CircularClone ring pose at move-drag start: (source_id, base_x, base_y, origin_x, origin_y).
