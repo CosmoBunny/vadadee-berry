@@ -1,13 +1,11 @@
 # Vadadee Berry
 
 <p align="center">
-  <img src="assets/logo.svg" alt="Vadadee Berry — studio (left) and MCP (right)" width="200" height="100" />
+  <img src="assets/logo.svg" alt="Vadadee Berry — studio (left) and MCP (right)" width="100%" />
 </p>
 
-A creative tool built in Rust with egui and wgpu. It combines a vector graphics
-editor, a video/audio timeline, a shader compositor, image editing, flowchart
-diagramming, and a music sequencer — all in a single native application with a
-GPU-accelerated canvas.
+A creative tool built in Rust with egui and wgpu. It combines a vector graphics editor, a video/audio timeline, a shader compositor, image editing, flowchart diagramming, and a music sequencer.
+All in a single native application with a GPU-accelerated canvas.
 
 ---
 
@@ -37,7 +35,7 @@ GPU-accelerated canvas.
 - Supports mp4, mkv, webm and other formats FFmpeg can decode
 - Timeline editor with multi-track AV clips, trim, offset, and sub-track rows
 - Frame scrubbing and playback
-- Export to MP4 (H.264/AAC) using libav directly — no subprocess
+- Export to MP4 (H.264/AAC) using libav directly
 
 ### Audio
 
@@ -50,7 +48,7 @@ GPU-accelerated canvas.
 
 - WGSL shader passes composited over the canvas via wgpu
 - Built-in procedural shaders: blackhole (GPU and CPU), CRT, vignette
-- **Dynamic custom shaders**: edit WGSL in the layer panel, load/save `.wgsl` files, or pass source via MCP `add_shading_layer` — compiled at runtime (no rebuild)
+- **Dynamic custom shaders**: edit WGSL in the layer panel, load/save `.wgsl` files, or pass source via MCP `add_shading_layer`  compiled at runtime (no rebuild)
 - Fragment entry required: `@fragment fn main` (or `fs_main`); multipass compute engines (e.g. Cuneus) are not drop-in compatible
 - Compose bindings: `input_tex@0`, `sampler@1`, `uniform@2` (procedural-only: uniform at `@binding(0)`)
 - Hot reload or Compile/Reload; validation errors surface in the shader editor
@@ -301,7 +299,7 @@ RELEASE_KEY_PASSWORD=yourkeypassword
 ## Video export dependency
 
 Video import and export require FFmpeg shared libraries at runtime.
-The application loads them dynamically (dlopen) — no static linking, no subprocess.
+The application loads them dynamically (dlopen) no static linking, no subprocess.
 
 Supported library versions: libavformat 60-61, libavcodec 60-61, libavutil 58-59.
 
@@ -374,8 +372,8 @@ cargo run --bin vadadee-berry --no-default-features
 - Export forces CV to complete synchronously so frames are final.
 - **Settings › Computer vision** chooses face detect backend:
   - **Auto** — OpenCV Haar when available, else native
-  - **OpenCV Haar** — force OpenCV (falls back if cascade missing)
-  - **Native (fast)** — pure-Rust skin ROI (usually faster for live preview)
+  - **OpenCV Haar** force OpenCV (falls back if cascade missing)
+  - **Native (fast)** pure-Rust skin ROI (usually faster for live preview)
 
 ---
 
